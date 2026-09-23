@@ -10394,3 +10394,28 @@ fn seed_degrade_disposition_retries_only_the_classified_transient() {
         SeedDegradeDisposition::LogAndDegrade
     );
 }
+
+/// A flock belongs to the open file description, so a child that another
+/// thread forks while a rotation guard is held carries a duplicate of the
+/// guard's descriptor until it execs, and that duplicate keeps the lock alive
+/// after the guard closes its own. Dropping the guard must release the lock
+/// anyway: the next acquire for the same profile must not find it held by an
+/// owner that has already let go. `try_clone` is the same duplicate a fork
+/// makes.
+#[test]
+fn a_dropped_rotation_guard_releases_while_a_duplicate_descriptor_lives() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("dup-holder");
+    let guard = RotationGuard::try_acquire(&name)
+        .expect("open the lock")
+        .expect("the lock starts free");
+    let inherited = guard._file.try_clone().expect("duplicate the descriptor");
+    drop(guard);
+    assert!(
+        RotationGuard::try_acquire(&name)
+            .expect("open the lock")
+            .is_some(),
+        "a released guard still blocks while a forked duplicate lives"
+    );
+    drop(inherited);
+}

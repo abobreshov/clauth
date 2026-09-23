@@ -1845,10 +1845,23 @@ pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
 /// session start takes.
 #[must_use]
 pub(crate) struct RotationGuard {
-    // Drops before `_rank` (declaration order): the flock releases, then the
-    // ROTATION rank pops — never the reverse.
+    // `Drop` unlocks first, then the fields drop in declaration order: the
+    // descriptor closes, then the ROTATION rank pops. The flock is released
+    // before the rank, never the reverse.
     _file: File,
     _rank: crate::lockorder::RankGuard,
+}
+
+impl Drop for RotationGuard {
+    /// Release the flock explicitly rather than by closing the descriptor. The
+    /// lock belongs to the open file description, and a child another thread
+    /// forks while this guard is held carries a duplicate of the descriptor
+    /// until it execs. Closing only our copy would leave the lock held through
+    /// that window, so the next acquire for this profile would find it busy
+    /// after its owner had let go. `LOCK_UN` releases it for every duplicate.
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
 }
 
 /// How long [`ProfileRuntime::acquire`] waits for this profile's rotation lock
