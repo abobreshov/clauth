@@ -618,6 +618,8 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
     let _home = HomeSandbox::new();
     let path = status_path();
     let body = crate::daemon::status_json::StatusBody {
+        provider_accounts: Vec::new(),
+        provider_monitor_error: None,
         schema: 1,
         generated_at: "t1".to_string(),
         active_profile: Some("alpha".to_string()),

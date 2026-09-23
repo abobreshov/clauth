@@ -6,7 +6,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
 
-use super::super::app::{App, CodexRow, MainItemKind};
+use super::super::accounts::{grouped_profiles, listed_native_pairs};
+use super::super::app::{App, CodexRow, OverviewPick, current_overview_pick};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
@@ -15,13 +16,15 @@ use super::format::{
 };
 use super::header::pulse_name_spans;
 use super::panes::{
-    bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line, wrap_words,
+    bold_when, draw_scrollbar, empty_state, group_mark, name_color, section_box, select_line,
+    wrap_words,
 };
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
 };
 use crate::profile::{AppConfig, Profile};
+use crate::provider_monitor::types::ProviderKind;
 use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
@@ -76,7 +79,8 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         &[]
     };
-    if app.config().profiles.is_empty() && codex.is_empty() {
+    let natives = native_reports(app);
+    if app.config().profiles.is_empty() && codex.is_empty() && natives.is_empty() {
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -88,49 +92,335 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
-    let items = if app.harness_filter.shows_claude() {
-        app.main_items()
-    } else {
-        Vec::new()
-    };
-    let sel = app.profile_cursor.min(items.len().saturating_sub(1));
+    let selected = current_overview_pick(app);
     let width = list_area.width;
-    let mut rows: Vec<ListItem<'_>> = items
-        .iter()
-        .enumerate()
-        .map(|(row, item)| match item {
-            MainItemKind::Profile(idx) => {
-                let selected = row == sel;
-                let line = render_overview_row(app, *idx, &widths, selected, focused);
-                ListItem::new(select_line(line, selected, focused, width))
-            }
-        })
-        .collect();
-    // The codex section, after the claude rows and never selectable: the cursor
-    // and every action are bound to `config.profiles`, and a codex account has
-    // no record there for them to act on. Rendering it read-only is what keeps
-    // "what the cursor can reach" and "what the screen shows" from diverging.
-    if !codex.is_empty() {
-        if !rows.is_empty() {
-            rows.push(ListItem::new(Line::from("")));
-        }
-        rows.push(ListItem::new(Line::from(vec![Span::styled(
-            "  codex — switch with `clauth <name>`",
-            theme::dim(),
-        )])));
-        for row in codex {
-            rows.push(ListItem::new(render_codex_row(row, &widths)));
-        }
-    }
-
-    let total = rows.len();
-    let list = List::new(rows).style(theme::base());
+    let built = overview_rows(app, &widths, focused, width, selected, codex, &natives);
+    let total = built.rows.len();
+    let list = List::new(built.rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(sel));
+    if let Some(index) = built.selected {
+        state.select(Some(index));
+    }
     frame.render_stateful_widget(list, list_area, &mut state);
 
     let viewport = list_area.height as usize;
     draw_scrollbar(frame, list_area, total, state.offset(), viewport);
+}
+
+struct BuiltRows<'a> {
+    rows: Vec<ListItem<'a>>,
+    selected: Option<usize>,
+}
+
+fn overview_rows<'a>(
+    app: &'a App,
+    widths: &OverviewWidths,
+    focused: bool,
+    width: u16,
+    selected: Option<OverviewPick>,
+    codex: &'a [CodexRow],
+    natives: &[(usize, crate::provider_monitor::ProviderReport)],
+) -> BuiltRows<'a> {
+    let mut rows = Vec::new();
+    let mut selected_at = None;
+    let mut push_gap = false;
+    // Copy the groups out before rendering. `render_overview_row` locks config
+    // itself, and holding that lock across the loop deadlocks the rank.
+    let groups = if app.harness_filter.shows_claude() {
+        let cfg = app.config();
+        grouped_profiles(&cfg.profiles)
+    } else {
+        Vec::new()
+    };
+
+    if !app.harness_filter.shows_claude() && !app.config().profiles.is_empty() {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  claude accounts are hidden — press c",
+            theme::dim(),
+        ))));
+        push_gap = true;
+    }
+
+    for (label, indexes) in groups {
+        if push_gap {
+            rows.push(ListItem::new(Line::from("")));
+        }
+        push_gap = true;
+        rows.push(group_header(label));
+        for idx in indexes {
+            let pick = OverviewPick::Claude(idx);
+            let is_selected = selected == Some(pick);
+            if is_selected {
+                selected_at = Some(rows.len());
+            }
+            let line = render_overview_row(app, idx, widths, is_selected, focused);
+            rows.push(ListItem::new(select_line(
+                line,
+                is_selected,
+                focused,
+                width,
+            )));
+        }
+    }
+    let fmt = ResetFmt::from_state(&app.config().state);
+    if !codex.is_empty() {
+        if push_gap {
+            rows.push(ListItem::new(Line::from("")));
+        }
+        push_gap = true;
+        rows.push(group_header("codex"));
+        for (idx, row) in codex.iter().enumerate() {
+            let is_selected = selected == Some(OverviewPick::Codex(idx));
+            if is_selected {
+                selected_at = Some(rows.len());
+            }
+            let line = render_codex_row(row, widths, is_selected, fmt);
+            rows.push(ListItem::new(select_line(
+                line,
+                is_selected,
+                focused,
+                width,
+            )));
+        }
+    }
+    if !natives.is_empty() {
+        let grok_rows = natives
+            .iter()
+            .filter(|(_, report)| report.provider == ProviderKind::Grok)
+            .count();
+        let agy_rows = natives
+            .iter()
+            .filter(|(_, report)| report.provider == ProviderKind::Antigravity)
+            .count();
+        let mut previous = None;
+        for (idx, report) in natives {
+            let title = match report.provider {
+                ProviderKind::Grok => "grok",
+                ProviderKind::Antigravity => "antigravity",
+                ProviderKind::Codex => continue,
+            };
+            if previous != Some(title) {
+                if push_gap || previous.is_some() {
+                    rows.push(ListItem::new(Line::from("")));
+                }
+                push_gap = true;
+                rows.push(group_header(title));
+                previous = Some(title);
+            }
+            let is_selected = selected == Some(OverviewPick::Native(*idx));
+            if is_selected {
+                selected_at = Some(rows.len());
+            }
+            // One listed login is the one the official client is signed in as.
+            // A second login of the same provider has no marker until one of
+            // them is selected.
+            let active = match report.provider {
+                ProviderKind::Grok => grok_rows == 1,
+                ProviderKind::Antigravity => agy_rows == 1,
+                ProviderKind::Codex => false,
+            };
+            let line = render_native_row(report, widths, fmt, is_selected, active);
+            rows.push(ListItem::new(select_line(
+                line,
+                is_selected,
+                focused,
+                width,
+            )));
+        }
+    }
+    let _ = push_gap;
+    let add_selected = selected == Some(OverviewPick::Add);
+    if add_selected {
+        selected_at = Some(rows.len());
+    }
+    rows.push(ListItem::new(select_line(
+        render_add_row(add_selected),
+        add_selected,
+        focused,
+        width,
+    )));
+    BuiltRows {
+        rows,
+        selected: selected_at,
+    }
+}
+
+fn group_header(title: &str) -> ListItem<'static> {
+    let (mark, style) = group_mark(title);
+    ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(mark, style),
+        Span::raw(" "),
+        Span::styled(title.to_string(), theme::dim()),
+    ]))
+}
+
+fn render_add_row(selected: bool) -> Line<'static> {
+    let cursor = if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let style = if selected {
+        theme::accent()
+    } else {
+        theme::dim()
+    };
+    Line::from(vec![cursor, Span::styled("+ add account", style)])
+}
+
+/// Grok and agy reports, in provider order. Codex usage is the codex account
+/// section, so a codex monitor target is not a second group.
+fn native_reports(app: &App) -> Vec<(usize, crate::provider_monitor::ProviderReport)> {
+    let pairs = listed_native_pairs(&app.provider_reports);
+    let mut reports = Vec::new();
+    for label in ["grok", "antigravity"] {
+        for (idx, name) in &pairs {
+            if *name == label
+                && let Some(report) = app.provider_reports.get(*idx)
+            {
+                reports.push((*idx, report.clone()));
+            }
+        }
+    }
+    reports
+}
+
+/// One Grok or agy account, in the Claude columns. The gutter is the same
+/// four cells (no status glyph). Only a shared ~5h bucket and a shared weekly
+/// bucket become window cells; a model quota or a monthly allowance does not.
+fn render_native_row(
+    report: &crate::provider_monitor::ProviderReport,
+    widths: &OverviewWidths,
+    fmt: ResetFmt,
+    selected: bool,
+    active: bool,
+) -> Line<'static> {
+    let (five, seven) = native_windows(report);
+    let plan = report
+        .data
+        .plan
+        .as_deref()
+        .map(shown)
+        .filter(|plan| !plan.is_empty());
+    let cursor = if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let marker = if active {
+        Span::styled("●", Style::default().fg(theme::accent_2_color()))
+    } else {
+        Span::raw(" ")
+    };
+    let mut spans = vec![
+        cursor,
+        marker,
+        Span::raw(" "),
+        Span::styled(fixed(&shown(&report.id), widths.name), name_color(active)),
+        gap(widths),
+        match plan.as_deref() {
+            Some(plan) => Span::styled(fixed(plan, widths.kind), theme::dim()),
+            None => Span::styled(fixed(NO_DATA, widths.kind), theme::faint()),
+        },
+        narrow_gap(widths),
+        Span::raw(" ".repeat(TIMER_SLOT)),
+    ];
+    spans.extend(usage_cell(five.as_ref(), widths.five_hour, true, fmt));
+    if widths.seven_day > 0 {
+        spans.push(gap(widths));
+        spans.extend(usage_cell(
+            seven.as_ref(),
+            widths.seven_day,
+            widths.seven_day >= 18,
+            fmt,
+        ));
+    }
+    Line::from(spans)
+}
+
+/// `Some(true)` is the 5h column, `Some(false)` the weekly column.
+pub(super) fn shared_column(bucket: &crate::provider_monitor::types::QuotaBucket) -> Option<bool> {
+    let text = format!("{} {}", bucket.label, bucket.id).to_ascii_lowercase();
+    if text.contains("5h") || text.contains("five hour") || text.contains("five-hour") {
+        return Some(true);
+    }
+    if text.contains("7d") || text.contains("weekly") {
+        return Some(false);
+    }
+    match bucket.window_seconds {
+        Some(secs) if (4 * 3600..=6 * 3600).contains(&secs) => Some(true),
+        Some(secs) if (6 * 86_400..=8 * 86_400).contains(&secs) => Some(false),
+        _ => None,
+    }
+}
+
+pub(super) fn shared_window(
+    bucket: &crate::provider_monitor::types::QuotaBucket,
+) -> Option<UsageWindow> {
+    let used = if let Some(used) = bucket.used_percent {
+        used
+    } else if let Some(remaining) = bucket.remaining_percent {
+        100.0 - remaining
+    } else if bucket.exhausted {
+        100.0
+    } else {
+        return None;
+    };
+    used.is_finite().then(|| UsageWindow {
+        utilization: used.clamp(0.0, 100.0),
+        resets_at: bucket.resets_at.clone(),
+    })
+}
+
+fn native_windows(
+    report: &crate::provider_monitor::ProviderReport,
+) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    let mut five = None;
+    let mut seven = None;
+    for bucket in &report.data.buckets {
+        if bucket.scope == "model" {
+            continue;
+        }
+        let Some(window) = shared_window(bucket) else {
+            continue;
+        };
+        match shared_column(bucket) {
+            Some(true) if five.is_none() => five = Some(window),
+            Some(false) if seven.is_none() => seven = Some(window),
+            _ => {}
+        }
+    }
+    (five, seven)
+}
+
+fn shown(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The Claude 5h/7d cell, padded to the column. `include_bar` follows the
+/// Claude row: always for 5h, and for 7d only when the column is wide enough
+/// for a bar. The reset suffix is whatever that cell already draws.
+fn usage_cell(
+    window: Option<&UsageWindow>,
+    width: usize,
+    include_bar: bool,
+    fmt: ResetFmt,
+) -> Vec<Span<'static>> {
+    let mut spans = window_summary_spans_bracketed(
+        window,
+        width,
+        include_bar,
+        None,
+        fmt,
+        window.is_some_and(is_past_reset),
+    );
+    let len: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let pad = width.saturating_sub(len);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -382,25 +672,35 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One codex account, in the claude columns: name, plan, 5h, 7d. The cursor
-/// and timer slots are kept blank and no live cell is drawn — this section is
-/// read-only, and a timer would promise a countdown the Overview cannot act on.
-fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
+/// One codex account, in the claude columns: name, plan, 5h, 7d. The timer
+/// slot stays blank — a countdown would promise a refresh the codex row does
+/// not run. Enter switches this account.
+fn render_codex_row(
+    row: &CodexRow,
+    widths: &OverviewWidths,
+    selected: bool,
+    fmt: ResetFmt,
+) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
     } else {
         theme::base()
     };
-    // The same slots every list row carries — the 2-cell cursor prefix (blank:
-    // a codex row is never selected), the marker cell and its gap — so the
-    // `×` and the name sit in the claude rows' columns under the header.
+    let cursor = if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let marker = if row.broken {
+        Span::styled("×", theme::danger())
+    } else if row.active {
+        Span::styled("●", Style::default().fg(theme::accent_2_color()))
+    } else {
+        Span::raw(" ")
+    };
     let mut spans = vec![
-        Span::raw("  "),
-        if row.broken {
-            Span::styled("×", theme::danger())
-        } else {
-            Span::raw(" ")
-        },
+        cursor,
+        marker,
         Span::raw(" "),
         Span::styled(fixed(row.name.as_str(), widths.name), name_style),
         Span::raw(" ".repeat(widths.gap)),
@@ -410,18 +710,24 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
         },
     ];
     // The usage cells take the claude row's lead-in (narrow gap + a blank
-    // timer slot) and its left alignment, and the 7d cell drops with its
+    // timer slot) and its bracketed bar, and the 7d cell drops with its
     // column, so a codex reading sits under `5h`/`7d` and never under `live`.
-    let cell = |window: Option<&crate::usage::UsageWindow>, w: usize| match window {
-        Some(win) => Span::styled(fixed(&format!("{:.0}%", win.utilization), w), theme::base()),
-        None => Span::styled(fixed(NO_DATA, w), theme::faint()),
-    };
     spans.push(narrow_gap(widths));
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
-    spans.push(cell(row.five_hour.as_ref(), widths.five_hour));
+    spans.extend(usage_cell(
+        row.five_hour.as_ref(),
+        widths.five_hour,
+        true,
+        fmt,
+    ));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        spans.push(cell(row.seven_day.as_ref(), widths.seven_day));
+        spans.extend(usage_cell(
+            row.seven_day.as_ref(),
+            widths.seven_day,
+            widths.seven_day >= 18,
+            fmt,
+        ));
     }
     Line::from(spans)
 }

@@ -537,18 +537,15 @@ pub(crate) fn account_tier(profile: &Profile) -> Option<PlanTier> {
         .and_then(|u| u.plan.as_ref())
         .map(|p| p.tier.clone())
         .filter(|t| *t != PlanTier::Unknown);
-    fetched.or_else(|| {
-        // No fetched plan yet — fall back to the OAuth token's subscription_type.
-        let sub = profile
-            .credentials
-            .as_ref()
-            .and_then(|c| c.claude_ai_oauth.as_ref())
-            .and_then(|o| o.subscription_type.as_deref());
-        match PlanTier::from_subscription_type(sub) {
-            PlanTier::Unknown => None,
-            tier => Some(tier),
-        }
-    })
+    let login = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .map(|oauth| {
+            PlanTier::from_login(oauth.subscription_type.as_deref(), oauth.rate_limit_tier())
+        })
+        .unwrap_or(PlanTier::Unknown);
+    PlanTier::resolve(fetched, login)
 }
 
 /// Percent from API `f64`: drops trailing `.0` on whole numbers → `42%`, `42.3%`.

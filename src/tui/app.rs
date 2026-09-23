@@ -1,8 +1,8 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - Overview: read-only account list; `profile_cursor` is shared with Usage
-//!     and Config so the highlight follows across tab switches.
+//!   - Overview: accounts grouped by provider, with add. `profile_cursor` is
+//!     shared with Usage and Config so a Claude highlight follows across tabs.
 //!   - Config: master-detail — account list + `+ new` row + inline editor
 //!     (`config_draft`). No popups for create / edit / rename / delete.
 //!   - Fallback: master-detail — ordered chain + `+ add` on the left; inline
@@ -21,14 +21,15 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
-    CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
-    capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
-    create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
+    CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_current_login,
+    capture_into_profile, capture_snapshot, classify_env_key, clear_profile_api_key,
+    clear_profile_credentials, codex_adopt_offer, codex_login_capture_quiet, create_blank_profile,
+    create_profile_from_login, delete_codex_profile, delete_profile, duplicate_profile,
     edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
-    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
-    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
-    snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
-    validate_name_chars, validate_profile_name,
+    find_matching_oauth_profile, operator_linked_codex_profile, overwrite_captured_profile,
+    rename_profile, reorder_profile, rotation_guard_for_mutation, set_chain_order,
+    set_member_threshold, set_wrap_off, snapshot_is_empty, switch_codex_profile, switch_off,
+    switch_profile, validate_foreign_harness_free, validate_name_chars, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -42,6 +43,12 @@ use crate::fallback::{
 };
 use crate::format::{format_pct, format_threshold_tokens};
 use crate::harness::Harness;
+use crate::provider_monitor::types::ProviderKind;
+
+use super::accounts::{
+    AddAccountForm, AddChoice, AddInputs, RosterSlot, added_account_groups, build_add_form,
+    listed_native_pairs,
+};
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -205,6 +212,20 @@ pub(crate) enum FallbackRow {
     /// `fallback::spend_room`. ⏎ opens an inline editor.
     MaxSpend,
     Remove,
+}
+
+/// A Setup detail row for a Codex, Grok or Antigravity account. Their logins
+/// live in the official tools, so the rows are the account actions clauth can
+/// take on them, drawn in the Claude row style. Built by [`native_setup_rows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSetupRow {
+    /// Codex only: capture the login `codex login` left in the operator slot
+    /// into this account, the TUI twin of `clauth login <name> --codex`.
+    Relogin,
+    /// Codex: delete the account and its stored login. Grok and Antigravity:
+    /// take it off the account lists and keep its monitor. Arms on the first
+    /// press, like the Claude `delete account` row.
+    Delete,
 }
 
 /// One editable line in the Setup tab's detail pane. Built per selection by
@@ -518,6 +539,15 @@ pub(crate) struct ConfirmState {
     pub(crate) on_confirm: ConfirmAction,
 }
 
+/// Which Overview row `delete account` removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OverviewRemoval {
+    Profile(String),
+    Codex(String),
+    /// `providers.toml` target id. The monitor row stays.
+    Native(String),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
     /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
@@ -534,6 +564,8 @@ pub(crate) enum ConfirmAction {
     /// byte formats differ), so this path forces the live link onto the target.
     AdoptDivergence(Box<CaptureSnapshot>, String),
     Switch(String),
+    /// Move the codex active marker. Does not relink the Claude credentials.
+    SwitchCodex(String),
     /// Confirm before discarding CC's freshly-written credentials and relinking.
     DiscardDivergence(String),
     /// Force-rotate all refresh tokens; active sessions may be logged out.
@@ -564,6 +596,13 @@ pub(crate) enum ConfirmAction {
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
+    /// Overview `delete account` after the first confirm. A profile or codex
+    /// account is removed. A native login is taken off Overview and stays on
+    /// the Providers tab.
+    DeleteOverview(OverviewRemoval),
+    /// Codex account with a live session: the unforced guard refuses, so
+    /// confirm and re-run with `force`.
+    DeleteLiveCodex(String),
     /// Fallback tab `+ add`: the candidate would mix api-key and oauth accounts
     /// in the chain. Confirm carries the add through; cancel returns to the
     /// picker. Non-destructive — the member can be removed after adding.
@@ -609,6 +648,10 @@ pub(crate) enum NamePromptAction {
     DuplicateProfile(String),
     /// Save this account's base url + models as a preset under the typed name.
     SavePreset(String),
+    /// Save the Claude login this machine is using under the typed name.
+    CaptureLiveLogin,
+    /// Adopt the Codex login on this machine under the typed name.
+    AdoptCodexLogin,
 }
 
 impl NamePromptAction {
@@ -618,6 +661,8 @@ impl NamePromptAction {
         match self {
             Self::DuplicateProfile(_) => "DUPLICATE",
             Self::SavePreset(_) => "SAVE PRESET",
+            Self::CaptureLiveLogin => "CAPTURE",
+            Self::AdoptCodexLogin => "ADOPT CODEX",
         }
     }
 
@@ -628,6 +673,12 @@ impl NamePromptAction {
             }
             Self::SavePreset(source) => {
                 format!("stores '{source}'s base url and model settings under this name.")
+            }
+            Self::CaptureLiveLogin => {
+                "saves the Claude login this machine is using as a new account.".to_string()
+            }
+            Self::AdoptCodexLogin => {
+                "saves the Codex login on this machine as a codex account.".to_string()
             }
         }
     }
@@ -801,6 +852,10 @@ pub(crate) enum ActionMenuAction {
     /// Usage, which carry no row for it).
     DisableProfile,
     EnableProfile,
+    /// Remove the highlighted Overview account. A Claude or API profile and a
+    /// codex account are deleted. A Grok or Antigravity login is taken off
+    /// Overview and kept as a provider monitor.
+    DeleteAccount,
     /// Open the focused account's provider console — where its api key is
     /// minted. Offered only for a recognised third-party endpoint, since that
     /// is the only case clauth knows a page for.
@@ -913,6 +968,9 @@ impl ActionMenuAction {
             // One letter across both halves of the disable/enable pair, so the
             // key doesn't move when the account's state flips.
             Self::DisableProfile | Self::EnableProfile => Some('d'),
+            // `d` is disable. Delete keeps one letter on every provider, so a
+            // codex or grok row (no disable item) does not move it onto `d`.
+            Self::DeleteAccount => Some('e'),
             // Mirror the Tokens tab's page keys so the menu teaches them.
             Self::ToggleCountCache => Some('c'),
             Self::ReloadTokenStats => Some('r'),
@@ -934,6 +992,7 @@ impl ActionMenuAction {
             Self::RotateTokens => "rotate access token",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
+            Self::DeleteAccount => "delete account",
             Self::OpenProviderConsole => "open provider console",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
@@ -977,6 +1036,8 @@ pub(crate) enum Modal {
     /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
     /// to the footer indicator — the login keeps running.
     Login,
+    /// Overview `n` / the `+ add account` row.
+    AddAccount(AddAccountForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -1046,10 +1107,12 @@ pub(crate) enum Tab {
     Status,
     /// Claude Code integration health: MCP wiring, plugin install, per-profile runtime.
     Plugin,
+    /// Native Codex, Grok and Antigravity subscription quotas.
+    Providers,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 8] = [
+    pub(crate) const ALL: [Tab; 9] = [
         Tab::Overview,
         Tab::Usage,
         Tab::Tokens,
@@ -1058,6 +1121,7 @@ impl Tab {
         Tab::Config,
         Tab::Status,
         Tab::Plugin,
+        Tab::Providers,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -1070,6 +1134,7 @@ impl Tab {
             Tab::Config => "Config",
             Tab::Status => "Status",
             Tab::Plugin => "Plugin",
+            Tab::Providers => "Providers",
         }
     }
 
@@ -1513,13 +1578,10 @@ pub(crate) enum MainItemKind {
     Profile(usize),
 }
 
-/// Which harness the Overview shows. A VIEW filter only: selection and every
-/// action stay bound to the claude list, because a codex account has no
-/// `Profile` record for them to act on and clauth switches it through its own
-/// CLI verb. So the codex section renders READ-ONLY, and while the claude rows
-/// are hidden every key bound to the selection is inert
-/// ([`claude_rows_hidden`]) rather than acting on a row the screen does not
-/// show.
+/// Which harness the Overview shows. A view filter: `c` cycles both, claude,
+/// and codex. Codex rows are selectable and Enter switches the codex account.
+/// Reorder and the action menu stay on Claude profiles, so while the Claude
+/// rows are hidden those keys stay inert ([`claude_rows_hidden`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HarnessFilter {
     #[default]
@@ -1554,6 +1616,56 @@ impl HarnessFilter {
     }
 }
 
+/// The account Overview, Usage, and Setup have open, or the add row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenSelection {
+    Account(RosterSlot),
+    Add,
+}
+
+/// One selectable Overview row. `Claude` indexes `config.profiles`, `Codex`
+/// indexes [`App::codex_rows`], `Native` indexes `provider_reports` for a
+/// listed Grok or Antigravity account. The same slot is [`App::roster_pick`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverviewPick {
+    Claude(usize),
+    Codex(usize),
+    Native(usize),
+    Add,
+}
+
+pub(crate) fn overview_picks(app: &App) -> Vec<OverviewPick> {
+    let profiles = app.config().profiles.clone();
+    let natives = listed_native_pairs(&app.provider_reports);
+    let mut picks = Vec::new();
+    for (label, slots) in added_account_groups(&profiles, app.codex_rows.len(), &natives) {
+        let show = match label {
+            "codex" => app.harness_filter.shows_codex(),
+            "grok" | "antigravity" => true,
+            _ => app.harness_filter.shows_claude(),
+        };
+        if !show {
+            continue;
+        }
+        for slot in slots {
+            picks.push(match slot {
+                RosterSlot::Profile(idx) => OverviewPick::Claude(idx),
+                RosterSlot::Codex(idx) => OverviewPick::Codex(idx),
+                RosterSlot::Native(idx) => OverviewPick::Native(idx),
+            });
+        }
+    }
+    picks.push(OverviewPick::Add);
+    picks
+}
+
+pub(crate) fn current_overview_pick(app: &App) -> Option<OverviewPick> {
+    let picks = overview_picks(app);
+    picks
+        .get(app.overview_cursor.min(picks.len().saturating_sub(1)))
+        .copied()
+}
+
 /// One codex account as the Overview renders it — name, plan, the two windows
 /// and whether its chain is quarantined. The windows come from the per-profile
 /// usage cache the codex leg writes; the plan from that cache, else from the
@@ -1568,6 +1680,14 @@ pub(crate) struct CodexRow {
     pub(crate) plan: Option<String>,
     pub(crate) five_hour: Option<crate::usage::UsageWindow>,
     pub(crate) seven_day: Option<crate::usage::UsageWindow>,
+    /// Epoch ms of the poll behind the cached reading, for the `stale` cue.
+    pub(crate) fetched_at: Option<u64>,
+    /// The limit codex says was reached, e.g. `primary`. `None` while under it.
+    pub(crate) limit_reached: Option<String>,
+    /// Limit-reset credits the account can still spend.
+    pub(crate) reset_credits: Option<i64>,
+    /// What this process's codex usage leg last did for the profile.
+    pub(crate) poll: Option<crate::usage::CodexPoll>,
 }
 
 /// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
@@ -1580,6 +1700,14 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
         return Vec::new();
     };
     let active = state.active_profile().cloned();
+    // No marker yet: the profile a bare `codex` is signed in as is still the
+    // active login. An explicit marker wins, so a switch is not undone by the
+    // operator slot.
+    let linked = if active.is_none() {
+        operator_linked_codex_profile()
+    } else {
+        None
+    };
     state
         .profiles()
         .iter()
@@ -1590,7 +1718,8 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
             );
             CodexRow {
                 name: name.clone(),
-                active: active.as_ref().is_some_and(|a| a == name),
+                active: active.as_ref().is_some_and(|a| a == name)
+                    || linked.as_deref().is_some_and(|a| a == name.as_str()),
                 broken: crate::codex_auth::read_quarantine(name.as_str()).is_some(),
                 plan: crate::codex_auth::plan_label(
                     name.as_str(),
@@ -1601,6 +1730,10 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
                 ),
                 five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
                 seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
+                fetched_at: cached.as_ref().and_then(|u| u.fetched_at),
+                limit_reached: cached.as_ref().and_then(|u| u.codex_limit_reached.clone()),
+                reset_credits: cached.as_ref().and_then(|u| u.codex_reset_credits),
+                poll: crate::usage::codex_poll(name.as_str()),
             }
         })
         .collect()
@@ -1762,13 +1895,27 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    /// The one open slot shared by Overview, Usage, and Setup.
+    /// [`Self::profile_cursor`], [`Self::roster_pick`], and
+    /// [`Self::selection_is_add`] are mirrors written only by
+    /// [`set_open_selection`].
+    pub(crate) open: OpenSelection,
+    /// Mirror of a Claude or API [`OpenSelection::Account`].
+    pub(crate) roster_pick: Option<RosterSlot>,
+    /// Mirror of [`OpenSelection::Add`].
+    pub(crate) selection_is_add: bool,
     /// Which harness the Overview lists (`c` cycles). A view filter only — see
     /// [`HarnessFilter`].
     pub(crate) harness_filter: HarnessFilter,
+    /// Index into [`overview_picks`]. Claude picks also write [`Self::profile_cursor`].
+    pub(crate) overview_cursor: usize,
     /// Which Setup pane has focus.
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
     pub(crate) config_action_cursor: usize,
+    /// A Codex, Grok or Antigravity Setup `Delete` row was pressed once and the
+    /// next press runs it. Cleared by moving off the row or leaving the pane.
+    pub(crate) native_setup_armed: bool,
     /// Inline editor for the Config detail pane; `Some` only while Actions has focus.
     pub(crate) config_draft: Option<ConfigDraft>,
     /// Cursor into `chain_items()` on the Fallback left pane.
@@ -1994,6 +2141,9 @@ pub(crate) struct App {
     /// One snapshot for both surfaces is also what keeps the header's count
     /// equal to the rows the Overview draws.
     pub(crate) codex_rows: Vec<CodexRow>,
+    pub(crate) provider_reports: Vec<crate::provider_monitor::ProviderReport>,
+    pub(crate) provider_error: Option<String>,
+    pub(crate) provider_scroll: u16,
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
@@ -2255,13 +2405,18 @@ impl App {
             third_party_status,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
+            overview_cursor: 0,
             herdr_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
             profile_cursor: 0,
+            open: OpenSelection::Account(RosterSlot::Profile(0)),
+            roster_pick: None,
+            selection_is_add: false,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
+            native_setup_armed: false,
             fallback_focus: FallbackFocus::Chain,
             fallback_detail_cursor: 0,
             fallback_armed_remove: false,
@@ -2334,6 +2489,9 @@ impl App {
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
+            provider_reports: Vec::new(),
+            provider_error: None,
+            provider_scroll: 0,
             last_codex_rows_refresh: Some(Instant::now()),
         };
         app.refresh_unsaved_live_login();
@@ -3004,10 +3162,18 @@ impl App {
         self.config().profiles.get(idx).map(|p| p.name.clone())
     }
 
-    /// Clamp `profile_cursor` to `0..profile_count`.
+    /// If the open account is a profile that no longer exists, move to the
+    /// last one. Add, Codex, and native slots are left alone.
     pub(crate) fn clamp_profile_cursor(&mut self) {
-        let max = self.profile_count().saturating_sub(1);
-        self.profile_cursor = self.profile_cursor.min(max);
+        let OpenSelection::Account(RosterSlot::Profile(idx)) = self.open else {
+            return;
+        };
+        let count = self.profile_count();
+        if count == 0 {
+            set_open_selection(self, OpenSelection::Add);
+        } else if idx >= count {
+            set_open_selection(self, OpenSelection::Account(RosterSlot::Profile(count - 1)));
+        }
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
@@ -3201,12 +3367,16 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if app.tab == Tab::Overview => {
             app.disarm_quit();
             app.harness_filter = app.harness_filter.next();
+            app.overview_cursor = 0;
+            sync_profile_from_overview(app);
             return;
         }
         KeyCode::Char('a') => {
             app.disarm_quit();
-            if app.tab == Tab::Overview && claude_rows_hidden(app) {
-                return;
+            // The menu follows the row on screen. Sync first so a harness
+            // filter cannot leave account actions aimed at a hidden profile.
+            if app.tab == Tab::Overview {
+                sync_profile_from_overview(app);
             }
             let state = build_action_menu(app);
             if !state.items.is_empty() {
@@ -3216,6 +3386,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('r') => {
             app.disarm_quit();
+            if app.tab == Tab::Providers {
+                crate::provider_monitor::request_refresh(
+                    app.refresh_interval.load(Ordering::Relaxed),
+                );
+                reread_native_rows(app);
+                app.toast(ToastKind::Info, "refreshing provider usage");
+                return;
+            }
             if app.tab == Tab::Status {
                 trigger_status_refresh(app);
                 return;
@@ -3233,7 +3411,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if app.tab == Tab::Usage {
                 queue_focused_usage_refresh(app);
             } else {
-                app.manual_refresh();
+                refresh_every_account(app);
                 app.toast(ToastKind::Info, "refreshing every account");
             }
             return;
@@ -3256,7 +3434,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('n') => {
             app.disarm_quit();
-            start_new_account(app);
+            if app.tab == Tab::Overview {
+                open_add_account(app);
+            } else {
+                start_new_account(app);
+            }
             return;
         }
         // Esc backs out of sub-focus; no-op at the top level.
@@ -3329,6 +3511,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
         Tab::Plugin => handle_plugin_key(app, key),
+        Tab::Providers => match key.code {
+            KeyCode::Down => app.provider_scroll = app.provider_scroll.saturating_add(1),
+            KeyCode::Up => app.provider_scroll = app.provider_scroll.saturating_sub(1),
+            KeyCode::PageDown => app.provider_scroll = app.provider_scroll.saturating_add(10),
+            KeyCode::PageUp => app.provider_scroll = app.provider_scroll.saturating_sub(10),
+            KeyCode::Home => app.provider_scroll = 0,
+            _ => {}
+        },
     }
 }
 
@@ -3442,10 +3632,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
-    // Clamp cursor: a Config `+ new` selection must land on a real account.
-    app.clamp_profile_cursor();
     match tab {
-        Tab::Overview | Tab::Usage => {}
+        Tab::Overview => snap_overview_to_profile(app),
+        Tab::Usage => {}
+        Tab::Providers => app.provider_scroll = 0,
         Tab::Tokens => {
             // Land on the dashboard; keep the model cursor reset for descend.
             app.token_view = TokenView::Dashboard;
@@ -3491,14 +3681,6 @@ fn switch_tab(app: &mut App, tab: Tab) {
     }
 }
 
-/// Move `profile_cursor` by `delta`, wrapping in `0..len`.
-fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
-    if len == 0 {
-        return;
-    }
-    app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
-}
-
 /// True, with a toast saying so, while the Overview's `Codex` filter hides the
 /// claude rows the cursor is bound to. Every key that reorders, steps or acts
 /// on the selection asks here first, so nothing acts on a row the screen does
@@ -3512,24 +3694,180 @@ fn claude_rows_hidden(app: &mut App) -> bool {
 }
 
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
-    let count = app.profile_count();
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Up | KeyCode::Down | KeyCode::Enter if claude_rows_hidden(app) => {}
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up => step_profile_cursor(app, -1, count),
-        KeyCode::Down => step_profile_cursor(app, 1, count),
-        KeyCode::Enter => activate_main_item(app),
+        KeyCode::Up | KeyCode::Down if shift => {
+            if claude_rows_hidden(app) {
+                return;
+            }
+            if !matches!(current_overview_pick(app), Some(OverviewPick::Claude(_))) {
+                app.toast(ToastKind::Info, "select a claude account to reorder");
+                return;
+            }
+            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+            reorder_main_cursor(app, delta);
+            snap_overview_to_profile(app);
+        }
+        KeyCode::Up => step_overview(app, -1),
+        KeyCode::Down => step_overview(app, 1),
+        KeyCode::Enter => activate_overview(app),
         _ => {}
     }
 }
 
+fn step_overview(app: &mut App, delta: i32) {
+    let len = overview_picks(app).len();
+    if len == 0 {
+        return;
+    }
+    app.overview_cursor = (app.overview_cursor as i32 + delta).rem_euclid(len as i32) as usize;
+    sync_profile_from_overview(app);
+}
+
+/// The only writer of the open slot and of its three mirrors.
+fn set_open_selection(app: &mut App, selection: OpenSelection) {
+    app.open = selection;
+    app.native_setup_armed = false;
+    match selection {
+        OpenSelection::Account(RosterSlot::Profile(idx)) => {
+            app.selection_is_add = false;
+            app.roster_pick = None;
+            app.profile_cursor = idx;
+        }
+        OpenSelection::Account(slot) => {
+            app.selection_is_add = false;
+            app.roster_pick = Some(slot);
+        }
+        OpenSelection::Add => {
+            app.selection_is_add = true;
+            app.roster_pick = None;
+            app.profile_cursor = app.profile_count();
+        }
+    }
+    snap_overview_to_profile(app);
+}
+
+fn sync_profile_from_overview(app: &mut App) {
+    let selection = match current_overview_pick(app) {
+        Some(OverviewPick::Claude(idx)) => OpenSelection::Account(RosterSlot::Profile(idx)),
+        Some(OverviewPick::Codex(idx)) => OpenSelection::Account(RosterSlot::Codex(idx)),
+        Some(OverviewPick::Native(idx)) => OpenSelection::Account(RosterSlot::Native(idx)),
+        Some(OverviewPick::Add) | None => OpenSelection::Add,
+    };
+    set_open_selection(app, selection);
+}
+
+fn wanted_overview_pick(app: &App) -> OverviewPick {
+    match app.open {
+        OpenSelection::Add => OverviewPick::Add,
+        OpenSelection::Account(RosterSlot::Profile(idx)) => OverviewPick::Claude(idx),
+        OpenSelection::Account(RosterSlot::Codex(idx)) => OverviewPick::Codex(idx),
+        OpenSelection::Account(RosterSlot::Native(idx)) => OverviewPick::Native(idx),
+    }
+}
+
+fn select_overview_pick(app: &mut App, wanted: OverviewPick) -> bool {
+    let picks = overview_picks(app);
+    let Some(pos) = picks.iter().position(|pick| *pick == wanted) else {
+        return false;
+    };
+    app.overview_cursor = pos;
+    true
+}
+
+fn snap_overview_to_profile(app: &mut App) {
+    let wanted = wanted_overview_pick(app);
+    if select_overview_pick(app, wanted) {
+        return;
+    }
+    // The open account is hidden by the harness filter. Reveal every added
+    // account so the highlight and the open slot are the same row.
+    if !matches!(wanted, OverviewPick::Add) {
+        app.harness_filter = HarnessFilter::All;
+        let _ = select_overview_pick(app, wanted);
+    }
+}
+
+fn activate_overview(app: &mut App) {
+    match current_overview_pick(app) {
+        Some(OverviewPick::Claude(idx)) => {
+            set_open_selection(app, OpenSelection::Account(RosterSlot::Profile(idx)));
+            activate_main_item(app);
+        }
+        Some(OverviewPick::Codex(idx)) => {
+            set_open_selection(app, OpenSelection::Account(RosterSlot::Codex(idx)));
+            request_codex_switch(app, idx);
+        }
+        Some(OverviewPick::Native(idx)) => {
+            set_open_selection(app, OpenSelection::Account(RosterSlot::Native(idx)));
+        }
+        Some(OverviewPick::Add) | None => open_add_account(app),
+    }
+}
+
+fn request_codex_switch(app: &mut App, idx: usize) {
+    let Some(row) = app.codex_rows.get(idx) else {
+        return;
+    };
+    if row.broken {
+        app.toast(
+            ToastKind::Warning,
+            format!(
+                "'{}' is quarantined\nre-login before switching to it",
+                row.name
+            ),
+        );
+        return;
+    }
+    if row.active {
+        return;
+    }
+    let name = row.name.to_string();
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: format!("switch codex to '{name}'?"),
+        detail: Some("clauth will start this codex account.".to_string()),
+        choice: true,
+        on_confirm: ConfirmAction::SwitchCodex(name),
+    }));
+}
+
+fn open_add_account(app: &mut App) {
+    let grok = crate::provider_monitor::detect_login_choices();
+    let (grok_entries, agy_configured) = match crate::provider_monitor::config::load() {
+        Ok(config) => {
+            let grok_entries = config
+                .targets
+                .iter()
+                .filter(|target| target.provider == ProviderKind::Grok && target.listed)
+                .map(|target| target.auth_entry.clone())
+                .collect();
+            let agy_configured = config
+                .targets
+                .iter()
+                .any(|target| target.provider == ProviderKind::Antigravity && target.listed);
+            (grok_entries, agy_configured)
+        }
+        Err(_) => (Vec::new(), false),
+    };
+    let codex_ready = matches!(
+        codex_adopt_offer(),
+        crate::actions::CodexAdoptOffer::Available
+    );
+    app.modals
+        .push(Modal::AddAccount(build_add_form(&AddInputs {
+            claude_live: app.unsaved_live_login,
+            codex_ready,
+            grok,
+            grok_entries,
+            agy_configured,
+        })));
+}
+
 /// Usage tab: up/down picks the account. Read-only pane.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
-    let count = app.profile_count();
     match key.code {
-        KeyCode::Up => step_profile_cursor(app, -1, count),
-        KeyCode::Down => step_profile_cursor(app, 1, count),
+        KeyCode::Up => step_added_account(app, -1, false),
+        KeyCode::Down => step_added_account(app, 1, false),
         KeyCode::Char('e') => toggle_show_estimates(app),
         KeyCode::Char('p') => toggle_show_pace(app),
         _ => {}
@@ -4619,11 +4957,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         app.toast(ToastKind::Danger, format!("reorder failed\n{e}"));
         return;
     }
-    if delta < 0 && app.profile_cursor > 0 {
-        app.profile_cursor -= 1;
-    } else if delta > 0 {
-        app.profile_cursor += 1;
-    }
+    set_open_selection(app, OpenSelection::Account(RosterSlot::Profile(new_idx)));
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
@@ -5137,10 +5471,13 @@ fn chain_cursor_for_profile(app: &App) -> usize {
     0
 }
 
-/// If the current `chain_cursor` points at a `Member`, sync `profile_cursor` to that
-/// member's index in the profile list. Leaves `profile_cursor` unchanged on `Add` or
-/// when the name is not found (e.g. empty chain).
+/// If the open slot is already a profile and the chain cursor points at a
+/// member, select that profile. A Codex, Grok, Antigravity, or add slot is
+/// left alone — entering Fallback must not replace it with the Claude chain.
 fn sync_profile_from_chain(app: &mut App) {
+    if !matches!(app.open, OpenSelection::Account(RosterSlot::Profile(_))) {
+        return;
+    }
     let chain_pos = app.chain_cursor;
     let profile_idx = {
         let cfg = app.config();
@@ -5150,7 +5487,7 @@ fn sync_profile_from_chain(app: &mut App) {
         }
     };
     if let Some(idx) = profile_idx {
-        app.profile_cursor = idx;
+        set_open_selection(app, OpenSelection::Account(RosterSlot::Profile(idx)));
     }
 }
 
@@ -6374,6 +6711,158 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
+        Modal::AddAccount(_) => handle_add_account_key(app, key),
+    }
+}
+
+fn handle_add_account_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::AddAccount(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = form.choices.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+        }
+        KeyCode::Enter => {
+            let choice = form.choices.get(form.cursor.min(last)).cloned();
+            app.modals.pop();
+            if let Some(choice) = choice {
+                run_add_choice(app, choice);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn run_add_choice(app: &mut App, choice: AddChoice) {
+    match choice {
+        AddChoice::CaptureClaude => {
+            app.modals.push(Modal::NamePrompt(NamePromptForm {
+                input: InputState::new(""),
+                action: NamePromptAction::CaptureLiveLogin,
+            }));
+        }
+        AddChoice::AdoptCodex => {
+            app.modals.push(Modal::NamePrompt(NamePromptForm {
+                input: InputState::new(""),
+                action: NamePromptAction::AdoptCodexLogin,
+            }));
+        }
+        AddChoice::AddGrok { entry, label } => {
+            add_native_provider(app, ProviderKind::Grok, entry, &label)
+        }
+        AddChoice::AddAgy => {
+            add_native_provider(app, ProviderKind::Antigravity, None, "Antigravity")
+        }
+        AddChoice::NewClaude => start_new_account(app),
+        AddChoice::NewApi(provider) => start_provider_account(app, provider),
+        AddChoice::GenericApi => {
+            start_new_account(app);
+            app.toast(ToastKind::Info, "type a name, base url, and api key");
+        }
+    }
+}
+
+fn add_native_provider(
+    app: &mut App,
+    provider: ProviderKind,
+    auth_entry: Option<String>,
+    label: &str,
+) {
+    match crate::provider_monitor::config::ensure_native_target(provider, auth_entry) {
+        Ok(true) => {
+            reload_provider_reports(app);
+            app.toast(
+                ToastKind::Success,
+                format!("{label} is on the overview\nrefresh reads its limits"),
+            );
+        }
+        Ok(false) => app.toast(ToastKind::Info, format!("{label} is already listed")),
+        Err(e) => app.toast(ToastKind::Danger, format!("could not add {label}\n{e}")),
+    }
+}
+
+fn reload_provider_reports(app: &mut App) {
+    // Paced by the Config tab interval, so the stale cue and the countdown
+    // follow the cadence the scheduler polls native logins at.
+    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
+    match crate::provider_monitor::reports_with(Some(interval_ms)) {
+        Ok(reports) => {
+            app.provider_reports = reports;
+            app.provider_error = None;
+        }
+        Err(error) => {
+            app.provider_reports.clear();
+            app.provider_error = Some(error.to_string());
+        }
+    }
+}
+
+fn start_provider_account(app: &mut App, provider: crate::providers::Provider) {
+    start_new_account(app);
+    let url = provider.default_base_url();
+    if let Some(draft) = app.config_draft.as_mut()
+        && let Some(url) = url
+    {
+        draft.base_url = InputState::new(url);
+    }
+    let hint = if url.is_some() {
+        format!(
+            "name the {} account, then paste its api key",
+            provider.display_name()
+        )
+    } else {
+        format!(
+            "name the {} account, paste its base url, then its api key",
+            provider.display_name()
+        )
+    };
+    app.toast(ToastKind::Info, hint);
+}
+
+fn capture_live_login(app: &mut App, name: &str) {
+    let result = {
+        let mut cfg = app.config();
+        capture_current_login(&mut cfg, name)
+    };
+    match result {
+        Ok(became_active) => {
+            app.refresh_tokens();
+            app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
+            let tail = if became_active {
+                "it is the active account"
+            } else {
+                "switch to it from the overview"
+            };
+            app.toast(ToastKind::Success, format!("saved '{name}'\n{tail}"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
+    }
+}
+
+fn adopt_codex_login(app: &mut App, name: &str) {
+    match codex_login_capture_quiet(name) {
+        Ok(()) => {
+            app.codex_rows = codex_rows();
+            app.toast(ToastKind::Success, format!("codex account '{name}' saved"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
     }
 }
 
@@ -6514,6 +7003,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
+        Tab::Providers => {}
         // Tokens: the period + model-filter lenses (minus the ones already
         // active) plus the page keys (`c` cache basis, `r` reload) for
         // discoverability.
@@ -6558,8 +7048,16 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 if focused_provider_console(app).is_some() {
                     scoped.push(OpenProviderConsole);
                 }
-            } else if app.profile_cursor >= app.profile_count() {
-                // `+ new` only: its draft is what a preset stamps.
+            } else if let Some(name) = open_native_name(app) {
+                // A Codex, Grok or Antigravity account: the same account work
+                // Overview offers for it.
+                context = Some(name);
+                scoped.push(RefreshUsage);
+                scoped.push(DeleteAccount);
+            } else if matches!(app.open, OpenSelection::Add) {
+                // `+ new` only: its draft is what a preset stamps. Keyed on the
+                // open selection, not `profile_cursor`, which a Codex or Grok
+                // row leaves wherever the last Claude row put it.
                 context = app
                     .config_draft
                     .as_ref()
@@ -6588,6 +7086,14 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 /// the menu titles that group with. Nothing to push when the cursor sits past
 /// the accounts (an empty Overview), which is also what leaves the title bare.
 fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+    if app.tab == Tab::Overview {
+        return push_overview_account_scope(app, scoped);
+    }
+    if let Some(name) = open_native_name(app) {
+        // The login lives in its own tool: refresh is what Usage can do here.
+        scoped.push(ActionMenuAction::RefreshUsage);
+        return Some(name);
+    }
     let (name, _, _) = focused_account(app)?;
     scoped.push(ActionMenuAction::RefreshUsage);
     scoped.push(ActionMenuAction::RotateTokens);
@@ -6596,6 +7102,60 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
         scoped.push(ActionMenuAction::OpenProviderConsole);
     }
     Some(name.to_string())
+}
+
+/// Overview's account half follows the highlighted row. Claude and API profiles
+/// keep refresh, rotate, and disable, and gain delete. Codex, Grok, and
+/// Antigravity offer refresh and delete. The add row has no account to act on.
+fn push_overview_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+    match current_overview_pick(app)? {
+        OverviewPick::Add => None,
+        OverviewPick::Claude(idx) => {
+            let name = app.profile_name_at(idx)?;
+            scoped.push(ActionMenuAction::RefreshUsage);
+            scoped.push(ActionMenuAction::RotateTokens);
+            scoped.push(disabled_toggle_action(app));
+            scoped.push(ActionMenuAction::DeleteAccount);
+            if focused_provider_console(app).is_some() {
+                scoped.push(ActionMenuAction::OpenProviderConsole);
+            }
+            Some(name.to_string())
+        }
+        OverviewPick::Codex(idx) => {
+            let name = app.codex_rows.get(idx)?.name.to_string();
+            scoped.push(ActionMenuAction::RefreshUsage);
+            scoped.push(ActionMenuAction::DeleteAccount);
+            Some(name)
+        }
+        OverviewPick::Native(idx) => {
+            let id = app
+                .provider_reports
+                .get(idx)
+                .filter(|report| report.listed)?
+                .id
+                .clone();
+            scoped.push(ActionMenuAction::RefreshUsage);
+            scoped.push(ActionMenuAction::DeleteAccount);
+            Some(id)
+        }
+    }
+}
+
+/// The name of the open Codex account or listed Grok / Antigravity login.
+fn open_native_name(app: &App) -> Option<String> {
+    match app.open {
+        OpenSelection::Account(RosterSlot::Codex(idx)) => {
+            Some(app.codex_rows.get(idx)?.name.to_string())
+        }
+        OpenSelection::Account(RosterSlot::Native(idx)) => Some(
+            app.provider_reports
+                .get(idx)
+                .filter(|report| report.listed)?
+                .id
+                .clone(),
+        ),
+        _ => None,
+    }
 }
 
 /// The console page the focused account's endpoint mints its api key on.
@@ -6705,9 +7265,48 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 /// refresh gate asks whether the account has a usage fetch leg, and the
 /// third-party leg fetches generic api-key endpoints too — `is_third_party`
 /// would refuse a litellm row the scheduler refreshes every cadence.
+fn added_slots(app: &App) -> Vec<RosterSlot> {
+    let profiles = app.config().profiles.clone();
+    let natives = listed_native_pairs(&app.provider_reports);
+    added_account_groups(&profiles, app.codex_rows.len(), &natives)
+        .into_iter()
+        .flat_map(|(_, slots)| slots)
+        .collect()
+}
+
+/// Walk the added accounts. Setup includes `+ new`. Usage includes it only
+/// while that row is already open, so Up from it selects the last account and
+/// Down the first. The index of add is `slots.len()`.
+fn step_added_account(app: &mut App, delta: i32, include_new: bool) {
+    let slots = added_slots(app);
+    let on_add = matches!(app.open, OpenSelection::Add);
+    let with_add = include_new || on_add;
+    let len = slots.len() + usize::from(with_add);
+    if len == 0 {
+        return;
+    }
+    let current = match app.open {
+        OpenSelection::Add => slots.len(),
+        OpenSelection::Account(slot) => slots.iter().position(|item| *item == slot).unwrap_or(0),
+    };
+    let next = (current as i32 + delta).rem_euclid(len as i32) as usize;
+    if with_add && next == slots.len() {
+        set_open_selection(app, OpenSelection::Add);
+        return;
+    }
+    let Some(slot) = slots.get(next).copied() else {
+        set_open_selection(app, OpenSelection::Add);
+        return;
+    };
+    set_open_selection(app, OpenSelection::Account(slot));
+}
+
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
+    let OpenSelection::Account(RosterSlot::Profile(idx)) = app.open else {
+        return None;
+    };
     let cfg = app.config();
-    cfg.profiles.get(app.profile_cursor).map(|p| {
+    cfg.profiles.get(idx).map(|p| {
         (
             p.name.clone(),
             p.login_is_oauth(),
@@ -6723,6 +7322,30 @@ fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
 /// and only an endpoint-only account with no credential either leg can use
 /// falls through to the nothing-to-refresh toast.
 fn queue_focused_usage_refresh(app: &mut App) {
+    match app.open {
+        OpenSelection::Account(RosterSlot::Codex(idx)) => {
+            let Some(name) = app.codex_rows.get(idx).map(|row| row.name.clone()) else {
+                return;
+            };
+            crate::usage::request_codex_refetch(name.as_str());
+            reread_native_rows(app);
+            app.toast(ToastKind::Info, format!("refreshing '{name}'"));
+            return;
+        }
+        OpenSelection::Account(RosterSlot::Native(idx)) => {
+            let Some(id) = app.provider_reports.get(idx).map(|r| r.id.clone()) else {
+                return;
+            };
+            crate::provider_monitor::request_refresh_target(
+                &id,
+                app.refresh_interval.load(Ordering::Relaxed),
+            );
+            reread_native_rows(app);
+            app.toast(ToastKind::Info, format!("refreshing '{id}'"));
+            return;
+        }
+        _ => {}
+    }
     match focused_account(app) {
         Some((name, true, _)) | Some((name, _, true)) => {
             app.manual_refresh_one(&name);
@@ -6733,6 +7356,23 @@ fn queue_focused_usage_refresh(app: &mut App) {
         }
         None => {}
     }
+}
+
+/// Overview `r`: every Claude and API account, every codex profile, and every
+/// native monitor, the same forced refresh `r` gives one row on Usage.
+fn refresh_every_account(app: &mut App) {
+    app.manual_refresh();
+    for row in &app.codex_rows {
+        crate::usage::request_codex_refetch(row.name.as_str());
+    }
+    crate::provider_monitor::request_refresh(app.refresh_interval.load(Ordering::Relaxed));
+    reread_native_rows(app);
+}
+
+/// Re-read the codex and native rows on the next tick instead of up to a second
+/// later, so the spinner a refresh request lights shows at once.
+fn reread_native_rows(app: &mut App) {
+    app.last_codex_rows_refresh = None;
 }
 
 /// Dispatch a selected action menu item to its handler.
@@ -6771,6 +7411,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
             toggle_focused_account_disabled(app);
         }
+        ActionMenuAction::DeleteAccount => prompt_delete_open_account(app),
         ActionMenuAction::OpenProviderConsole => open_provider_console(app),
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
@@ -6814,16 +7455,20 @@ fn set_token_period(app: &mut App, period: TokenPeriod) {
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    let sel_len = app.profile_count() + 1; // includes trailing `+ new` row
-    app.profile_cursor = app.profile_cursor.min(sel_len - 1);
-
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
-            KeyCode::Up => step_profile_cursor(app, -1, sel_len),
-            KeyCode::Down => step_profile_cursor(app, 1, sel_len),
-            KeyCode::Enter => enter_config_detail(app),
+            KeyCode::Up => step_added_account(app, -1, true),
+            KeyCode::Down => step_added_account(app, 1, true),
+            KeyCode::Enter => {
+                if open_is_native(app) {
+                    enter_native_setup(app);
+                    return;
+                }
+                enter_config_detail(app);
+            }
             _ => {}
         },
+        ConfigFocus::Actions if open_is_native(app) => handle_native_setup_key(app, key),
         ConfigFocus::Actions => {
             let rows = config_rows(app);
             if rows.is_empty() {
@@ -6864,6 +7509,135 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
         }
+    }
+}
+
+/// The open account is a Codex, Grok or Antigravity login.
+pub(crate) fn open_is_native(app: &App) -> bool {
+    matches!(
+        app.open,
+        OpenSelection::Account(RosterSlot::Codex(_) | RosterSlot::Native(_))
+    )
+}
+
+/// Setup detail rows for the open Codex, Grok or Antigravity account. Empty for
+/// a Claude or API account, whose rows are [`config_rows`].
+pub(crate) fn native_setup_rows(app: &App) -> Vec<NativeSetupRow> {
+    match app.open {
+        OpenSelection::Account(RosterSlot::Codex(idx)) if idx < app.codex_rows.len() => {
+            vec![NativeSetupRow::Relogin, NativeSetupRow::Delete]
+        }
+        OpenSelection::Account(RosterSlot::Native(idx))
+            if app.provider_reports.get(idx).is_some_and(|r| r.listed) =>
+        {
+            vec![NativeSetupRow::Delete]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn enter_native_setup(app: &mut App) {
+    if native_setup_rows(app).is_empty() {
+        return;
+    }
+    app.config_action_cursor = 0;
+    app.native_setup_armed = false;
+    app.config_draft = None;
+    app.config_focus = ConfigFocus::Actions;
+}
+
+fn handle_native_setup_key(app: &mut App, key: KeyEvent) {
+    let rows = native_setup_rows(app);
+    if rows.is_empty() {
+        app.config_focus = ConfigFocus::Profiles;
+        app.native_setup_armed = false;
+        return;
+    }
+    let last = rows.len() - 1;
+    app.config_action_cursor = app.config_action_cursor.min(last);
+    match key.code {
+        KeyCode::Up => {
+            app.native_setup_armed = false;
+            app.config_action_cursor = app.config_action_cursor.checked_sub(1).unwrap_or(last);
+        }
+        KeyCode::Down => {
+            app.native_setup_armed = false;
+            app.config_action_cursor = if app.config_action_cursor >= last {
+                0
+            } else {
+                app.config_action_cursor + 1
+            };
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            run_native_setup_row(app, rows[app.config_action_cursor]);
+        }
+        _ => {}
+    }
+}
+
+fn run_native_setup_row(app: &mut App, row: NativeSetupRow) {
+    match (row, app.open) {
+        (NativeSetupRow::Relogin, OpenSelection::Account(RosterSlot::Codex(idx))) => {
+            let Some(name) = app.codex_rows.get(idx).map(|r| r.name.to_string()) else {
+                return;
+            };
+            relogin_codex(app, &name);
+        }
+        (NativeSetupRow::Delete, _) if !app.native_setup_armed => {
+            app.native_setup_armed = true;
+        }
+        (NativeSetupRow::Delete, OpenSelection::Account(RosterSlot::Codex(idx))) => {
+            app.native_setup_armed = false;
+            let Some(name) = app.codex_rows.get(idx).map(|r| r.name.to_string()) else {
+                return;
+            };
+            app.config_focus = ConfigFocus::Profiles;
+            delete_open_codex(app, &name);
+        }
+        (NativeSetupRow::Delete, OpenSelection::Account(RosterSlot::Native(idx))) => {
+            app.native_setup_armed = false;
+            let Some(id) = app.provider_reports.get(idx).map(|r| r.id.clone()) else {
+                return;
+            };
+            app.config_focus = ConfigFocus::Profiles;
+            delete_open_native(app, &id);
+        }
+        _ => {}
+    }
+}
+
+/// Setup `re-login` on a Codex account: capture the operator's current codex
+/// login into it. The capture itself refuses a slot that already belongs to a
+/// different profile; this only answers the two cases it reports as success
+/// without capturing anything.
+fn relogin_codex(app: &mut App, name: &str) {
+    if operator_linked_codex_profile().is_some_and(|holder| holder.eq_ignore_ascii_case(name)) {
+        app.toast(
+            ToastKind::Info,
+            format!("codex already runs as '{name}'\nnothing new to capture"),
+        );
+        return;
+    }
+    if matches!(
+        codex_adopt_offer(),
+        crate::actions::CodexAdoptOffer::Unavailable
+    ) {
+        app.toast(
+            ToastKind::Info,
+            "no codex login to capture\nrun `codex login`, then re-login here",
+        );
+        return;
+    }
+    match codex_login_capture_quiet(name) {
+        Ok(()) => {
+            app.codex_rows = codex_rows();
+            crate::usage::request_codex_refetch(name);
+            app.toast(
+                ToastKind::Success,
+                format!("captured the current codex login into '{name}'"),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("re-login failed\n{e}")),
     }
 }
 
@@ -7009,7 +7783,7 @@ fn enter_config_detail(app: &mut App) {
 /// Jump to the `+ new` create form (global `n`).
 fn start_new_account(app: &mut App) {
     switch_tab(app, Tab::Setup);
-    app.profile_cursor = app.profile_count();
+    set_open_selection(app, OpenSelection::Add);
     app.config_action_cursor = 0;
     app.config_draft = Some(build_draft_new());
     app.config_focus = ConfigFocus::Actions;
@@ -7074,6 +7848,7 @@ fn leave_config_detail(app: &mut App) {
     });
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
+    app.native_setup_armed = false;
     if mint_dropped {
         app.toast(
             ToastKind::Warning,
@@ -8551,7 +9326,7 @@ fn commit_new_account(app: &mut App) {
                 .iter()
                 .position(|p| p.name == name)
                 .unwrap_or(0);
-            app.profile_cursor = new_idx;
+            set_open_selection(app, OpenSelection::Account(RosterSlot::Profile(new_idx)));
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
             app.toast(ToastKind::Success, format!("created '{name}'"));
@@ -8594,7 +9369,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
             app.refresh_unsaved_live_login();
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
-            app.clamp_profile_cursor();
+            reseat_open_account(app);
             app.toast(ToastKind::Success, format!("deleted '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
@@ -8636,6 +9411,141 @@ fn toggle_focused_account_disabled(app: &mut App) {
         choice: false,
         on_confirm: ConfirmAction::DisableOne(name.to_string()),
     }));
+}
+
+/// Overview `delete account`. The confirm names the highlighted row. A profile
+/// with a live session gets the existing second confirm inside [`perform_delete`].
+fn prompt_delete_open_account(app: &mut App) {
+    let Some(removal) = overview_removal(app) else {
+        return;
+    };
+    let (message, detail) = match &removal {
+        OverviewRemoval::Profile(name) => (
+            format!("delete '{name}'?"),
+            "deletes the account and everything stored for it, usage history included",
+        ),
+        OverviewRemoval::Codex(name) => (
+            format!("delete '{name}'?"),
+            "removes the codex account and its stored login",
+        ),
+        OverviewRemoval::Native(id) => (
+            format!("delete '{id}'?"),
+            "removes it from the overview. the providers tab keeps watching it, and add account puts it back.",
+        ),
+    };
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message,
+        detail: Some(detail.to_string()),
+        choice: false,
+        on_confirm: ConfirmAction::DeleteOverview(removal),
+    }));
+}
+
+/// The account a delete confirmation removes. Overview syncs the open
+/// selection to its highlighted row before `a` opens, so the open selection is
+/// the row on screen there and the open account on Setup.
+fn overview_removal(app: &App) -> Option<OverviewRemoval> {
+    match app.open {
+        OpenSelection::Account(RosterSlot::Profile(idx)) => Some(OverviewRemoval::Profile(
+            app.profile_name_at(idx)?.to_string(),
+        )),
+        OpenSelection::Account(RosterSlot::Codex(idx)) => Some(OverviewRemoval::Codex(
+            app.codex_rows.get(idx)?.name.to_string(),
+        )),
+        OpenSelection::Account(RosterSlot::Native(idx)) => {
+            let id = app
+                .provider_reports
+                .get(idx)
+                .filter(|report| report.listed)?
+                .id
+                .clone();
+            Some(OverviewRemoval::Native(id))
+        }
+        OpenSelection::Add => None,
+    }
+}
+
+/// After a removal, the open slot has to name an account that is still listed.
+/// A profile index that shifted onto the next account stays. A codex or native
+/// index that no longer is an account moves to the row now under the cursor.
+fn reseat_open_account(app: &mut App) {
+    app.clamp_profile_cursor();
+    let slots = added_slots(app);
+    let current_ok = match app.open {
+        OpenSelection::Add => true,
+        OpenSelection::Account(slot) => slots.contains(&slot),
+    };
+    if current_ok {
+        snap_overview_to_profile(app);
+        return;
+    }
+    let picks = overview_picks(app);
+    let Some(pick) = picks
+        .get(app.overview_cursor.min(picks.len().saturating_sub(1)))
+        .copied()
+    else {
+        set_open_selection(app, OpenSelection::Add);
+        return;
+    };
+    let selection = match pick {
+        OverviewPick::Claude(idx) => OpenSelection::Account(RosterSlot::Profile(idx)),
+        OverviewPick::Codex(idx) => OpenSelection::Account(RosterSlot::Codex(idx)),
+        OverviewPick::Native(idx) => OpenSelection::Account(RosterSlot::Native(idx)),
+        OverviewPick::Add => OpenSelection::Add,
+    };
+    set_open_selection(app, selection);
+}
+
+fn delete_open_codex(app: &mut App, name: &str) {
+    let owned = ProfileName::from(name);
+    if crate::runtime::has_live_session(&owned) {
+        app.modals.push(Modal::Confirm(ConfirmState {
+            message: format!("delete '{name}' anyway?"),
+            detail: Some(
+                "this account has a live clauth start session; deleting it may log that \
+                 session out."
+                    .to_string(),
+            ),
+            choice: false,
+            on_confirm: ConfirmAction::DeleteLiveCodex(name.to_string()),
+        }));
+        return;
+    }
+    finish_codex_delete(app, name, false);
+}
+
+fn finish_codex_delete(app: &mut App, name: &str, force: bool) {
+    let result = rotation_guard_for_mutation(&ProfileName::from(name))
+        .and_then(|rotation| delete_codex_profile(name, force, &rotation));
+    match result {
+        Ok(detached) => {
+            app.codex_rows = codex_rows();
+            reseat_open_account(app);
+            let body = match detached {
+                Some(slot) => format!(
+                    "deleted '{name}'\n{} was detached, so your own codex has no login now",
+                    slot.display()
+                ),
+                None => format!("deleted '{name}'"),
+            };
+            app.toast(ToastKind::Success, body);
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
+    }
+}
+
+fn delete_open_native(app: &mut App, id: &str) {
+    match crate::provider_monitor::config::unlist_native_target(id) {
+        Ok(()) => {
+            reload_provider_reports(app);
+            reseat_open_account(app);
+            app.toast(
+                ToastKind::Success,
+                format!("removed '{id}' from the overview"),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
+    }
 }
 
 // ── Setup menu: duplicate + presets ───────────────────────────────────────────
@@ -8747,6 +9657,22 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                         return;
                     }
                     save_preset_from(app, &source, &name);
+                }
+                NamePromptAction::CaptureLiveLogin => {
+                    if let Err(e) = validate_profile_name(&name, Harness::Claude, None) {
+                        app.toast(ToastKind::Danger, format!("{e}"));
+                        return;
+                    }
+                    app.modals.pop();
+                    capture_live_login(app, &name);
+                }
+                NamePromptAction::AdoptCodexLogin => {
+                    if let Err(e) = validate_profile_name(&name, Harness::Codex, None) {
+                        app.toast(ToastKind::Danger, format!("{e}"));
+                        return;
+                    }
+                    app.modals.pop();
+                    adopt_codex_login(app, &name);
                 }
             }
         }
@@ -8970,7 +9896,7 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
                 .iter()
                 .position(|p| p.name == *new_name)
                 .unwrap_or(0);
-            app.profile_cursor = idx;
+            set_open_selection(app, OpenSelection::Account(RosterSlot::Profile(idx)));
             app.config_action_cursor = 0;
             if app.config_focus == ConfigFocus::Actions {
                 app.config_draft = Some(build_draft_existing(app, new_name));
@@ -9245,6 +10171,13 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             perform_switch(app, &name);
         }
+        ConfirmAction::SwitchCodex(name) => match switch_codex_profile(&name) {
+            Ok(()) => {
+                app.codex_rows = codex_rows();
+                app.toast(ToastKind::Success, format!("codex account is '{name}'"));
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("switch failed\n{e}")),
+        },
         ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
         ConfirmAction::RotateAll => {
             // Refuse if anything is in-flight. Bootstrap is a whole-worker
@@ -9392,6 +10325,14 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::DeleteLiveSession(name) => {
             finish_delete(app, &ProfileName::from(name), true)
         }
+        ConfirmAction::DeleteOverview(OverviewRemoval::Profile(name)) => {
+            perform_delete(app, &ProfileName::from(name))
+        }
+        ConfirmAction::DeleteOverview(OverviewRemoval::Codex(name)) => {
+            delete_open_codex(app, &name)
+        }
+        ConfirmAction::DeleteOverview(OverviewRemoval::Native(id)) => delete_open_native(app, &id),
+        ConfirmAction::DeleteLiveCodex(name) => finish_codex_delete(app, &name, true),
         ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &ProfileName::from(name)),
         ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
         ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
@@ -10161,6 +11102,7 @@ fn poll_codex_rows(app: &mut App) {
     }
     app.last_codex_rows_refresh = Some(Instant::now());
     app.codex_rows = codex_rows();
+    reload_provider_reports(app);
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `● daemon`

@@ -848,6 +848,17 @@ pub(crate) struct MonitorArgs {
 
 #[tool_router]
 impl ClauthServer {
+    #[tool(
+        description = "Read configured Codex, Grok and Antigravity subscription plans, all observed quota buckets and reset times. Disk cache only: state and observed_at_ms describe freshness; unavailable quota is not unlimited. Shared pools are not independent model budgets. Use clauth providers init/refresh or the daemon to populate this feed."
+    )]
+    async fn provider_usage(&self) -> Result<CallToolResult, ErrorData> {
+        let reports = crate::provider_monitor::reports()
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let text = serde_json::to_string(&reports)
+            .map_err(|_| ErrorData::internal_error("could not encode provider usage", None))?;
+        Ok(CallToolResult::success(single_block(text)))
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),

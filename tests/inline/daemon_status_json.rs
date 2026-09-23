@@ -1702,6 +1702,8 @@ fn third_party_availability_matches_legacy_json_bytes() {
 #[test]
 fn status_body_matches_legacy_json_bytes() {
     let body = StatusBody {
+        provider_accounts: Vec::new(),
+        provider_monitor_error: None,
         schema: 2,
         generated_at: "2026-09-13T00:00:00Z".to_string(),
         active_profile: Some("work".to_string()),
@@ -1827,6 +1829,8 @@ fn status_body_matches_legacy_json_bytes() {
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
     let body = StatusBody {
+        provider_accounts: Vec::new(),
+        provider_monitor_error: None,
         schema: 2,
         generated_at: "2026-09-13T00:00:00Z".to_string(),
         active_profile: None,

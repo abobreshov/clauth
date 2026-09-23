@@ -17,7 +17,9 @@
 
 The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint clauth doesn't recognize shows none. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
 
-Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section headed ``codex — switch with `clauth <name>` ``, in the same columns: name (bold, in the blue accent, when it is the active codex profile), plan, 5h and 7d, with `—` where nothing is cached. The section is read-only: no cursor reaches it, <kbd>⏎</kbd> and <kbd>a</kbd> never act on a codex row, and there is no live or timer cell. A codex row shows the same `×` marker when its chain is quarantined, and its plan cell falls back to the plan the account's login claims while no poll has cached one. The header's account count is the rows the Overview lists: both harnesses by default, one under its `claude only` / `codex only` chip (`3 accounts · codex only`).
+A codex, grok or antigravity account's Usage pane has the same layout: a `plan` row, the `status` block, then one bar per window with its pace marker and reset. A provider with one pool per window gets plain `5h` and `7d` bars; antigravity's separate pools read `5h gemini`, `7d claude and gpt` and so on. Per-model readings are not drawn as bars, because they report onto those pools rather than holding a budget of their own. Grok names its products on a `products` row, and codex its spare limit resets on a `resets` row. These logins refresh on the same `refresh` interval as Claude accounts, never faster than every 30 s, and their status block counts down to the next check the same way.
+
+Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section headed ``codex — switch with `clauth <name>` ``, in the same columns: name (bold, in the blue accent, when it is the active codex profile), plan, 5h and 7d, with `—` where nothing is cached. The cursor reaches codex rows like any other: <kbd>⏎</kbd> asks to make that account the one a bare `codex` runs as (it never relinks `~/.claude`), and <kbd>a</kbd> offers `refresh usage` and `delete account`. There is no live or timer cell. A codex row shows the same `×` marker when its chain is quarantined, and its plan cell falls back to the plan the account's login claims while no poll has cached one. The header's account count is the rows the Overview lists: both harnesses by default, one under its `claude only` / `codex only` chip (`3 accounts · codex only`).
 
 ## Keys
 
@@ -41,7 +43,7 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 
 | Key | Behavior |
 |-----|----------|
-| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every Claude Code account |
+| <kbd>r</kbd> | Usage: refresh the selected account only, whichever provider it belongs to. Providers: refresh every monitored login. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every account, codex, grok and antigravity included |
 | <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every Claude Code account's token, after a confirm |
 | <kbd>⏎</kbd> | Overview: switch to the selected account. Tokens: open the model breakdown. Setup / Fallback: open a detail row, or commit an edit. Status / Plugin: open the detail |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | Overview: reorder accounts. Fallback (chain focus): reorder chain members |
@@ -54,7 +56,7 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 
 On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out.
 
-The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, the keys bound to the Claude Code selection (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd>, <kbd>⏎</kbd>, <kbd>a</kbd>) do nothing and a toast says `claude rows are hidden, press c`. <kbd>n</kbd>, <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
+The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> do nothing to the hidden Claude accounts and a toast says `claude rows are hidden, press c`. <kbd>a</kbd> follows the highlighted row. <kbd>r</kbd> refreshes every account, codex rows included. <kbd>n</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; rotation never reaches a codex row, because a codex chain rotates only in the background. On every other tab <kbd>c</kbd> keeps its own meaning or none.
 
 ## Action menus
 
@@ -64,10 +66,10 @@ Entries above the rule act on the account named in the menu's title bar; entries
 
 | Tab | Account | Tab-wide |
 |-----|---------|----------|
-| Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `new account` |
-| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
+| Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `delete account`, `open provider console` | `refresh all accounts`, `new account` |
+| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console`; `refresh usage` alone on a codex, grok or antigravity account | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
-| Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` | none |
+| Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console`; `refresh usage` and `delete account` on a codex, grok or antigravity account | none |
 | Status | none | `refresh status`, `open in browser` |
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint clauth knows a key page for, so an OAuth account's menu is one entry shorter.
@@ -85,7 +87,16 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 
 `disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
+`delete account` is on Overview, on <kbd>e</kbd> beside disable. It asks first. A Claude or API account is removed the same way as Setup's delete row, and a live session asks a second time. A codex account is removed with its stored login. A grok or antigravity account leaves the overview and stays on the Providers tab, so `+ add account` can list it again. Codex, grok, and antigravity rows offer refresh and delete, not the Claude rotate or disable entries.
+
 ## Setup tab rows
+
+A codex, grok or antigravity account opens on <kbd>⏎</kbd> like a Claude account, with a header block (`status` when its login is dead, `type`, `plan`, and for codex whether it is the login codex runs as) and its own rows. Their logins live in the official tools, so the rows are the account actions clauth can take:
+
+| Account | Rows |
+|---------|------|
+| codex | `re-login` captures the login `codex login` left in `~/.codex` into this account, the same capture as `clauth login <name> --codex`. `delete account` arms on the first press and removes the account and its stored login on the second |
+| grok, antigravity | `remove from overview` arms on the first press, then takes the login off the account lists. The Providers tab keeps watching it, and `+ add account` lists it again |
 
 The account list ends in an action row: `+ new`, which turns this pane into the create form. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed.
 

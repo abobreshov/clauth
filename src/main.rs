@@ -38,6 +38,7 @@ mod pricing;
 mod profile;
 mod profile_cache;
 mod profile_json;
+mod provider_monitor;
 mod providers;
 mod runtime;
 mod sessions;
@@ -46,6 +47,7 @@ mod settings_sync;
 mod spinner;
 mod start;
 mod status;
+mod tasks;
 mod throughput;
 mod token_ledger;
 mod tokens;
@@ -258,6 +260,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
+        Command::Providers(args) => provider_monitor::run(args),
+        Command::Tasks(args) => tasks::run(args),
         Command::Jobs { json } => jobs_cli::run(json),
         Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
         // One positional is the bare-word act under its own verb: the exact

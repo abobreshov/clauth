@@ -1,13 +1,13 @@
-//! Top bar: claude glyph on the left; brand and account count in the text
-//! column to the right. Three rows always — [`header_height`] keeps
-//! `render::draw`'s layout in step.
+//! Top bar: brand, account count, and the tab strip, each starting at the
+//! left edge. Three rows always — [`header_height`] keeps `render::draw`'s
+//! layout in step.
 //!
 //! The active-profile usage gauge sits on row 1 to the right of the account
 //! count, separated by a middle dot. The collapse ladder drops the usage bar
 //! before the name.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -15,6 +15,7 @@ use ratatui::widgets::Paragraph;
 use super::super::app::{App, Tab};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
+use crate::provider_monitor::types::ProviderKind;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -191,12 +192,7 @@ pub(super) fn header_height(_app: &App) -> u16 {
 // ── Draw ─────────────────────────────────────────────────────────────────
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols: [Rect; 2] =
-        Layout::horizontal([Constraint::Length(10), Constraint::Min(20)]).areas(area);
-
-    draw_logo(frame, cols[0], app);
-
-    let rows: [Rect; 3] = Layout::vertical([Constraint::Length(1); 3]).areas(cols[1]);
+    let rows: [Rect; 3] = Layout::vertical([Constraint::Length(1); 3]).areas(area);
 
     // The account rows the Overview lists under the harness filter: claude
     // while it shows them, codex while it shows those; both by default.
@@ -210,7 +206,20 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         0
     };
-    let n = claude_n + codex_n;
+    // Listed Grok and Antigravity stay on the table under every harness
+    // filter, so they stay in the count. The chip still names claude or codex.
+    let native_n = app
+        .provider_reports
+        .iter()
+        .filter(|report| {
+            report.listed
+                && matches!(
+                    report.provider,
+                    ProviderKind::Grok | ProviderKind::Antigravity
+                )
+        })
+        .count();
+    let n = claude_n + codex_n + native_n;
     let info_width = rows[0].width as usize;
 
     let gauge = if app.tab == Tab::Overview || app.compact {
@@ -333,29 +342,6 @@ fn daemon_dot_color(app: &App) -> Option<ratatui::style::Color> {
         DaemonHealth::Stale => Some(theme::warning_color()),
         DaemonHealth::Fresh => Some(theme::success_color()),
     }
-}
-
-fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let blink = (app.anim_ms() % 6000) < 200;
-
-    let style = Style::default().fg(theme::accent_2_color());
-
-    let logo_top = if blink {
-        " ▐█████▌ "
-    } else {
-        " ▐▛███▜▌ "
-    };
-    let logo_mid = "▝▜█████▛▘";
-    let logo_eyes = "  ▘▘ ▝▝  ";
-
-    let lines = vec![
-        Line::from(Span::styled(logo_top, style)).alignment(Alignment::Left),
-        Line::from(Span::styled(logo_mid, style)).alignment(Alignment::Left),
-        Line::from(Span::styled(logo_eyes, style)).alignment(Alignment::Left),
-    ];
-
-    let para = Paragraph::new(lines).style(theme::base());
-    frame.render_widget(para, area);
 }
 
 #[cfg(test)]

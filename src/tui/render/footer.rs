@@ -10,6 +10,7 @@ use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
     HERDR_OPTIONS, HerdrOption, LoginSession, Modal, PluginFocus, StatusFocus, Tab, TokenView,
     build_action_menu, config_rows, fallback_hint, has_sub_focus, herdr_config_writable,
+    open_is_native,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -48,7 +49,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let q_label: &str = if has_sub_focus(app) { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
+        Tab::Providers => &[("↑↓", "scroll"), ("r", "refresh"), ("?", "help")],
         Tab::Overview => &[
+            ("n", "add"),
             ("⇧↑↓", "reorder"),
             ("a", "actions"),
             ("c", "harness"),
@@ -85,6 +88,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("a", "actions"),
                 ("?", "help"),
             ],
+            // A Codex, Grok or Antigravity account's rows are actions only.
+            ConfigFocus::Actions if open_is_native(app) => {
+                &[("↑↓", "row"), ("↵", "run"), ("a", "actions"), ("?", "help")]
+            }
             ConfigFocus::Actions => {
                 // Row-aware: the `model` row cycles on space; env rows edit a value
                 // or open the add-env key editor.
@@ -331,10 +338,10 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
         return &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")];
     }
     let fix = app.plugin.selected_fix().is_some();
-    if !app
+    if app
         .plugin
         .selected_check()
-        .is_some_and(|c| c.label == "herdr")
+        .is_none_or(|c| c.label != "herdr")
     {
         return if fix {
             &[

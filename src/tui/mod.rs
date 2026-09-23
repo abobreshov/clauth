@@ -1,6 +1,7 @@
 //! TUI runtime. `run` is the only public surface; everything below is glue
 //! between ratatui, the `App` state machine, and shutdown housekeeping.
 
+mod accounts;
 mod app;
 mod render;
 pub(crate) mod theme;

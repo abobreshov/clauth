@@ -453,13 +453,14 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 9].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 10].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "╭ ACTIONS ─────────────── acct ╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh usage          r  │".to_string(),
             "│    rotate access token    t  │".to_string(),
             "│    disable account        d  │".to_string(),
+            "│    delete account         e  │".to_string(),
             "│  ──────────────────────────  │".to_string(),
             "│    refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),

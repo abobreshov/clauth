@@ -371,6 +371,43 @@ impl PlanTier {
         }
     }
 
+    /// The tier the stored login claims. `subscription_type` names the plan.
+    /// A Max login's `rateLimitTier` (`default_claude_max_20x`) supplies the
+    /// multiplier a fetch has not written yet. An unrecognized subscription
+    /// word stays unknown: the rate-limit stamp is not a reason to invent a
+    /// different plan over a claim this classifier does not know.
+    pub(crate) fn from_login(
+        subscription_type: Option<&str>,
+        rate_limit_tier: Option<&str>,
+    ) -> Self {
+        match Self::from_subscription_type(subscription_type) {
+            PlanTier::Max(None) => PlanTier::Max(max_multiplier(rate_limit_tier)),
+            PlanTier::Unknown
+                if subscription_type.is_none()
+                    && rate_limit_tier.is_some_and(|tier| tier.contains("claude_max")) =>
+            {
+                PlanTier::Max(max_multiplier(rate_limit_tier))
+            }
+            other => other,
+        }
+    }
+
+    /// Fetched plan wins. A Max plan that has not learned its multiplier yet
+    /// takes it from the login. No fetched plan leaves the login's claim.
+    pub(crate) fn resolve(fetched: Option<Self>, login: Self) -> Option<Self> {
+        match fetched {
+            Some(PlanTier::Max(None)) => match login {
+                PlanTier::Max(Some(n)) => Some(PlanTier::Max(Some(n))),
+                _ => Some(PlanTier::Max(None)),
+            },
+            Some(tier) => Some(tier),
+            None => match login {
+                PlanTier::Unknown => None,
+                tier => Some(tier),
+            },
+        }
+    }
+
     /// The long `Claude <tier>` form, for every known tier. `None`
     /// for `Unknown`, mirroring [`PlanTier::short_label`]: a bare "Claude" reads
     /// as a real plan the account never claimed, so each surface renders its own
@@ -530,7 +567,8 @@ impl UsageInfo {
 /// Nominal length of the rolling window named by `label`, in seconds. `None`
 /// for labels with no fixed window (e.g. the monthly extra-credits bar).
 pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
-    if label == LABEL_5H {
+    if label == LABEL_5H || label.starts_with("5h ") {
+        // `5h` plus a native provider's per-pool five-hour label (`"5h gemini"`).
         Some(5 * 3600)
     } else if label == LABEL_7D || label.starts_with("7d ") {
         // `7d` plus every per-model weekly label (`"7d fable"`, `"7d opus"`, …).

@@ -9,58 +9,39 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use super::super::accounts::RosterSlot;
 use super::super::app::{
     App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS, config_rows,
 };
 use super::super::theme;
 use super::panes::{
-    DIAG_DISABLED, bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
-    picker_row, pill, section_box, section_box_verbatim,
+    DIAG_DISABLED, added_line_count, bold_when, cycle_option, draw_added_accounts,
+    draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row, key_cell, label_style,
+    master_detail, open_slot, pill, section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // +1 for the trailing `+ new` picker row.
-    let items = app.config().profiles.len() + 1;
-    let (selector, settings) = master_detail(area, items);
+mod native;
 
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (selector, settings) = master_detail(area, added_line_count(app, true));
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
     draw_selector(frame, selector, app, profiles_focused);
-    draw_settings(frame, settings, app);
+    match open_slot(app) {
+        Some(slot @ (RosterSlot::Codex(_) | RosterSlot::Native(_))) => {
+            native::draw_native_settings(frame, settings, app, slot);
+        }
+        Some(RosterSlot::Profile(_)) | None => draw_settings(frame, settings, app),
+    }
 }
 
+/// Setup's account list. Tests drive this entry so the grouped rows, not a
+/// copy of the picker, are what get styled.
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let cfg = app.config();
-    let count = cfg.profiles.len();
-    let sel = app.profile_cursor.min(count);
-    draw_selector_list(frame, area, "accounts", focused, sel, |w| {
-        let mut rows: Vec<_> = cfg
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                // A disabled account can never be active, so dim wins outright.
-                let ns = if p.is_disabled() {
-                    theme::dim()
-                } else {
-                    name_color(cfg.is_active(&p.name))
-                };
-                picker_row(i == sel, focused, p.name.to_string(), ns, w)
-            })
-            .collect();
-        rows.push(picker_row(
-            count == sel,
-            focused,
-            "+ new".to_string(),
-            theme::accent(),
-            w,
-        ));
-        rows
-    });
+    draw_added_accounts(frame, area, app, focused, true);
 }
 
 /// Snapshot taken under one short `config` guard, decoupled from render so

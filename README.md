@@ -110,10 +110,13 @@ clauth start --isolated personal -p < prompt.txt
 | `clauth list` / `clauth which` | account table with cached usage / who owns this session |
 | `clauth sessions`, `resume`, `info` | browse past Claude Code sessions and resume one anywhere |
 | `clauth daemon` | headless refresh + auto-switch loop, optionally serving the REST API (`--listen`) |
+| `clauth providers init`, `refresh`, `--json` | configure and inspect native Codex, Grok and Antigravity subscription quotas |
+| `clauth providers start <target> [--herdr]` | launch a configured native tool, optionally in a sibling Herdr pane |
+| `clauth tasks register`, `checkpoint`, `resource`, `show` | persist portable task checkpoints and resource declarations; does not transfer execution ownership ([boundaries](docs/provider-monitoring.md#durable-checkpoint-foundation)) |
 
 Every command and flag: [Quickstart](https://github.com/uwuclxdy/clauth/wiki/Quickstart#commands).
 
-The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> move between the eight tabs, <kbd>?</kbd> lists the keys for the tab you are on.
+The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> move between the nine tabs, <kbd>?</kbd> lists the keys for the tab you are on.
 
 | Tab | What it holds |
 |-----|---------------|
@@ -125,6 +128,11 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 | **Config** | appearance, scheduler, auto-switch defaults |
 | **Status** | Claude incident feed |
 | **Plugin** | Claude Code wiring + per-profile runtime, with one-key fixes |
+| **Providers** | native Codex, Grok and Antigravity plans, quota pools, resets and freshness |
+
+See [native provider monitoring](docs/provider-monitoring.md) for configuration,
+credential handling and current limitations. Cross-tool handoff is not implemented
+by the launch command.
 
 ## Claude Code plugin
 

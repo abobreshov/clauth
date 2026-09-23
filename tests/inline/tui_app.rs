@@ -137,6 +137,20 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
 
 use super::App;
 
+/// Open Claude account `idx` the way the UI does: through the one writer of
+/// the shared selection, so `app.open` and `profile_cursor` agree.
+fn open_profile(app: &mut App, idx: usize) {
+    super::set_open_selection(
+        app,
+        super::OpenSelection::Account(crate::tui::accounts::RosterSlot::Profile(idx)),
+    );
+}
+
+/// Open the `+ new` row the way the UI does.
+fn open_add_row(app: &mut App) {
+    super::set_open_selection(app, super::OpenSelection::Add);
+}
+
 fn bare_app() -> App {
     use crate::profile::{AppConfig, AppState};
     App::new(AppConfig {
@@ -2361,6 +2375,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("refresh usage", Some('r')),
             ("rotate access token", Some('t')),
             ("disable account", Some('d')),
+            ("delete account", Some('e')),
             ("refresh all accounts", Some('f')),
             ("new account", Some('n')),
         ]
@@ -2441,7 +2456,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     };
 
     // The generic row the fix is about: queued, not toasted away.
-    app.profile_cursor = 2;
+    open_profile(&mut app, 2);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         queued(&app).contains(&"litellm".to_string()),
@@ -2451,7 +2466,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 
     // The two arms that must not move.
-    app.profile_cursor = 0;
+    open_profile(&mut app, 0);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         queued(&app).contains(&"oauth".to_string()),
@@ -2460,7 +2475,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     );
     assert_eq!(last_toast(&app), "refreshing 'oauth'");
 
-    app.profile_cursor = 1;
+    open_profile(&mut app, 1);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         queued(&app).contains(&"vendor".to_string()),
@@ -2471,7 +2486,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
 
     // A keyless endpoint has no credential either leg can fetch with: the
     // toast arm is unchanged for it.
-    app.profile_cursor = 3;
+    open_profile(&mut app, 3);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         !queued(&app).contains(&"keyless".to_string()),
@@ -2481,7 +2496,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     assert_eq!(last_toast(&app), "'keyless' has no usage to refresh");
 
     // The menu entry rides the same gate.
-    app.profile_cursor = 2;
+    open_profile(&mut app, 2);
     dispatch_action_menu_action(&mut app, ActionMenuAction::RefreshUsage);
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 }
@@ -6129,14 +6144,14 @@ fn focused_account_types_the_hybrid_on_its_credential() {
         profiles: vec![hybrid, api_key_only],
     });
 
-    app.profile_cursor = 0;
+    open_profile(&mut app, 0);
     assert_eq!(
         focused_account(&app),
         Some((crate::profile::ProfileName::from("hybrid"), true, true)),
         "a stored pair is rotatable no matter where requests route"
     );
 
-    app.profile_cursor = 1;
+    open_profile(&mut app, 1);
     assert_eq!(
         focused_account(&app),
         Some((crate::profile::ProfileName::from("apikey"), false, true)),
@@ -9369,7 +9384,7 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    open_profile(&mut app, 0);
 
     for focus in [ConfigFocus::Profiles, ConfigFocus::Actions] {
         app.config_focus = focus;
@@ -9392,7 +9407,7 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
 
     // `+ new` sits past the roster: only `apply preset` is offered, scoped to
     // the draft (no context name until the user types one).
-    app.profile_cursor = app.profile_count();
+    open_add_row(&mut app);
     let menu = build_action_menu(&app);
     assert_eq!(
         menu.items
@@ -9583,7 +9598,7 @@ fn a_saved_preset_applies_onto_another_account() {
 
     let mut app = app_with(vec![src, target]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    open_profile(&mut app, 0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::SaveAsPreset);
     for ch in "mine".chars() {
@@ -9599,7 +9614,7 @@ fn a_saved_preset_applies_onto_another_account() {
 
     // Apply it onto the blank second account: nothing is set there, so no
     // warning stands between the pick and the write.
-    app.profile_cursor = 1;
+    open_profile(&mut app, 1);
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
     let Some(Modal::PresetPicker(picker)) = app.modals.last() else {
         panic!("apply opens the picker");
@@ -11650,10 +11665,10 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
 
 // ── the codex-only view disarms every key bound to the claude selection ──────
 
-/// With the claude rows hidden, reorder, cursor, switch and the action menu
-/// would act on a row the screen does not show. Each is inert with a toast
-/// saying why, and every filter that shows the claude rows (`All` and `Claude`
-/// alike) re-arms all four.
+/// With the claude rows hidden, reorder and enter do not act on an account the
+/// screen does not show. `a` on the add row opens only the tab-wide actions.
+/// Every filter that shows the claude rows (`All` and `Claude` alike) re-arms
+/// reorder, the cursor, enter, and the account menu.
 #[test]
 fn the_codex_only_view_disarms_the_claude_selection_keys() {
     use super::{HarnessFilter, KeyEvent, KeyModifiers, Modal, handle_key};
@@ -11695,7 +11710,15 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     );
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.profile_cursor, 0, "the cursor does not step");
+    assert_eq!(
+        order(&app),
+        ["a", "b"],
+        "down does not reorder hidden accounts"
+    );
+    assert!(
+        matches!(app.open, super::OpenSelection::Add),
+        "the only visible row is add, not a hidden account"
+    );
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(
@@ -11703,10 +11726,39 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
         None,
         "enter switches nothing"
     );
-    assert!(app.modals.is_empty(), "enter pushes no confirm");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::AddAccount(_))),
+        "the only visible row is add account"
+    );
+    app.modals.clear();
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
-    assert!(app.modals.is_empty(), "`a` opens no action menu");
+    let Some(Modal::ActionMenu(menu)) = app.modals.last() else {
+        panic!("`a` on add opens the tab-wide menu");
+    };
+    assert!(menu.context.is_none(), "the menu names no hidden account");
+    assert!(
+        menu.items.iter().all(|item| !matches!(
+            item.action,
+            super::ActionMenuAction::DeleteAccount
+                | super::ActionMenuAction::DisableProfile
+                | super::ActionMenuAction::EnableProfile
+                | super::ActionMenuAction::RefreshUsage
+                | super::ActionMenuAction::RotateTokens
+        )),
+        "add offers no account action: {:?}",
+        menu.items.iter().map(|item| item.label).collect::<Vec<_>>()
+    );
+    app.modals.clear();
+    assert_eq!(order(&app), ["a", "b"]);
+
+    // The codex filter left the highlight on add. Put it back on the first
+    // account before checking that All and Claude re-arm the claude keys.
+    app.harness_filter = HarnessFilter::All;
+    super::set_open_selection(
+        &mut app,
+        super::OpenSelection::Account(crate::tui::accounts::RosterSlot::Profile(0)),
+    );
 
     // Every filter showing the claude rows re-arms all four keys; each pass
     // reorders from cursor 0, so the order flips back and forth.
@@ -11738,4 +11790,148 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     };
     re_armed(&mut app, HarnessFilter::All, ["b", "a"]);
     re_armed(&mut app, HarnessFilter::Claude, ["a", "b"]);
+}
+
+/// `n` on the Overview lists a Grok login found in the official auth file, and
+/// choosing it records the account selector only. The token stays in that file.
+#[test]
+fn overview_add_records_a_detected_grok_login_without_its_token() {
+    use super::{KeyCode, Modal, Tab, handle_key};
+    use crate::tui::accounts::AddChoice;
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".grok");
+    std::fs::create_dir_all(&dir).expect("grok dir");
+    std::fs::write(
+        dir.join("auth.json"),
+        r#"{"https://auth.x.ai::desk":{"key":"secret-token-value"}}"#,
+    )
+    .expect("auth file");
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    let index = {
+        let Some(Modal::AddAccount(form)) = app.modals.last() else {
+            panic!("n opens add account");
+        };
+        form.choices
+            .iter()
+            .position(
+                |choice| matches!(choice, AddChoice::AddGrok { label, .. } if label == "desk"),
+            )
+            .expect("the detected grok login is a choice")
+    };
+    if let Some(Modal::AddAccount(form)) = app.modals.last_mut() {
+        assert!(!form.choices[index].label().contains("secret-token"));
+        form.cursor = index;
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let text = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("providers.toml"),
+    )
+    .expect("providers.toml");
+    assert!(
+        text.contains("grok"),
+        "the grok provider is stored:\n{text}"
+    );
+    assert!(
+        !text.contains("secret-token"),
+        "the token is not copied into providers.toml:\n{text}"
+    );
+    assert!(
+        app.provider_reports
+            .iter()
+            .any(|report| report.provider == crate::provider_monitor::types::ProviderKind::Grok),
+        "the overview reloads the new grok row"
+    );
+}
+
+/// Adding an unlisted monitor target lists that row instead of copying it.
+/// Adding the same API login a second time does not append another profile.
+#[test]
+fn add_account_lists_a_monitor_target_and_does_not_duplicate_an_api_login() {
+    use super::{AddChoice, commit_new_account, run_add_choice};
+    use crate::provider_monitor::types::ProviderKind;
+    use crate::providers::Provider;
+    use crate::tui::accounts::added_account_groups;
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = crate::provider_monitor::config::path().expect("providers path");
+    std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&path, crate::provider_monitor::config::EXAMPLE).expect("example");
+
+    let mut app = app_with(vec![]);
+    run_add_choice(
+        &mut app,
+        AddChoice::AddGrok {
+            entry: None,
+            label: "grok".into(),
+        },
+    );
+    run_add_choice(
+        &mut app,
+        AddChoice::AddGrok {
+            entry: None,
+            label: "grok".into(),
+        },
+    );
+    let config = crate::provider_monitor::config::load().expect("load");
+    let grok: Vec<_> = config
+        .targets
+        .iter()
+        .filter(|target| target.provider == ProviderKind::Grok)
+        .collect();
+    assert_eq!(grok.len(), 1, "adding the login copied the monitor target");
+    assert!(
+        grok[0].listed,
+        "the monitor target stayed off the account list"
+    );
+    let agy = config
+        .targets
+        .iter()
+        .find(|target| target.provider == ProviderKind::Antigravity)
+        .expect("agy monitor");
+    assert!(!agy.listed, "antigravity was listed without being added");
+
+    run_add_choice(&mut app, AddChoice::NewApi(Provider::DeepSeek));
+    {
+        let draft = app.config_draft.as_mut().expect("deepseek draft");
+        draft.name = InputState::new("ds-one");
+        draft.api_key = InputState::new("sk-ds-test");
+    }
+    commit_new_account(&mut app);
+    run_add_choice(&mut app, AddChoice::NewApi(Provider::DeepSeek));
+    {
+        let draft = app.config_draft.as_mut().expect("second draft");
+        draft.name = InputState::new("ds-one");
+        draft.api_key = InputState::new("sk-ds-test");
+    }
+    commit_new_account(&mut app);
+
+    let profiles = app.config().profiles.clone();
+    assert_eq!(
+        profiles
+            .iter()
+            .filter(|profile| profile.name.as_str() == "ds-one")
+            .count(),
+        1,
+        "the second add appended another deepseek row"
+    );
+    let groups = added_account_groups(&profiles, 0, &[]);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0, "DeepSeek");
+    assert_eq!(groups[0].1.len(), 1);
+
+    if let Ok(dir) = std::env::var("CLAUTH_GOAL_SCRATCH")
+        && !dir.is_empty()
+    {
+        let path = std::path::Path::new(&dir);
+        let _ = std::fs::create_dir_all(path);
+        let _ = std::fs::write(
+            path.join("add-account-result.txt"),
+            format!("grok targets {}\ndeepseek profiles 1\n", grok.len()),
+        );
+    }
 }

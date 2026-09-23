@@ -2529,7 +2529,7 @@ fn report_profile_run(
     write_shim(
         home.home(),
         "herdr",
-        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nexit 0\n",
+        "if [ \"$1\" = pane ] && [ \"$2\" = get ]; then echo '{\"result\":{\"pane\":{\"agent\":\"claude\"}}}'; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nexit 0\n",
     );
     write_shim(
         home.home(),
@@ -2737,7 +2737,7 @@ fn report_profile_resolve_run(
         home.home(),
         "herdr",
         &format!(
-            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info_json}'; exit 0; fi\nexit 0\n"
+            "if [ \"$1\" = pane ] && [ \"$2\" = get ]; then echo '{{\"result\":{{\"pane\":{{\"agent\":\"claude\"}}}}}}'; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info_json}'; exit 0; fi\nexit 0\n"
         ),
     );
     write_shim(home.home(), "ps", ps_body);

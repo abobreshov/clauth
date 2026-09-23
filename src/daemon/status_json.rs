@@ -646,6 +646,11 @@ pub(crate) struct StatusBody {
     #[serde(default)]
     pub(crate) clauth_version: String,
     pub(crate) profiles: Vec<ProfileEntry>,
+    /// Native tool usage, independent of the credential-switching profile roster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) provider_accounts: Vec<crate::provider_monitor::ProviderReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_monitor_error: Option<String>,
 }
 
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
@@ -669,6 +674,11 @@ pub(crate) fn build_status(
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
 
+    let (provider_accounts, provider_monitor_error) = match crate::provider_monitor::reports() {
+        Ok(reports) => (reports, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+
     StatusBody {
         schema: SCHEMA_VERSION,
         generated_at: iso_from_ms(now),
@@ -681,6 +691,8 @@ pub(crate) fn build_status(
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         profiles,
+        provider_accounts,
+        provider_monitor_error,
     }
 }
 

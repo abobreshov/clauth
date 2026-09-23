@@ -121,6 +121,9 @@ fn no_tls_fixture() {
 /// CI marks as required was silently carrying zero listener coverage while
 /// reporting green — a skipped test is indistinguishable from a passing one
 /// in a summary line.
+///
+/// Callers must hold a `HomeSandbox` while generating the chain: other tests
+/// replace process-wide `PATH` with command shims under its environment lock.
 pub(crate) fn generate_chain(
     dir: &Path,
 ) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
@@ -385,6 +388,7 @@ fn round_trip(
 
 #[test]
 fn a_real_tls_request_is_served_end_to_end() {
+    let home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
     let Some((paths, ca_crt)) = generate_chain(dir.path()).expect("fixture") else {
         eprintln!("SKIPPED a_real_tls_request_is_served_end_to_end: openssl is not usable here");
@@ -396,7 +400,6 @@ fn a_real_tls_request_is_served_end_to_end() {
         return;
     };
 
-    let home = HomeSandbox::new();
     let ctx = ctx();
     let feed = r#"{"schema":1,"active_profile":"alpha","profiles":[]}"#;
     crate::profile::mkdir_700(&crate::profile::clauth_dir().unwrap()).expect("mkdir");
@@ -554,12 +557,14 @@ struct Fixture {
 
 /// `None` when openssl cannot produce a certificate here.
 fn fixture() -> Option<Fixture> {
+    // The OpenSSL subprocesses read PATH too, so take the environment lock
+    // before generating certificates, not only before creating API state.
+    let home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
     let (paths, ca_crt) = generate_chain(dir.path()).expect("fixture")?;
     let server_tls = tls::server_config_from(&paths).expect("server config");
     let client_tls = client_config(&ca_crt)?;
 
-    let home = HomeSandbox::new();
     let ctx = ctx();
     let feed = r#"{"schema":1,"active_profile":"alpha","profiles":[]}"#.to_string();
     crate::profile::mkdir_700(&crate::profile::clauth_dir().unwrap()).expect("mkdir");
@@ -1142,6 +1147,7 @@ fn a_framing_error_answers_and_closes_even_on_a_persistent_connection() {
 /// answer over, and the server must not fall back to one.
 #[test]
 fn a_plaintext_client_gets_nothing_back() {
+    let _home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
     let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
         eprintln!("SKIPPED a_plaintext_client_gets_nothing_back: openssl is not usable here");
@@ -1149,7 +1155,6 @@ fn a_plaintext_client_gets_nothing_back() {
     };
     let server_tls = tls::server_config_from(&paths).expect("server config");
 
-    let _home = HomeSandbox::new();
     let ctx = ctx();
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -1382,6 +1387,7 @@ fn an_explicit_certificate_pair_on_a_tailnet_bind_builds_a_config() {
 /// for "the certificate is not there", never for every tailnet-range bind.
 #[test]
 fn a_working_lego_identity_still_loads_on_a_tailnet_bind() {
+    let _home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
     let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
         return;

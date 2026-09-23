@@ -133,6 +133,14 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
+    pub(crate) const ALL: [Provider; 5] = [
+        Self::DeepSeek,
+        Self::Zai,
+        Self::Alibaba,
+        Self::OpenRouter,
+        Self::MiniMax,
+    ];
+
     /// Match a base URL to a known provider. `None` when unrecognised.
     pub(crate) fn from_base_url(url: &str) -> Option<Self> {
         if deepseek::matches_base_url(url) {
@@ -157,6 +165,18 @@ impl Provider {
             Self::Alibaba => alibaba::DISPLAY_NAME,
             Self::OpenRouter => openrouter::DISPLAY_NAME,
             Self::MiniMax => minimax::DISPLAY_NAME,
+        }
+    }
+
+    /// The endpoint a new account of this provider starts from. Alibaba has
+    /// more than one console host, so the operator pastes that url.
+    pub(crate) fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            Self::DeepSeek => Some(deepseek::ORIGIN),
+            Self::Zai => Some(zai::ORIGIN),
+            Self::OpenRouter => Some(openrouter::ORIGIN),
+            Self::MiniMax => Some(minimax::ORIGIN),
+            Self::Alibaba => None,
         }
     }
 

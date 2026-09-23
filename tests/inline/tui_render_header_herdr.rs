@@ -16,7 +16,7 @@ fn app_with_mode(herdr_mode: bool) -> App {
     .with_herdr_mode(herdr_mode)
 }
 
-/// Row 0 past the 10-cell logo column, plus the buffer for style pins.
+/// Row 0 from the left edge, plus the buffer for style pins.
 fn row0_render(app: &App, width: u16) -> (String, ratatui::buffer::Buffer) {
     let height = header_height(app);
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("backend");
@@ -27,7 +27,7 @@ fn row0_render(app: &App, width: u16) -> (String, ratatui::buffer::Buffer) {
     .expect("draw");
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
-    (rows[0].chars().skip(10).collect(), buf)
+    (rows[0].clone(), buf)
 }
 
 /// The row-0 contract spelled from the outside: brand, the tag while the full
@@ -68,7 +68,7 @@ fn herdr_mode_shows_the_tag_after_the_brand_before_the_daemon_dot() {
     let (row0, buf) = row0_render(&app, width);
     assert_eq!(
         row0,
-        expected_row0(true, true, (width - 10) as usize),
+        expected_row0(true, true, width as usize),
         "row 0 must be the brand, tag, daemon dot, then the right-aligned version"
     );
     assert!(
@@ -80,7 +80,7 @@ fn herdr_mode_shows_the_tag_after_the_brand_before_the_daemon_dot() {
     // theme mapping itself rather than a restated color.
     let col = row0.find("[ herdr ]").expect("tag renders");
     assert_eq!(
-        buf.content[10 + col].fg,
+        buf.content[col].fg,
         super::theme::text_dim_color(),
         "the tag must render in TEXT_DIM"
     );
@@ -91,13 +91,17 @@ fn herdr_mode_sheds_the_tag_instead_of_clipping_the_version_at_narrow_width() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with_mode(true);
     app.daemon_health = crate::daemon::DaemonHealth::Fresh;
-    let width = 40;
+    // One column under the fit, so the tag drops and the version stays put.
+    let ver = format!("v{VERSION}");
+    let used = "clauth".chars().count() + "  ● daemon".chars().count();
+    let tag_w = "  [ herdr ]".chars().count();
+    let width = (used + tag_w + ver.chars().count() - 1) as u16;
 
     let (row0, _buf) = row0_render(&app, width);
     assert_eq!(
         row0,
-        expected_row0(true, true, (width - 10) as usize),
-        "at 40 cols the tag must drop and the row read exactly like a plain launch"
+        expected_row0(true, true, width as usize),
+        "below the fit the tag must drop and the row read exactly like a plain launch"
     );
     assert!(
         !row0.contains("[ herdr ]"),
@@ -120,10 +124,10 @@ fn the_tag_fits_exactly_at_the_boundary_and_sheds_one_column_narrower() {
     app.daemon_health = crate::daemon::DaemonHealth::Fresh;
     let ver = format!("v{VERSION}");
     // The renderer's fit rule: brand + daemon dot + tag + version against the
-    // row width, where the row starts after the 10-column logo.
+    // full row width. The tab strip starts at the left edge.
     let used = "clauth".chars().count() + "  ● daemon".chars().count();
     let tag_w = "  [ herdr ]".chars().count();
-    let boundary = 10 + used + tag_w + ver.chars().count();
+    let boundary = used + tag_w + ver.chars().count();
 
     let (at, _buf) = row0_render(&app, boundary as u16);
     assert!(
@@ -147,8 +151,8 @@ fn the_tag_fits_exactly_at_the_boundary_and_sheds_one_column_narrower() {
 
     // Both sides against the independently derived expectation, so the pin
     // cannot drift from the renderer's own fit rule.
-    assert_eq!(at, expected_row0(true, true, boundary - 10));
-    assert_eq!(shed, expected_row0(true, true, boundary - 11));
+    assert_eq!(at, expected_row0(true, true, boundary));
+    assert_eq!(shed, expected_row0(true, true, boundary - 1));
 }
 
 /// The "byte-identical to today" half: a non-herdr launch renders the exact
@@ -163,7 +167,7 @@ fn a_non_herdr_launch_renders_row0_byte_identically_at_both_widths() {
         let (row0, _buf) = row0_render(&app, width);
         assert_eq!(
             row0,
-            expected_row0(false, true, (width - 10) as usize),
+            expected_row0(false, true, width as usize),
             "herdr_mode=false must render the pre-tag row 0 at {width} cols"
         );
     }
@@ -178,7 +182,7 @@ fn herdr_tag_renders_without_a_daemon_dot() {
     let (row0, _buf) = row0_render(&app, width);
     assert_eq!(
         row0,
-        expected_row0(true, false, (width - 10) as usize),
+        expected_row0(true, false, width as usize),
         "the tag is herdr-mode's, not the daemon dot's — it must render either way"
     );
 }

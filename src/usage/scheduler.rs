@@ -3384,6 +3384,7 @@ fn tick(state: &SchedulerState) {
     // chain that just re-stamped its access token polls with the fresh one
     // instead of spending a tick on a 401 the kick then has to undo.
     codex_usage_tick(state);
+    crate::provider_monitor::schedule_refresh(interval_ms);
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -3572,12 +3573,93 @@ fn tick(state: &SchedulerState) {
 /// serialize behind the anthropic ones and vice versa.
 const CODEX_USAGE_ORIGIN: &str = "chatgpt.com";
 
-/// Per-profile pacing for the codex usage leg, epoch ms of the last poll. Its
-/// own map rather than `LastFetchedAt` because that store feeds the claude
-/// countdown surfaces, which have no codex column until the published-surface
-/// phase adds one.
-static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
+/// Per-profile pacing and outcome for the codex usage leg. Its own map rather
+/// than `LastFetchedAt` because that store feeds the claude countdown surfaces,
+/// which have no codex column until the published-surface phase adds one.
+static CODEX_POLLS: std::sync::Mutex<Option<HashMap<String, CodexPoll>>> =
     std::sync::Mutex::new(None);
+
+/// What the codex usage leg last did for one profile: the pacing it polls by,
+/// and what the Usage tab status rows show. Process-local, like the claude
+/// activity marks: a TUI standing down behind the daemon has none and reads
+/// the cache file's age instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexPoll {
+    /// Epoch ms of the last poll that reached the wire.
+    pub(crate) polled_at: Option<u64>,
+    /// The server's own wait after a 429, when it is longer than the interval.
+    pub(crate) retry_after_ms: Option<u64>,
+    /// How the last poll ended. `None` before the first one.
+    pub(crate) outcome: Option<CodexPollOutcome>,
+    /// Consecutive polls that did not return a reading.
+    pub(crate) failures: u32,
+    /// A manual refresh asked for this profile and the leg has not taken it.
+    pub(crate) queued: bool,
+    /// The leg is polling this profile now.
+    pub(crate) fetching: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexPollOutcome {
+    Fresh,
+    /// A 401: the access token is stale and the standby leg was kicked.
+    Unauthorized,
+    RateLimited,
+    Failed,
+    /// No stored chain to poll with; re-capture the login.
+    NoLogin,
+}
+
+impl CodexPoll {
+    /// Epoch ms of the next poll at `interval_ms`. `None` before the first poll.
+    pub(crate) fn next_poll_ms(&self, interval_ms: u64) -> Option<u64> {
+        let wait = interval_ms.max(self.retry_after_ms.unwrap_or(0));
+        self.polled_at.map(|at| at.saturating_add(wait))
+    }
+
+    fn due(&self, now: u64, interval_ms: u64) -> bool {
+        self.queued
+            || self
+                .next_poll_ms(interval_ms)
+                .is_none_or(|next| now >= next)
+    }
+}
+
+/// The codex leg's record for `name`, for the Usage status rows.
+pub(crate) fn codex_poll(name: &str) -> Option<CodexPoll> {
+    CODEX_POLLS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|m| m.get(name).copied()))
+}
+
+/// Poll `name` on the next tick whatever its cadence (`r` on its Usage row, or
+/// on Overview for every codex profile). Only the lease holder polls; a TUI
+/// standing down drops the mark on its next tick, as it does for claude.
+pub(crate) fn request_codex_refetch(name: &str) {
+    update_codex_poll(name, |poll| poll.queued = true);
+}
+
+fn update_codex_poll(name: &str, change: impl FnOnce(&mut CodexPoll)) {
+    if let Ok(mut guard) = CODEX_POLLS.lock() {
+        change(
+            guard
+                .get_or_insert_with(HashMap::new)
+                .entry(name.to_string())
+                .or_default(),
+        );
+    }
+}
+
+fn clear_codex_queued() {
+    if let Ok(mut guard) = CODEX_POLLS.lock()
+        && let Some(map) = guard.as_mut()
+    {
+        for poll in map.values_mut() {
+            poll.queued = false;
+        }
+    }
+}
 
 /// Codex accounts whose last poll answered 401. Their access token is stale, so
 /// the standby leg force-refreshes them on its next pass — see
@@ -3603,7 +3685,7 @@ fn codex_usage_tick(state: &SchedulerState) {
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
     let now = now_ms();
     let due: Vec<ProfileName> = {
-        let Ok(mut guard) = CODEX_POLLED_AT.lock() else {
+        let Ok(mut guard) = CODEX_POLLS.lock() else {
             return;
         };
         let seen = guard.get_or_insert_with(HashMap::new);
@@ -3612,7 +3694,7 @@ fn codex_usage_tick(state: &SchedulerState) {
             .iter()
             .filter(|name| {
                 seen.get(name.as_str())
-                    .is_none_or(|last| now.saturating_sub(*last) >= interval_ms)
+                    .is_none_or(|poll| poll.due(now, interval_ms))
             })
             .cloned()
             .collect()
@@ -3625,21 +3707,52 @@ fn codex_usage_tick(state: &SchedulerState) {
         // Read the chain from the profile store, never from a session home: the
         // store is the one physical carrier (decision 8), and this leg holds no
         // rotation guard because it only READS.
-        let Some(auth) = crate::codex_auth::read_store_auth(name.as_str()) else {
+        let token = crate::codex_auth::read_store_auth(name.as_str())
+            .and_then(|auth| Some((auth.access_token()?.to_string(), auth)));
+        let Some((token, auth)) = token else {
+            update_codex_poll(name.as_str(), |poll| {
+                poll.queued = false;
+                poll.outcome = Some(CodexPollOutcome::NoLogin);
+            });
             continue;
         };
-        let Some(token) = auth.access_token() else {
-            continue;
-        };
+        update_codex_poll(name.as_str(), |poll| {
+            poll.queued = false;
+            poll.fetching = true;
+        });
         await_request_slot(CODEX_USAGE_ORIGIN);
-        let outcome = crate::usage::fetch_codex_usage(token, auth.account_id(), now_epoch_secs());
-        if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
-            guard
-                .get_or_insert_with(HashMap::new)
-                .insert(name.to_string(), now);
-        }
+        let outcome = crate::usage::fetch_codex_usage(&token, auth.account_id(), now_epoch_secs());
+        let polled_at = now_ms();
+        update_codex_poll(name.as_str(), |poll| {
+            poll.fetching = false;
+            poll.polled_at = Some(polled_at);
+            poll.retry_after_ms = match &outcome {
+                Err(FetchError::RateLimited {
+                    retry_after: Some(wait),
+                    ..
+                }) => u64::try_from(wait.as_millis()).ok(),
+                _ => None,
+            };
+            let ended = match &outcome {
+                Ok(_) => CodexPollOutcome::Fresh,
+                Err(FetchError::Status(401)) => CodexPollOutcome::Unauthorized,
+                Err(FetchError::Status(429) | FetchError::RateLimited { .. }) => {
+                    CodexPollOutcome::RateLimited
+                }
+                Err(_) => CodexPollOutcome::Failed,
+            };
+            poll.failures = if ended == CodexPollOutcome::Fresh {
+                0
+            } else {
+                poll.failures.saturating_add(1)
+            };
+            poll.outcome = Some(ended);
+        });
         match outcome {
-            Ok(info) => {
+            Ok(mut info) => {
+                // Dated like a claude reading, so the Usage tab and the
+                // published feed can tell a current codex figure from an old one.
+                info.fetched_at = Some(polled_at);
                 crate::codex_auth::kick_reset(name.as_str());
                 // Persist through the same per-profile cache the claude leg
                 // writes, so every reader that resolves a window BY NAME —
@@ -3818,6 +3931,9 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
     clear_orphaned_forced(&state.activity, &forced, &HashSet::new());
+    // The codex leg does not run while standing down either, so a codex
+    // refresh mark would spin forever. The daemon's poll lands in the cache.
+    clear_codex_queued();
     // With no worker running, EVERY Queued mark is an orphan — not only forced
     // ones. The bootstrap pre-marks cache-due profiles Queued so the first
     // paint shows a spinner instead of a stale countdown, expecting the first

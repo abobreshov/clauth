@@ -1273,9 +1273,48 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
     codex_login_capture_at(name, &chrono::Utc::now().to_rfc3339())
 }
 
+/// The Overview adopt path. Same capture as [`codex_login_capture`], without
+/// the CLI notes: those lines are stdout, and stdout paints over the accounts
+/// table while the TUI owns the screen.
+pub(crate) fn codex_login_capture_quiet(name: &str) -> Result<()> {
+    codex_login_capture_announced(name, &chrono::Utc::now().to_rfc3339(), false)
+}
+
+/// Whether the Overview can offer to adopt the operator's Codex login.
+/// Read-only: it does not copy or relink `auth.json`.
+pub(crate) enum CodexAdoptOffer {
+    /// A regular `auth.json` is present and is not already a profile link.
+    Available,
+    /// The operator slot is already the symlink for a codex profile.
+    Already,
+    /// No login to adopt, or the operator home cannot be resolved.
+    Unavailable,
+}
+
+pub(crate) fn codex_adopt_offer() -> CodexAdoptOffer {
+    let Ok(operator) = codex_operator_home() else {
+        return CodexAdoptOffer::Unavailable;
+    };
+    let auth_path = operator.join("auth.json");
+    if let Ok(target) = std::fs::read_link(&auth_path)
+        && clauth_auth_store_owner(&target).is_some()
+    {
+        return CodexAdoptOffer::Already;
+    }
+    if auth_path.is_file() {
+        CodexAdoptOffer::Available
+    } else {
+        CodexAdoptOffer::Unavailable
+    }
+}
+
 /// [`codex_login_capture`] with the capture time injected, so the re-stamp is
 /// pinnable.
 pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()> {
+    codex_login_capture_announced(name, now_rfc3339, true)
+}
+
+fn codex_login_capture_announced(name: &str, now_rfc3339: &str, announce: bool) -> Result<()> {
     let trimmed = validate_name_chars(name)?.to_string();
     let operator = codex_operator_home()?;
     match codex_operator_store_mode(&operator).as_deref() {
@@ -1295,10 +1334,12 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         && let Some(holder) = clauth_auth_store_owner(&target)
     {
         if holder.eq_ignore_ascii_case(&trimmed) {
-            outln!(
-                "clauth: {} already follows codex profile '{holder}' — nothing to capture",
-                auth_path.display()
-            );
+            if announce {
+                outln!(
+                    "clauth: {} already follows codex profile '{holder}' — nothing to capture",
+                    auth_path.display()
+                );
+            }
             return Ok(());
         }
         // NOT "run `codex login`": that slot is a LINK to '{holder}'s store, and
@@ -1393,30 +1434,32 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         Ok((canonical, reauth, adopted))
     })?;
 
-    if reauth {
-        outln!("clauth: re-captured the operator codex login into '{canonical}'");
-    } else {
-        outln!("clauth: captured the operator codex login into codex profile '{canonical}'");
-    }
-    if adopted {
-        outln!(
-            "clauth: {} now follows the profile store — your own codex and clauth \
-             sessions share one chain",
-            auth_path.display()
-        );
-        outln!(
-            "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s \
-             chain through that link and revoke it server-side — remove the link first \
-             if you mean to mint a chain for a different account"
-        );
-    } else {
-        outln!(
-            "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE \
-             copy of a single-use rotating chain, and the first refresh on either side \
-             strands the other. Run codex only through `clauth start {canonical}` from \
-             here on, or `codex login` again for your own use",
-            auth_path.display()
-        );
+    if announce {
+        if reauth {
+            outln!("clauth: re-captured the operator codex login into '{canonical}'");
+        } else {
+            outln!("clauth: captured the operator codex login into codex profile '{canonical}'");
+        }
+        if adopted {
+            outln!(
+                "clauth: {} now follows the profile store — your own codex and clauth \
+                 sessions share one chain",
+                auth_path.display()
+            );
+            outln!(
+                "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s \
+                 chain through that link and revoke it server-side — remove the link first \
+                 if you mean to mint a chain for a different account"
+            );
+        } else {
+            outln!(
+                "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE \
+                 copy of a single-use rotating chain, and the first refresh on either side \
+                 strands the other. Run codex only through `clauth start {canonical}` from \
+                 here on, or `codex login` again for your own use",
+                auth_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1566,6 +1609,16 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
 /// The home codex reads with no `CODEX_HOME` set: `~/.codex`.
 fn default_codex_operator_home() -> Result<std::path::PathBuf> {
     Ok(crate::profile::home_dir()?.join(".codex"))
+}
+
+/// The codex profile a bare `codex` is signed in as, when the operator slot
+/// is the symlink a capture installed. `None` when that slot is absent, is a
+/// regular file, or does not point at a clauth profile store. Reads the link
+/// only.
+pub(crate) fn operator_linked_codex_profile() -> Option<String> {
+    let home = codex_operator_home().ok()?;
+    let target = std::fs::read_link(home.join("auth.json")).ok()?;
+    clauth_auth_store_owner(&target)
 }
 
 /// The codex profile owning a clauth auth store path

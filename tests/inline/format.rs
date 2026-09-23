@@ -520,6 +520,86 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
     assert_eq!(account_tier(&free), Some(PlanTier::Free));
 }
 
+/// The login's own stamp is a plan before any usage fetch. `subscription_type`
+/// names it, and a Max login's `rateLimitTier` keeps the multiplier.
+#[test]
+fn account_tier_detects_the_login_subscription_before_a_fetch() {
+    let login = |sub: Option<&str>, rate: Option<&str>| {
+        let mut oauth = crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: sub.map(str::to_string),
+            ..crate::profile::OAuthToken::default_extra()
+        };
+        if let Some(rate) = rate {
+            oauth.set_rate_limit_tier(rate.to_string());
+        }
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(oauth),
+        });
+        profile
+    };
+    assert_eq!(
+        account_tier(&login(Some("max"), Some("default_claude_max_20x"))),
+        Some(PlanTier::Max(Some(20)))
+    );
+    assert_eq!(
+        account_tier(&login(Some("max"), Some("default_claude_max_5x"))),
+        Some(PlanTier::Max(Some(5)))
+    );
+    assert_eq!(account_tier(&login(Some("pro"), None)), Some(PlanTier::Pro));
+    assert_eq!(
+        account_tier(&login(Some("team"), None)),
+        Some(PlanTier::Team)
+    );
+    assert_eq!(
+        account_tier(&login(Some("enterprise"), None)),
+        Some(PlanTier::Enterprise)
+    );
+    assert_eq!(
+        account_tier(&login(Some("free"), None)),
+        Some(PlanTier::Free)
+    );
+    assert_eq!(
+        account_tier(&login(None, Some("default_claude_max_20x"))),
+        Some(PlanTier::Max(Some(20))),
+        "a rate-limit stamp with no subscription word is still Max"
+    );
+    assert_eq!(
+        account_tier(&login(
+            Some("something_new"),
+            Some("default_claude_max_20x")
+        )),
+        None,
+        "an unrecognized subscription word is not rewritten into Max"
+    );
+
+    let mut fetched = login(Some("max"), Some("default_claude_max_20x"));
+    fetched.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Max(None),
+            subscription_status: Some("active".into()),
+            codex_plan: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        account_tier(&fetched),
+        Some(PlanTier::Max(Some(20))),
+        "an active Max plan with no multiplier yet takes the login's"
+    );
+
+    fetched.usage.as_mut().unwrap().plan.as_mut().unwrap().tier = PlanTier::Pro;
+    assert_eq!(
+        account_tier(&fetched),
+        Some(PlanTier::Pro),
+        "a fetched plan still wins over the login stamp"
+    );
+}
+
 /// The other direction: a real tier still renders, and `Free` is untouched by
 /// the unfetched-plan change.
 #[test]

@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 
 use crate::profile::DivergenceChoice;
 
+use super::super::accounts::AddAccountForm;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
@@ -35,7 +36,23 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
+        Modal::AddAccount(form) => draw_add_account(frame, area, form),
     }
+}
+
+fn draw_add_account(frame: &mut Frame<'_>, area: Rect, form: &AddAccountForm) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "detected logins are listed first",
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+    let cursor = form.cursor.min(form.choices.len().saturating_sub(1));
+    for (index, choice) in form.choices.iter().enumerate() {
+        lines.push(option_line(index == cursor, choice.label()));
+    }
+    draw_modal(frame, area, "ADD ACCOUNT", lines);
 }
 
 /// In-flight login progress. Renders live from `App::login` (the stage, the
@@ -325,6 +342,8 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
             | ConfirmAction::DeleteLiveSession(_)
+            | ConfirmAction::DeleteOverview(_)
+            | ConfirmAction::DeleteLiveCodex(_)
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -634,8 +653,12 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "accounts",
             &[
                 ("\u{2191}\u{2193}", "move cursor"),
-                ("\u{21b5}", "switch to selected account (confirm)"),
-                ("shift \u{2191}\u{2193}", "reorder account up / down"),
+                ("\u{21b5}", "switch to the account, or add on the last row"),
+                ("n", "add an account"),
+                (
+                    "shift \u{2191}\u{2193}",
+                    "reorder a claude account up / down",
+                ),
             ][..],
         )],
         Tab::Usage => vec![(
@@ -699,6 +722,14 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{21b5}", "open incident timeline"),
                 ("r", "refresh the feed"),
                 ("esc", "back to the list"),
+            ][..],
+        )],
+        Tab::Providers => vec![(
+            "provider subscriptions",
+            &[
+                ("↑↓ / PgUp PgDn", "scroll model quotas"),
+                ("r", "refresh native provider usage"),
+                ("TOML", "configure ~/.clauth/providers.toml"),
             ][..],
         )],
         Tab::Plugin => vec![(

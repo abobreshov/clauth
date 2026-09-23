@@ -11688,3 +11688,50 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
         "global twin: the dead-reading bypass must queue the switch the wedge held back"
     );
 }
+
+// ── codex usage leg pacing and the Usage status record ─────────────────────
+
+#[test]
+fn a_codex_poll_is_due_on_its_cadence_or_when_queued() {
+    let interval = 90_000;
+    let fresh = super::CodexPoll {
+        polled_at: Some(1_000),
+        ..Default::default()
+    };
+    assert_eq!(fresh.next_poll_ms(interval), Some(91_000));
+    assert!(!fresh.due(50_000, interval));
+    assert!(fresh.due(91_000, interval));
+    let queued = super::CodexPoll {
+        queued: true,
+        ..fresh
+    };
+    assert!(
+        queued.due(50_000, interval),
+        "a manual refresh skips the cadence"
+    );
+    assert!(
+        super::CodexPoll::default().due(0, interval),
+        "never polled is due"
+    );
+}
+
+#[test]
+fn a_codex_429_waits_for_the_servers_retry_after_when_it_is_longer() {
+    let poll = super::CodexPoll {
+        polled_at: Some(1_000),
+        retry_after_ms: Some(600_000),
+        outcome: Some(super::CodexPollOutcome::RateLimited),
+        failures: 2,
+        ..Default::default()
+    };
+    assert_eq!(poll.next_poll_ms(90_000), Some(601_000));
+}
+
+#[test]
+fn a_codex_refresh_request_marks_the_profile_queued_until_a_stand_down_clears_it() {
+    let name = "codex-refetch-probe";
+    super::request_codex_refetch(name);
+    assert!(super::codex_poll(name).is_some_and(|p| p.queued));
+    super::clear_codex_queued();
+    assert!(super::codex_poll(name).is_some_and(|p| !p.queued));
+}

@@ -1,7 +1,8 @@
 //! Single top-level `draw` fn dispatches the whole frame.
 //!
 //! Visual language: one content frame per tab, no nested boxes; chrome is dim
-//! lowercase; sapphire = active element; orange = logo + active-account marker.
+//! lowercase; sapphire = active element; orange = the claude spark and the
+//! active-account marker.
 //!
 //! Where new things go:
 //!   - new tab → submodule + dispatch in `draw` + entry in `tabs.rs`
@@ -19,6 +20,7 @@ mod modals;
 mod overview;
 mod panes;
 mod plugin;
+mod providers;
 mod status;
 mod tabs;
 mod toasts;
@@ -67,6 +69,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Tab::Config => global_config::draw(frame, body_area, app),
         Tab::Status => status::draw(frame, body_area, app),
         Tab::Plugin => plugin::draw(frame, body_area, app),
+        Tab::Providers => providers::draw(frame, body_area, app),
     }
     footer::draw(frame, footer_area, app);
 
@@ -80,3 +83,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 #[cfg(test)]
 #[path = "../../../tests/inline/tui_render_mod.rs"]
 mod render_smoke;
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_screens.rs"]
+mod screen_tests;

@@ -236,7 +236,16 @@ fn tools_list_returns_the_whole_tool_surface() {
     // Four tools, the slice-1 surface: `delegate` keeps its name because the
     // bundled PostToolUse hook matcher is anchored `delegate$` — a rename there
     // silently breaks result auto-delivery.
-    assert_eq!(names, ["delegate", "monitor", "profiles", "switch_profile"]);
+    assert_eq!(
+        names,
+        [
+            "delegate",
+            "monitor",
+            "profiles",
+            "provider_usage",
+            "switch_profile"
+        ]
+    );
     for tool in result["tools"].as_array().expect("tools") {
         assert!(
             tool["inputSchema"].is_object(),

@@ -683,7 +683,13 @@ fn headless_showcase_renders() {
 
     // Select the profile carrying a populated spend cap. Real accounts return it
     // disabled, so the demo is the only place the guarded spend bar is observable.
-    app.profile_cursor = 1; // personal → work
+    // personal → work, the way the Usage list steps: one row down.
+    app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.profile_name_at(app.profile_cursor)
+            .map(|n| n.to_string()),
+        Some("work".to_string())
+    );
     term.draw(|f| render::draw(f, &app)).unwrap();
     let work_usage = flatten(&term);
     assert!(
@@ -819,11 +825,12 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Plugin);
     press(&mut app, KeyCode::Right);
+    assert_eq!(app.tab, Tab::Providers);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
-    assert_eq!(app.tab, Tab::Plugin, "← wraps to the last tab");
-    // Seven ← from the last tab walk back to the first.
-    for _ in 0..7 {
+    assert_eq!(app.tab, Tab::Providers, "← wraps to the last tab");
+    for _ in 1..Tab::ALL.len() {
         press(&mut app, KeyCode::Left);
     }
     assert_eq!(app.tab, Tab::Overview);
@@ -892,8 +899,18 @@ fn demo_data_drives_all_actions() {
 
     // ── Toggle ──
     assert!(auto_start_of(&app, "personal"), "demo seeds personal ON");
-    press(&mut app, KeyCode::Up); // 2 → 1 (work)
-    press(&mut app, KeyCode::Up); // → 0 (personal)
+    // The list is grouped, Claude accounts first (personal, work, research),
+    // then the endpoint accounts (side-project, bedrock-dev). From
+    // side-project, up walks research → work → personal.
+    press(&mut app, KeyCode::Up); // side-project → research
+    press(&mut app, KeyCode::Up); // → work
+    press(&mut app, KeyCode::Up); // → personal
+    assert_eq!(
+        app.profile_name_at(app.profile_cursor)
+            .map(|n| n.to_string()),
+        Some("personal".to_string()),
+        "three steps up from side-project reach personal"
+    );
     press(&mut app, KeyCode::Enter); // focus detail for personal
     // auto-start sits right below name (OAuth-only); one step down reaches it.
     press(&mut app, KeyCode::Down); // Name → AutoStart
@@ -980,9 +997,20 @@ fn demo_data_drives_all_actions() {
     let before = app.profile_count();
     press(&mut app, KeyCode::Left); // Fallback → Setup
     assert_eq!(app.tab, Tab::Setup);
-    for _ in 0..4 {
-        press(&mut app, KeyCode::Down); // 0 → 4 ("research")
-    }
+    assert_eq!(
+        app.profile_name_at(app.profile_cursor)
+            .map(|n| n.to_string()),
+        Some("personal".to_string()),
+        "Setup opens on the account the chain cursor held"
+    );
+    // Grouped list: personal, work, research, then the endpoint accounts.
+    press(&mut app, KeyCode::Down); // personal → work
+    press(&mut app, KeyCode::Down); // → research
+    assert_eq!(
+        app.profile_name_at(app.profile_cursor)
+            .map(|n| n.to_string()),
+        Some("research".to_string())
+    );
     press(&mut app, KeyCode::Enter); // focus detail
     press(&mut app, KeyCode::Up); // Name → Delete (wraps to last row)
     press(&mut app, KeyCode::Enter); // arm
@@ -1003,8 +1031,18 @@ fn demo_data_drives_all_actions() {
 
     // ── Create ──
     let before = app.profile_count();
-    // Navigate to the + new row (last slot in Setup list)
-    press(&mut app, KeyCode::Down); // 4 → end ("+ new")
+    // Navigate to the + new row (last slot in Setup list), wherever the
+    // delete left the selection.
+    for _ in 0..8 {
+        if matches!(app.open, app::OpenSelection::Add) {
+            break;
+        }
+        press(&mut app, KeyCode::Down);
+    }
+    assert!(
+        matches!(app.open, app::OpenSelection::Add),
+        "+ new is reached"
+    );
     press(&mut app, KeyCode::Enter); // focus detail (auto-positions on Name)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
@@ -1116,8 +1154,8 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right); // Fallback → Config
     press(&mut app, KeyCode::Right); // Config → Status
     press(&mut app, KeyCode::Right); // Status → Plugin
-    // One more right wraps back to Overview
-    press(&mut app, KeyCode::Right); // Plugin → Overview
+    press(&mut app, KeyCode::Right); // Plugin → Providers
+    press(&mut app, KeyCode::Right); // Providers → Overview
     assert_eq!(app.tab, Tab::Overview);
 
     // ── Quit ──
@@ -1170,12 +1208,13 @@ fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
     press(&mut app, KeyCode::Tab);
     assert_eq!(app.tab, Tab::Plugin);
     press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Providers);
+    press(&mut app, KeyCode::Tab);
     assert_eq!(app.tab, Tab::Overview, "Tab wraps back to Overview");
 
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(app.tab, Tab::Plugin, "BackTab wraps to the last tab");
-    // Seven BackTab from the last tab walk back to the first, same as ←.
-    for _ in 0..7 {
+    assert_eq!(app.tab, Tab::Providers, "BackTab wraps to the last tab");
+    for _ in 1..Tab::ALL.len() {
         press(&mut app, KeyCode::BackTab);
     }
     assert_eq!(app.tab, Tab::Overview);

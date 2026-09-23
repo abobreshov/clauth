@@ -55,6 +55,12 @@ pub(crate) enum ThemeArg {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Monitor native Codex, Grok and Antigravity plans/quotas and launch tools.
+    Providers(crate::provider_monitor::ProviderArgs),
+
+    /// Store portable task checkpoints and resource declarations (not a write fence).
+    Tasks(crate::tasks::TaskArgs),
+
     /// Launch claude under a profile, in a per-profile CLAUDE_CONFIG_DIR
     ///
     /// Args clauth does not recognize go to `claude` untouched, leading hyphens

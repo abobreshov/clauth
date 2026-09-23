@@ -905,6 +905,37 @@ fn credentialed_long_label_clamps_to_kind_width() {
     );
 }
 
+/// No usage fetch yet: the type column still reads the login. `max` plus
+/// `default_claude_max_20x` is Max 20x, and the active account keeps its dot.
+#[test]
+fn the_type_column_reads_the_active_logins_subscription() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut acct = credentialed_profile("acct", "max");
+    acct.credentials
+        .as_mut()
+        .unwrap()
+        .claude_ai_oauth
+        .as_mut()
+        .unwrap()
+        .set_rate_limit_tier("default_claude_max_20x".to_string());
+    let config = config_with(vec![acct], Some("acct"), vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app);
+    let text: String = render_overview_row(&app, 0, &widths, false, true)
+        .spans
+        .iter()
+        .map(|span| span.content.to_string())
+        .collect();
+    assert!(
+        text.contains("Max 20x"),
+        "type column missed the login's subscription: {text}"
+    );
+    assert!(
+        text.contains('●'),
+        "the active account keeps its dot: {text}"
+    );
+}
+
 // ── disabled accounts (feature: per-account disable toggle) ──────────────
 
 /// A disabled account's row dims its name (never `name_color`'s active/
@@ -2350,6 +2381,48 @@ fn codex_rows_plan_falls_back_to_the_id_token_claim() {
     );
 }
 
+/// No active marker in the roster: the profile a bare `codex` is signed in as
+/// is still the active row. An explicit marker wins over that link.
+#[test]
+fn the_operator_codex_login_is_active_when_the_roster_has_no_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    let store = dir
+        .join("profiles")
+        .join("openai-personal")
+        .join("auth.json");
+    std::fs::create_dir_all(store.parent().expect("parent")).expect("profile dir");
+    std::fs::write(&store, b"{}").expect("store");
+    let slot = home.home().join(".codex");
+    std::fs::create_dir_all(&slot).expect("operator home");
+    std::os::unix::fs::symlink(&store, slot.join("auth.json")).expect("link");
+
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "profiles = [\"openai-personal\"]\n",
+    )
+    .expect("roster");
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].active,
+        "the linked operator login is the active codex account"
+    );
+
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"other\"\nprofiles = [\"openai-personal\", \"other\"]\n",
+    )
+    .expect("roster with a marker");
+    let rows = crate::tui::app::codex_rows();
+    assert!(
+        !rows[0].active,
+        "an explicit marker is not the linked profile"
+    );
+    assert!(rows[1].active, "the roster marker stays the active row");
+}
+
 /// A codex row's usage cells take the claude row's columns: the 5h value sits
 /// under the `5h` header (the same lead-in as the claude bar), the 7d value
 /// under `7d`, and when the width drops the 7d column the codex row renders no
@@ -2368,17 +2441,22 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
             resets_at: None,
         }),
         seven_day: None,
+        fetched_at: None,
+        limit_reached: None,
+        reset_credits: None,
+        poll: None,
     };
     let app = App::new(config_with(vec![], None, vec![]));
 
     let wide = OverviewWidths::new(80, &app);
     assert!(wide.seven_day > 0, "80 columns keep the 7d column");
-    let line = render_codex_row(&row, &wide);
-    assert_eq!(
-        five_hour_cell_text(&wide, false, &line),
-        fixed("42%", wide.five_hour),
-        "the 5h value sits under the 5h header, left-aligned like the claude bar"
+    let line = render_codex_row(&row, &wide, false, ResetFmt::default());
+    let five = five_hour_cell_text(&wide, false, &line);
+    assert!(
+        five.contains('[') && five.contains("42%"),
+        "the 5h cell is the claude bracketed bar, left-aligned under the header: {five:?}"
     );
+    assert_eq!(five.chars().count(), wide.five_hour, "{five:?}");
     assert_eq!(
         seven_day_cell_text(&wide, &line),
         fixed("—", wide.seven_day),
@@ -2387,15 +2465,72 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 
     let narrow = OverviewWidths::new(56, &app);
     assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
-    let line = render_codex_row(&row, &narrow);
-    assert_eq!(
-        five_hour_cell_text(&narrow, false, &line),
-        fixed("42%", narrow.five_hour)
+    let line = render_codex_row(&row, &narrow, false, ResetFmt::default());
+    let five = five_hour_cell_text(&narrow, false, &line);
+    assert!(
+        five.contains('[') && five.contains("42%"),
+        "a 12-cell 5h column still draws the short claude bar: {five:?}"
     );
+    assert_eq!(five.chars().count(), narrow.five_hour, "{five:?}");
     assert_eq!(
         live_cell_text(&narrow, &line).trim_end(),
         "",
         "no 7d cell is rendered where the column is gone, so nothing sits under live"
+    );
+}
+
+/// At a width where the Claude 5h cell is a bracketed bar with a reset suffix,
+/// the Codex cell is that same text. A missing Codex window stays the faint dash.
+#[test]
+fn codex_row_matches_the_claude_bracketed_bar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let reset = reset_in(86_400);
+    let mut claude = profile("beta", 80.0, 42.0, 86_400);
+    if let Some(window) = claude
+        .usage
+        .as_mut()
+        .and_then(|usage| usage.five_hour.as_mut())
+    {
+        window.resets_at = Some(reset.clone());
+    }
+    let app = App::new(config_with(vec![claude], None, vec![]));
+    let widths = OverviewWidths::new(160, &app);
+    assert!(
+        widths.five_hour >= 26,
+        "this width is the tier where Claude draws the reset suffix"
+    );
+    let fmt = ResetFmt::from_state(&app.config().state);
+    let claude_line = render_overview_row(&app, 0, &widths, false, true);
+    let codex_line = render_codex_row(
+        &CodexRow {
+            name: crate::profile::ProfileName::from("cx1"),
+            active: false,
+            broken: false,
+            plan: Some("pro".into()),
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(reset),
+            }),
+            seven_day: None,
+            fetched_at: None,
+            limit_reached: None,
+            reset_credits: None,
+            poll: None,
+        },
+        &widths,
+        false,
+        fmt,
+    );
+    let claude_five = five_hour_cell_text(&widths, false, &claude_line);
+    let codex_five = five_hour_cell_text(&widths, false, &codex_line);
+    assert_eq!(claude_five, codex_five, "codex uses the claude cell");
+    assert!(
+        codex_five.contains('[') && codex_five.contains("42%") && codex_five.contains('('),
+        "{codex_five:?}"
+    );
+    assert_eq!(
+        seven_day_cell_text(&widths, &codex_line),
+        fixed(NO_DATA, widths.seven_day)
     );
 }
 
@@ -2430,8 +2565,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
 
     let app = App::new(config_with(vec![], None, vec![]));
     let widths = OverviewWidths::new(80, &app);
-    let broken = render_codex_row(&rows[0], &widths);
-    let live = render_codex_row(&rows[1], &widths);
+    let broken = render_codex_row(&rows[0], &widths, false, ResetFmt::default());
+    let live = render_codex_row(&rows[1], &widths, false, ResetFmt::default());
 
     // The codex row carries the list rows' slots (blank 2-cell cursor prefix,
     // marker cell, gap, name), so the glyph and the name sit in the claude
@@ -2448,10 +2583,12 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
         "  × cx1",
         "a quarantined chain shows the broken glyph in the marker cell"
     );
+    // cx2 is the roster's active profile, so its marker cell holds the active
+    // dot: a live chain never shows the broken glyph.
     assert_eq!(
         live_text[..name_col + 3].iter().collect::<String>(),
-        "    cx2",
-        "a live chain keeps the blank marker cell"
+        "  ● cx2",
+        "a live active chain shows the active dot, not the broken glyph"
     );
     let glyph = broken
         .spans
@@ -2737,10 +2874,11 @@ fn accounts_scrollbar_column(app: &App, width: u16, height: u16) -> String {
         .collect()
 }
 
-/// Two claude rows never overflow a 5-row list on their own; with a codex
-/// section (a spacer, a header line, three rows) the same list holds seven
-/// rows, and the scrollbar must say so: it measures every row pushed, never
-/// the claude rows alone. Both controls render no track at all.
+/// Two claude rows never overflow a 5-row list on their own. With a provider
+/// header, a codex section (a spacer, a header, three rows) and the add row,
+/// the same list holds nine rows, and the scrollbar must say so: it measures
+/// every row pushed, never the claude rows alone. Both controls render no
+/// track at all when the rows fit.
 #[test]
 fn the_accounts_scrollbar_counts_the_codex_rows() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2775,11 +2913,305 @@ fn the_accounts_scrollbar_counts_the_codex_rows() {
     assert_eq!(
         accounts_scrollbar_column(&with_codex, 80, 12),
         "         ",
-        "seven rows fit a 9-row list: no track"
+        "nine rows fit a 9-row list: no track"
     );
     assert_eq!(
         accounts_scrollbar_column(&with_codex, 80, 8),
-        "┃┃┃┊┊",
-        "seven rows overflow a 5-row list: thumb 5*5/7 = 3 rows at offset 0, then track"
+        "┃┃┊┊┊",
+        "nine rows overflow a 5-row list: thumb 5*5/9 = 2 rows at offset 0, then track"
     );
+}
+
+/// Claude accounts and a DeepSeek account render under their own provider
+/// headings, in provider order, with config order kept inside the Claude group.
+#[test]
+fn overview_groups_accounts_by_provider() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            deepseek_profile("ds-main", &["1.00 USD"]),
+            profile("beta", 80.0, 10.0, 3_600),
+            profile("alpha", 80.0, 20.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+        .expect("draw");
+    let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    let claude = text.find("claude").expect("claude group");
+    let alpha = text.find("alpha").expect("alpha row");
+    let beta = text.find("beta").expect("beta row");
+    let deepseek = text.find("DeepSeek").expect("deepseek group");
+    let ds = text.find("ds-main").expect("deepseek row");
+    let add = text.find("add account").expect("add row");
+    assert!(
+        claude < beta && beta < alpha,
+        "claude accounts stay in config order:\n{text}"
+    );
+    assert!(
+        alpha < deepseek && deepseek < ds,
+        "deepseek follows the claude group:\n{text}"
+    );
+    assert!(ds < add, "add account is the last row:\n{text}");
+}
+
+/// Grok and agy accounts use the Claude columns: clipped name, plan in type,
+/// a bracketed used-percent bar for a shared 5h or weekly bucket, and a dash
+/// where that window is absent. A model quota is not a cell.
+#[test]
+fn overview_native_rows_use_the_claude_bars() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app_profiles = config_with(vec![profile("beta", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(app_profiles);
+    let long_id = "grok-desk-account-name-extra-long";
+    let mut grok_week = shared_bucket(
+        "Grok shared weekly allowance",
+        "shared",
+        None,
+        Some(49.0),
+        None,
+    );
+    grok_week.resets_at = Some(reset_in(3 * 86_400));
+    let mut agy_five = shared_bucket(
+        "Five Hour Limit Remaining",
+        "pool:5h",
+        Some(20.0),
+        None,
+        Some(18_000),
+    );
+    agy_five.resets_at = Some(reset_in(5 * 3_600));
+    let mut agy_week = shared_bucket(
+        "Weekly Limit Remaining",
+        "pool:weekly",
+        Some(80.0),
+        None,
+        Some(604_800),
+    );
+    agy_week.resets_at = Some(reset_in(6 * 86_400));
+    let mut model = shared_bucket("Future Model", "model:future", Some(99.0), None, None);
+    model.scope = "model".into();
+    app.provider_reports = vec![
+        native_report(
+            long_id,
+            crate::provider_monitor::types::ProviderKind::Grok,
+            "Super",
+            vec![
+                grok_week,
+                shared_bucket(
+                    "Grok shared monthly allowance",
+                    "month",
+                    Some(30.0),
+                    None,
+                    Some(2_592_000),
+                ),
+            ],
+        ),
+        native_report(
+            "agy-main",
+            crate::provider_monitor::types::ProviderKind::Antigravity,
+            "Pro",
+            vec![agy_five, agy_week, model],
+        ),
+    ];
+    let width = 160u16;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).expect("terminal");
+    term.draw(|frame| draw_overview_accounts(frame, frame.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let text = rows.join("\n");
+    if let Ok(dir) = std::env::var("CLAUTH_GOAL_SCRATCH")
+        && !dir.is_empty()
+    {
+        std::fs::write(
+            std::path::Path::new(&dir).join("overview-native-bars.txt"),
+            &text,
+        )
+        .expect("write overview buffer");
+    }
+    assert!(!text.contains("remaining"), "{text}");
+    assert!(!text.contains(long_id), "{text}");
+    assert!(!text.contains("99"), "{text}");
+    assert!(
+        !text.contains("30%"),
+        "a monthly allowance is not a 7d bar\n{text}"
+    );
+    let header = rows
+        .iter()
+        .find(|row| row.contains("account") && row.contains("type") && row.contains("5h"))
+        .expect("header");
+    let account_col = char_at(header, "account");
+    let type_col = char_at(header, "type");
+    let five_col = char_at(header, "5h");
+    let seven_col = char_at(header, "7d");
+    let inner = width as usize - 4;
+    let widths = OverviewWidths::new(inner as u16, &app);
+    let grok = rows
+        .iter()
+        .find(|row| row.contains('…'))
+        .expect("clipped grok name");
+    let name = slice_chars(grok, account_col, widths.name);
+    assert!(
+        name.starts_with("grok") && name.contains('…') && name.chars().count() == widths.name,
+        "name stays clipped inside the account column: {name:?}\n{grok}"
+    );
+    assert!(
+        slice_chars(grok, type_col, widths.kind).starts_with("Super"),
+        "plan stays in the type column: {grok}"
+    );
+    assert!(
+        grok.contains('●'),
+        "the only grok login is the active one: {grok}"
+    );
+    let grok_five = slice_chars(grok, five_col, widths.five_hour);
+    let grok_seven = slice_chars(grok, seven_col, widths.seven_day);
+    assert!(
+        grok_five.trim() == NO_DATA,
+        "weekly grok does not fill 5h: {grok_five:?}"
+    );
+    assert!(
+        grok_seven.contains('[') && grok_seven.contains("51%") && grok_seven.contains('('),
+        "49% remaining is a 51% used bar under 7d, with the reset suffix: {grok_seven:?}"
+    );
+    let agy = rows
+        .iter()
+        .find(|row| row.contains("agy-main"))
+        .expect("agy row");
+    assert!(
+        slice_chars(agy, type_col, widths.kind).starts_with("Pro"),
+        "{agy}"
+    );
+    assert!(
+        agy.contains('●'),
+        "the only antigravity login is the active one: {agy}"
+    );
+    let agy_five = slice_chars(agy, five_col, widths.five_hour);
+    let agy_seven = slice_chars(agy, seven_col, widths.seven_day);
+    assert!(
+        agy_five.contains('[') && agy_five.contains("20%") && agy_five.contains('('),
+        "{agy_five:?}"
+    );
+    assert!(
+        agy_seven.contains('[') && agy_seven.contains("80%"),
+        "{agy_seven:?}"
+    );
+    assert!(
+        !agy_seven.contains("20%") && !agy_five.contains("80%"),
+        "each window stays in its own cell\n{agy}"
+    );
+    let live_col = header
+        .find("live")
+        .map(|byte| header[..byte].chars().count());
+    if let Some(live_col) = live_col {
+        let grok_live = slice_chars(grok, live_col, widths.live.max(1));
+        assert!(
+            grok_live.trim().is_empty(),
+            "a window cell does not land under live: {grok_live:?}"
+        );
+    }
+    let claude = text.find("claude").expect("claude group");
+    let grok_at = text.find("grok").expect("grok group");
+    let agy_at = text.find("antigravity").expect("antigravity group");
+    let add = text.find("add account").expect("add row");
+    assert!(
+        claude < grok_at && grok_at < agy_at && agy_at < add,
+        "{text}"
+    );
+    assert!(text.contains('✳'), "claude group carries the spark\n{text}");
+    assert!(
+        text.contains('✧'),
+        "antigravity group carries its mark\n{text}"
+    );
+}
+
+#[test]
+fn unlisted_grok_and_antigravity_stay_off_the_overview() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("beta", 80.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+    let mut hidden = native_report(
+        "grok",
+        crate::provider_monitor::types::ProviderKind::Grok,
+        "Super",
+        vec![shared_bucket(
+            "Grok shared weekly allowance",
+            "shared",
+            Some(40.0),
+            None,
+            None,
+        )],
+    );
+    hidden.listed = false;
+    app.provider_reports = vec![hidden];
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).expect("terminal");
+    term.draw(|frame| draw_overview_accounts(frame, frame.area(), &app))
+        .expect("draw");
+    let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(!text.contains("Super"), "{text}");
+    assert!(!text.contains('✶'), "{text}");
+    assert!(text.contains("beta"), "{text}");
+}
+
+fn char_at(text: &str, needle: &str) -> usize {
+    let byte = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle}"));
+    text[..byte].chars().count()
+}
+
+fn slice_chars(text: &str, start: usize, len: usize) -> String {
+    text.chars().skip(start).take(len).collect()
+}
+
+fn native_report(
+    id: &str,
+    provider: crate::provider_monitor::types::ProviderKind,
+    plan: &str,
+    buckets: Vec<crate::provider_monitor::types::QuotaBucket>,
+) -> crate::provider_monitor::ProviderReport {
+    crate::provider_monitor::ProviderReport {
+        id: id.into(),
+        provider,
+        tool: provider.tool().into(),
+        model: None,
+        state: crate::provider_monitor::types::ObservationState::Fresh,
+        observed_at_ms: None,
+        checked_at_ms: None,
+        identity_checked_at_observation_only: false,
+        data: crate::provider_monitor::ProviderData {
+            plan: Some(plan.into()),
+            buckets,
+            ..crate::provider_monitor::ProviderData::default()
+        },
+        message: None,
+        warning: false,
+        listed: true,
+        refresh: Default::default(),
+    }
+}
+
+fn shared_bucket(
+    label: &str,
+    id: &str,
+    used: Option<f64>,
+    remaining: Option<f64>,
+    window_seconds: Option<u64>,
+) -> crate::provider_monitor::types::QuotaBucket {
+    crate::provider_monitor::types::QuotaBucket {
+        id: id.into(),
+        label: label.into(),
+        scope: "shared".into(),
+        used_percent: used,
+        remaining_percent: remaining,
+        window_seconds,
+        exhausted: false,
+        ..crate::provider_monitor::types::QuotaBucket::default()
+    }
 }

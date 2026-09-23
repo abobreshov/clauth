@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr providers tasks completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -48,6 +48,48 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "devices" ]; then
         COMPREPLY=( $(compgen -W "pair add revoke allow-sessions --json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "providers" ]; then
+        COMPREPLY=( $(compgen -W "status init example refresh start --json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "tasks" ]; then
+        COMPREPLY=( $(compgen -W "register show checkpoint resource process-identity herdr-identity inspect-resource policy check-handoff propose-handoff cancel-handoff classify-resources reconcile-resources continue-handoff recover-handoff release-handoff-source run execution bind-session stop-execution example" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "register" ]; then
+        COMPREPLY=( $(compgen -W "--from" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "inspect-resource" ]; then
+        COMPREPLY=( $(compgen -W "--resource" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "herdr-identity" ]; then
+        COMPREPLY=( $(compgen -W "--socket --pane" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "checkpoint" ]; then
+        COMPREPLY=( $(compgen -W "--from --session --expected-generation --capture-workspace" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && { [ "${COMP_WORDS[2]}" = "policy" ] || [ "${COMP_WORDS[2]}" = "resource" ]; }; then
+        COMPREPLY=( $(compgen -W "--from --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "check-handoff" ]; then
+        COMPREPLY=( $(compgen -W "--to --model" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "propose-handoff" ]; then
+        COMPREPLY=( $(compgen -W "--request-id --to --model --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "cancel-handoff" ]; then
+        COMPREPLY=( $(compgen -W "--handoff-id --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "classify-resources" ]; then
+        COMPREPLY=( $(compgen -W "--handoff-id --source-cgroup --binding-digest --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "reconcile-resources" ]; then
+        COMPREPLY=( $(compgen -W "--handoff-id --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "continue-handoff" ]; then
+        COMPREPLY=( $(compgen -W "--handoff-id --target --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "recover-handoff" ]; then
+        COMPREPLY=( $(compgen -W "--handoff-id" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "release-handoff-source" ]; then
+        COMPREPLY=( $(compgen -W "--handoff-id --execution-id --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "run" ]; then
+        COMPREPLY=( $(compgen -W "--target --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "bind-session" ]; then
+        COMPREPLY=( $(compgen -W "--target --session --expected-generation" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "stop-execution" ]; then
+        COMPREPLY=( $(compgen -W "--session --expected-generation --execution-id" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "tasks" ] && [ "${COMP_WORDS[2]}" = "example" ]; then
+        COMPREPLY=( $(compgen -W "task checkpoint resource policy" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "providers" ] && [ "${COMP_WORDS[2]}" = "start" ]; then
+        COMPREPLY=( $(compgen -W "--herdr --cwd --json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "providers" ] && { [ "${COMP_WORDS[2]}" = "status" ] || [ "${COMP_WORDS[2]}" = "init" ] || [ "${COMP_WORDS[2]}" = "example" ] || [ "${COMP_WORDS[2]}" = "refresh" ]; }; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--control --sessions" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
@@ -104,6 +146,8 @@ _clauth() {
             'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
+            'providers[monitor native Codex, Grok and Antigravity subscriptions]' \
+            'tasks[store portable task checkpoints and declared resources]' \
             'herdr[install the herdr plugin and bind a key to it]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
@@ -143,6 +187,49 @@ _clauth() {
             'revoke[remove a device]' \
             'allow-sessions[grant a control device the sessions flag]'
         _values 'flag' '--json[emit the device list as JSON]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == providers ]]; then
+        _values 'subcommand' 'status[read Codex and Grok limits]' 'init[create providers.toml]' 'example[print TOML template]' 'refresh[refresh usage]' 'start[launch a configured tool]'
+        _values 'flag' '--json[emit cached provider usage as JSON]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == tasks ]]; then
+        _values 'subcommand' 'register[record a task and source session]' 'show[read a task]' 'checkpoint[save a compacted checkpoint]' 'resource[declare a resource]' 'process-identity[observe a Linux process identity]' 'herdr-identity[observe an explicit local Herdr pane identity]' 'inspect-resource[re-observe a declared resource]' 'policy[record sharing rules]' 'check-handoff[check workspace and destination]' 'propose-handoff[record an idempotent transfer proposal]' 'cancel-handoff[cancel an active transfer proposal]' 'classify-resources[classify resources against the source scope]' 'reconcile-resources[re-probe resources after source stop]' 'continue-handoff[launch the successor and commit after receipts]' 'recover-handoff[reconcile a saved successor without a second launch]' 'release-handoff-source[persist stop intent and release the exact source scope]' 'run[run the source tool in a recorded local scope]' 'execution[inspect recorded local processes]' 'bind-session[observe a registered Codex, Grok or agy session]' 'stop-execution[stop only the recorded scope]' 'example[print input templates]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == register ]]; then
+        _values 'flag' '--from[task JSON file]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == inspect-resource ]]; then
+        _values 'flag' '--resource[exact registered resource ID]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == herdr-identity ]]; then
+        _values 'flag' '--socket[explicit local Herdr socket path]' '--pane[explicit pane ID]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == checkpoint ]]; then
+        _values 'flag' '--from[JSON file]' '--session[source native session ID]' '--expected-generation[optimistic revision check]' '--capture-workspace[bind the checkpoint to observed workspace content]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == (policy|resource) ]]; then
+        _values 'flag' '--from[JSON file]' '--session[source native session ID]' '--expected-generation[optimistic revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == check-handoff ]]; then
+        _values 'flag' '--to[destination tool]' '--model[actual destination model]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == propose-handoff ]]; then
+        _values 'flag' '--request-id[stable retry key]' '--to[destination tool]' '--model[actual destination model]' '--session[source native session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == cancel-handoff ]]; then
+        _values 'flag' '--handoff-id[exact proposal ID]' '--session[source native session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == classify-resources ]]; then
+        _values 'flag' '--handoff-id[exact proposal ID]' '--source-cgroup[source scope cgroup path]' '--binding-digest[execution binding digest]' '--session[source native session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == reconcile-resources ]]; then
+        _values 'flag' '--handoff-id[exact proposal ID]' '--session[source native session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == continue-handoff ]]; then
+        _values 'flag' '--handoff-id[exact proposal ID]' '--target[configured successor provider]' '--session[source native session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == recover-handoff ]]; then
+        _values 'flag' '--handoff-id[exact proposal ID]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == release-handoff-source ]]; then
+        _values 'flag' '--handoff-id[exact proposal ID]' '--execution-id[exact source execution]' '--session[source native session ID]' '--expected-generation[initial or current task revision]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == run ]]; then
+        _values 'flag' '--target[configured source provider]' '--session[registered source session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == bind-session ]]; then
+        _values 'flag' '--target[configured source provider]' '--session[registered source session ID]' '--expected-generation[task revision check]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == stop-execution ]]; then
+        _values 'flag' '--session[registered source session ID]' '--expected-generation[task revision check]' '--execution-id[exact observed execution]'
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == tasks && "${words[3]}" == example ]]; then
+        _values 'kind' task checkpoint resource policy
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == providers && "${words[3]}" == start ]]; then
+        _values 'flag' '--herdr[start in a sibling Herdr pane]' '--cwd[working directory]' '--json[emit JSON]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == providers && "${words[3]}" == (status|init|example|refresh) ]]; then
+        _values 'flag' '--json[emit JSON]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then
         _values 'flag' '--control[the device may switch accounts, not only read]' \
             '--sessions[the device may mint sessions through the API]'
@@ -220,6 +307,30 @@ complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless sc
 complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
+complete -c clauth -f -n __fish_is_first_token -a providers -d "Monitor native provider subscriptions"
+complete -c clauth -f -n __fish_is_first_token -a tasks -d "Store portable task checkpoints"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks" -a "register show checkpoint resource process-identity herdr-identity inspect-resource policy check-handoff propose-handoff cancel-handoff classify-resources reconcile-resources continue-handoff recover-handoff release-handoff-source run execution bind-session stop-execution example" -d "Task records"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from inspect-resource" -a "--resource" -d "Exact resource observation"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from herdr-identity" -a "--socket --pane" -d "Explicit local Herdr identity"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from register" -a --from -d "Task JSON file"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from checkpoint resource policy" -a "--from --session --expected-generation" -d "Update a task record"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from checkpoint" -a --capture-workspace -d "Bind to observed workspace content"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from check-handoff" -a "--to --model" -d "Destination identity"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from propose-handoff" -a "--request-id --to --model --session --expected-generation" -d "Transfer proposal"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from cancel-handoff" -a "--handoff-id --session --expected-generation" -d "Cancel exact proposal"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from run" -a --target -d "Configured source provider"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from run bind-session stop-execution" -a "--session --expected-generation" -d "Task consistency checks"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from bind-session" -a "--target" -d "Configured native source"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from stop-execution" -a "--execution-id" -d "Exact observed execution"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from classify-resources" -a "--handoff-id --source-cgroup --binding-digest --session --expected-generation" -d "Resource classification"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from reconcile-resources" -a "--handoff-id --session --expected-generation" -d "Resource reconciliation"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from continue-handoff" -a "--handoff-id --target --session --expected-generation" -d "Successor continuation"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from recover-handoff" -a "--handoff-id" -d "Successor recovery"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from release-handoff-source" -a "--handoff-id --execution-id --session --expected-generation" -d "Stop-first source release"
+complete -c clauth -f -n "__fish_seen_subcommand_from tasks; and __fish_seen_subcommand_from example" -a "task checkpoint resource policy" -d "Input template"
+complete -c clauth -f -n "__fish_seen_subcommand_from providers" -a "status init example refresh start --json" -d "Native provider monitoring"
+complete -c clauth -f -n "__fish_seen_subcommand_from providers; and __fish_seen_subcommand_from start" -a "--herdr --cwd --json" -d "Launch a native provider tool"
+complete -c clauth -f -n "__fish_seen_subcommand_from providers; and __fish_seen_subcommand_from status init example refresh" -a --json -d "Emit JSON"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"

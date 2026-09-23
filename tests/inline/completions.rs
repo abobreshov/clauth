@@ -1098,3 +1098,42 @@ fn every_shell_drops_the_manual_login_flag() {
     assert!(ZSH.contains("'login[log in via browser OAuth or an API key]'"));
     assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }
+
+#[test]
+fn every_shell_exposes_explicit_resource_observation_commands() {
+    for script in [&BASH, &ZSH, &FISH] {
+        for item in [
+            "process-identity",
+            "herdr-identity",
+            "inspect-resource",
+            "--resource",
+            "--socket",
+            "--pane",
+        ] {
+            assert!(script.contains(item), "missing resource completion: {item}");
+        }
+    }
+}
+
+#[test]
+fn every_shell_exposes_stop_first_source_release() {
+    for script in [&BASH, &ZSH, &FISH] {
+        for item in [
+            "release-handoff-source",
+            "classify-resources",
+            "reconcile-resources",
+            "continue-handoff",
+            "recover-handoff",
+            "--handoff-id",
+            "--execution-id",
+            "--source-cgroup",
+            "--binding-digest",
+            "--expected-generation",
+        ] {
+            assert!(
+                script.contains(item),
+                "missing source release completion: {item}"
+            );
+        }
+    }
+}

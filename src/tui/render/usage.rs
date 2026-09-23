@@ -10,6 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::super::accounts::RosterSlot;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{
@@ -18,8 +19,8 @@ use super::format::{
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
-    section_box, section_box_verbatim,
+    added_line_count, draw_added_accounts, empty_state, key_cell, master_detail, open_slot, pill,
+    rail_hint_lines, section_box, section_box_verbatim,
 };
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
@@ -86,15 +87,25 @@ struct HeaderState {
     queue_slot: Option<QueueSlot>,
 }
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let items = app.config().profiles.len();
-    let (selector, detail) = master_detail(area, items);
+mod native;
 
-    draw_profile_selector(frame, selector, app, app.profile_cursor, true);
-    draw_usage_detail(frame, detail, app);
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (selector, detail) = master_detail(area, added_line_count(app, false));
+    draw_added_accounts(frame, selector, app, true, false);
+    match open_slot(app) {
+        Some(RosterSlot::Profile(idx)) => draw_usage_detail(frame, detail, app, idx),
+        Some(RosterSlot::Codex(idx)) => native::draw_codex_usage(frame, detail, app, idx),
+        Some(RosterSlot::Native(idx)) => native::draw_native_usage(frame, detail, app, idx),
+        None => {
+            let block = section_box("usage", false, false);
+            let inner = block.inner(detail);
+            frame.render_widget(block, detail);
+            frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        }
+    }
 }
 
-fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: usize) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
     let streaks: HashMap<String, StreakCounts> = app
@@ -115,9 +126,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let queue_anchor = queue_anchor_cached(&app.auto_start_queue);
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
-    let profile = cfg
-        .profiles
-        .get(app.profile_cursor.min(cfg.profiles.len().saturating_sub(1)));
+    let profile = cfg.profiles.get(profile_index);
 
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
     // Detail pane: read-only, focus never descends into it; second panel on screen.

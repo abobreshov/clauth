@@ -18,6 +18,8 @@ utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already
 toml = "1.1.6"
 anyhow = "1.0.104"
 dirs = "7.0.0"
+# Resolve native execution targets to absolute paths; also handles Windows shims.
+which = "8.0.6"
 ureq = "3.4.2"
 self-replace = "1.5.0"
 signal-hook = "0.4.4"
@@ -112,10 +114,13 @@ agentgear = "0.1.4"
 # resolver 3 keeps a dev-dependency's features out of the normal build.
 tokio = { version = "1.53.1", features = ["test-util"] }
 
-# npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
-# resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.
-[target.'cfg(windows)'.dependencies]
-which = "8.0.6"
+# Antigravity CLI stores its OAuth session in the desktop Secret Service.
+# Read unlocked items only; clauth never rotates this native credential.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.2", features = ["rt-async-io-crypto-rust"] }
+# Already in the lock graph; safe peer credentials and nonblocking local sockets
+# for identity-only Herdr resource checks (no raw FFI in the adapter).
+rustix = { version = "1.1.4", features = ["net", "process"] }
 
 [profile.release]
 opt-level = 3

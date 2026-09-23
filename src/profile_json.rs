@@ -61,20 +61,18 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.usage_cache_is_third_party() {
         return None;
     }
-    let fetched = cached_plan(&profile.name).filter(|p| p.tier != PlanTier::Unknown);
-    match fetched {
-        Some(plan) => plan.tier.short_label(),
-        None => {
-            let sub = profile
-                .credentials
-                .as_ref()?
-                .claude_ai_oauth
-                .as_ref()?
-                .subscription_type
-                .as_deref()?;
-            PlanTier::from_subscription_type(Some(sub)).short_label()
-        }
-    }
+    let fetched = cached_plan(&profile.name)
+        .filter(|p| p.tier != PlanTier::Unknown)
+        .map(|plan| plan.tier);
+    let login = profile
+        .credentials
+        .as_ref()
+        .and_then(|creds| creds.claude_ai_oauth.as_ref())
+        .map(|oauth| {
+            PlanTier::from_login(oauth.subscription_type.as_deref(), oauth.rate_limit_tier())
+        })
+        .unwrap_or(PlanTier::Unknown);
+    PlanTier::resolve(fetched, login).and_then(|tier| tier.short_label())
 }
 
 /// The usage cache a profile's OWN fetch leg writes. The third-party leg never

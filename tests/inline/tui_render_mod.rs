@@ -1085,8 +1085,12 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     // The create form sits past the roster: only `apply preset` is offered
     // (no source account to duplicate or save), but that still means the menu
     // has an item, so the footer keeps advertising `a`.
-    app.profile_cursor = app.profile_count();
-    app.config_draft = None;
+    // Back out of the detail rows and step down onto `+ new`, the way the UI
+    // reaches it, so the shared selection is the add row.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(matches!(app.open, crate::tui::app::OpenSelection::Add));
+    assert!(app.config_draft.is_none());
     let menu = crate::tui::app::build_action_menu(&app);
     assert_eq!(menu.items.len(), 1);
     assert_eq!(
@@ -1128,7 +1132,9 @@ fn narrow_header_hides_the_gauge_without_a_dangling_separator() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     app.tab = Tab::Usage;
-    let narrow = dump(&app, 45, 38);
+    // The gauge hides only once the row cannot hold even the percent. The
+    // header text starts at column 0, so that point is narrower than 45.
+    let narrow = dump(&app, 35, 38);
     let row = narrow
         .lines()
         .find(|l| l.contains("accounts"))

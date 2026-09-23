@@ -1,6 +1,6 @@
 # clauth herdr plugin
 
-Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.dev) popup: the account table, the usage windows, and the auto-switch chain, over whatever you were doing, without a pane of its own. It labels every herdr pane with the account that pane is spending, and it shows when a delegate runs inside a pane. The popup width, the pane tag, and the delegate state all tune from the dashboard's Plugin tab.
+Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.dev) popup: the account table, provider usage, and the auto-switch chain, over whatever you were doing, without a pane of its own. The current account-label adapter is Claude-only; it does not assign the global Claude account to Codex, Grok, or agy panes. It also shows when a delegate runs inside a pane. The popup width, the pane tag, and the delegate state all tune from the dashboard's Plugin tab.
 
 **The manual for all of it lives in the wiki: [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin).** This file covers what the plugin itself is, for anyone reading it before letting herdr run it.
 
@@ -26,6 +26,14 @@ Two actions and two event hooks, all of them one of the two shell scripts below,
 - `clauth.which` re-reads the account the focused pane burns and publishes it as pane metadata, and the same script runs on herdr's `pane.agent_detected` and `pane.agent_status_changed` events. Reporting a Claude Code pane starts the watcher for that pane.
 
 The watcher re-publishes the account every few seconds until the pane closes. An account swap fires no herdr event, so the timer is what keeps the tag from going stale. The scripts write only herdr's own pane metadata plus one pidfile per watched pane in the plugin state directory.
+
+Each report rechecks the explicit target pane's live agent. Non-Claude, missing,
+or unrecognized identity clears this plugin's old Claude token and border label.
+Claude border labels additionally use Herdr's agent scope; tokens still require
+the live check because Herdr 0.9 does not filter tokens by that scope. Metadata is
+observational and eventually refreshed, never account/session ownership proof or
+an input to automatic quota routing. Verified per-provider pane bindings remain
+separate work; provider usage is available in the dashboard and JSON CLI now.
 
 The six knobs live in `~/.clauth/profiles.toml` under `[herdr]` and edit from the dashboard's Plugin tab (herdr row, options). The scripts read them through `clauth herdr config get <key>` and fall back to the shipped defaults when the binary predates the subcommand. The delegate state token (`clauth_delegate`) reports on the pane JSON and, with the `delegate_row_text` knob on, beside the row.
 

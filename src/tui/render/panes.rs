@@ -8,6 +8,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
+use super::super::accounts::{RosterSlot, added_account_groups, listed_native_pairs};
 use super::super::app::{App, InputState};
 use super::super::theme;
 use crate::profile::AppConfig;
@@ -230,6 +231,167 @@ pub(super) fn pill(label: String, label_style: Style) -> Vec<Span<'static>> {
         Span::styled(label, label_style),
         Span::styled(" ]", theme::dim()),
     ]
+}
+
+/// Two-cell provider mark. Claude is the spark; the others are one glyph plus a space.
+pub(super) fn group_mark(title: &str) -> (String, Style) {
+    let (mark, color) = match title {
+        "claude" => ("✳ ", theme::accent_2_color()),
+        "codex" => ("▣ ", theme::success_color()),
+        "grok" => ("✶ ", theme::warning_color()),
+        "antigravity" => ("✧ ", theme::accent_color()),
+        _ => ("· ", theme::text_dim_color()),
+    };
+    (mark.to_string(), Style::default().fg(color))
+}
+
+/// The account Usage and Setup have open. `None` is Setup's `+ new` row.
+pub(super) fn open_slot(app: &App) -> Option<RosterSlot> {
+    match app.open {
+        crate::tui::app::OpenSelection::Account(slot) => Some(slot),
+        crate::tui::app::OpenSelection::Add => None,
+    }
+}
+
+pub(super) fn added_line_count(app: &App, include_new: bool) -> usize {
+    let profiles = app.config().profiles.clone();
+    let groups = added_account_groups(
+        &profiles,
+        app.codex_rows.len(),
+        &listed_native_pairs(&app.provider_reports),
+    );
+    let mut n = 0usize;
+    for (i, (_, slots)) in groups.iter().enumerate() {
+        if i > 0 {
+            n += 1;
+        }
+        n += 1 + slots.len();
+    }
+    if include_new {
+        if n > 0 {
+            n += 1;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Grouped added-account list. Headers carry the provider mark. Account names
+/// share one column. An unlisted monitor target is not a row.
+pub(super) fn draw_added_accounts(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    focused: bool,
+    include_new: bool,
+) {
+    let profiles: Vec<(String, bool, bool)> = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .map(|profile| {
+                (
+                    profile.name.to_string(),
+                    profile.is_disabled(),
+                    cfg.is_active(&profile.name),
+                )
+            })
+            .collect()
+    };
+    let owned: Vec<crate::profile::Profile> = app.config().profiles.clone();
+    let groups = added_account_groups(
+        &owned,
+        app.codex_rows.len(),
+        &listed_native_pairs(&app.provider_reports),
+    );
+    let selected = open_slot(app);
+
+    let block = section_box("accounts", focused, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if groups.is_empty() && !include_new {
+        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        return;
+    }
+    let width = inner.width;
+    let mut rows = Vec::new();
+    let mut selected_at = None;
+    for (i, (label, slots)) in groups.iter().enumerate() {
+        if i > 0 {
+            rows.push(Line::from(""));
+        }
+        let (mark, style) = group_mark(label);
+        rows.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(mark, style),
+            Span::raw(" "),
+            Span::styled((*label).to_string(), theme::dim()),
+        ]));
+        for slot in slots {
+            let name = match slot {
+                RosterSlot::Profile(idx) => profiles
+                    .get(*idx)
+                    .map(|row| row.0.clone())
+                    .unwrap_or_default(),
+                RosterSlot::Codex(idx) => app
+                    .codex_rows
+                    .get(*idx)
+                    .map(|row| row.name.to_string())
+                    .unwrap_or_default(),
+                RosterSlot::Native(idx) => app
+                    .provider_reports
+                    .get(*idx)
+                    .map(|row| row.id.clone())
+                    .unwrap_or_default(),
+            };
+            let name_style = match slot {
+                RosterSlot::Profile(idx) => match profiles.get(*idx) {
+                    Some((_, true, _)) => theme::dim(),
+                    Some((_, _, active)) => name_color(*active),
+                    None => theme::base(),
+                },
+                RosterSlot::Codex(idx) => {
+                    name_color(app.codex_rows.get(*idx).is_some_and(|row| row.active))
+                }
+                RosterSlot::Native(_) => theme::base(),
+            };
+            if selected == Some(*slot) {
+                selected_at = Some(rows.len());
+            }
+            rows.push(picker_row(
+                selected == Some(*slot),
+                focused,
+                name,
+                name_style,
+                width,
+            ));
+        }
+    }
+    if include_new {
+        if !rows.is_empty() {
+            rows.push(Line::from(""));
+        }
+        let is_selected = selected.is_none();
+        if is_selected {
+            selected_at = Some(rows.len());
+        }
+        rows.push(picker_row(
+            is_selected,
+            focused,
+            "+ new".to_string(),
+            theme::accent(),
+            width,
+        ));
+    }
+    let total = rows.len();
+    let list =
+        List::new(rows.into_iter().map(ListItem::new).collect::<Vec<_>>()).style(theme::base());
+    let mut state = ListState::default();
+    if let Some(at) = selected_at {
+        state.select(Some(at));
+    }
+    frame.render_stateful_widget(list, inner, &mut state);
+    draw_scrollbar(frame, inner, total, state.offset(), inner.height as usize);
 }
 
 pub(super) fn picker_row(
@@ -595,30 +757,4 @@ fn section_box_impl(
         .border_style(border_style)
         .title(Line::from(title_spans))
         .padding(Padding::horizontal(1))
-}
-
-pub(super) fn draw_profile_selector(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    selected: usize,
-    focused: bool,
-) {
-    let cfg = app.config();
-    let sel = selected.min(cfg.profiles.len().saturating_sub(1));
-    draw_selector_list(frame, area, "accounts", focused, sel, |w| {
-        cfg.profiles
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                // A disabled account can never be active, so dim wins outright.
-                let ns = if p.is_disabled() {
-                    theme::dim()
-                } else {
-                    name_color(cfg.is_active(&p.name))
-                };
-                picker_row(i == sel, focused, p.name.to_string(), ns, w)
-            })
-            .collect()
-    });
 }

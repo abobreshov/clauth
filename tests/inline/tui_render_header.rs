@@ -93,12 +93,9 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     crate::testutil::buffer_rows(term.backend().buffer())
 }
 
-/// A header row's content past the claude-glyph column (0..10).
+/// One header row, from the left edge.
 fn row_content(app: &App, width: u16, row: usize) -> String {
-    render_header_rows(app, width)[row]
-        .chars()
-        .skip(10)
-        .collect()
+    render_header_rows(app, width)[row].to_string()
 }
 
 // ── `gauge_fit` — collapse ladder: bar before name ──────────────────────
@@ -291,7 +288,7 @@ fn row2_is_tabs_only() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
-    let row2 = row_content(&app, 90, 2);
+    let row2 = row_content(&app, 110, 2);
     assert!(row2.contains("overview"), "tabs on row 2");
     assert!(
         !row2.contains("uwuclxdy"),

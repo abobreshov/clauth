@@ -67,15 +67,31 @@ row_profile() {
 # context instead, and that fallback is consulted ONLY when no pane id is set
 # (actions have none) — an event hook reading the context's focused pane would
 # answer for whichever pane holds focus, not the pane the event fired for.
-# Neither is set for a plain shell pane, which is the one case that still gets
-# an answer.
+# For explicit panes, the live lookup below overrides both values. A plain or
+# unrecognized shell pane is cleared instead of receiving a global account.
 agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | sed -n 's/.*"agent":"\([^"]*\)".*/\1/p')
-if [ -z "$agent" ] && [ -z "$pane" ]; then
+if [ -n "$pane" ]; then
+    # Event values and watcher spawn context can outlive the occupant. Read
+    # only this explicit pane. The parser accepts Herdr's pane envelope and
+    # fails closed if its shape changes; never substitute the focused pane.
+    current=$("$herdr_bin" pane get "$pane" 2>/dev/null) || current=""
+    agent=$(printf '%s' "$current" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*{[[:space:]]*"pane"[[:space:]]*:[[:space:]]*{[[:space:]]*"agent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$agent" ] || agent=unknown
+elif [ -z "$agent" ]; then
     agent=$(printf '%s' "${HERDR_PLUGIN_CONTEXT_JSON:-}" | sed -n 's/.*"focused_pane_agent":"\([^"]*\)".*/\1/p')
 fi
 case "$agent" in
     "" | claude) ;;
-    *) exit 0 ;;
+    *)
+        # An occupant change must remove our old Claude attribution, not
+        # merely skip publishing. Never clear another plugin's metadata.
+        if [ -n "$pane" ]; then
+            "$herdr_bin" pane report-metadata "$pane" \
+                --source "${HERDR_PLUGIN_ID:-clauth}" \
+                --clear-token clauth --clear-display-agent
+        fi
+        exit 0
+        ;;
 esac
 
 profile=""
@@ -138,7 +154,9 @@ border_label=$(clauth herdr config get border_label 2>/dev/null || printf 'off')
 # The pane id goes BEFORE the flags. `report-metadata --help` prints it last,
 # and that order answers `unknown option: <value>` at exit 2 on 0.8.0. Named
 # flags may sit in any order; only the positional-first order is load-bearing.
-set -- "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" "$token_flag" "$token_value"
+# Scope the border label as an additional replacement guard. Herdr does not
+# scope tokens this way, so the explicit live-agent check above is essential.
+set -- "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --agent claude "$token_flag" "$token_value"
 if [ "$border_label" = on ]; then
     set -- "$@" --display-agent "$profile"
 else
