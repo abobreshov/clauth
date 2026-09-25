@@ -15,8 +15,8 @@ use super::format::{
 };
 use super::header::pulse_name_spans;
 use super::panes::{
-    bold_when, draw_scrollbar, empty_state, name_color, section_box, section_box_verbatim_meta,
-    select_line, wrap_words,
+    bold_when, draw_scrollbar, empty_state, name_color, section_box, section_box_meta, select_line,
+    wrap_words,
 };
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{
@@ -85,10 +85,8 @@ fn harness_counts(app: &App) -> String {
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Sole interactive content panel on this screen — always focused.
     let focused = true;
-    // The eyebrow is pre-cased because the verbatim builder skips the central
-    // uppercase.
-    let block = section_box_verbatim_meta(
-        "ACCOUNTS",
+    let block = section_box_meta(
+        "accounts",
         app.harness_filter.label_name(),
         &harness_counts(app),
         focused,

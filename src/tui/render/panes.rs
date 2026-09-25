@@ -640,11 +640,12 @@ pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> B
 /// single dash between the two reads as part of the title's own rule run.
 const META_RULE_MIN: usize = 3;
 
-/// [`section_box_verbatim`] with two meta slots: `left` inside the title
-/// inset one space after the title (`╭ TITLE left ───`), `meta` in the border
+/// [`section_box`] with two meta slots: `left` as a title of its own one
+/// border cell after the title (`╭ TITLE ─ left ───`), `meta` in the border
 /// break just before the top-right corner (`… meta ─╮`). Both are data styled
 /// alike, `TEXT_DIM` and never bold or italic, and the dashes around them keep
-/// the border token.
+/// the border token: the dash between the title and `left` is the cell ratatui
+/// leaves bare between two left-aligned titles.
 ///
 /// Only the right slot gives way: it renders while `width` leaves it at least
 /// [`META_RULE_MIN`] border cells of rule after the title and the left slot,
@@ -653,7 +654,7 @@ const META_RULE_MIN: usize = 3;
 /// the title names; only a panel too narrow for the title line itself clips
 /// that line from the right, the left slot first. An empty `meta` renders no
 /// right slot.
-pub(super) fn section_box_verbatim_meta(
+pub(super) fn section_box_meta(
     title: &str,
     left: Option<&str>,
     meta: &str,
@@ -661,17 +662,19 @@ pub(super) fn section_box_verbatim_meta(
     first: bool,
     width: u16,
 ) -> Block<'static> {
-    let left: Vec<Span<'static>> = left
-        .map(|name| vec![Span::styled(format!("{name} "), theme::dim())])
-        .unwrap_or_default();
-    // `╭` + ` title ` + `left ` + rule + ` meta ` + the slot's closing dash + `╮`.
+    let left = left.map(|name| Line::from(Span::styled(format!(" {name} "), theme::dim())));
+    // `╭` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`.
     let insets = 2
-        + (title.chars().count() + 2)
-        + left.iter().map(Span::width).sum::<usize>()
-        + (meta.chars().count() + 3);
-    let rule = (width as usize).saturating_sub(insets);
+        + Line::from(title_label(title, true)).width()
+        + left.as_ref().map_or(0, |left| 1 + left.width())
+        + meta_line(meta, Style::default()).width();
+    let rule = usize::from(width).saturating_sub(insets);
     let meta = (!meta.is_empty() && rule >= META_RULE_MIN).then_some(meta);
-    section_box_impl(title, focused, first, false, left, meta)
+    let block = section_box_impl(title, focused, first, true, Vec::new(), meta);
+    match left {
+        Some(left) => block.title_top(left),
+        None => block,
+    }
 }
 
 /// [`section_box`] with a live braille spinner `frame` appended inside the title
@@ -716,12 +719,7 @@ fn section_box_impl(
             base
         }
     };
-    let label = if uppercase {
-        format!(" {} ", title.to_uppercase())
-    } else {
-        format!(" {} ", title)
-    };
-    let mut title_spans = vec![Span::styled(label, title_style)];
+    let mut title_spans = vec![Span::styled(title_label(title, uppercase), title_style)];
     title_spans.extend(suffix);
     let mut block = Block::bordered()
         .border_set(border::ROUNDED)
@@ -729,17 +727,29 @@ fn section_box_impl(
         .title(Line::from(title_spans))
         .padding(Padding::horizontal(1));
     if let Some(meta) = meta {
-        // A right-aligned title ends flush against the top-right corner, so the
-        // slot closes with a border cell of its own: `… meta ─╮`.
-        block = block.title_top(
-            Line::from(vec![
-                Span::styled(format!(" {meta} "), theme::dim()),
-                Span::styled("─", border_style),
-            ])
-            .right_aligned(),
-        );
+        block = block.title_top(meta_line(meta, border_style));
     }
     block
+}
+
+/// A panel title as it sits in the border break: ` TITLE `.
+fn title_label(title: &str, uppercase: bool) -> String {
+    if uppercase {
+        format!(" {} ", title.to_uppercase())
+    } else {
+        format!(" {title} ")
+    }
+}
+
+/// The title-right meta slot. A right-aligned title ends flush against the
+/// top-right corner, so the slot closes with a border cell of its own:
+/// `… meta ─╮`.
+fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {meta} "), theme::dim()),
+        Span::styled("─", border_style),
+    ])
+    .right_aligned()
 }
 
 pub(super) fn draw_profile_selector(
