@@ -1331,20 +1331,23 @@ impl FetchOutcome {
 /// just-opened window closed (the same 5-min ceiling as the degraded fetch
 /// floor). Past it the wire's closed reading wins — a server-side reset (e.g.
 /// a subscription upgrade) must reach the surfaces within minutes, not wait
-/// out the window's own `resets_at`.
+/// out the window's own `resets_at`. Both ends of the comparison are wall clock
+/// because `open_at` survives a restart, so a backward clock step of N seconds
+/// extends the carry by up to N: accepted, since the horizon is a grace for a
+/// lagging read and `resets_at` still bounds the window's liveness.
 const KICK_LAG_HORIZON_SECS: i64 = 300;
 
 /// Patch a just-kicked live 5h window back into a Fresh body that lags it. A
 /// kick opens the window before `/usage` reflects it, so a Fresh body fetched
 /// in the same tick can still report the window closed; writing it verbatim
 /// would re-lapse the window and re-fire the kick. When `fresh` has no live 5h
-/// window but `prev` holds one THIS PROCESS kicked open — `open_at` stamped no
-/// more than [`KICK_LAG_HORIZON_SECS`] ago — keep `prev`'s window and its
-/// stamp, so the next lagging tick re-derives the bound instead of carrying
-/// the window until its own `resets_at`. Any other live `prev` (wire-sourced,
-/// or a kick past the horizon — e.g. a server-side reset such as a
-/// subscription upgrade) takes `fresh` verbatim, so the wire's verdict wins
-/// once the kick's lag can have passed. A genuine new window (live in
+/// window but `prev` holds one a kick opened — `open_at` stamped no more than
+/// [`KICK_LAG_HORIZON_SECS`] ago, by this process or, through the seeded cache,
+/// an earlier one — keep `prev`'s window and its stamp, so the next lagging
+/// tick re-derives the bound instead of carrying the window until its own
+/// `resets_at`. Any other live `prev` (wire-sourced, or a kick past the horizon
+/// — e.g. a server-side reset such as a subscription upgrade) takes `fresh`
+/// verbatim, so the wire's verdict wins once the kick's lag can have passed. A genuine new window (live in
 /// `fresh`) or a still-closed `prev` is left untouched.
 fn preserve_live_window(
     mut fresh: UsageInfo,
@@ -4435,6 +4438,9 @@ fn scan_recovery(
         if cfg.state.active_profile.is_some() {
             return;
         }
+        // An empty chain yields no members, so no switch follows either way: the
+        // return only saves the kick-block read and the store clone, so no test
+        // pins it.
         if cfg.state.fallback_chain.is_empty() {
             return;
         }

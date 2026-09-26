@@ -4421,7 +4421,7 @@ fn an_isolated_session_gets_no_decision() {
 /// A Fresh `/usage` body fetched in the same tick as a kick can lag the
 /// just-opened window and still report it closed; `preserve_live_window` keeps
 /// the live window we already hold so it can't re-lapse and re-fire the kick.
-/// The carry is gated on kick provenance: only a window this process stamped
+/// The carry is gated on kick provenance: only a window a kick stamped
 /// (`open_at`) within `KICK_LAG_HORIZON_SECS` survives, and the stamp rides
 /// the merge so the next lagging tick re-derives the bound. A wire-sourced
 /// prev (`open_at: None`) or a kick past the horizon takes the fresh body
@@ -8661,7 +8661,7 @@ fn a_cached_body_appends_no_sample() {
 /// used to carry ANY prev live window into a Fresh body reporting none, so the
 /// wire's post-reset reading (`utilization: 0.0, resets_at: null`) was
 /// overwritten with the frozen pre-reset window and re-stamped Fresh. The
-/// carry is gated on kick provenance: a prev this process never kicked open
+/// carry is gated on kick provenance: a prev no kick opened
 /// (`open_at: None` — every wire parse) or one whose kick aged past
 /// `KICK_LAG_HORIZON_SECS` takes the Fresh body verbatim, in store and on
 /// disk.
