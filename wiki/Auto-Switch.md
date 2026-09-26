@@ -14,7 +14,7 @@ On every scheduler tick, and once at startup:
 
 The walk prefers members whose usage was read live over ones showing cached numbers, and falls through to accept a stale-reading member rather than strand you on an exhausted account.
 
-The active account's own exhaustion is judged only on fresh readings, so a rate-limited poll cannot trigger a switch by itself. Two states are the exception, because neither can ever report a fresh reading again: a dead account switches away on any reading, and an account whose usage polls have been rate-limited long enough to stop draining switches away too, once its last-known numbers say it is genuinely spent.
+The active account's own exhaustion is judged only on fresh readings, so a rate-limited poll cannot trigger a switch by itself. Two states are the exception, because neither can recover that evidence on its own: a dead account switches away on any reading, and an account whose usage polls have been rate-limited long enough to stop draining switches away too. A deep-stuck account with a last-known window still moves only when that window says it is genuinely spent; one with no window moves because the reading channel can never supply the missing exhaustion evidence. The same rule applies to Anthropic usage polls and to a provider's own usage endpoint.
 
 ## Exhausted
 
@@ -47,13 +47,14 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 | `disabled` | you ran `clauth disable <name>`, or flipped it on the Setup tab |
 | `canceled` | the subscription reads canceled at Anthropic |
 | `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` (a codex chain: `clauth login <name> --codex --browser`) |
+| `key rejected` | a third-party provider rejected the inference api key; re-enter it on the Setup tab |
 | `weekly spent` | 7d at 100%, dead until the week resets |
 | `claude code blocked` | the messages limiter keeps refusing this account, twice running, with quota still ahead |
 | `extra usage spent` | out of subscription quota and out of the spend ceiling below |
 | `5h <pct>%` | 5h past its line |
 | `weekly <pct>%` / `<model> <pct>%` | past a weekly line, per the gates above |
 
-Being dead is its own switch trigger. An active account marked `auth broken`, `canceled`, or `claude code blocked` can never report fresh usage again, so clauth walks off it instead of wedging on the corpse.
+Being dead is its own switch trigger. An active account marked `auth broken`, `key rejected`, `canceled`, or `claude code blocked` is walked off instead of wedging on the corpse, and a rejected-key member is never picked as a target or as switch-off recovery. Alibaba's lapsed console login is different: it suppresses only the usage poll because the api key can still serve, so the account stays in the chain.
 
 ## Last resort and preferred
 
@@ -63,7 +64,7 @@ Two radio toggles on a member's Fallback card. Marking one clears it on every ot
 - **`preferred`** is the home account. Once it reads clear and fresh, clauth walks back to it on its own, from wherever the chain left you.
 - **`walk order`** (Config tab) reorders each accept pass by the soonest weekly reset when set to `soonest weekly reset`: the member whose 7d window resets soonest drains first, so less quota expires unspent; ties keep chain position, and a member with no readable reset ranks last. The default `chain` is today's walk exactly. With no `preferred` set, a healthy active walks home to the soonest-reset clear+fresh member and parks there. Every other gate is unchanged: the mode only reorders members that already pass.
 
-Which account is home can also depend on the day. A `preferred_days` list in a profile's `config.toml` ([Configuration](Configuration#configtoml)) names the weekdays that account is home, in local time, and those days are claimed against every account: a plain `preferred` elsewhere stands down on them and holds the rest. Only chain members that could actually serve are home at all: a list on an account that is off the chain, disabled, or auth-broken is inert, so it never leaves a day with nobody home, and a plain `preferred` on such an account is inert too rather than marking a homecoming the walk cannot make. One line on the weekend account is the whole weekday / weekend split, and the rollover needs no restart. The list reaches the claude chain only — the codex chain has no home account, so `preferred_days` does nothing there.
+Which account is home can also depend on the day. A `preferred_days` list in a profile's `config.toml` ([Configuration](Configuration#configtoml)) names the weekdays that account is home, in local time, and those days are claimed against every account: a plain `preferred` elsewhere stands down on them and holds the rest. Only chain members that could actually serve are home at all: a list on an account that is off the chain, disabled, auth-broken, or carrying a rejected api key is inert, so it never leaves a day with nobody home, and a plain `preferred` on such an account is inert too rather than marking a homecoming the walk cannot make. One line on the weekend account is the whole weekday / weekend split, and the rollover needs no restart. The list reaches the claude chain only — the codex chain has no home account, so `preferred_days` does nothing there.
 
 ## When everyone is out
 

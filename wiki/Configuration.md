@@ -207,9 +207,9 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
-`preferred_days` has a `preferred days` row on the member's Fallback card: <kbd>space</kbd> steps `never` → `weekdays` → `weekends` → `every day` and back to `never` (a custom set jumps straight to `never`), and <kbd>⏎</kbd> opens a day picker for any other set ([Interface and keys](Interface-And-Keys#tab-dependent)). A list matching no preset shows its days. The card's `preferred` row names the days once a list is set, and `+ add` names a list an account still carries from before it left the chain. In a hand-written list, full names and three-letter forms parse in any case (`["sat", "Sunday"]`), and an entry that does not parse is dropped on the next rewrite. The list is re-read per chain build, so the rollover at midnight needs no restart.
+`preferred_days` has a `preferred days` row on the member's Fallback card, listing the presets `never  weekdays  weekends  every day` with the current one lit: <kbd>space</kbd> steps through them and back to `never`, saving each step, and <kbd>⏎</kbd> opens a day picker for any other set ([Interface and keys](Interface-And-Keys#tab-dependent)). A list matching no preset shows its days after the presets and stays one more stop after `every day` while the card is open, so stepping past it and back brings it back. The card's `preferred` row names the days once a list is set, and `+ add` names a list an account still carries from before it left the chain. In a hand-written list, full names and three-letter forms parse in any case (`["sat", "Sunday"]`), and an entry that does not parse is dropped on the next rewrite. The list is re-read per chain build, so the rollover at midnight needs no restart.
 
-A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled or auth-broken claims nothing: a member's `preferred days` row names a disabled or auth-broken account, `+ add` names one that is off the chain, and saving such a list warns (once per day-picker visit). A list can also go inert later, or arrive by hand-editing the file, so clauth says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
+A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled, auth-broken or carrying a rejected api key claims nothing: a member's `preferred days` row names the blocker (`its api key was rejected` for that case), `+ add` names one that is off the chain, and saving such a list warns (once per day-picker visit, and on each <kbd>space</kbd> step that sets days). A lapsed Alibaba console login does not block the claim because its inference key still serves. A list can also go inert later, or arrive by hand-editing the file, so clauth says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
 
 **A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
 
@@ -240,8 +240,12 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   .completions_installed   # marker: completions have been installed
   conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
+  jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
+  jobs/<id>.json.delivered # exactly-once delivery ledger after collection
+  keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session
   live_sessions/<sid>.json # one row per live `clauth start` session
+  mcp_live/<pid>           # one marker per live `clauth mcp` server, so its delegate jobs read dead once it exits
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
   keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
@@ -263,10 +267,12 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       kick_block.json      # messages-limiter block state
       throughput_cache.json# observed delegate tokens/sec per model
       touch-receipt.json   # what the last credential swap wrote, for the watchdog
+      adopt_refusal.json   # last standing live-credential adoption refusal announced
       quarantine/          # credentials parked after a refresh token was rejected
       runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
+      sessions-isolated-<sid>/
     cx/                    # a codex profile (see Codex)
       config.toml          # harness = "codex", plus hooks_json
       auth.json            # the ChatGPT token chain; ~/.codex/auth.json links here after a capture
@@ -286,7 +292,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   markers/<hash>           # the install record `clauth self-heal` keys on
 ```
 
-Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. That is the whole tree: every path clauth writes is listed above, so a file you find here that is not is a leftover from an older version. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
+Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other clauth-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
 Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 

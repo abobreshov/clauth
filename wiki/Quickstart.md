@@ -72,7 +72,7 @@ clauth list           # account table with cached usage, no network
 | `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `clauth enable <profile>` | | put a disabled profile back |
 | `clauth which` | `--json` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile |
-| `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; Claude Code accounts only |
+| `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
 | `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
 | `clauth switch <name>` / `clauth switch <sid> <profile>` | | one name switches the global account (the bare `clauth <name>` form, deprecated); two names move a live session, picked up at its next request |
 | `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
