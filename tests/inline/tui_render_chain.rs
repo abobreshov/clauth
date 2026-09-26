@@ -140,6 +140,7 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
@@ -152,6 +153,7 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
@@ -172,6 +174,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     assert!(
@@ -204,6 +207,7 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
             width: 28,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -242,6 +246,7 @@ fn last_resort_hint_names_the_currently_marked_member() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let hint = lines
@@ -275,6 +280,7 @@ fn preferred_hint_names_the_day_list_when_one_is_set() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     assert_eq!(
@@ -309,6 +315,7 @@ fn preferred_hint_drops_a_day_list_the_account_cannot_serve() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let hint = lines
@@ -346,6 +353,7 @@ fn preferred_hint_says_which_days_are_left_when_another_account_claims() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let hint = lines
@@ -379,6 +387,7 @@ fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     // "The rest" would be false the moment another member's list names one of
@@ -404,6 +413,7 @@ fn usage_gate_rows_hint_the_current_state() {
                 width: 80,
                 ..Default::default()
             },
+            &HashSet::new(),
         )
         .0
         .iter()
@@ -469,6 +479,7 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let pill = lines
@@ -486,6 +497,7 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     assert!(
@@ -570,6 +582,7 @@ fn last_resort_value_aligns_with_other_rows() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0
     .iter()
@@ -628,6 +641,7 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
                 width: 60,
                 ..Default::default()
             },
+            &HashSet::new(),
         )
         .0
         .iter()
@@ -769,7 +783,7 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
         .find(&crate::profile::ProfileName::from("acct"))
         .unwrap();
     assert_eq!(
-        blocked_reason(&cfg, p, None),
+        blocked_reason(&cfg, p, None, &HashSet::new()),
         Some(BlockedReason::Disabled),
         "disabled ranks first, above canceled and auth broken"
     );
@@ -783,7 +797,8 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
             enabled
                 .find(&crate::profile::ProfileName::from("acct"))
                 .unwrap(),
-            None
+            None,
+            &HashSet::new(),
         ),
         Some(BlockedReason::Canceled),
         "without the disabled bit the canceled rung wins"
@@ -807,7 +822,8 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
             &cfg,
             cfg.find(&crate::profile::ProfileName::from("acct"))
                 .unwrap(),
-            None
+            None,
+            &HashSet::new(),
         ),
         None,
         "a disabled ACTIVE member has headroom and reports no block"
@@ -822,7 +838,8 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
             inactive
                 .find(&crate::profile::ProfileName::from("acct"))
                 .unwrap(),
-            None
+            None,
+            &HashSet::new(),
         ),
         Some(BlockedReason::Disabled),
         "a disabled NON-active member reports the block"
@@ -843,6 +860,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -875,6 +893,7 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -920,6 +939,7 @@ fn headroom_member_shows_no_reason_pill() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let first = line_text(&lines[0]);
@@ -957,6 +977,7 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
                 width,
                 ..Default::default()
             },
+            &HashSet::new(),
         );
         let first_row_at = lines
             .iter()
@@ -1220,6 +1241,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     );
     let block: Vec<String> = lines.iter().take(4).map(line_text).collect();
     assert_eq!(
@@ -1245,6 +1267,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     );
     assert_eq!(
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
@@ -1333,6 +1356,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         BlockedReason::Disabled,
         BlockedReason::Canceled,
         BlockedReason::AuthBroken,
+        BlockedReason::KeyRejected,
         BlockedReason::WeeklySpent { resets_in: None },
         BlockedReason::KickRejected { lifts_in: 60 },
         BlockedReason::BudgetSpent,
@@ -1358,7 +1382,32 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         );
         seen.push(fix);
     }
-    assert_eq!(seen.len(), 9, "every variant contributed a distinct fix");
+    assert_eq!(seen.len(), 10, "every variant contributed a distinct fix");
+}
+
+/// F2: the key-rejected copy is cloudy's verbatim, pinned by equality — the
+/// `reason_fix` line, the `key rejected` pill label, and the rendered `[ … ]`
+/// pill. A copy typo must red, not ride a reachability/nonempty check.
+#[test]
+fn key_rejected_copy_is_pinned_by_equality() {
+    let fix = reason_fix(
+        &BlockedReason::KeyRejected,
+        &crate::profile::ProfileName::from("acct"),
+    );
+    assert_eq!(
+        fix, "re-enter the api key on the setup tab",
+        "the KeyRejected fix line is cloudy's verbatim"
+    );
+    assert_eq!(
+        super::DIAG_KEY_REJECTED,
+        "key rejected",
+        "the pill label is cloudy's verbatim"
+    );
+    let pill: String = reason_pill_spans(&BlockedReason::KeyRejected, ResetFmt::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(pill, "[ key rejected ]", "the rendered pill is {pill:?}");
 }
 
 // ── `max spend` dims while inert (spend budget off) ──────────────────────────
@@ -1388,6 +1437,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let off_val = off
@@ -1410,6 +1460,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     let on_val = on
@@ -1439,6 +1490,7 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
                 width: 80,
                 ..Default::default()
             },
+            &HashSet::new(),
         )
         .0
         .iter()
@@ -1507,6 +1559,7 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
                 width: 80,
                 ..Default::default()
             },
+            &HashSet::new(),
         )
         .0
         .iter()
@@ -1835,6 +1888,7 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
             width: 60,
             ..Default::default()
         },
+        &HashSet::new(),
     );
     let texts = card_texts(&lines);
 
@@ -1997,6 +2051,7 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
                     width,
                     ..Default::default()
                 },
+                &HashSet::new(),
             );
             let first_row_at = lines
                 .iter()
@@ -2059,6 +2114,7 @@ fn preferred_days_line(cfg: &AppConfig) -> Line<'static> {
             width: 80,
             ..Default::default()
         },
+        &HashSet::new(),
     )
     .0;
     lines
@@ -2155,6 +2211,7 @@ fn preferred_days_row_hint_names_the_blocker_then_the_list_state() {
                 width: 80,
                 ..Default::default()
             },
+            &HashSet::new(),
         )
         .0;
         hint_after(&lines, "preferred days")
@@ -2319,7 +2376,7 @@ fn the_add_picker_names_a_carried_day_list_before_the_add() {
     let mut app = App::new(cfg);
     // At 80 the blurb holds one line, so the candidates open on the fifth.
     let picker = |app: &App| -> Vec<String> {
-        add_detail(app, true, 80)
+        add_detail(app, true, 80, &HashSet::new())
             .0
             .iter()
             .skip(4)
@@ -2373,7 +2430,7 @@ fn the_add_picker_names_the_blocker_before_a_carried_list() {
     cfg.state.auth_broken.push("b".into());
     let mut app = App::new(cfg);
     app.fallback_detail_cursor = 0;
-    let picker: Vec<String> = add_detail(&app, true, 80)
+    let picker: Vec<String> = add_detail(&app, true, 80, &HashSet::new())
         .0
         .iter()
         .skip(4)

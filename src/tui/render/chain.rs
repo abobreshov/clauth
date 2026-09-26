@@ -16,6 +16,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
+use std::collections::HashSet;
 
 use super::super::app::{
     App, CardEdit, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState,
@@ -27,10 +28,11 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::default_reminder;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
-    DIAG_DISABLED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when,
-    cycle_row_lines, draw_scrolled_lines, draw_selector_list, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
-    rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret, wrap_words,
+    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
+    bold_when, cycle_row_lines, draw_scrolled_lines, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
+    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
+    wrap_words,
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
@@ -45,13 +47,22 @@ const GAUGE_W: usize = 22;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (selector, detail) = master_detail(area, chain_items(app).len());
+    // The live key-rejected set, read once per frame (never per candidate)
+    // before either pane locks the config guard.
+    let key_rejected = app.key_rejected_names();
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
-    draw_chain_selector(frame, selector, app, chain_focused);
-    draw_chain_detail(frame, detail, app);
+    draw_chain_selector(frame, selector, app, chain_focused, &key_rejected);
+    draw_chain_detail(frame, detail, app, &key_rejected);
 }
 
-fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+fn draw_chain_selector(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    focused: bool,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
+) {
     let items = chain_items(app);
     // Switch-grade kick blocks the chip flags — read before the Config lock
     // (rank order: KickBlockState 230 < Config 400).
@@ -96,7 +107,12 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             bold_when(name_color(cfg.is_active(&name)), selected && focused)
                         };
                         let reason = cfg.find(&name).and_then(|p| {
-                            blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied())
+                            blocked_reason(
+                                &cfg,
+                                p,
+                                kick_lifts.get(name.as_str()).copied(),
+                                key_rejected,
+                            )
                         });
                         let rail_w = rail.width();
                         let mut spans = vec![rail];
@@ -142,7 +158,12 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
     });
 }
 
-fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_chain_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
+) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
     let inner_w = section_box("", detail_focused, false).inner(area).width as usize;
     let items = chain_items(app);
@@ -207,11 +228,12 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         kick_lift,
                         sessions: app.live_sessions.member(&name),
                     },
+                    key_rejected,
                 );
                 (name.to_string(), true, lines, spans)
             }
             Some(ChainItemKind::Add) => {
-                let (lines, focus) = add_detail(app, detail_focused, inner_w);
+                let (lines, focus) = add_detail(app, detail_focused, inner_w, key_rejected);
                 add_focus = focus;
                 (
                     "add to chain".to_string(),
@@ -327,6 +349,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::Disabled => ("⊖", theme::faint()),
         BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => ("×", theme::danger()),
+        BlockedReason::KeyRejected => ("×", theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
@@ -356,6 +379,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::Disabled => (DIAG_DISABLED.to_string(), theme::dim().bold(), None),
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
+        BlockedReason::KeyRejected => (DIAG_KEY_REJECTED.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in } => (
             DIAG_WEEKLY_SPENT.to_string(),
             theme::danger().bold(),
@@ -404,6 +428,7 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
         BlockedReason::AuthBroken => format!("re-login with clauth login {name}"),
+        BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
         BlockedReason::WeeklySpent { .. } => "weekly limit is spent".to_string(),
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
         BlockedReason::BudgetSpent => "raise max spend below".to_string(),
@@ -555,6 +580,7 @@ fn member_detail(
     cfg: &AppConfig,
     name: &crate::profile::ProfileName,
     card: MemberCard<'_>,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
 ) -> (Vec<Line<'static>>, RowSpans) {
     let MemberCard {
         focused,
@@ -597,10 +623,10 @@ fn member_detail(
     // `health_blocked_reason`), so the pills can't disagree with the marker.
     let fmt = ResetFmt::from_state(&cfg.state);
     let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
-    if let Some(reason) = blocked_reason(cfg, profile, kick_lift) {
+    if let Some(reason) = blocked_reason(cfg, profile, kick_lift, key_rejected) {
         pills.push((reason_pill_spans(&reason, fmt), reason_fix(&reason, name)));
         if reason == BlockedReason::Disabled
-            && let Some(health) = health_blocked_reason(cfg, profile, kick_lift)
+            && let Some(health) = health_blocked_reason(cfg, profile, kick_lift, key_rejected)
         {
             pills.push((reason_pill_spans(&health, fmt), reason_fix(&health, name)));
         }
@@ -758,7 +784,7 @@ fn member_detail(
         }
         if *row == FallbackRow::Preferred && selected {
             lines.extend(help_tooltip_lines(
-                &preferred_hint(cfg, name, profile.preferred),
+                &preferred_hint(cfg, name, profile.preferred, key_rejected),
                 width,
             ));
         }
@@ -771,8 +797,11 @@ fn member_detail(
         // (`is_home_on` reads the claimant set), so that arm says so instead of
         // promising this account the day. Descended, the picker's grammar.
         if *row == FallbackRow::PreferredDays && selected {
-            let shared = shared_days(cfg, name, &profile.preferred_days);
-            let hint = match (picking, crate::fallback::day_claim_blocker(cfg, name)) {
+            let shared = shared_days(cfg, name, &profile.preferred_days, key_rejected);
+            let hint = match (
+                picking,
+                crate::fallback::day_claim_blocker(cfg, name, key_rejected),
+            ) {
                 (Some(_), _) => {
                     "← → walk · space toggles and saves · ↵ esc done · ↑ ↓ leave".to_string()
                 }
@@ -803,10 +832,12 @@ fn member_detail(
                 // An uncapped config warns whether or not the row is selected:
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
-                None if spend_is_uncapped(cfg, ceiling) => lines.extend(invalid_tooltip_lines(
-                    &format!("nothing stops the spending: {}", uncapped_spend_fix()),
-                    width,
-                )),
+                None if spend_is_uncapped(cfg, ceiling, key_rejected) => {
+                    lines.extend(invalid_tooltip_lines(
+                        &format!("nothing stops the spending: {}", uncapped_spend_fix()),
+                        width,
+                    ))
+                }
                 None if selected => lines.extend(help_tooltip_lines(
                     &max_spend_hint(cfg, name, ceiling),
                     width,
@@ -821,7 +852,7 @@ fn member_detail(
     // member is currently maxed, name whichever one resumes first instead of
     // leaving the recovery implicit (issue #10 follow-up). Chain-wide, so it
     // renders under whichever member happens to be selected.
-    if let Some((resume_name, eta)) = soonest_resume(cfg) {
+    if let Some((resume_name, eta)) = soonest_resume(cfg, key_rejected) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!(
@@ -857,7 +888,12 @@ fn last_resort_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: boo
 /// Hint under the `preferred` toggle — twin of [`last_resort_hint`]: on →
 /// describes the standing return behavior; off → what turning it on does,
 /// naming the member the (exclusive) mark would move away from.
-fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
+fn preferred_hint(
+    cfg: &AppConfig,
+    name: &crate::profile::ProfileName,
+    on: bool,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
+) -> String {
     // A day list decides the days it names, for every account — so the hint
     // reads off the lists before the toggle, on both sides of one. A list here
     // does not answer for the days no list claims, so the toggle still speaks
@@ -871,7 +907,7 @@ fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool)
         .find(name)
         .map(|p| p.preferred_days.clone())
         .filter(|d| !d.is_empty())
-        .filter(|_| crate::fallback::day_claim_blocker(cfg, name).is_none())
+        .filter(|_| crate::fallback::day_claim_blocker(cfg, name, key_rejected).is_none())
     {
         let named = crate::profile::render_preferred_days(&days).join(", ");
         // The toggle's half names the days it really decides: "the rest" would
@@ -888,7 +924,7 @@ fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool)
     // the claim scan in `is_home_on`.
     let claimed_elsewhere = cfg.state.fallback_chain.iter().any(|n| {
         n != name
-            && !crate::fallback::walk_excluded(cfg, n)
+            && !crate::fallback::walk_excluded(cfg, n, key_rejected)
             && cfg.find(n).is_some_and(|p| !p.preferred_days.is_empty())
     });
     if on {
@@ -1231,10 +1267,11 @@ fn shared_days(
     cfg: &AppConfig,
     name: &crate::profile::ProfileName,
     days: &[Weekday],
+    key_rejected: &HashSet<crate::profile::ProfileName>,
 ) -> Vec<Weekday> {
     WEEKDAYS_ALL
         .into_iter()
-        .filter(|day| days.contains(day) && cfg.day_listers(*day).any(|n| n != name))
+        .filter(|day| days.contains(day) && cfg.day_listers(*day, key_rejected).any(|n| n != name))
         .collect()
 }
 
@@ -1380,7 +1417,12 @@ fn day_picker_lines(days: &[Weekday], caret: usize, width: usize) -> Vec<Line<'s
 
 /// The `+ add` pane's lines, and the block the view keeps on screen: the
 /// candidate under the cursor with the note it carries.
-fn add_detail(app: &App, focused: bool, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
+fn add_detail(
+    app: &App,
+    focused: bool,
+    width: usize,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
+) -> (Vec<Line<'static>>, (usize, usize)) {
     let candidates = chain_candidates(app);
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled("add an account to the rotation", theme::dim())),
@@ -1439,7 +1481,7 @@ fn add_detail(app: &App, focused: bool, width: usize) -> (Vec<Line<'static>>, (u
             && !days.is_empty()
         {
             let label = day_list_label(&days);
-            let blocker = crate::fallback::walk_blocker(&app.config(), &member);
+            let blocker = crate::fallback::walk_blocker(&app.config(), &member, key_rejected);
             let hint = match blocker {
                 Some(reason) => format!("its day list ({label}) would claim nothing: {reason}"),
                 None => format!("brings back its preferred days: {label}"),

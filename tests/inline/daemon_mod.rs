@@ -18,16 +18,34 @@ use crate::profile::{
     reload_fingerprint, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
-use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity, now_ms};
+use crate::usage::{
+    FetchLeg, PendingSwitchTarget, ProfileActivity, mark_activity, mark_fetch_activity, now_ms,
+};
 
 use super::Daemon;
 
-/// Queue a switch target on the daemon's pending set.
+/// Queue a switch target on the daemon's pending set, with no key-rejection cause
+/// (an ordinary exhaustion/home decision).
 fn stage_switch(d: &Daemon, target: &str) {
     d.pending_switch
         .lock()
         .expect("pending_switch")
-        .insert(target.into());
+        .insert(PendingSwitchTarget {
+            target: target.into(),
+            key_rejected_cause: None,
+        });
+}
+
+/// Queue a switch-away caused by the active's key rejection, recording the
+/// fingerprint the decision was made under.
+fn stage_key_rejected_switch(d: &Daemon, target: &str, active: &str, recorded_fp: u64) {
+    d.pending_switch
+        .lock()
+        .expect("pending_switch")
+        .insert(PendingSwitchTarget {
+            target: target.into(),
+            key_rejected_cause: Some((active.to_string(), recorded_fp)),
+        });
 }
 
 /// Snapshot the queued switch targets (sorted), for asserting re-queue / clearing.
@@ -37,7 +55,7 @@ fn queued_targets(d: &Daemon) -> Vec<String> {
         .lock()
         .expect("pending_switch")
         .iter()
-        .cloned()
+        .map(|t| t.target.clone())
         .collect();
     v.sort();
     v
@@ -372,6 +390,319 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
         active_of(&daemon).as_deref(),
         Some("beta"),
         "an idle, clean, installable target must be switched to"
+    );
+}
+
+/// Q1 (repair direction): a queued switch-away whose record carries the
+/// key-rejection cause is dropped when the active is re-keyed before dispatch —
+/// the active stays and the stale decision is not re-queued.
+#[test]
+fn drain_pending_switch_drops_a_repaired_key_rejected_switch_away() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    let mut daemon = daemon_for(config);
+    let old_fp = crate::usage::profile_credential_fingerprint(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("tp"))
+            .expect("tp present"),
+    )
+    .expect("credentialed");
+    stage_key_rejected_switch(&daemon, "oauth", "tp", old_fp);
+
+    // A repair lands before dispatch: the tp api key is re-keyed in place.
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .find_mut(&crate::profile::ProfileName::from("tp"))
+        .expect("tp present")
+        .api_key = Some("new-key".to_string());
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("tp"),
+        "the re-keyed active stays put"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the stale switch-away is dropped, not re-queued"
+    );
+}
+
+/// Q1 (ordinary direction): a cause-absent ordinary exhaustion/home decision
+/// still switches even beside a stale raw broken mark — a same-name re-key left
+/// an inert old-key mark that must not drop the move.
+#[test]
+fn drain_pending_switch_still_switches_an_ordinary_decision_beside_a_stale_mark() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    let mut daemon = daemon_for(config);
+    // A stale mark: recorded under a fingerprint that no longer matches tp's
+    // current credential (the leftover a same-name re-key leaves behind).
+    let stale_fp = crate::usage::profile_credential_fingerprint(&crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("other-key".to_string()),
+    ))
+    .expect("credentialed");
+    daemon
+        .third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("tp".to_string(), stale_fp);
+
+    // The ordinary decision carries no cause.
+    stage_switch(&daemon, "oauth");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("oauth"),
+        "the ordinary exhaustion switch still executes beside the stale mark"
+    );
+}
+
+/// Q1 producer→drain: a current key-rejection mark plus an independently
+/// exhausted active must produce a cause-ABSENT record (the exhaustion alone
+/// forces the move, so the scan — not a hand-built `stage_switch` — records no
+/// cause), and a same-name OAuth conversion before dispatch must not drop it.
+#[test]
+fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conversion() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let mut config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    config.state.fallback_chain = vec!["tp".into(), "oauth".into()];
+    let mut daemon = daemon_for(config);
+
+    // tp is key-rejected (a matching live mark) and independently exhausted;
+    // oauth is clear + fresh, so the walk lands on it for exhaustion alone.
+    let tp_fp = crate::usage::profile_credential_fingerprint(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("tp"))
+            .expect("tp present"),
+    )
+    .expect("credentialed");
+    daemon
+        .third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("tp".to_string(), tp_fp);
+    let now = crate::usage::now_epoch_secs();
+    let spent = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let clear = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    daemon
+        .usage_store
+        .lock()
+        .expect("usage")
+        .insert("tp".to_string(), spent);
+    daemon
+        .usage_store
+        .lock()
+        .expect("usage")
+        .insert("oauth".to_string(), clear);
+    daemon
+        .usage_status
+        .lock()
+        .expect("status")
+        .insert("oauth".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // The producer queues the record; the test asserts the cause it records,
+    // never hand-constructing a cause-absent record.
+    crate::usage::scan_auto_switch(
+        &daemon.config,
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.third_party_status,
+        &daemon.third_party_streaks,
+        &daemon.third_party_broken,
+        &daemon.poll_streaks,
+        &daemon.kick_blocks,
+        &daemon.activity,
+        &daemon.pending_switch,
+        &daemon.pending_switch_off,
+    );
+    let queued: Vec<PendingSwitchTarget> = daemon
+        .pending_switch
+        .lock()
+        .expect("pending")
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(
+        queued,
+        vec![PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        }],
+        "the producer must queue a cause-absent record for an independently exhausted key-rejected active"
+    );
+
+    // Same-name OAuth conversion before dispatch leaves the old key-rejection
+    // mark inert; the ordinary record must still execute.
+    {
+        let mut c = daemon.config.lock().expect("config");
+        let tp = c
+            .find_mut(&crate::profile::ProfileName::from("tp"))
+            .expect("tp present");
+        tp.base_url = None;
+        tp.api_key = None;
+    }
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("oauth"),
+        "the producer ordinary switch still executes after the same-name conversion"
+    );
+}
+
+/// Q1 producer→drain (whole-chain home): the active's key rejection suppresses
+/// its `preferred_days` claim, so the scan walks to the sibling whose bare
+/// `preferred` fallback flag fires, and the record carries the cause. Repairing
+/// the active before dispatch drops that rejection-caused switch.
+#[test]
+fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
+    use chrono::Weekday::*;
+    let _home = HomeSandbox::new();
+    let mut a = crate::profile::Profile::new(
+        "a".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    a.preferred_days = vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
+    let mut b = profile_with_creds("b", "at-b");
+    b.preferred = true;
+    let mut config = persist(vec![a, b], Some("a"), 90_000);
+    config.state.fallback_chain = vec!["a".into(), "b".into()];
+    let mut daemon = daemon_for(config);
+
+    let a_fp = crate::usage::profile_credential_fingerprint(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("a"))
+            .expect("a present"),
+    )
+    .expect("credentialed");
+    daemon
+        .third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("a".to_string(), a_fp);
+
+    // b clear + fresh so the walk lands on it; a holds no usage entry, so the
+    // without-run reads it healthy and home.
+    let now = crate::usage::now_epoch_secs();
+    let clear = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    daemon
+        .usage_store
+        .lock()
+        .expect("usage")
+        .insert("b".to_string(), clear);
+    daemon
+        .usage_status
+        .lock()
+        .expect("status")
+        .insert("b".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // The producer queues the record; the test asserts the cause it records,
+    // never hand-constructing a cause-bearing record.
+    crate::usage::scan_auto_switch(
+        &daemon.config,
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.third_party_status,
+        &daemon.third_party_streaks,
+        &daemon.third_party_broken,
+        &daemon.poll_streaks,
+        &daemon.kick_blocks,
+        &daemon.activity,
+        &daemon.pending_switch,
+        &daemon.pending_switch_off,
+    );
+    let queued: Vec<PendingSwitchTarget> = daemon
+        .pending_switch
+        .lock()
+        .expect("pending")
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(
+        queued,
+        vec![PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: Some(("a".to_string(), a_fp)),
+        }],
+        "the producer must queue a cause-bearing record when the active's day claim alone reclaims home without rejection"
+    );
+
+    // A repair lands before dispatch: `a` is re-keyed in place, so the recorded
+    // fingerprint no longer matches the current credential.
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .expect("a present")
+        .api_key = Some("new-key".to_string());
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("a"),
+        "the repaired day-claim active stays put"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the rejection-caused switch-away is dropped, not re-queued"
     );
 }
 
@@ -1623,5 +1954,51 @@ fn the_daemon_logs_a_day_collision_once_per_change() {
         1,
         "clearing a notice says nothing: {:?}",
         lines.snapshot()
+    );
+}
+
+/// N2 (D-arc): the status writer reads the SAME `third_party_streaks` Arc the
+/// scheduler leg writes — `live_stores()` clones that Arc, never a fresh empty
+/// store — so a deep streak the scheduler recorded moves the published `stale`.
+#[test]
+fn the_status_writer_reads_the_schedulers_own_streak_store() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+    let mut api = blank_profile(&crate::profile::ProfileName::from("zai"));
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![api],
+    };
+    let daemon = daemon_for(config);
+
+    // The scheduler's own store (the Arc the refresher leg writes).
+    daemon
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1);
+    daemon
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::FetchStatus::RateLimited);
+
+    // The status writer's input: `live_stores()` clones the scheduler's Arc.
+    let snapshot = daemon.live_stores().snapshot();
+    let live = snapshot.signals();
+    let cfg_snap = daemon.config.lock().unwrap().clone();
+    let body = super::status_json::build_status(&cfg_snap, 300_000, Some(&live), false);
+    let stale = body
+        .profiles
+        .iter()
+        .find(|p| p.name.as_str() == "zai")
+        .unwrap()
+        .stale;
+    assert!(
+        stale,
+        "the writer must read the scheduler's own streak store"
     );
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1270,7 +1270,12 @@ impl AppConfig {
     /// mark it home on the days no list claims. Reading the chain rather than
     /// `profiles` follows the spend warning, which is on the chain for the
     /// same reason.
-    pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
+    pub(crate) fn is_home_on(
+        &self,
+        name: &ProfileName,
+        day: Weekday,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> bool {
         // An account the walk would never visit is home on NO day: a list on it
         // claims nothing, and its flag decides nothing either. One guard at the
         // entry rather than one per branch — the gap this closes was exactly a
@@ -1278,10 +1283,10 @@ impl AppConfig {
         // the gap. Redundant on the claimed branch, where `day_listers` has
         // already applied it; the redundancy is what makes the omission
         // impossible.
-        if !crate::fallback::serves_the_chain(self, name) {
+        if !crate::fallback::serves_the_chain(self, name, key_rejected) {
             return false;
         }
-        let mut listers = self.day_listers(day);
+        let mut listers = self.day_listers(day, key_rejected);
         match listers.next() {
             // Home on a claimed day IS the claimant set, asked of the scan
             // rather than re-derived beside it. A second predicate drifts:
@@ -1295,12 +1300,17 @@ impl AppConfig {
 
     /// Chain members that name `day` and could actually serve it, in chain
     /// order. Empty when the day is unclaimed, which is what hands it back to
-    /// `preferred`.
-    pub(crate) fn day_listers(&self, day: Weekday) -> impl Iterator<Item = &ProfileName> {
+    /// `preferred`. `key_rejected` is the key-rejected set the caller read once
+    /// outside the config guard.
+    pub(crate) fn day_listers<'a>(
+        &'a self,
+        day: Weekday,
+        key_rejected: &'a HashSet<ProfileName>,
+    ) -> impl Iterator<Item = &'a ProfileName> + 'a {
         self.state
             .fallback_chain
             .iter()
-            .filter(move |n| !crate::fallback::walk_excluded(self, n))
+            .filter(move |n| !crate::fallback::walk_excluded(self, n, key_rejected))
             .filter(move |n| {
                 self.find(n)
                     .is_some_and(|p| p.preferred_days.contains(&day))
@@ -1319,8 +1329,15 @@ impl AppConfig {
     /// the claimants in chain order, so it changes exactly when the midnight
     /// rollover or a config edit changes what is being warned about, and stays
     /// byte-equal across every tick in between.
-    pub(crate) fn day_claim_collision(&self, day: Weekday) -> Option<String> {
-        let names: Vec<String> = self.day_listers(day).map(|n| format!("'{n}'")).collect();
+    pub(crate) fn day_claim_collision(
+        &self,
+        day: Weekday,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> Option<String> {
+        let names: Vec<String> = self
+            .day_listers(day, key_rejected)
+            .map(|n| format!("'{n}'"))
+            .collect();
         if names.len() < 2 {
             return None;
         }
@@ -1344,13 +1361,17 @@ impl AppConfig {
     /// Same gate-key scheme as [`AppConfig::day_claim_collision`]: the day, the
     /// blocked accounts in profile-list order, and what became of the day are
     /// all in the message.
-    pub(crate) fn day_claim_passed_over(&self, day: Weekday) -> Option<String> {
+    pub(crate) fn day_claim_passed_over(
+        &self,
+        day: Weekday,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> Option<String> {
         let blocked: Vec<String> = self
             .profiles
             .iter()
             .filter(|p| p.preferred_days.contains(&day))
             .filter_map(|p| {
-                crate::fallback::day_claim_blocker(self, &p.name)
+                crate::fallback::day_claim_blocker(self, &p.name, key_rejected)
                     .map(|why| format!("'{}' ({why})", p.name))
             })
             .collect();
@@ -1361,7 +1382,7 @@ impl AppConfig {
         // What happened to the day, not just that a line is inert: a carried
         // day still has somebody home and reads as a stray line, while an
         // uncarried one has quietly fallen back to the flag.
-        let tail = match self.day_listers(day).next() {
+        let tail = match self.day_listers(day, key_rejected).next() {
             Some(carrier) => format!("'{carrier}' carries it"),
             None => format!("nothing else claims {named}, so `preferred` decides it"),
         };
@@ -1381,11 +1402,14 @@ impl AppConfig {
     /// Each entry is its own gate key, so a caller holding the previous set
     /// emits only what is new rather than repainting the rest — a second list
     /// arriving must not re-toast a collision the operator has already read.
-    pub(crate) fn day_claim_notices_today(&self) -> Vec<String> {
+    pub(crate) fn day_claim_notices_today(
+        &self,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> Vec<String> {
         let day = Local::now().weekday();
         [
-            self.day_claim_collision(day),
-            self.day_claim_passed_over(day),
+            self.day_claim_collision(day, key_rejected),
+            self.day_claim_passed_over(day, key_rejected),
         ]
         .into_iter()
         .flatten()
@@ -1395,8 +1419,12 @@ impl AppConfig {
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
     /// per chain build rather than at load: the fingerprint that drives a hot
     /// reload is built from `config.toml` mtimes, and midnight moves no file.
-    pub(crate) fn is_home_today(&self, name: &ProfileName) -> bool {
-        self.is_home_on(name, Local::now().weekday())
+    pub(crate) fn is_home_today(
+        &self,
+        name: &ProfileName,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> bool {
+        self.is_home_on(name, Local::now().weekday(), key_rejected)
     }
 
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid

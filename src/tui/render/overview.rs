@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
+use std::collections::HashSet;
 
 use super::super::app::{App, CodexRow, MainItemKind};
 use super::super::theme;
@@ -22,7 +23,7 @@ use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
 };
-use crate::profile::{AppConfig, Profile};
+use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
@@ -829,6 +830,9 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    // The live key-rejected set, read once per frame before the Config lock
+    // (both stores rank below it) — never a durable read under the guard.
+    let key_rejected = app.key_rejected_names();
     let narrow = super::panes::narrow(width as u16);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
@@ -884,7 +888,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Project the active profile's next switch once, up front: a `To(target)`
     // renders inline on the target member's row (right side); `Off` has no
     // single target row, so it stays a caption below.
-    let projection = projected_switch(app, &cfg);
+    let projection = projected_switch(app, &cfg, &key_rejected);
     let switch_to = match &projection {
         Some((SwitchAction::To(target), secs)) => Some((target.clone(), *secs)),
         _ => None,
@@ -897,9 +901,14 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let reason = cfg
-                .find(name)
-                .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied()));
+            let reason = cfg.find(name).and_then(|p| {
+                blocked_reason(
+                    &cfg,
+                    p,
+                    kick_lifts.get(name.as_str()).copied(),
+                    &key_rejected,
+                )
+            });
             let switch_eta = switch_to
                 .as_ref()
                 .filter(|(target, _)| target.as_str() == name.as_str())
@@ -987,7 +996,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // equivalent), name whichever one resumes first. Mutually exclusive with the
     // projection — `burn_rate_eta` returns `None` once the active crosses its
     // own threshold, which is a precondition for `soonest_resume` to return.
-    if let Some((name, eta)) = soonest_resume(&cfg) {
+    if let Some((name, eta)) = soonest_resume(&cfg, &key_rejected) {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -1007,7 +1016,11 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 /// did: only when the active crosses its threshold BEFORE its 5h window resets
 /// (past the reset the window refills and no switch fires). Shared by the inline
 /// `To` hint (on the target's row) and the `Off` caption.
-fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
+fn projected_switch(
+    app: &App,
+    cfg: &AppConfig,
+    key_rejected: &HashSet<ProfileName>,
+) -> Option<(SwitchAction, i64)> {
     if cfg.state.fallback_chain.len() <= 1 {
         return None;
     }
@@ -1023,7 +1036,7 @@ fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
     if reset_secs.is_some_and(|reset| eta_secs >= reset) {
         return None;
     }
-    next_target(cfg, active_rate).map(|action| (action, eta_secs))
+    next_target(cfg, active_rate, key_rejected).map(|action| (action, eta_secs))
 }
 
 /// Cells between the widest chain row's content and the shared trailer column.

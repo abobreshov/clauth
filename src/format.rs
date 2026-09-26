@@ -614,6 +614,7 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
 pub(crate) const DIAG_DISABLED: &str = "disabled";
 pub(crate) const DIAG_CANCELED: &str = "canceled";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
+pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(crate) const DIAG_KICK: &str = "claude code blocked";
 pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";

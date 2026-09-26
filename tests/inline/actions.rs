@@ -641,6 +641,78 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     assert!(config.is_active(&crate::profile::ProfileName::from("b")));
 }
 
+/// m1: the startup one-shot routes a key-rejected third-party ACTIVE through the
+/// same bypass as an OAuth auth-broken one — the durable verdict (no live
+/// `ThirdPartyBroken` set exists yet) so a rejected key never parks the TUI for
+/// one cadence on a dead account.
+#[test]
+fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
+    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::providers::Provider;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+
+    // Active "a": a z.ai api-key member whose key was rejected, last read maxed
+    // on a LAPSED window (reads as idle headroom — the wedge the bypass closes).
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    a.api_key = Some("a-key".to_string());
+    a.provider = Provider::from_base_url(a.base_url.as_deref().unwrap());
+    a.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+        }),
+        ..Default::default()
+    });
+    let fp = crate::usage::profile_credential_fingerprint(&a).unwrap();
+    crate::profile_cache::write_auth_expired(&a.name, fp);
+    crate::profile::save_profile(&a).expect("save profile");
+
+    // Target "b": healthy OAuth member with a live headroom window.
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "b-access".to_string(),
+            refresh_token: Some("b-access-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    b.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    });
+    crate::profile::save_profile(&b).expect("save profile");
+
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
+    assert_eq!(
+        action,
+        Some(SwitchAction::To("b".to_string())),
+        "a key-rejected active with stale-headroom usage must still be walked away from"
+    );
+    assert!(config.is_active(&crate::profile::ProfileName::from("b")));
+}
+
 /// The scoped trigger through the REAL UI one-shot: `auto_switch_if_needed`
 /// must hop off an otherwise-healthy active whose per-model week is spent —
 /// through `fully_clear_target`, its only walk — and actually land the switch.

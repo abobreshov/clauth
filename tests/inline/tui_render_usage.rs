@@ -597,6 +597,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -664,6 +665,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -707,6 +709,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -756,6 +759,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts::default(),
             kick_block: None,
             queue_slot: slot,
@@ -869,6 +873,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: Some(QueueSlot {
@@ -920,6 +925,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -968,6 +974,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1010,6 +1017,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1066,6 +1074,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1097,6 +1106,7 @@ fn disabled_rung_header(kick: bool) -> HeaderState {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: kick.then(|| KickBlock {
             streak: 3,
@@ -1132,6 +1142,7 @@ fn status_lines_renders_stale_cue_from_age_alone() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1170,6 +1181,7 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1192,6 +1204,7 @@ fn status_lines_stale_prepends_the_fetch_row() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1250,6 +1263,7 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1298,6 +1312,7 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1353,6 +1368,7 @@ fn status_lines_oauth_profile_never_renders_no_key() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1475,6 +1491,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block,
         queue_slot: None,
@@ -1559,6 +1576,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts {
                 rate_limit: 3,
                 refresh_fail: 0,
@@ -1639,6 +1657,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 45_000),
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 3,
@@ -1708,6 +1727,7 @@ fn status_lines_single_hint_has_no_rail() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 20_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -1752,6 +1772,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 30_000),
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts::default(),
             kick_block: Some(KickBlock {
                 streak: 1,
@@ -1804,6 +1825,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts::default(),
             kick_block: Some(KickBlock {
                 streak: 1,
@@ -1845,6 +1867,7 @@ fn rate_limited_suffix_counts_the_retry() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts {
             rate_limit: streak,
             refresh_fail: 0,
@@ -1888,6 +1911,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts {
             rate_limit: 0,
             refresh_fail,
@@ -1950,6 +1974,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
         streaks,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
@@ -2013,6 +2038,7 @@ fn spent_skipped_account_pill_is_bare() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -2188,6 +2214,7 @@ fn status_lines_renders_the_auto_start_divergence() {
                 activity: ProfileActivity::Idle,
                 next_refresh_ms: Some(now_ms() + 90_000),
                 tick: 0,
+                rate_limit_source: super::RateLimitSource::ThirdParty,
                 streaks: StreakCounts::default(),
                 kick_block: Some(KickBlock {
                     streak: 2,
@@ -2228,6 +2255,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts::default(),
             kick_block: None,
             queue_slot: None,
@@ -2268,6 +2296,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 3,
@@ -2327,6 +2356,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
             streaks: StreakCounts::default(),
             kick_block: None,
             queue_slot: None,
@@ -2432,6 +2462,7 @@ fn header_lines_pricing_row_only_with_windows() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -2555,5 +2586,247 @@ fn peak_state_for_is_provider_bound() {
     assert!(
         app.peak_state_for(&bare).is_none(),
         "a pin is never a provider: no indicator without one"
+    );
+}
+
+/// Ruling 1 (display parity): the row's stuck streak is OAuth-first with the
+/// third-party fallback — the same rule `reading_is_actionable` applies, so a
+/// member with no OAuth status entry reads its third-party provider-429 streak.
+/// The returned source names which reading won, so the stuck hint names the
+/// endpoint that actually throttled (cloudy's "name the winning source").
+#[test]
+fn effective_rate_limit_is_oauth_first_with_a_third_party_fallback() {
+    use crate::profile::ProfileName;
+    use std::collections::{HashMap, HashSet};
+
+    let name = ProfileName::from("zai");
+    let oauth = HashMap::from([(
+        "zai".to_string(),
+        StreakCounts {
+            rate_limit: 3,
+            refresh_fail: 0,
+        },
+    )]);
+    let third_party = HashMap::from([("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1)]);
+
+    // No OAuth status entry → the third-party streak wins.
+    let none = HashSet::new();
+    assert_eq!(
+        effective_rate_limit(&name, &oauth, &third_party, &none),
+        (
+            crate::usage::ACTIVE_CAP_MAX_STREAK + 1,
+            super::RateLimitSource::ThirdParty
+        ),
+        "a pure third-party member reads its own provider-429 streak"
+    );
+    // OAuth status entry present → the OAuth axis is authoritative.
+    let has = HashSet::from(["zai".to_string()]);
+    assert_eq!(
+        effective_rate_limit(&name, &oauth, &third_party, &has),
+        (3, super::RateLimitSource::OAuth),
+        "a hybrid keeps its OAuth streak authoritative over the third-party one"
+    );
+}
+
+// ── m3: stuck-429 hint copy (cloudy, verbatim) ──────────────────────────────
+
+/// The complete stuck-429 hint string for one typed provider, exhaustive — a new
+/// `Provider` variant breaks this match at compile time, so it cannot ship
+/// without its copy fixture.
+fn typed_throttler_hint(provider: Provider) -> &'static str {
+    match provider {
+        Provider::DeepSeek => "deepseek is throttling usage reads",
+        Provider::Zai => "z.ai is throttling usage reads",
+        Provider::Alibaba => "alibaba model studio is throttling usage reads",
+        Provider::OpenRouter => "openrouter is throttling usage reads",
+        Provider::MiniMax => "minimax is throttling usage reads",
+    }
+}
+
+/// A third-party streak names a typed provider's lowercase display name or
+/// `the endpoint` for a generic base URL; an OAuth streak reads `anthropic`.
+/// Every full hint string is pinned by equality, never by a nonempty/one-example
+/// check, so a copy typo reds.
+#[test]
+fn stuck_429_hint_names_the_throttler() {
+    use crate::profile::ProfileName;
+
+    // Exhaustive over the typed providers: the helper's match above fails to
+    // compile for a new variant, so this loop can never skip it silently.
+    for provider in [
+        Provider::DeepSeek,
+        Provider::Zai,
+        Provider::Alibaba,
+        Provider::OpenRouter,
+        Provider::MiniMax,
+    ] {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from("acct"));
+        p.provider = Some(provider);
+        p.api_key = Some("k".to_string());
+        let throttler = throttler_name(&p, super::RateLimitSource::ThirdParty);
+        assert_eq!(
+            diag_fix(UsageDiag::Stuck429 { throttler }, "acct"),
+            typed_throttler_hint(provider),
+            "a typed provider's stuck hint names its lowercase display name"
+        );
+    }
+
+    let mut generic = crate::testutil::blank_profile(&ProfileName::from("gen"));
+    generic.api_key = Some("k".to_string());
+    generic.base_url = Some("https://example.com/v1".to_string());
+    assert_eq!(
+        diag_fix(
+            UsageDiag::Stuck429 {
+                throttler: throttler_name(&generic, super::RateLimitSource::ThirdParty),
+            },
+            "gen"
+        ),
+        "the endpoint is throttling usage reads",
+        "a generic api-key endpoint reads `the endpoint`"
+    );
+
+    let oauth = crate::testutil::blank_profile(&ProfileName::from("oa"));
+    assert_eq!(
+        diag_fix(
+            UsageDiag::Stuck429 {
+                throttler: throttler_name(&oauth, super::RateLimitSource::OAuth),
+            },
+            "oa"
+        ),
+        "anthropic is throttling usage reads",
+        "an OAuth streak reads `anthropic`"
+    );
+}
+
+/// N-hybrid: a hybrid row (OAuth pair + api key + typed provider) must name the
+/// reading source that won, never the row's provider. Both directions are
+/// pinned: OAuth stuck / provider healthy reads `anthropic`; OAuth absent /
+/// provider stuck reads the typed provider — on the SAME hybrid profile shape.
+#[test]
+fn a_hybrid_stuck_hint_names_the_winning_reading_source() {
+    use crate::profile::ProfileName;
+    use std::collections::{HashMap, HashSet};
+
+    let name = ProfileName::from("hybrid");
+    // A hybrid row: typed provider (z.ai) + an api key. The OAuth status store
+    // decides the source; the provider is present either way, so a row-type
+    // throttler would misname the OAuth leg.
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.provider = Some(Provider::Zai);
+    hybrid.api_key = Some("k".to_string());
+    hybrid.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    let deep = crate::usage::ACTIVE_CAP_MAX_STREAK + 1;
+
+    // OAuth leg deep-stuck, provider leg healthy → the OAuth streak wins.
+    let oauth = HashMap::from([(
+        "hybrid".to_string(),
+        StreakCounts {
+            rate_limit: deep,
+            refresh_fail: 0,
+        },
+    )]);
+    let healthy_tp = HashMap::from([("hybrid".to_string(), 1u32)]);
+    let oauth_has = HashSet::from(["hybrid".to_string()]);
+    let (streak, source) = effective_rate_limit(&name, &oauth, &healthy_tp, &oauth_has);
+    assert_eq!(
+        (streak, source),
+        (deep, super::RateLimitSource::OAuth),
+        "an OAuth status entry is authoritative even over a healthy provider leg"
+    );
+    assert_eq!(
+        diag_fix(
+            UsageDiag::Stuck429 {
+                throttler: throttler_name(&hybrid, source),
+            },
+            "hybrid"
+        ),
+        "anthropic is throttling usage reads",
+        "the OAuth-stuck hybrid names anthropic, not its provider"
+    );
+
+    // OAuth leg absent, provider leg deep-stuck → the third-party streak wins.
+    let none = HashSet::new();
+    let stuck_tp = HashMap::from([("hybrid".to_string(), deep)]);
+    let (streak, source) = effective_rate_limit(&name, &oauth, &stuck_tp, &none);
+    assert_eq!(
+        (streak, source),
+        (deep, super::RateLimitSource::ThirdParty),
+        "with no OAuth status entry the third-party streak wins"
+    );
+    assert_eq!(
+        diag_fix(
+            UsageDiag::Stuck429 {
+                throttler: throttler_name(&hybrid, source),
+            },
+            "hybrid"
+        ),
+        "z.ai is throttling usage reads",
+        "the third-party-stuck hybrid names its provider"
+    );
+}
+
+// ── m4: TestBackend row render pin ──────────────────────────────────────────
+
+/// A stuck third-party row renders the red `rate limited` pill, the 7th-retry
+/// ordinal, and the provider hint — one frame, so the wiring from the
+/// third-party streak store to the row cannot drift green (T-W / T-K).
+#[test]
+fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::{FetchLeg, FetchStatus, now_ms};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    zai.fetch_status = Some(FetchStatus::RateLimited);
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.profile_cursor = 0;
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1);
+    // The third-party status store carries the member's `RateLimited` entry; the
+    // T-K plant (reading `oauth_status_has` from it) must flip the row off the
+    // third-party streak, so seeding it here makes that plant red.
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::RateLimited);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::ThirdParty.key(ProfileName::from("zai")),
+        now_ms() + 40_000,
+    );
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    let fetch_row = rows
+        .iter()
+        .find(|r| r.contains("rate limited"))
+        .expect("the fetch row renders the rate limited pill");
+    assert!(
+        fetch_row.contains("7th retry in"),
+        "a deep streak reads as a 7th retry ordinal: {fetch_row:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("z.ai is throttling usage reads")),
+        "the hint names z.ai as the throttler: {rows:?}"
     );
 }

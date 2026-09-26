@@ -1317,11 +1317,20 @@ fn chain_would_act(
     config: &crate::profile::AppConfig,
     anchor: &crate::profile::ProfileName,
 ) -> bool {
-    let Some(snapshot) = crate::fallback::snapshot_chain_from(config, anchor) else {
+    let key_rejected = crate::fallback::durable_key_rejected(config);
+    let Some(mut snapshot) = crate::fallback::snapshot_chain_from(config, anchor, &key_rejected)
+    else {
         // The resolved account is outside the chain: the leg would do
         // nothing, which is exactly "nothing would catch".
         return false;
     };
+    // The key-rejected union the scheduler's live leg performs on top of the
+    // snapshot, read off the durable per-credential verdict instead: a hook
+    // process has no refresher's live `ThirdPartyBroken` set, and a dead key
+    // is not a bounded corner — the leg skips that sibling every tick, so a
+    // replay that reads it as headroom would answer "the chain would act"
+    // about a switch nothing will make.
+    snapshot.broken.extend(key_rejected);
     let usage: std::collections::HashMap<String, crate::usage::UsageInfo> = snapshot
         .chain
         .iter()

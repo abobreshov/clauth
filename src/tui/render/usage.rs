@@ -70,6 +70,10 @@ struct HeaderState {
     /// The retry suffix names which retry the countdown leads to, so a deep slot
     /// reads as stuck from the count alone, no judgment label.
     streaks: StreakCounts,
+    /// The reading source behind `streaks.rate_limit` — OAuth-first, so the
+    /// stuck hint names the endpoint that actually throttled, never the row's
+    /// provider.
+    rate_limit_source: RateLimitSource,
     /// Live kick-429 block for the shown profile: the messages endpoint is
     /// rejecting the 5h auto-start kick. Orthogonal to `fetch_status` — `/usage`
     /// can stay Fresh straight through the outage — so it earns its own pill.
@@ -97,6 +101,39 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_usage_detail(frame, detail, app);
 }
 
+/// Which reading source the shown profile's stuck judgment took — the one that
+/// actually won, never the row's shape. The stuck hint must name THIS endpoint
+/// (a hybrid whose OAuth leg is throttled reads `anthropic`, not its provider).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RateLimitSource {
+    OAuth,
+    ThirdParty,
+}
+
+/// The shown profile's effective consecutive-429 streak for the stuck judgment,
+/// plus the reading source it came from: OAuth-first — a member with an OAuth
+/// status entry reads the OAuth `rate_limit` axis, else the third-party streak —
+/// the same rule `reading_is_actionable` applies. Pure so the fallback is
+/// unit-testable.
+fn effective_rate_limit(
+    name: &crate::profile::ProfileName,
+    oauth: &HashMap<String, StreakCounts>,
+    third_party: &HashMap<String, u32>,
+    oauth_status_has: &std::collections::HashSet<String>,
+) -> (u32, RateLimitSource) {
+    if oauth_status_has.contains(name.as_str()) {
+        (
+            oauth.get(name.as_str()).map(|s| s.rate_limit).unwrap_or(0),
+            RateLimitSource::OAuth,
+        )
+    } else {
+        (
+            third_party.get(name.as_str()).copied().unwrap_or(0),
+            RateLimitSource::ThirdParty,
+        )
+    }
+}
+
 fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
@@ -104,6 +141,20 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .poll_streaks
         .lock()
         .map(|m| m.clone())
+        .unwrap_or_default();
+    // The third-party consecutive-429 streak + the OAuth status store: the stuck
+    // judgment below mirrors the decision predicate's OAuth-first fallback, so a
+    // member with no OAuth status entry reads its third-party streak. Both ranks
+    // (ThirdPartyStreak 290, UsageStatus 350) sit below CONFIG (400).
+    let third_party_streaks: HashMap<String, u32> = app
+        .third_party_streaks
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let oauth_status_has: std::collections::HashSet<String> = app
+        .usage_status
+        .lock()
+        .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
     // Same discipline as streaks: KickBlockState (230) ranks below CONFIG (400).
     let kick_blocks: HashMap<String, KickBlock> = app
@@ -117,6 +168,10 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // which a render pass must not.
     let queue_anchor = queue_anchor_cached(&app.auto_start_queue);
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    // The live key-rejected set, read once before the Config lock (both stores
+    // rank below it) — the spend-uncapped check under the guard never re-reads
+    // the durable verdict per member.
+    let key_rejected = app.key_rejected_names();
     let cfg = app.config();
     let profile = cfg
         .profiles
@@ -139,6 +194,12 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // `config` (via `cfg`) is outer of activity/refresh-timer in lock order.
+    let (effective_streak, rate_limit_source) = effective_rate_limit(
+        &profile.name,
+        &streaks,
+        &third_party_streaks,
+        &oauth_status_has,
+    );
     let header = HeaderState {
         activity: app
             .activity
@@ -152,10 +213,15 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .ok()
             .and_then(|m| selected_next_refresh(&m, profile)),
         tick: app.tick_count,
-        streaks: streaks
-            .get(profile.name.as_str())
-            .copied()
-            .unwrap_or_default(),
+        streaks: {
+            let mut s = streaks
+                .get(profile.name.as_str())
+                .copied()
+                .unwrap_or_default();
+            s.rate_limit = effective_streak;
+            s
+        },
+        rate_limit_source,
         kick_block: kick_blocks.get(profile.name.as_str()).copied(),
         // Config-dependent predicates, computed under the live config guard so
         // the lock-free line builders below just read booleans. Reuses the
@@ -168,7 +234,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 auto_start: profile.auto_start,
                 weekly_hard: crate::fallback::weekly_hard_blocked(profile),
                 budget_spent: crate::fallback::budget_spent_blocking(&cfg, profile),
-                spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling),
+                spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling, &key_rejected),
             }
         },
         queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
@@ -1129,7 +1195,9 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             // A deep slot the daemon itself distrusts (#40) names the throttle; a
             // shallow one is merely serving old numbers.
             fetch_hint = Some(if is_stuck_streak(header.streaks.rate_limit) {
-                UsageDiag::Stuck429
+                UsageDiag::Stuck429 {
+                    throttler: throttler_name(profile, header.rate_limit_source),
+                }
             } else {
                 UsageDiag::Stale
             });
@@ -1264,7 +1332,7 @@ fn render_status_rows(rows: Vec<DiagRow>, width: usize) -> Vec<Line<'static>> {
 /// A detected Usage-tab diagnostic state paired with the config context that
 /// shapes its fix. Pure input to [`diag_fix`]; render-only, no decision consumes
 /// it (mirrors `fallback::blocked_reason`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum UsageDiag {
     /// Operator disabled the account: the scheduler doesn't poll it at all.
     Disabled,
@@ -1276,8 +1344,11 @@ enum UsageDiag {
     KickSwitchGrade { auto_start: bool },
     /// Burst (non-switch-grade) kick 429 — pill + backoff only, no chain switch.
     KickBurst,
-    /// Deep-slot stuck-429 distrust (#40).
-    Stuck429,
+    /// Deep-slot stuck-429 distrust (#40). `throttler` names the endpoint that
+    /// is throttling, keyed on the reading source that won: `anthropic` for an
+    /// OAuth streak, a typed provider's lowercase display name or `the endpoint`
+    /// for a third-party streak.
+    Stuck429 { throttler: String },
     /// AUTH-1 quarantine.
     AuthBroken,
     /// 7d window at/over the hard cap.
@@ -1296,6 +1367,20 @@ enum UsageDiag {
     NoKey,
 }
 
+/// The stuck-429 throttler name, keyed on the reading source that won (never
+/// the row type): an OAuth streak reads `anthropic`, a third-party streak reads
+/// the typed provider's lowercase display name or `the endpoint` for a generic
+/// api-key base URL.
+fn throttler_name(profile: &Profile, source: RateLimitSource) -> String {
+    match source {
+        RateLimitSource::OAuth => "anthropic".to_string(),
+        RateLimitSource::ThirdParty => match profile.provider {
+            Some(p) => p.throttle_hint_name(),
+            None => "the endpoint".to_string(),
+        },
+    }
+}
+
 /// The `└` fix text for a diagnostic state: what's wrong and the concrete fix,
 /// varying with config. The `KickSwitchGrade` `auto_start` split is the flagship
 /// (state, config) → hint divergence — an auto_start account self-recovers on
@@ -1311,7 +1396,7 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
             "won't recover with auto-start off, enable it".to_string()
         }
         UsageDiag::KickBurst => "claude code hit a burst limit".to_string(),
-        UsageDiag::Stuck429 => "anthropic is throttling usage reads".to_string(),
+        UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
         UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
         UsageDiag::WeeklyHard => "weekly limit is spent".to_string(),
         UsageDiag::BudgetSpent => "raise max spend on the fallback tab".to_string(),

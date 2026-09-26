@@ -49,9 +49,10 @@ use crate::profile::{
 use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
     PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenList, UsageStore, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, spawn_refresher,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, bootstrap_fetch,
+    bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
+    spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -390,13 +391,22 @@ fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
 /// reason: there they would count as a SINK catching the spend, where a
 /// hopeful read invents a safety net that isn't there.
 fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
+    // Boot-time one-shot with no refresher's live set: the durable verdict is
+    // the only key-rejected source here, read once (never per member).
+    let key_rejected = crate::fallback::durable_key_rejected(config);
     config
         .state
         .fallback_chain
         .iter()
         .filter_map(|name| config.find(name))
         .filter(|p| !p.is_disabled())
-        .filter(|p| crate::fallback::spend_is_uncapped(config, p.max_auto_spend.unwrap_or(0.0)))
+        .filter(|p| {
+            crate::fallback::spend_is_uncapped(
+                config,
+                p.max_auto_spend.unwrap_or(0.0),
+                &key_rejected,
+            )
+        })
         .map(|p| p.name.as_str())
         .collect()
 }
@@ -711,12 +721,13 @@ fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
 /// `fetch_status`, `next_refresh_at`, `stale` and `pending_switch`, on the same
 /// daemon, in the same second.
 ///
-/// Seven `Arc` clones, so handing one to the listener costs nothing and shares
+/// Eight `Arc` clones, so handing one to the listener costs nothing and shares
 /// the scheduler's state rather than copying it.
 #[derive(Clone)]
 pub(crate) struct LiveStores {
     pub(crate) usage_status: StatusStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
+    pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
     pub(crate) poll_streaks: PollStreaks,
     pub(crate) pending_switch: PendingSwitch,
@@ -732,6 +743,7 @@ impl Default for LiveStores {
         Self {
             usage_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
             poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             pending_switch: Arc::new(RankedMutex::new(Default::default())),
@@ -746,6 +758,7 @@ impl Default for LiveStores {
 pub(crate) struct LiveSnapshot {
     status: HashMap<String, FetchStatus>,
     third_party_status: HashMap<String, FetchStatus>,
+    third_party_streaks: HashMap<String, u32>,
     next_refresh: HashMap<LegKey, u64>,
     streaks: HashMap<String, u32>,
     pending_switch: Option<String>,
@@ -773,6 +786,11 @@ impl LiveStores {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        let third_party_streaks = self
+            .third_party_streaks
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         let next_refresh = self
             .next_refresh_per_profile
             .lock()
@@ -789,11 +807,11 @@ impl LiveStores {
         // shows in-flight truth instead of a timing heuristic. The set holds at
         // most one scheduler target in practice (`scan_auto_switch` skips while
         // one is pending); `min` keeps the snapshot deterministic anyway.
-        let pending_switch = self
-            .pending_switch
-            .lock()
-            .ok()
-            .and_then(|q| q.iter().min().cloned());
+        let pending_switch = self.pending_switch.lock().ok().and_then(|q| {
+            q.iter()
+                .min_by(|a, b| a.target.cmp(&b.target))
+                .map(|d| d.target.clone())
+        });
         // `switch_grade_kick_lifts` keys ARE the blocked set: it and the
         // scheduler's own `kick_rejected_names` share one predicate, which is how
         // the TUI's queue chips read it too.
@@ -806,6 +824,7 @@ impl LiveStores {
         LiveSnapshot {
             status,
             third_party_status,
+            third_party_streaks,
             next_refresh,
             streaks,
             pending_switch,
@@ -820,6 +839,7 @@ impl LiveSnapshot {
         LiveSignals {
             status: &self.status,
             third_party_status: &self.third_party_status,
+            third_party_streaks: &self.third_party_streaks,
             next_refresh: &self.next_refresh,
             streaks: &self.streaks,
             pending_switch: self.pending_switch.as_deref(),
@@ -861,6 +881,8 @@ struct Daemon {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    third_party_streaks: ThirdPartyStreaks,
+    third_party_broken: ThirdPartyBroken,
     shutting_down: Arc<AtomicBool>,
     /// Last-seen reload fingerprint (`profiles.toml` mtime + per-account
     /// config.toml count/newest-mtime) — drives external-change reload. Bumped to
@@ -911,6 +933,8 @@ impl Daemon {
             third_party_tokens,
             third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
             // Never set by the daemon: process exit IS its shutdown (a
             // supervisor restarts crashes; the singleton flock releases on
             // exit). The flag exists for `spawn_refresher`'s contract — its
@@ -997,6 +1021,8 @@ impl Daemon {
             Arc::clone(&self.third_party_tokens),
             Arc::clone(&self.third_party_usage_store),
             Arc::clone(&self.third_party_status),
+            Arc::clone(&self.third_party_streaks),
+            Arc::clone(&self.third_party_broken),
             suppressed_auth_expired,
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
@@ -1101,6 +1127,7 @@ impl Daemon {
         LiveStores {
             usage_status: Arc::clone(&self.usage_status),
             third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
             next_refresh_per_profile: Arc::clone(&self.next_refresh_per_profile),
             poll_streaks: Arc::clone(&self.poll_streaks),
             pending_switch: Arc::clone(&self.pending_switch),

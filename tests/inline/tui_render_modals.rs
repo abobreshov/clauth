@@ -340,7 +340,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 15].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 16].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -357,6 +357,8 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
             "│    ⊖                   canceled                                         │"
                 .to_string(),
             "│    ×                   auth broken                                      │"
+                .to_string(),
+            "│    ×                   key rejected                                     │"
                 .to_string(),
             "│    ⊘                   weekly spent                                     │"
                 .to_string(),
@@ -377,11 +379,12 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
 
     // Every mark's own hue, read off the rendered cell. The two repeated glyphs
     // are the whole point: same shape, different color, different meaning.
-    let expected: [Color; 13] = [
+    let expected: [Color; 14] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
         crate::tui::theme::text_faint_color(),
+        crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
@@ -396,7 +399,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
     // 2-space gutter all sit ahead of the mark.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..13)
+    let got: Vec<Color> = (0..14)
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());

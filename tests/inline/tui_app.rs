@@ -978,6 +978,218 @@ fn api_relogin_chain_walks_base_url_then_api_key() {
     assert_eq!(d.active, None, "⎋ ends editing");
 }
 
+/// F1: a Setup re-key persists the new credential but the live key-rejected set
+/// must drop the name SAME-FRAME — not on the next tick's reload. The success
+/// arm calls `refresh_tokens`, so `key_rejected_names` re-evaluates the current
+/// entry fingerprint at once instead of intersecting the stale one.
+#[test]
+fn rekeying_an_endpoint_drops_the_live_broken_mark_immediately() {
+    use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+
+    let api = Profile::new(
+        "api".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("old-key".to_string()),
+    );
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("api")],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+
+    // The live rejection mark is recorded under the OLD credential fingerprint.
+    let old_fp = app
+        .third_party_tokens
+        .lock()
+        .expect("tokens store unpoisoned")
+        .iter()
+        .find(|e| e.name.as_str() == "api")
+        .expect("the old third-party entry is collected at construction")
+        .credential_fingerprint();
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("api".to_string(), old_fp);
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("api")),
+        "the old key's rejection is live before the re-key"
+    );
+
+    // Re-key through the real producer (the Setup endpoint editor's ⏎).
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_draft.as_mut().expect("draft").base_url =
+        InputState::new("https://api.z.ai/api/anthropic");
+    app.config_draft.as_mut().expect("draft").api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+
+    assert!(
+        !app.key_rejected_names().contains(&ProfileName::from("api")),
+        "a re-keyed account drops out of the live broken set the same frame"
+    );
+
+    // Q2: the refresh leg republished the fetch entry with the NEW credential
+    // fingerprint same-frame — not merely that verdict authority now ignores the
+    // stale list. Read config first (dropped before the token store, per lock
+    // order), then the re-collected entry.
+    {
+        let new_fp = {
+            let cfg = app.config();
+            let p = cfg
+                .find(&ProfileName::from("api"))
+                .expect("profile present");
+            crate::usage::profile_credential_fingerprint(p)
+                .expect("the re-keyed profile is credentialed")
+        };
+        let list_fp = app
+            .third_party_tokens
+            .lock()
+            .expect("tokens store unpoisoned")
+            .iter()
+            .find(|e| e.name.as_str() == "api")
+            .expect("the re-keyed entry is re-collected same-frame")
+            .credential_fingerprint();
+        assert_ne!(
+            list_fp, old_fp,
+            "the re-keyed entry fingerprint differs from the old one"
+        );
+        assert_eq!(
+            list_fp, new_fp,
+            "third_party_tokens carries the NEW credential fingerprint immediately"
+        );
+    }
+}
+
+/// Q1 (TUI repair direction): the `on_tick` drain drops a queued switch-away
+/// whose record carries a key-rejection cause when the active is re-keyed before
+/// dispatch — the active stays and the stale decision is not re-queued.
+#[test]
+fn on_tick_drops_a_repaired_key_rejected_switch_away() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+    let old_fp = crate::usage::profile_credential_fingerprint(
+        app.config()
+            .find(&ProfileName::from("tp"))
+            .expect("tp present"),
+    )
+    .expect("credentialed");
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: Some(("tp".to_string(), old_fp)),
+        });
+
+    // Re-key tp before the drain dispatches.
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("tp"))
+            .expect("tp present")
+            .api_key = Some("new-key".to_string());
+    }
+
+    // First tick drains the queued decision (and drops it); the second would
+    // complete a switch had one been dispatched.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "the re-keyed active stays put"
+    );
+    assert!(
+        app.pending_switch.lock().expect("pending").is_empty(),
+        "the stale switch-away is dropped, not re-queued"
+    );
+}
+
+/// Q1 (TUI ordinary direction): a cause-absent ordinary exhaustion decision
+/// still switches even beside a stale raw broken mark (the leftover of a
+/// same-name re-key).
+#[test]
+fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+
+    // A stale mark: recorded under a fingerprint that no longer matches tp's
+    // current credential. The ordinary decision carries no cause.
+    let stale_fp = crate::usage::profile_credential_fingerprint(&Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("other-key".to_string()),
+    ))
+    .expect("credentialed");
+    app.third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("tp".to_string(), stale_fp);
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // First tick dispatches (posts the gate); the second completes it.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("oauth"),
+        "the ordinary exhaustion switch still executes beside the stale mark"
+    );
+}
+
 #[test]
 fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
     use super::{ConfigRow, InputState, build_draft_existing, build_draft_new, config_rows};

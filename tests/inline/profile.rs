@@ -118,8 +118,8 @@ fn an_unclaimed_day_leaves_the_flag_in_charge() {
     let mut flagged = Profile::new("work".to_string(), None, None);
     flagged.preferred = true;
     let cfg = config_of(vec![flagged]);
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon, &HashSet::new()));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()));
 }
 
 // A list on an account the walk never visits claims nothing. Letting it count
@@ -141,10 +141,14 @@ fn a_non_members_list_reads_inert() {
     };
 
     assert!(
-        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()),
         "an off-chain list does not stand the flag down"
     );
-    assert!(!cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat));
+    assert!(!cfg.is_home_on(
+        &ProfileName::from("personal"),
+        Weekday::Sat,
+        &HashSet::new()
+    ));
 }
 
 // Same for a member the walk skips: disabled here, and auth-broken and
@@ -160,11 +164,15 @@ fn a_dead_members_list_hands_its_days_back_to_the_flag() {
     let cfg = config_of(vec![flagged, dead]);
 
     assert!(
-        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()),
         "a disabled lister leaves saturday to the flag"
     );
     assert!(
-        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        !cfg.is_home_on(
+            &ProfileName::from("personal"),
+            Weekday::Sat,
+            &HashSet::new()
+        ),
         "and cannot be home itself"
     );
 }
@@ -186,15 +194,18 @@ fn a_listed_day_stands_the_flag_down_elsewhere() {
     let personal = ProfileName::from("personal");
 
     assert!(
-        cfg.is_home_on(&personal, Weekday::Sat),
+        cfg.is_home_on(&personal, Weekday::Sat, &HashSet::new()),
         "the list claims sat"
     );
     assert!(
-        !cfg.is_home_on(&work, Weekday::Sat),
+        !cfg.is_home_on(&work, Weekday::Sat, &HashSet::new()),
         "the flag stands down on a claimed day"
     );
-    assert!(cfg.is_home_on(&work, Weekday::Mon), "monday is unclaimed");
-    assert!(!cfg.is_home_on(&personal, Weekday::Mon));
+    assert!(
+        cfg.is_home_on(&work, Weekday::Mon, &HashSet::new()),
+        "monday is unclaimed"
+    );
+    assert!(!cfg.is_home_on(&personal, Weekday::Mon, &HashSet::new()));
 }
 
 // One claimant is the ordinary case the whole feature is for, and zero is
@@ -206,8 +217,16 @@ fn one_claimant_or_none_raises_no_collision() {
     let flagged = Profile::new("work".to_string(), None, None);
     let cfg = config_of(vec![flagged, weekend]);
 
-    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None, "one claimant");
-    assert_eq!(cfg.day_claim_collision(Weekday::Mon), None, "no claimant");
+    assert_eq!(
+        cfg.day_claim_collision(Weekday::Sat, &HashSet::new()),
+        None,
+        "one claimant"
+    );
+    assert_eq!(
+        cfg.day_claim_collision(Weekday::Mon, &HashSet::new()),
+        None,
+        "no claimant"
+    );
 }
 
 // Two lists naming the same day break nothing — the return pass takes the
@@ -221,7 +240,9 @@ fn two_claimants_raise_a_collision_naming_both() {
     b.preferred_days = vec![Weekday::Sat];
     let cfg = config_of(vec![a, b]);
 
-    let notice = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    let notice = cfg
+        .day_claim_collision(Weekday::Sat, &HashSet::new())
+        .expect("collision");
     assert!(notice.contains("2 accounts claim sat"), "got {notice}");
     assert!(notice.contains("'work'"), "got {notice}");
     assert!(notice.contains("'personal'"), "got {notice}");
@@ -239,7 +260,7 @@ fn a_dead_listers_claim_does_not_count_as_a_collision() {
     dead.disabled = true;
     let cfg = config_of(vec![live, dead]);
 
-    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None);
+    assert_eq!(cfg.day_claim_collision(Weekday::Sat, &HashSet::new()), None);
 }
 
 // The notice is its callers' once-gate key, so it has to be byte-stable while
@@ -253,14 +274,17 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
     b.preferred_days = vec![Weekday::Sat, Weekday::Sun];
     let cfg = config_of(vec![a, b]);
 
-    let sat = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    let sat = cfg
+        .day_claim_collision(Weekday::Sat, &HashSet::new())
+        .expect("collision");
     assert_eq!(
-        cfg.day_claim_collision(Weekday::Sat).as_deref(),
+        cfg.day_claim_collision(Weekday::Sat, &HashSet::new())
+            .as_deref(),
         Some(sat.as_str()),
         "the same day re-derives the same bytes"
     );
     assert_ne!(
-        cfg.day_claim_collision(Weekday::Sun),
+        cfg.day_claim_collision(Weekday::Sun, &HashSet::new()),
         Some(sat.clone()),
         "the rollover changes it"
     );
@@ -275,7 +299,7 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
         .push(ProfileName::from("spare"));
     widened.profiles.push(third);
     assert_ne!(
-        widened.day_claim_collision(Weekday::Sat),
+        widened.day_claim_collision(Weekday::Sat, &HashSet::new()),
         Some(sat),
         "a config edit changes it"
     );
@@ -302,9 +326,13 @@ fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
         profiles: vec![member, off_chain],
     };
 
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()));
     assert!(
-        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        !cfg.is_home_on(
+            &ProfileName::from("personal"),
+            Weekday::Sat,
+            &HashSet::new()
+        ),
         "a healthy account off the chain cannot be home on a day it cannot serve"
     );
 }
@@ -320,7 +348,7 @@ fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
     disabled.disabled = true;
     let cfg = config_of(vec![Profile::new("work".to_string(), None, None), disabled]);
     assert!(
-        !cfg.is_home_on(&ProfileName::from("old"), Weekday::Mon),
+        !cfg.is_home_on(&ProfileName::from("old"), Weekday::Mon, &HashSet::new()),
         "a disabled account carrying the flag is home on no day"
     );
 
@@ -335,7 +363,7 @@ fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
         profiles: vec![Profile::new("work".to_string(), None, None), off_chain],
     };
     assert!(
-        !cfg.is_home_on(&ProfileName::from("spare"), Weekday::Mon),
+        !cfg.is_home_on(&ProfileName::from("spare"), Weekday::Mon, &HashSet::new()),
         "and neither is one off the chain"
     );
 }
@@ -347,7 +375,7 @@ fn a_healthy_members_flag_still_answers_an_unclaimed_day() {
     let mut flagged = Profile::new("work".to_string(), None, None);
     flagged.preferred = true;
     let cfg = config_of(vec![flagged]);
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon, &HashSet::new()));
 }
 
 // A list that cannot claim is worth saying at tick time, not just at save
@@ -362,7 +390,9 @@ fn a_passed_over_lister_names_what_became_of_the_day() {
     dead.disabled = true;
     let cfg = config_of(vec![carrier, dead]);
 
-    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    let notice = cfg
+        .day_claim_passed_over(Weekday::Sat, &HashSet::new())
+        .expect("a notice");
     assert!(notice.starts_with("sat:"), "got {notice}");
     assert!(notice.contains("the list on 'old'"), "got {notice}");
     assert!(notice.contains("the account is disabled"), "got {notice}");
@@ -381,7 +411,9 @@ fn a_passed_over_lister_with_no_carrier_names_the_fallback() {
     dead.disabled = true;
     let cfg = config_of(vec![dead]);
 
-    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    let notice = cfg
+        .day_claim_passed_over(Weekday::Sat, &HashSet::new())
+        .expect("a notice");
     assert!(notice.contains("nothing else claims sat"), "got {notice}");
     assert!(notice.contains("`preferred` decides it"), "got {notice}");
 }
@@ -396,9 +428,18 @@ fn listers_that_can_all_serve_raise_no_passed_over_notice() {
     b.preferred_days = vec![Weekday::Sun];
     let cfg = config_of(vec![a, b]);
 
-    assert_eq!(cfg.day_claim_passed_over(Weekday::Sat), None);
-    assert_eq!(cfg.day_claim_passed_over(Weekday::Sun), None);
-    assert_eq!(cfg.day_claim_passed_over(Weekday::Mon), None);
+    assert_eq!(
+        cfg.day_claim_passed_over(Weekday::Sat, &HashSet::new()),
+        None
+    );
+    assert_eq!(
+        cfg.day_claim_passed_over(Weekday::Sun, &HashSet::new()),
+        None
+    );
+    assert_eq!(
+        cfg.day_claim_passed_over(Weekday::Mon, &HashSet::new()),
+        None
+    );
 }
 
 // `disabled` (the per-account exclusion toggle) must default to `false` so

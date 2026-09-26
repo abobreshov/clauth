@@ -19,8 +19,9 @@ use super::chain::reason_marker;
 use super::format::spinner_frame;
 use super::overview::switch_mark;
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
-    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines, head_cols, key_cell,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
+    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines,
+    head_cols, key_cell,
 };
 use crate::fallback::BlockedReason;
 
@@ -837,6 +838,7 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         reason(BlockedReason::Disabled, DIAG_DISABLED),
         reason(BlockedReason::Canceled, DIAG_CANCELED),
         reason(BlockedReason::AuthBroken, DIAG_AUTH_BROKEN),
+        reason(BlockedReason::KeyRejected, DIAG_KEY_REJECTED),
         reason(
             BlockedReason::WeeklySpent { resets_in: None },
             DIAG_WEEKLY_SPENT,

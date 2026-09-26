@@ -60,12 +60,13 @@ use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
-    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
-    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
-    clear_activity, collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle,
-    mark_activity, now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
+    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff,
+    PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, StartupReceiver,
+    StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
+    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
+    now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1836,6 +1837,8 @@ pub(crate) struct App {
     pub(crate) third_party_tokens: ThirdPartyList,
     pub(crate) third_party_usage_store: ThirdPartyUsageStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
+    pub(crate) third_party_streaks: ThirdPartyStreaks,
+    pub(crate) third_party_broken: ThirdPartyBroken,
     pub(crate) tab: Tab,
     /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
     /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
@@ -2137,6 +2140,8 @@ struct WorkerHandles {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    third_party_streaks: ThirdPartyStreaks,
+    third_party_broken: ThirdPartyBroken,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
     bootstrap_active: Arc<AtomicBool>,
@@ -2165,6 +2170,8 @@ impl WorkerHandles {
             third_party_tokens: Arc::clone(&app.third_party_tokens),
             third_party_usage_store: Arc::clone(&app.third_party_usage_store),
             third_party_status: Arc::clone(&app.third_party_status),
+            third_party_streaks: Arc::clone(&app.third_party_streaks),
+            third_party_broken: Arc::clone(&app.third_party_broken),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
             bootstrap_active: Arc::clone(&app.bootstrap_active),
@@ -2220,6 +2227,8 @@ impl App {
         let third_party_usage_store: ThirdPartyUsageStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+        let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
@@ -2346,6 +2355,8 @@ impl App {
             third_party_tokens,
             third_party_usage_store,
             third_party_status,
+            third_party_streaks,
+            third_party_broken,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
@@ -2430,6 +2441,24 @@ impl App {
         };
         app.refresh_unsaved_live_login();
         app
+    }
+
+    /// The live key-rejected member set, read once per render (never per walk
+    /// candidate): the broken fingerprint map intersected with the CURRENT
+    /// config profiles (the same `profile_credential_fingerprint` the scheduler
+    /// scans use), so a repair that landed in the config drops the name the
+    /// moment the render reads it — never gated on the separately refreshed
+    /// `ThirdPartyList`.
+    pub(crate) fn key_rejected_names(&self) -> HashSet<ProfileName> {
+        let broken = self
+            .third_party_broken
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let cfg = self.config();
+        crate::usage::current_key_rejected_names(&broken, &cfg.profiles)
+            .into_iter()
+            .collect()
     }
 
     /// Landing, applied at construction (before the first paint). The FIRST
@@ -2695,9 +2724,10 @@ impl App {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
+                let key_rejected = self.key_rejected_names();
                 let returned = self
                     .config()
-                    .is_home_today(&ProfileName::from(target.clone()));
+                    .is_home_today(&ProfileName::from(target.clone()), &key_rejected);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
@@ -2742,6 +2772,8 @@ impl App {
             h.third_party_tokens,
             h.third_party_usage_store,
             h.third_party_status,
+            h.third_party_streaks,
+            h.third_party_broken,
             suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
@@ -6398,7 +6430,10 @@ fn write_preferred_days(
     };
     match result {
         Ok(saved) => (!saved.is_empty())
-            .then(|| crate::fallback::day_claim_blocker(&app.config(), name))
+            .then(|| {
+                let key_rejected = app.key_rejected_names();
+                crate::fallback::day_claim_blocker(&app.config(), name, &key_rejected)
+            })
             .flatten(),
         Err(e) => {
             app.toast(
@@ -8832,6 +8867,11 @@ fn commit_endpoint(app: &mut App) {
     };
     match result {
         Ok(()) => {
+            // Re-collect the token and third-party entries so the fetch leg
+            // schedules the re-keyed credential's first fetch same-frame. The
+            // rejection verdict reads the AppConfig profile fingerprint, never
+            // this list, so a stale entry cannot keep the name key-rejected.
+            app.refresh_tokens();
             // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
@@ -10480,13 +10520,13 @@ pub(crate) fn on_tick(app: &mut App) {
 
     drain_switch_gates(app);
 
-    let auto_switch_targets: Vec<String> = app
+    let auto_switch_targets: Vec<PendingSwitchTarget> = app
         .pending_switch
         .lock()
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
-    for name in auto_switch_targets {
-        let name = ProfileName::from(name);
+    for decision in auto_switch_targets {
+        let name = ProfileName::from(decision.target.clone());
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
         }
@@ -10496,7 +10536,23 @@ pub(crate) fn on_tick(app: &mut App) {
         // can also land here when the preferred is the only clear member left —
         // both are genuinely "now on home", so the destination-based label holds
         // without threading the cause through `SwitchAction`.
-        let returning = app.config().is_home_today(&name);
+        let key_rejected = app.key_rejected_names();
+        // Revalidate under the fresh config (reloaded above). Only a record that
+        // CARRIES a key-rejection cause can be stale: a repair landing between
+        // the scan's queue and this dispatch changes the active's fingerprint, so
+        // the switch-away it motivated is dropped instead of moving off the
+        // just-repaired account. A cause-absent (ordinary exhaustion/home) record
+        // executes even beside an ambient stale mark.
+        {
+            let cfg = app.config();
+            if crate::usage::queued_switch_away_is_stale(
+                decision.key_rejected_cause.as_ref(),
+                &cfg.profiles,
+            ) {
+                continue;
+            }
+        }
+        let returning = app.config().is_home_today(&name, &key_rejected);
         let msg = if returning {
             format!("returning to preferred account '{name}'")
         } else {
@@ -10536,7 +10592,8 @@ pub(crate) fn on_tick(app: &mut App) {
 /// Dropping a notice out of the set is what lets the same state, removed and
 /// re-introduced, warn again.
 pub(crate) fn warn_day_claim_notices(app: &mut App) {
-    let notices = app.config().day_claim_notices_today();
+    let key_rejected = app.key_rejected_names();
+    let notices = app.config().day_claim_notices_today(&key_rejected);
     if notices == app.day_claim_notices {
         return;
     }

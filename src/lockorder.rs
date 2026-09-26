@@ -148,6 +148,21 @@ pub(crate) mod rank {
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;
         ThirdPartyStatus = 280;
+        /// Per-profile consecutive provider-429 streak
+        /// (`usage::scheduler::ThirdPartyStreaks`): the third-party analogue of
+        /// [`PollStreak`]'s `rate_limit` axis, driving the same stuck judgment.
+        /// Leaf like `ThirdPartyStatus` — bumped/reset in the third-party leg
+        /// and read alone by the two auto-switch predicates, the status feed,
+        /// and the TUI Usage row.
+        ThirdPartyStreak = 290;
+        /// Per-profile third-party key-rejection set
+        /// (`usage::scheduler::ThirdPartyBroken`): members whose api KEY the
+        /// provider rejected, treated as auth-broken by the chain walks. Live
+        /// only (never persisted); leaf — written/cleared in the third-party
+        /// leg and read by the scans, the TUI/daemon key-rejected helpers (chain
+        /// walks and day notices), and both switch drains, each comparing the
+        /// recorded fingerprint with the current profile under one config snapshot.
+        ThirdPartyBroken = 295;
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;
