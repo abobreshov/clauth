@@ -3969,9 +3969,9 @@ fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
 }
 
 /// Re-run `report-profile.sh` for one pane with the pane id set and the
-/// event/context JSON cleared — the exact `watch-profile.sh` invocation. The
-/// script's pidfile gate skips the watcher spawn while a live watch exists,
-/// so re-running it alongside the live watchers is safe.
+/// event/context JSON cleared, so the script reads the pane's live agent
+/// itself. The script's pidfile gate skips the watcher spawn while a live
+/// watch exists, so re-running it alongside the live watchers is safe.
 fn rerun_pane_report(script: &str, pane: &str) {
     let _ = crate::herdr::bounded_output(
         script,

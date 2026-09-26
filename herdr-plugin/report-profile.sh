@@ -91,28 +91,61 @@ row_profile() {
     printf '%s\n' "$_p"
 }
 
+# Reads a herdr pane JSON line's own `agent` field from stdin. The nested
+# objects that carry their own `agent` key — a persisted session record
+# (`agent_session`, whose `agent` field is always present), state labels, and
+# metadata tokens — are cut off first, so the greedy match reads the pane's
+# top-level `agent`, never a nested one; an absent top-level `agent` (an idle
+# pane) reads empty.
+pane_agent() {
+    sed -n 's/"state_labels":.*//; s/"tokens":.*//; s/"agent_session":.*//; s/.*"agent":"\([^"]*\)".*/\1/p'
+}
+
 # The agent hooks fire for every agent herdr detects. Claude Code and codex
 # panes spend a clauth account; cursor and the rest do not. Both hooked events
-# carry `agent`; the watcher's re-report empties the event JSON on purpose and
-# names the harness it was spawned for in CLAUTH_PANE_AGENT instead, so a codex
-# pane's re-run cannot fall to the Claude Code answer; the `clauth.which`
-# action carries `focused_pane_agent` in its context, and that fallback is
-# consulted ONLY when no pane id is set (actions have none) — an event hook
-# reading the context's focused pane would answer for whichever pane holds
-# focus, not the pane the event fired for. Nothing is set for a plain shell
-# pane, which is the one case that still gets an answer.
-agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | sed -n 's/.*"agent":"\([^"]*\)".*/\1/p')
-[ -n "$agent" ] || agent="${CLAUTH_PANE_AGENT:-}"
-if [ -z "$agent" ] && [ -z "$pane" ]; then
-    agent=$(printf '%s' "${HERDR_PLUGIN_CONTEXT_JSON:-}" | sed -n 's/.*"focused_pane_agent":"\([^"]*\)".*/\1/p')
+# name the agent when herdr has one; the watcher's re-report empties the event
+# JSON on purpose and hands the live agent it just read from `pane get` in
+# CLAUTH_PANE_AGENT, sparing a second `pane get`; the `clauth.which` action and
+# the TUI knob push carry neither. The `"agent":"` anchor keeps the pane's
+# `"display_agent":"` from matching.
+if [ -n "$pane" ]; then
+    # A pane's live agent outranks the event's: a release event names the agent
+    # that just exited, while `pane get` names what runs now. The watcher's
+    # CLAUTH_PANE_AGENT is its own live read a moment earlier, so it stands in
+    # for a fresh one.
+    agent="${CLAUTH_PANE_AGENT:-}"
+    if [ -z "$agent" ]; then
+        if raw=$("$herdr_bin" pane get "$pane" 2>/dev/null); then
+            agent=$(printf '%s\n' "$raw" | pane_agent)
+        else
+            # A failed `pane get` is not a definitive "no agent": fall back to
+            # the event's agent, and with none keep the last tag — publish
+            # nothing, spawn nothing.
+            agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | pane_agent)
+            [ -n "$agent" ] || exit 0
+        fi
+    fi
+else
+    agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | pane_agent)
 fi
+# A pane whose live agent is neither claude nor codex (its live read names no
+# agent, or another one) spends no clauth account. It publishes the matching
+# clears and spawns no watcher, from every caller, like the watcher's own exit,
+# so an idle shell pane stops showing an account instead of inheriting the
+# claude-arm answer. Without a pane there is nothing to clear, and the claude
+# arm below keeps its answer.
+agentless=""
 case "$agent" in
-    "" | claude | codex) ;;
-    *) exit 0 ;;
+    claude | codex) ;;
+    *)
+        if [ -n "$pane" ]; then
+            agentless=1
+        fi
+        ;;
 esac
 
 profile=""
-if [ -n "$pane" ]; then
+if [ -z "$agentless" ] && [ -n "$pane" ]; then
     info=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null)
     # The pane's own session is named by the foreground process group id herdr
     # reports — the `clauth start` supervisor for every clauth-started pane
@@ -150,24 +183,39 @@ fi
 # `codex` burns the operator's own login, which is a clauth account only once
 # adopted — and `clauth which` is never asked for it: a caller holding no
 # CODEX_HOME gets the Claude Code answer there, a different harness's account.
-if [ -z "$profile" ]; then
+definitive_empty=""
+if [ -z "$agentless" ] && [ -z "$profile" ]; then
     if [ "$agent" = codex ]; then
         profile=$(adopted_codex_profile)
+        # A codex pane with no adopted login is a DEFINITIVE empty resolution:
+        # the pane spends no clauth account, so the empty side publishes the
+        # clear and spawns the watcher below. The claude arm's empty is a
+        # `clauth which` failure (`clauth which` prints `unknown` at exit 0
+        # when nothing resolves), not a statement about the pane, and keeps
+        # today's silent exit — whatever the caller.
+        [ -z "$profile" ] && definitive_empty=1
     else
         profile=$(clauth which 2>/dev/null) || profile=""
     fi
 fi
-[ -n "$profile" ] || exit 0
+[ -n "$profile" ] || { [ -n "$definitive_empty" ] && [ -n "$pane" ]; } || [ -n "$agentless" ] || exit 0
 
-printf '%s\n' "$profile"
+[ -z "$profile" ] || printf '%s\n' "$profile"
 
 [ -n "$pane" ] || exit 0
+# An agentless pane clears both artifacts in every knob combination, so publish
+# the clears directly and skip the clauth knob reads below — the watcher's exit
+# clear (`watch-profile.sh`) does the same.
+if [ -n "$agentless" ]; then
+    "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --clear-token clauth --clear-display-agent
+    exit 0
+fi
 # Each knob owns one artifact, and its off side publishes the matching clear
-# instead of nothing: a knob toggled off must not leave its stale artifact
-# standing on the pane. pane_tag still gates the watcher spawn below, while
-# the resolve above prints either way.
+# instead of nothing: a knob toggled off, or an empty resolution, must not
+# leave its stale artifact standing on the pane. pane_tag still gates the
+# watcher spawn below, while the resolve above prints either way.
 pane_tag=$(clauth herdr config get pane_tag 2>/dev/null || printf 'on')
-if [ "$pane_tag" = on ]; then
+if [ -n "$profile" ] && [ "$pane_tag" = on ]; then
     token_flag="--token"
     token_value="clauth=$profile"
 else
@@ -181,7 +229,7 @@ border_label=$(clauth herdr config get border_label 2>/dev/null || printf 'off')
 # and that order answers `unknown option: <value>` at exit 2 on 0.8.0. Named
 # flags may sit in any order; only the positional-first order is load-bearing.
 set -- "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" "$token_flag" "$token_value"
-if [ "$border_label" = on ]; then
+if [ -n "$profile" ] && [ "$border_label" = on ]; then
     set -- "$@" --display-agent "$profile"
 else
     set -- "$@" --clear-display-agent
@@ -192,9 +240,10 @@ fi
 # A --with-fallback session moves onto another account mid-run with no herdr
 # event, so the one-shot report above goes stale until the next status change.
 # Spawn a detached per-pane watcher to re-report on a timer instead. Only
-# claude and codex panes spend a clauth account; a plain shell pane resolves
-# `agent` empty and is left alone. The pidfile makes later invocations skip the spawn
-# while that watch lives, and the watcher removes it when the pane closes.
+# claude and codex panes spend a clauth account; an agentless pane publishes
+# its clear above and is left watcher-less. The pidfile makes later invocations
+# skip the spawn while that watch lives, and the watcher removes it when it
+# exits: the pane closed, or it runs neither claude nor codex.
 case "$agent" in
     claude | codex) ;;
     *) exit 0 ;;
@@ -211,4 +260,4 @@ if ! ( umask 077; set -C; echo "$$" > "$pidfile" ) 2>/dev/null; then
     [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && exit 0
 fi
 dir=$(dirname "$0")
-"$dir/watch-profile.sh" "$pane" "$pidfile" "$agent" </dev/null >/dev/null 2>&1 &
+"$dir/watch-profile.sh" "$pane" "$pidfile" </dev/null >/dev/null 2>&1 &
