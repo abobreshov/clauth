@@ -189,6 +189,8 @@ pub(crate) enum Command {
     /// Reads the same on-disk usage caches `status --json` prints, so the
     /// numbers match, and never fetches. The active profile is marked `*` and
     /// always shown; disabled profiles are hidden unless `--all`/`--disabled`.
+    /// Codex accounts follow in their own section, the active one marked `*`
+    /// too; they have no disabled state, so `--all` does not change that section.
     List {
         /// Also list disabled profiles, hidden by default.
         #[arg(long)]
