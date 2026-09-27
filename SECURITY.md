@@ -135,7 +135,7 @@ Nothing else sends inference or writes to your account.
 
 ## Auto-update verification
 
-Binary installs check for a newer release in the background on launch. Every step fails closed, so if any of them errors the update is skipped and the running binary stays put:
+Binary installs check for a newer release in the background on launch, unless auto-update is off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) or `CLAUTH_NO_UPDATE=1` is set. Every step fails closed, so if any of them errors the update is skipped and the running binary stays put:
 
 1. Ask the GitHub releases API for the latest tag; stop if it isn't newer.
 2. Download `sha256sums.txt`. A fetch error stops here (no integrity, no update).
@@ -143,7 +143,7 @@ Binary installs check for a newer release in the background on launch. Every ste
 4. Download the platform asset (10 MB ceiling) and check its SHA-256 against the now-trusted sums file. A mismatch stops the update.
 5. Write to a temp file, fsync, then self-replace atomically. The new binary takes over on the next launch.
 
-`cargo` installs (binary under `~/.cargo/bin`) are told an update exists but never replaced. `CLAUTH_NO_UPDATE=1` turns the whole thing off.
+`cargo` installs (binary under `~/.cargo/bin`) are told an update exists but never replaced. Auto-update off or `CLAUTH_NO_UPDATE=1` turns the whole thing off.
 
 Releases are signed in CI with a passwordless minisign key kept as a GitHub Actions secret; the signing step writes the key to disk and deletes it on exit. The public half is pinned in `src/update.rs`.
 
@@ -183,7 +183,8 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 
 | Switch | Effect |
 |--------|--------|
-| `CLAUTH_NO_UPDATE=1` | disables all background update checks and self-replacement |
+| auto-update off (the Config tab row, `[update] auto_update = false`) | disables all background update checks, self-replacement, and the herdr-plugin reinstall |
+| `CLAUTH_NO_UPDATE=1` | the same, even when auto-update is on |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completion-install prompt |
 | `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket, whatever the flags say |
 | an empty `fallback_chain` (the default) | clauth never switches accounts on its own |

@@ -165,8 +165,10 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] first_landing_done` | bool | `false` | set to `true` once the first herdr launch lands; later launches open `home_tab` |
 | `[serve]` | table | `{}` | the daemon-wide session-creation switch ([Daemon](Daemon)) |
 | `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
+| `[update]` | table | `{}` | the auto-updater toggle (Config tab) |
+| `[update] auto_update` | bool | `true` | the background update check on launch and the daemon's remote herdr-plugin reinstall; the whole table is omitted while on, and `CLAUTH_NO_UPDATE=1` disables both even when this is on |
 
-A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
+A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker — including a key nested inside a table clauth does model, so a future knob under `[update]`, `[herdr]` or `[serve]` survives the same way, even on a save where that table's own modelled key is back at its default and the table would render nothing. The one exception is a nested key whose name is not a bare identifier, which is dropped rather than written mis-scoped. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
 
 ## `codex-profiles.toml`
 

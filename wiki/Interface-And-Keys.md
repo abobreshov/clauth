@@ -83,7 +83,7 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
 | `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
-There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an empty value saves as empty, so the key stays. Drop one by editing the account's `config.toml`.
+There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
 
 `disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
@@ -103,7 +103,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `api key` | the key for that endpoint |
 | `model` | the account's default model; <kbd>space</kbd> cycles presets, <kbd>⏎</kbd> types a full id |
 | `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
-| env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one keeps the key |
+| env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one removes the key |
 | `+ login` / `re-login` | what it runs depends on the account, the same three-way split `clauth login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone. While a browser login runs its modal offers <kbd>r</kbd> to open the browser again, <kbd>c</kbd> to copy the sign-in link for another device to your local clipboard through the terminal (OSC 52: kitty, WezTerm, Windows Terminal, tmux with `set-clipboard on`, and iTerm2 once `General > Selection > Applications in terminal may access clipboard` is on), and <kbd>p</kbd> to turn that row into a code field: type or paste the code the link's page shows, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back; a bad paste clears the field and says why |
 | `log out` | drops the stored credentials, keeps the profile |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again, or signs Claude Code out when the account has only an api key behind it; the row's hint names which. Appears while ANY long-lived piece exists — the token, the preserved mint backup, or a set `rolling_token` flag — arms on the first press, clears on the second (the full exit: flag, sidecar, and backup together). Faint and inert when clearing would strip the account's last credential; a flag-only account disarms regardless, since no credential is touched |
@@ -124,6 +124,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
+| `auto-update` | check for a newer release on launch (hint copy provisional pending sign-off) | on |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
 | `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |

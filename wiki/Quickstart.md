@@ -116,7 +116,7 @@ clauth list           # account table with cached usage, no network
 
 | Variable | Effect |
 |----------|--------|
-| `CLAUTH_NO_UPDATE=1` | disables the background update check and self-replacement |
+| `CLAUTH_NO_UPDATE=1` | disables the background update check and self-replacement even when the Config tab's `auto-update` toggle is on |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completions prompt |
 | `CLAUTH_NO_API=1` | disables the daemon's REST listener whatever `--listen` says |
 | `CLAUDE_CONFIG_DIR` | scopes `which` and `start` to that config dir's credentials |

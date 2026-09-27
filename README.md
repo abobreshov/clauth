@@ -67,7 +67,7 @@ cargo install clauth
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
 ```
 
-Binary installs update themselves in the background, checksum and signature verified before anything is replaced; `CLAUTH_NO_UPDATE=1` turns that off. Cargo installs upgrade with `cargo install clauth`. On first launch clauth offers to install shell completions, asking before it touches your shell rc. More: [Install](https://github.com/uwuclxdy/clauth/wiki/Install).
+Binary installs update themselves in the background, checksum and signature verified before anything is replaced; the Config tab's `auto-update` toggle turns that off, and `CLAUTH_NO_UPDATE=1` overrides it. Cargo installs upgrade with `cargo install clauth`. On first launch clauth offers to install shell completions, asking before it touches your shell rc. More: [Install](https://github.com/uwuclxdy/clauth/wiki/Install).
 
 ## Quickstart
 
