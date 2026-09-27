@@ -641,11 +641,13 @@ pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> B
 const META_RULE_MIN: usize = 3;
 
 /// [`section_box`] with two meta slots: `left` as a title of its own one
-/// border cell after the title (`╭ TITLE ─ left ───`), `meta` in the border
+/// border cell after the title (`╭─ TITLE ─ left ───`), `meta` in the border
 /// break just before the top-right corner (`… meta ─╮`). Both are data styled
 /// alike, `TEXT_DIM` and never bold or italic, and the dashes around them keep
-/// the border token: the dash between the title and `left` is the cell ratatui
-/// leaves bare between two left-aligned titles.
+/// the border token: the corner-adjacent dash and the dash between the title
+/// and `left` are border cells — the corner dash is part of the title line,
+/// the between-titles dash is the cell ratatui leaves bare between two
+/// left-aligned titles.
 ///
 /// Only the right slot gives way: it renders while `width` leaves it at least
 /// [`META_RULE_MIN`] border cells of rule after the title and the left slot,
@@ -663,8 +665,10 @@ pub(super) fn section_box_meta(
     width: u16,
 ) -> Block<'static> {
     let left = left.map(|name| Line::from(Span::styled(format!(" {name} "), theme::dim())));
-    // `╭` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`.
-    let insets = 2
+    // `╭─` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`:
+    // the corner-adjacent dash is a border cell of its own, counted here so the
+    // right slot keeps its ≥[`META_RULE_MIN`] rule cells at the compliant shape.
+    let insets = 3
         + Line::from(title_label(title, true)).width()
         + left.as_ref().map_or(0, |left| 1 + left.width())
         + meta_line(meta, Style::default()).width();
@@ -719,7 +723,17 @@ fn section_box_impl(
             base
         }
     };
-    let mut title_spans = vec![Span::styled(title_label(title, uppercase), title_style)];
+    let mut title_spans = Vec::with_capacity(2 + suffix.len());
+    if !title.is_empty() {
+        // The corner-adjacent dash `╭─ TITLE`: chrome owns every `─` cell, so it
+        // carries the border token, never the title style.
+        title_spans.push(Span::styled("─", border_style));
+        title_spans.push(Span::styled(title_label(title, uppercase), title_style));
+    }
+    // An EMPTY title pushes no spans at all — not even `title_label("")`'s
+    // two-space inset, which would punch a hole in the top border. The
+    // width-probe callers never render, and a rendered empty title must keep
+    // the full rule run (no dash, no hole).
     title_spans.extend(suffix);
     let mut block = Block::bordered()
         .border_set(border::ROUNDED)

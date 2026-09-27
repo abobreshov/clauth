@@ -2274,11 +2274,12 @@ fn accounts_title_row(app: &App, width: u16) -> String {
 /// eyebrow unfiltered, the harness name under the filter as a left meta slot,
 /// a title of its own one border cell after the eyebrow (`ACCOUNTS ─ claude`).
 ///
-/// The panel's row is `╭` + ` TITLE ` + `─` + ` left ` + rule + ` meta ` +
-/// `─` + `╮`, so the one-claude fixture's ` 1 claude ` slot (10 cells) needs
-/// `rule = width - 23 >= 3` unfiltered and `width - 23 - 1 - left >= 3`
-/// filtered (`left` = the name plus its two insets): at width 25 the
-/// unfiltered rule is 2 and a filtered one is shorter still, so the counts
+/// The panel's row is `╭─` + ` TITLE ` + `─` + ` left ` + rule + ` meta ` +
+/// `─` + `╮` (the corner-adjacent dash is a border cell of the title line), so
+/// the one-claude fixture's ` 1 claude ` slot (10 cells, ` meta ` plus its
+/// closing dash) needs `width - 3 - 10 - 10 >= 3` unfiltered and
+/// `width - 3 - 10 - 1 - left - 10 >= 3` filtered (`left` = the name plus its
+/// two insets): the unfiltered slot holds at 26, and at width 25 the counts
 /// slot sheds in all three rows and they read as the title, its left slot and
 /// the rule alone.
 #[test]
@@ -2293,33 +2294,73 @@ fn the_accounts_title_row_carries_the_harness_filter() {
 
     assert_eq!(
         accounts_title_row(&app, 25),
-        "╭ ACCOUNTS ─────────────╮",
+        "╭─ ACCOUNTS ────────────╮",
         "unfiltered: the eyebrow and the border rule alone"
     );
 
     app.harness_filter = HarnessFilter::Claude;
     assert_eq!(
         accounts_title_row(&app, 25),
-        "╭ ACCOUNTS ─ claude ────╮",
+        "╭─ ACCOUNTS ─ claude ───╮",
         "the claude filter names the harness it shows"
     );
 
     app.harness_filter = HarnessFilter::Codex;
     assert_eq!(
         accounts_title_row(&app, 25),
-        "╭ ACCOUNTS ─ codex ─────╮",
+        "╭─ ACCOUNTS ─ codex ────╮",
         "the codex filter names the harness it shows"
+    );
+}
+
+/// R1: the title opens with the corner-adjacent dash `╭─ ACCOUNTS` — a border
+/// cell in the border token, never title styling — and the give-way arithmetic
+/// counts it before the right slot keeps its ≥3 rule cells: the
+/// `3 claude · 2 codex` meta holds at 46 and sheds at 45 under ` claude `, one
+/// column past the pre-dash boundary.
+#[test]
+fn the_accounts_title_opens_with_the_corner_dash_and_the_counts_keep_their_gap() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let mut app = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+            profile("cl3", 80.0, 30.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ────────────╮",
+        "unfiltered: the corner-adjacent dash opens the border break"
+    );
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert_eq!(
+        accounts_title_row(&app, 46),
+        "╭─ ACCOUNTS ─ claude ─── 3 claude · 2 codex ─╮",
+        "at 46 the counts keep their three rule cells behind the corner dash"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 45),
+        "╭─ ACCOUNTS ─ claude ───────────────────────╮",
+        "at 45 the counts shed, one column past the pre-dash boundary"
     );
 }
 
 /// Below the title line's own width ratatui clips the row from the right, the
 /// left slot first; nothing sheds ahead of the clip. At 12 columns the eyebrow
-/// fills the border break and at 13 one bare border cell follows it, so every
-/// filter state reads the same there. From 14 the slot shows as far as the row
-/// reaches: at 16 a filtered row still names its harness by its first letters,
-/// and at 20 the clip takes only the claude slot's closing inset. A slot that
-/// shed instead would read as the unfiltered row at 16 under either filter and
-/// at 20 under claude; ` codex ` fills its line whole at 20.
+/// loses its trailing inset behind the corner dash and at 13 the label fills
+/// the border break, so every filter state reads the same there. From 14 the
+/// slot shows as far as the row reaches: at 16 a filtered row still names its
+/// harness by its first letter, and at 20 the clip takes the claude slot's
+/// tail and the codex slot's closing inset. A slot that shed instead would
+/// read as the unfiltered row at 16 under either filter; ` codex ` fills its
+/// line whole at 21.
 #[test]
 fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
     use crate::tui::app::HarnessFilter;
@@ -2333,29 +2374,29 @@ fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
     for (filter, at_16, at_20) in [
         (
             HarnessFilter::All,
-            "╭ ACCOUNTS ────╮",
-            "╭ ACCOUNTS ────────╮",
+            "╭─ ACCOUNTS ───╮",
+            "╭─ ACCOUNTS ───────╮",
         ),
         (
             HarnessFilter::Claude,
-            "╭ ACCOUNTS ─ cl╮",
-            "╭ ACCOUNTS ─ claude╮",
+            "╭─ ACCOUNTS ─ c╮",
+            "╭─ ACCOUNTS ─ claud╮",
         ),
         (
             HarnessFilter::Codex,
-            "╭ ACCOUNTS ─ co╮",
-            "╭ ACCOUNTS ─ codex ╮",
+            "╭─ ACCOUNTS ─ c╮",
+            "╭─ ACCOUNTS ─ codex╮",
         ),
     ] {
         app.harness_filter = filter;
         assert_eq!(
             accounts_title_row(&app, 12),
-            "╭ ACCOUNTS ╮",
+            "╭─ ACCOUNTS╮",
             "{filter:?} at 12"
         );
         assert_eq!(
             accounts_title_row(&app, 13),
-            "╭ ACCOUNTS ─╮",
+            "╭─ ACCOUNTS ╮",
             "{filter:?} at 13"
         );
         assert_eq!(accounts_title_row(&app, 16), at_16, "{filter:?} at 16");
@@ -2366,14 +2407,16 @@ fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
 /// Every term of the meta slot's give-way arithmetic counts display cells,
 /// never chars, each pinned at the width that holds the meta on its three rule
 /// cells and one column narrower, where it sheds (`buffer_rows` reads each wide
-/// glyph's continuation cell as a space):
-/// - the meta: `界界` (4 cells) under the 10-cell title needs `rule = width -
-///   12 - 7 >= 3`, holding at 22; counting chars keeps it at 21.
-/// - the left slot: `界界` beside a `1 x` meta needs `rule = width - 12 - 1 -
-///   6 - 6 >= 3`, holding at 28; counting chars keeps it at 27.
+/// glyph's continuation cell as a space). The insets count the corner-adjacent
+/// dash too (3 = the two corners plus that dash):
+/// - the meta: `界界` (4 cells) under the 10-cell title needs
+///   `rule = width - 13 - 7 >= 3`, holding at 23; counting chars keeps it at 22.
+/// - the left slot: `界界` beside a `1 x` meta needs
+///   `rule = width - 13 - 1 - 6 - 6 >= 3`, holding at 29; counting chars keeps
+///   it at 28.
 /// - the title: `界ß` uppercases to ` 界SS ` (6 cells, 5 chars, 4 before
-///   uppercasing) and needs `rule = width - 8 - 6 >= 3` beside `1 x`, holding
-///   at 17; counting chars either way keeps it at 16.
+///   uppercasing) and needs `rule = width - 9 - 6 >= 3` beside `1 x`, holding
+///   at 18; counting chars either way keeps it at 17.
 #[test]
 fn every_give_way_term_measures_wide_glyphs_in_display_cells() {
     let row = |title: &str, left: Option<&str>, meta: &str, width: u16| {
@@ -2390,46 +2433,47 @@ fn every_give_way_term_measures_wide_glyphs_in_display_cells() {
     };
 
     assert_eq!(
-        row("accounts", None, "界界", 22),
-        "╭ ACCOUNTS ─── 界 界  ─╮",
-        "a wide meta keeps its three rule cells at 22"
+        row("accounts", None, "界界", 23),
+        "╭─ ACCOUNTS ─── 界 界  ─╮",
+        "a wide meta keeps its three rule cells at 23"
     );
     assert_eq!(
-        row("accounts", None, "界界", 21),
-        "╭ ACCOUNTS ─────────╮",
-        "a wide meta is gone at 21"
+        row("accounts", None, "界界", 22),
+        "╭─ ACCOUNTS ─────────╮",
+        "a wide meta is gone at 22"
+    );
+    assert_eq!(
+        row("accounts", Some("界界"), "1 x", 29),
+        "╭─ ACCOUNTS ─ 界 界  ─── 1 x ─╮",
+        "beside a wide left slot the meta keeps its three rule cells at 29"
     );
     assert_eq!(
         row("accounts", Some("界界"), "1 x", 28),
-        "╭ ACCOUNTS ─ 界 界  ─── 1 x ─╮",
-        "beside a wide left slot the meta keeps its three rule cells at 28"
+        "╭─ ACCOUNTS ─ 界 界  ────────╮",
+        "beside a wide left slot the meta is gone at 28"
     );
     assert_eq!(
-        row("accounts", Some("界界"), "1 x", 27),
-        "╭ ACCOUNTS ─ 界 界  ────────╮",
-        "beside a wide left slot the meta is gone at 27"
+        row("界ß", None, "1 x", 18),
+        "╭─ 界 SS ─── 1 x ─╮",
+        "under a wide, lengthening title the meta keeps its three rule cells at 18"
     );
     assert_eq!(
         row("界ß", None, "1 x", 17),
-        "╭ 界 SS ─── 1 x ─╮",
-        "under a wide, lengthening title the meta keeps its three rule cells at 17"
-    );
-    assert_eq!(
-        row("界ß", None, "1 x", 16),
-        "╭ 界 SS ────────╮",
-        "under a wide, lengthening title the meta is gone at 16"
+        "╭─ 界 SS ────────╮",
+        "under a wide, lengthening title the meta is gone at 17"
     );
 }
 
 /// The counts slot gives way before the filter slot: its give-way arithmetic
 /// counts the filter's cells, so a filtered panel needs
-/// `rule = width - 12 - 1 - left - 21 >= 3` under the `3 claude · 2 codex`
-/// meta (the bare gap cell, then ` meta ─`), where `left` is the name plus its
-/// two insets. That holds the counts at 45 under ` claude ` and
-/// 44 under ` codex `; one column narrower the counts drop whole and the
-/// filter stays, since a filtered list under a bare title would misread it.
-/// The 36 and 35 rows are the unfiltered shed test's widths: the unfiltered
-/// panel holds its counts at 36, and a filtered one has shed them at both.
+/// `width - 3 - 10 - 1 - left - 21 >= 3` under the `3 claude · 2 codex`
+/// meta (the corner-adjacent dash, the bare gap cell, then ` meta ─`), where
+/// `left` is the name plus its two insets. That holds the counts at 46 under
+/// ` claude ` and 45 under ` codex `; one column narrower the counts drop
+/// whole and the filter stays, since a filtered list under a bare title would
+/// misread it. The 37 and 36 rows are the unfiltered shed test's widths: the
+/// unfiltered panel holds its counts at 37, and a filtered one has shed them
+/// at both.
 #[test]
 fn the_counts_slot_sheds_before_the_filter_slot() {
     use crate::tui::app::HarnessFilter;
@@ -2452,45 +2496,45 @@ fn the_counts_slot_sheds_before_the_filter_slot() {
 
     app.harness_filter = HarnessFilter::Claude;
     assert_eq!(
-        accounts_title_row(&app, 45),
-        "╭ ACCOUNTS ─ claude ─── 3 claude · 2 codex ─╮",
-        "at 45 the counts keep their three rule cells after the claude slot"
+        accounts_title_row(&app, 46),
+        "╭─ ACCOUNTS ─ claude ─── 3 claude · 2 codex ─╮",
+        "at 46 the counts keep their three rule cells after the claude slot"
     );
     assert_eq!(
-        accounts_title_row(&app, 44),
-        "╭ ACCOUNTS ─ claude ───────────────────────╮",
+        accounts_title_row(&app, 45),
+        "╭─ ACCOUNTS ─ claude ───────────────────────╮",
         "one column narrower the counts are gone and the claude slot stays"
     );
     assert_eq!(
         accounts_title_row(&app, 36),
-        "╭ ACCOUNTS ─ claude ───────────────╮",
+        "╭─ ACCOUNTS ─ claude ──────────────╮",
         "at 36 the claude slot stays without the counts"
     );
     assert_eq!(
         accounts_title_row(&app, 35),
-        "╭ ACCOUNTS ─ claude ──────────────╮",
+        "╭─ ACCOUNTS ─ claude ─────────────╮",
         "at 35 the claude slot stays without the counts"
     );
 
     app.harness_filter = HarnessFilter::Codex;
     assert_eq!(
-        accounts_title_row(&app, 44),
-        "╭ ACCOUNTS ─ codex ─── 3 claude · 2 codex ─╮",
-        "at 44 the counts keep their three rule cells after the codex slot"
+        accounts_title_row(&app, 45),
+        "╭─ ACCOUNTS ─ codex ─── 3 claude · 2 codex ─╮",
+        "at 45 the counts keep their three rule cells after the codex slot"
     );
     assert_eq!(
-        accounts_title_row(&app, 43),
-        "╭ ACCOUNTS ─ codex ───────────────────────╮",
+        accounts_title_row(&app, 44),
+        "╭─ ACCOUNTS ─ codex ───────────────────────╮",
         "one column narrower the counts are gone and the codex slot stays"
     );
     assert_eq!(
         accounts_title_row(&app, 36),
-        "╭ ACCOUNTS ─ codex ────────────────╮",
+        "╭─ ACCOUNTS ─ codex ───────────────╮",
         "at 36 the codex slot stays without the counts"
     );
     assert_eq!(
         accounts_title_row(&app, 35),
-        "╭ ACCOUNTS ─ codex ───────────────╮",
+        "╭─ ACCOUNTS ─ codex ──────────────╮",
         "at 35 the codex slot stays without the counts"
     );
 }
@@ -2523,12 +2567,12 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
         let buf = term.backend().buffer();
         let row = crate::testutil::buffer_rows(buf)[0].clone();
         assert!(
-            row.starts_with(&format!("╭ ACCOUNTS ─ {name} ")),
+            row.starts_with(&format!("╭─ ACCOUNTS ─ {name} ")),
             "{filter:?}: the filter slot follows the eyebrow: {row:?}"
         );
-        let eyebrow = "╭ ".chars().count();
-        let gap = "╭ ACCOUNTS ".chars().count();
-        let start = "╭ ACCOUNTS ─ ".chars().count();
+        let eyebrow = "╭─ ".chars().count();
+        let gap = "╭─ ACCOUNTS ".chars().count();
+        let start = "╭─ ACCOUNTS ─ ".chars().count();
 
         let dash = &buf.content[gap];
         assert_eq!(dash.symbol(), "─", "{filter:?}: the gap is a border cell");
@@ -2599,21 +2643,21 @@ fn the_accounts_meta_slot_counts_both_harnesses_whatever_the_filter_shows() {
 
     assert_eq!(
         accounts_title_row(&app, 50),
-        "╭ ACCOUNTS ───────────────── 3 claude · 2 codex ─╮",
+        "╭─ ACCOUNTS ──────────────── 3 claude · 2 codex ─╮",
         "unfiltered: both rosters, no filter slot leaving a longer rule"
     );
 
     app.harness_filter = HarnessFilter::Claude;
     assert_eq!(
         accounts_title_row(&app, 50),
-        "╭ ACCOUNTS ─ claude ──────── 3 claude · 2 codex ─╮",
+        "╭─ ACCOUNTS ─ claude ─────── 3 claude · 2 codex ─╮",
         "the claude filter leaves the counts alone"
     );
 
     app.harness_filter = HarnessFilter::Codex;
     assert_eq!(
         accounts_title_row(&app, 50),
-        "╭ ACCOUNTS ─ codex ───────── 3 claude · 2 codex ─╮",
+        "╭─ ACCOUNTS ─ codex ──────── 3 claude · 2 codex ─╮",
         "the codex filter leaves the counts alone"
     );
 }
@@ -2634,7 +2678,7 @@ fn the_accounts_meta_slot_omits_a_roster_with_no_accounts() {
     ));
     assert_eq!(
         accounts_title_row(&claude_only, 50),
-        "╭ ACCOUNTS ─────────────────────────── 2 claude ─╮"
+        "╭─ ACCOUNTS ────────────────────────── 2 claude ─╮"
     );
 
     crate::testutil::write_codex_roster(&["cx1", "cx2"]);
@@ -2646,7 +2690,7 @@ fn the_accounts_meta_slot_omits_a_roster_with_no_accounts() {
     );
     assert_eq!(
         accounts_title_row(&codex_only, 50),
-        "╭ ACCOUNTS ──────────────────────────── 2 codex ─╮"
+        "╭─ ACCOUNTS ─────────────────────────── 2 codex ─╮"
     );
 }
 
@@ -2658,14 +2702,33 @@ fn an_empty_roster_pair_renders_no_meta_slot() {
     let app = App::new(config_with(Vec::new(), None, vec![]));
     assert_eq!(
         accounts_title_row(&app, 50),
-        "╭ ACCOUNTS ──────────────────────────────────────╮"
+        "╭─ ACCOUNTS ─────────────────────────────────────╮"
+    );
+}
+
+/// An EMPTY title renders the full rule run: both the corner-adjacent dash and
+/// the `title_label("")` two-space inset are skipped, so a never-titled box
+/// (today only the two width-probe callers, which measure `.inner()`) cannot
+/// punch a hole in the top border if it is ever rendered.
+#[test]
+fn an_empty_title_keeps_the_full_rule_run() {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 3)).expect("terminal");
+    term.draw(|f| f.render_widget(section_box("", true, true), f.area()))
+        .expect("draw");
+    assert_eq!(
+        crate::testutil::buffer_rows(term.backend().buffer())[0],
+        "╭──────────╮",
+        "no dash, no hole: the border rule runs corner to corner"
     );
 }
 
 /// The slot sheds whole rather than crowding the title: at a `3 claude ·
-/// 2 codex` meta (18 cells) under an `ACCOUNTS` title (8) it renders while
-/// `rule = width - 8 - 18 - 7 >= 3`, so 36 holds it at the three rule cells
-/// `META_RULE_MIN` asks for and 35 drops it with the rule run whole.
+/// 2 codex` meta under an `ACCOUNTS` title it renders while
+/// `rule = width - 3 - 10 - 21 >= 3` (10 = the title and its corner-adjacent
+/// dash in display cells, 21 = the bare cell plus the meta text and its
+/// closing dash), so 37 holds it at the three rule cells
+/// `META_RULE_MIN` asks for and 36 drops it with the rule run whole.
 #[test]
 fn the_accounts_meta_slot_sheds_before_the_title_loses_its_rule() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2686,13 +2749,13 @@ fn the_accounts_meta_slot_sheds_before_the_title_loses_its_rule() {
     );
 
     assert_eq!(
-        accounts_title_row(&app, 36),
-        "╭ ACCOUNTS ─── 3 claude · 2 codex ─╮",
-        "at 36 the slot keeps its three rule cells"
+        accounts_title_row(&app, 37),
+        "╭─ ACCOUNTS ─── 3 claude · 2 codex ─╮",
+        "at 37 the slot keeps its three rule cells"
     );
     assert_eq!(
-        accounts_title_row(&app, 35),
-        "╭ ACCOUNTS ───────────────────────╮",
+        accounts_title_row(&app, 36),
+        "╭─ ACCOUNTS ───────────────────────╮",
         "one column narrower the slot is gone and the title keeps its rule"
     );
 }

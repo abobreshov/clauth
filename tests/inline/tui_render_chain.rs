@@ -1682,7 +1682,7 @@ fn a_chain_row_carries_no_live_session_tally() {
     assert_eq!(
         pane,
         vec![
-            "╭ CHAIN ─────────────────────╮".to_string(),
+            "╭─ CHAIN ────────────────────╮".to_string(),
             "│ ❯  #1 busy                 │".to_string(),
             "│    #2 idle                 │".to_string(),
             "│                            │".to_string(),
@@ -1925,7 +1925,7 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     assert_eq!(
         chain_selector_pane(&app, 120, 6),
         vec![
-            "╭ CHAIN ───────────────────────────╮".to_string(),
+            "╭─ CHAIN ──────────────────────────╮".to_string(),
             "│ ❯  #1 busy                       │".to_string(),
             "│                                  │".to_string(),
             "│                                  │".to_string(),
@@ -1987,7 +1987,7 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
     assert_eq!(
         chain_selector_pane(&marker_app(), 100, 8),
         vec![
-            "╭ CHAIN ─────────────────────╮".to_string(),
+            "╭─ CHAIN ────────────────────╮".to_string(),
             "│ ❯  #1 ok                   │".to_string(),
             "│    #2 blockedname        ⊖ │".to_string(),
             "│    #3 hot                ◔ │".to_string(),
@@ -2014,7 +2014,7 @@ fn a_narrow_pane_clamps_a_marked_members_name_rather_than_dropping_its_marker() 
     assert_eq!(
         chain_selector_pane(&marker_app(), 60, 8),
         vec![
-            "╭ CHAIN ───────────╮".to_string(),
+            "╭─ CHAIN ──────────╮".to_string(),
             "│ ❯  #1 ok         │".to_string(),
             "│    #2 blocked… ⊖ │".to_string(),
             "│    #3 hot      ◔ │".to_string(),

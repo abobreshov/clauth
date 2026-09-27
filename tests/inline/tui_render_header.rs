@@ -579,7 +579,7 @@ fn the_word_accounts_renders_on_the_panel_title_alone() {
         "the word renders exactly once on the whole screen: {carrying:?}"
     );
     assert!(
-        rows[carrying[0]].starts_with("╭ ACCOUNTS "),
+        rows[carrying[0]].starts_with("╭─ ACCOUNTS "),
         "and it is the accounts panel's title: {:?}",
         rows[carrying[0]]
     );
