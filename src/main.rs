@@ -2295,11 +2295,12 @@ fn use_reset_with(
         );
     };
     let account_id = auth.as_ref().and_then(|a| a.account_id());
+    let fedramp = auth.as_ref().is_some_and(|a| a.is_fedramp());
     if !list && !yes && !interactive {
         anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
     }
 
-    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id)
+    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id, fedramp)
         .map_err(|e| anyhow::anyhow!(reset::list_failure(&canonical, &e)))?;
     if list {
         for line in reset::describe_reset_credits(&canonical, &credits) {
@@ -2320,6 +2321,7 @@ fn use_reset_with(
         &urls.consume,
         access_token,
         account_id,
+        fedramp,
         &redeem_request_id,
         &credit.id,
     )

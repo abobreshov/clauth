@@ -28,6 +28,10 @@ minisign-verify = "0.2.5"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
 # transitively; pinned here as a direct dep). No unsafe in our crate.
 getrandom = "0.4.3"
+# The OS half of the codex UA (`codex_cli_rs/<version> (<os> <os version>;
+# <arch>) <terminal>`): codex's own client builds it from this crate, so
+# clauth's parity UA reads the same OS fields the same way.
+os_info = "3.15"
 # Echo-off prompt for the API key in `clauth login --base-url/--api-key`, so the
 # key never routes through argv / shell history / process listings. Cross-
 # platform; no transitive deps beyond libc (already in the tree).

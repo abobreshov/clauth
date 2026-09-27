@@ -441,7 +441,9 @@ fn is_v4_uuid(s: &str) -> bool {
 
 /// The wire against a loopback stub: the GET lists, the POST consumes the
 /// named credit under a v4 key, and both carry codex's headers — bearer,
-/// account id (only when there is one), `codex-cli`, JSON accept.
+/// account id (only when there is one), the parity UA, the fedramp flag only
+/// when the account is one, and no `Accept` (codex's backend client sends
+/// none).
 #[test]
 fn use_reset_list_and_consume_send_codexs_request() {
     let list_body = r#"{"credits": [{"id": "c-1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-01T00:00:00Z"}], "available_count": 1}"#;
@@ -454,18 +456,20 @@ fn use_reset_list_and_consume_send_codexs_request() {
     });
     let urls = ResetUrls::under(&addr);
 
-    let listed = list_reset_credits_at(&urls.list, "at.secret", Some("acc-1")).expect("200 lists");
+    let listed =
+        list_reset_credits_at(&urls.list, "at.secret", Some("acc-1"), true).expect("200 lists");
     assert_eq!(listed.next_to_use().map(|c| c.id.as_str()), Some("c-1"));
     let reply = consume_reset_credit_at(
         &urls.consume,
         "at.secret",
         Some("acc-1"),
+        false,
         "11111111-2222-4333-8444-555555555555",
         "c-1",
     )
     .expect("200 consumes");
     assert_eq!(reply.outcome(), ConsumeOutcome::Reset { windows_reset: 2 });
-    list_reset_credits_at(&urls.list, "at.secret", Some("  ")).expect("200 lists");
+    list_reset_credits_at(&urls.list, "at.secret", Some("  "), false).expect("200 lists");
 
     let seen = handle.join().expect("join stub");
     assert_eq!(seen.len(), 3, "one request per call, no retries");
@@ -482,9 +486,32 @@ fn use_reset_list_and_consume_send_codexs_request() {
         let header = |name| crate::testutil::request_header(raw, name);
         assert_eq!(header("authorization").as_deref(), Some("Bearer at.secret"));
         assert_eq!(header("chatgpt-account-id").as_deref(), Some("acc-1"));
-        assert_eq!(header("user-agent").as_deref(), Some("codex-cli"));
-        assert_eq!(header("accept").as_deref(), Some("application/json"));
+        let ua = header("user-agent").expect("a UA");
+        assert!(
+            ua == "codex_cli_rs" || ua.starts_with("codex_cli_rs/"),
+            "codex's own UA shape: {ua}"
+        );
     }
+    assert_eq!(
+        crate::testutil::request_header(get, "accept"),
+        None,
+        "codex's backend client sends no Accept on the GET"
+    );
+    assert_eq!(
+        crate::testutil::request_header(post, "accept"),
+        None,
+        "ureq's default Accept is suppressed on the POST too"
+    );
+    assert_eq!(
+        crate::testutil::request_header(get, "x-openai-fedramp").as_deref(),
+        Some("true"),
+        "a fedramp account flags itself the way codex does"
+    );
+    assert_eq!(
+        crate::testutil::request_header(post, "x-openai-fedramp"),
+        None,
+        "an ordinary account sends no fedramp flag"
+    );
     assert_eq!(
         crate::testutil::request_header(post, "content-type").as_deref(),
         Some("application/json")
@@ -517,19 +544,19 @@ fn use_reset_statuses_map_to_their_errors_without_a_retry() {
     });
     let urls = ResetUrls::under(&addr);
     assert_eq!(
-        list_reset_credits_at(&urls.list, "at", None),
+        list_reset_credits_at(&urls.list, "at", None, false),
         Err(ResetCallError::Unauthorized)
     );
     assert_eq!(
-        consume_reset_credit_at(&urls.consume, "at", None, "id", "c"),
+        consume_reset_credit_at(&urls.consume, "at", None, false, "id", "c"),
         Err(ResetCallError::Unauthorized)
     );
     assert_eq!(
-        consume_reset_credit_at(&urls.consume, "at", None, "id", "c"),
+        consume_reset_credit_at(&urls.consume, "at", None, false, "id", "c"),
         Err(ResetCallError::Status(503))
     );
     assert_eq!(
-        consume_reset_credit_at(&urls.consume, "at", None, "id", "c"),
+        consume_reset_credit_at(&urls.consume, "at", None, false, "id", "c"),
         Err(ResetCallError::Parse)
     );
     assert_eq!(handle.join().expect("join stub").len(), 4);
@@ -546,10 +573,11 @@ fn use_reset_transport_failure_is_reported_not_retried() {
         .port();
     let urls = ResetUrls::under(&format!("http://127.0.0.1:{port}"));
     assert_eq!(
-        list_reset_credits_at(&urls.list, "at", None),
+        list_reset_credits_at(&urls.list, "at", None, false),
         Err(ResetCallError::Transport)
     );
-    let err = consume_reset_credit_at(&urls.consume, "at", None, "id", "c").expect_err("no answer");
+    let err = consume_reset_credit_at(&urls.consume, "at", None, false, "id", "c")
+        .expect_err("no answer");
     assert_eq!(err, ResetCallError::Transport);
     assert!(consume_failure("work", &err).contains("may or may not have gone through"));
 }

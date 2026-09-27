@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::fetch::{http_agent, iso_to_epoch_secs};
+use super::fetch::iso_to_epoch_secs;
 use crate::format::{local_stamp, plural, truncate};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
@@ -34,13 +34,10 @@ pub(crate) const CODEX_RESET_CREDITS_URL: &str =
 pub(crate) const CODEX_RESET_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
-/// What codex's backend client sends when it has no richer User-Agent.
-const CODEX_USER_AGENT: &str = "codex-cli";
-
-/// End to end, body included. The shared agent's 8s wait for headers is lifted
-/// for these calls, because codex itself gives the consume 10s; this 15s
-/// deadline is the only bound after connect (the agent's 4s connect bound
-/// stays), so a stalled body can't hang the command.
+/// End to end, body included: codex itself gives the consume 10s and the list
+/// 5s (`app-server/src/request_processors/account_processor/rate_limit_resets.rs`),
+/// so this 15s global deadline is the only bound after connect — a stalled
+/// body can't hang the command.
 const RESET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The only reset type codex's picker knows by name; preferred when an account
@@ -198,29 +195,6 @@ pub(crate) enum ResetCallError {
     Parse,
 }
 
-/// codex's headers on both calls (its `BackendClient::headers`), plus the
-/// per-request deadline.
-fn codex_request<B>(
-    req: ureq::RequestBuilder<B>,
-    access_token: &str,
-    account_id: Option<&str>,
-) -> ureq::RequestBuilder<B> {
-    let mut req = req
-        .config()
-        .timeout_recv_response(None)
-        .timeout_global(Some(RESET_REQUEST_TIMEOUT))
-        .build()
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("User-Agent", CODEX_USER_AGENT)
-        .header("Accept", "application/json");
-    // A multi-workspace login answers for whichever account this names; without
-    // it the server picks, and the reset could land on the wrong workspace.
-    if let Some(id) = account_id.map(str::trim).filter(|id| !id.is_empty()) {
-        req = req.header("ChatGPT-Account-Id", id);
-    }
-    req
-}
-
 fn read_reply<T: DeserializeOwned>(
     result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<T, ResetCallError> {
@@ -242,8 +216,17 @@ pub(crate) fn list_reset_credits_at(
     url: &str,
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
 ) -> Result<ResetCredits, ResetCallError> {
-    read_reply(codex_request(http_agent().get(url), access_token, account_id).call())
+    read_reply(
+        super::codex_headers::apply_codex_headers(
+            super::codex_headers::codex_agent().get(url),
+            access_token,
+            account_id,
+            fedramp,
+        )
+        .call(),
+    )
 }
 
 /// The consume body. `credit_id` is optional on codex's wire (the server then
@@ -262,13 +245,23 @@ pub(crate) fn consume_reset_credit_at(
     url: &str,
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
     redeem_request_id: &str,
     credit_id: &str,
 ) -> Result<ConsumeReply, ResetCallError> {
     read_reply(
-        codex_request(http_agent().post(url), access_token, account_id)
-            .header("Content-Type", "application/json")
-            .send(consume_body(redeem_request_id, credit_id)),
+        super::codex_headers::apply_codex_headers(
+            super::codex_headers::codex_agent().post(url),
+            access_token,
+            account_id,
+            fedramp,
+        )
+        .config()
+        .timeout_recv_response(None)
+        .timeout_global(Some(RESET_REQUEST_TIMEOUT))
+        .build()
+        .header("Content-Type", "application/json")
+        .send(consume_body(redeem_request_id, credit_id)),
     )
 }
 

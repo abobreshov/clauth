@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, http_agent};
+use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
 
 /// The ChatGPT-flavored usage endpoint. codex's client also knows an
 /// `/api/codex/usage` spelling for API-key accounts (`PathStyle::CodexApi`);
@@ -198,17 +198,15 @@ pub(crate) fn fetch_codex_usage_at(
     url: &str,
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
-    let mut req = http_agent()
-        .get(url)
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("Accept", "application/json");
-    // Multi-workspace logins answer for whichever account this header names;
-    // without it the server picks, which is not necessarily the profile's.
-    if let Some(id) = account_id.map(str::trim).filter(|id| !id.is_empty()) {
-        req = req.header("chatgpt-account-id", id);
-    }
+    let req = super::codex_headers::apply_codex_headers(
+        super::codex_headers::codex_agent().get(url),
+        access_token,
+        account_id,
+        fedramp,
+    );
     let mut response = req.call().map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
     if status != 200 {
@@ -224,9 +222,10 @@ pub(crate) fn fetch_codex_usage_at(
 pub(crate) fn fetch_codex_usage(
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
-    fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, now_secs)
+    fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, fedramp, now_secs)
 }
 
 #[cfg(test)]

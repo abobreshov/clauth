@@ -3812,7 +3812,12 @@ fn codex_usage_tick(state: &SchedulerState) {
             continue;
         };
         await_request_slot(CODEX_USAGE_ORIGIN);
-        let outcome = crate::usage::fetch_codex_usage(token, auth.account_id(), now_epoch_secs());
+        let outcome = crate::usage::fetch_codex_usage(
+            token,
+            auth.account_id(),
+            auth.is_fedramp(),
+            now_epoch_secs(),
+        );
         if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
             guard
                 .get_or_insert_with(HashMap::new)

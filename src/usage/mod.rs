@@ -1,6 +1,9 @@
 mod auto_start_queue;
 mod burn;
 mod codex;
+// The headers codex's own CLI sends on its WHAM endpoints, shared by the poll
+// and the reset spend so the two cannot drift apart again.
+mod codex_headers;
 // `clauth use-reset`: the list/consume pair, its selection rule and its text.
 // One caller (`main.rs`), so reached by path rather than re-exported item by item.
 pub(crate) mod codex_reset;
