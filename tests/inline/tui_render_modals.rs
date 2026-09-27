@@ -502,7 +502,7 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
     assert_eq!(
         rows[top..top + 9].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ─────────────── acct ╮".to_string(),
+            "╭─ ACTIONS ───────────── acct ─╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh usage          r  │".to_string(),
             "│    rotate access token    t  │".to_string(),
@@ -534,7 +534,7 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
     assert_eq!(
         rows[top..top + 6].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ─────────────────────╮".to_string(),
+            "╭─ ACTIONS ────────────────────╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
@@ -576,7 +576,7 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     assert_eq!(
         rows[top..top + 7].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ──────────── acct ╮".to_string(),
+            "╭─ ACTIONS ────────── acct ─╮".to_string(),
             "│                           │".to_string(),
             "│  ❯ duplicate account   d  │".to_string(),
             "│    save as preset      s  │".to_string(),

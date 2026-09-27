@@ -21,7 +21,7 @@ use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
     DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines,
-    head_cols, key_cell,
+    head_cols, key_cell, meta_line,
 };
 use crate::fallback::BlockedReason;
 
@@ -276,8 +276,11 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 }
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
+/// The title opens with the corner-adjacent border dash (`╭─ TITLE`), the
+/// same chrome rule the panel family follows.
 fn modal_block(title: impl Into<String>) -> Block<'static> {
     let title_line = Line::from(vec![
+        Span::styled("─", Style::default().fg(theme::accent_2_color())),
         Span::raw(" "),
         Span::styled(
             title.into().to_uppercase(),
@@ -300,9 +303,12 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
     let block = modal_block(title);
     match meta {
-        Some(meta) => block.title(
-            Line::from(Span::styled(format!(" {meta} "), theme::dim())).alignment(Alignment::Right),
-        ),
+        // The name closes with a border cell of its own (`… name ─╮`), the
+        // border token matching the modal's orange border.
+        Some(meta) => block.title(meta_line(
+            meta,
+            Style::default().fg(theme::accent_2_color()),
+        )),
         None => block,
     }
 }

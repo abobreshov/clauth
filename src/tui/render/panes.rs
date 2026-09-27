@@ -758,7 +758,7 @@ fn title_label(title: &str, uppercase: bool) -> String {
 /// The title-right meta slot. A right-aligned title ends flush against the
 /// top-right corner, so the slot closes with a border cell of its own:
 /// `… meta ─╮`.
-fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
+pub(super) fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {meta} "), theme::dim()),
         Span::styled("─", border_style),

@@ -240,7 +240,10 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         .fg(theme::accent_2_color())
         .add_modifier(title_mods);
 
-    let mut title_spans = vec![Span::styled(" PLUGIN ", title_style)];
+    let mut title_spans = vec![
+        Span::styled("─", Style::default().fg(border_color)),
+        Span::styled(" PLUGIN ", title_style),
+    ];
     if app.plugin.fetching {
         title_spans.push(Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),

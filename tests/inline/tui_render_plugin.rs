@@ -681,6 +681,18 @@ fn the_delegates_pane_renders_its_empty_state_with_the_steer_line() {
 }
 
 #[test]
+fn the_pane_title_opens_with_the_corner_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_delegates(Vec::new());
+    let (rows, _) = render(&app);
+    assert!(
+        rows.iter().any(|r| r.starts_with("╭─ PLUGIN ")),
+        "the pane title carries the corner-adjacent dash:\n{:?}",
+        rows.iter().take(3).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn herdr_row_renders_ok_dot_without_fix() {
     let _home = crate::testutil::HomeSandbox::new();
     let check = herdr_check(&healthy_probe(), Some(&healthy_config()));

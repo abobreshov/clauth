@@ -18,7 +18,7 @@
 //! cards fall back to lifetime (badged) and costs render as `+`-marked floors.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -27,7 +27,7 @@ use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_m
 use super::super::theme;
 use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_selector_list, master_detail, picker_row, section_box, section_box_loading,
+    draw_selector_list, master_detail, meta_line, picker_row, section_box, section_box_loading,
     section_box_verbatim,
 };
 use crate::pricing::{HourTokens, PriceTable};
@@ -976,9 +976,10 @@ fn card(
         None => section_box(title, false, first),
     };
     if let Some(m) = meta {
-        block = block.title(
-            Line::from(Span::styled(format!(" {m} "), theme::dim())).alignment(Alignment::Right),
-        );
+        // The badge closes with a border cell of its own (`… badge ─╮`), the
+        // same rule the meta-slot family follows — the card border is the
+        // unfocused `LINE`.
+        block = block.title(meta_line(m, Style::default().fg(theme::line_color())));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);

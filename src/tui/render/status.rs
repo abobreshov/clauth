@@ -235,8 +235,12 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         .fg(theme::accent_2_color())
         .add_modifier(title_mods);
 
-    // Title token: ` INCIDENTS ` with the spinner inside the trailing inset.
-    let mut title_spans = vec![Span::styled(" INCIDENTS ", title_style)];
+    // Title token: ` INCIDENTS ` with the spinner inside the trailing inset,
+    // opened by the corner-adjacent border dash (`╭─ INCIDENTS`).
+    let mut title_spans = vec![
+        Span::styled("─", border_style),
+        Span::styled(" INCIDENTS ", title_style),
+    ];
     if app.status.fetching {
         title_spans.push(Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
