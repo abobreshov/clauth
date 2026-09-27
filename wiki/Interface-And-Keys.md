@@ -124,7 +124,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
-| `auto-update` | check for a newer release on launch (hint copy provisional pending sign-off) | on |
+| `auto-update` | checks for updates at launch, unless `CLAUTH_NO_UPDATE=1` | on |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
 | `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |
