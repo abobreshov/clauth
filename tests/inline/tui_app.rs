@@ -6265,6 +6265,70 @@ fn auto_start_queue_space_noops_until_an_account_opts_in() {
     assert!(reloaded.auto_start_queue, "the toggle persists to disk");
 }
 
+// ── auto-update (the [update] toggle) ────────────────────────────────────────
+
+/// The row flips the persisted `[update]` table through the real Config
+/// router: space off writes `auto_update = false` explicitly, ⏎ back on
+/// omits the whole table again (on is the default, so nothing renders).
+#[test]
+fn auto_update_row_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoUpdate)
+        .unwrap();
+    assert!(app.config().state.update.auto_update, "on by default");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.update.auto_update,
+        "space toggles it off"
+    );
+
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let reloaded: crate::profile::AppState =
+        toml::from_str(&std::fs::read_to_string(&path).expect("read profiles.toml"))
+            .expect("parse profiles.toml");
+    assert!(!reloaded.update.auto_update, "off persists to disk");
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        on_disk.contains("auto_update = false"),
+        "an explicit off must render or the next load reverts it to on:\n{on_disk}"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config().state.update.auto_update,
+        "⏎ mirrors space and toggles it back on"
+    );
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !on_disk.contains("update"),
+        "on (default) omits the whole [update] table:\n{on_disk}"
+    );
+}
+
+/// `App::new` reads the saved toggle: with `auto_update = false` persisted no
+/// update thread spawns — no handle, so no network path is ever driven.
+#[test]
+fn saved_off_update_leaves_new_app_with_no_update_handle() {
+    use crate::profile::AppConfig;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut state = crate::profile::AppState::default();
+    state.update.auto_update = false;
+    crate::profile::save_app_state(&state).expect("persist off toggle");
+    let app = App::new(AppConfig {
+        state,
+        profiles: Vec::new(),
+    });
+    assert!(
+        app.update_handle.is_none(),
+        "saved off → no update thread at startup"
+    );
+}
+
 // `money spent` is its own row, not an alias of `quota spent`: staying is free
 // when quota runs out and costs money when a budget does, so the two must be
 // settable in opposite directions.

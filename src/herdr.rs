@@ -750,16 +750,20 @@ static HEAL_THROTTLE: crate::plugin_host::HealThrottle = crate::plugin_host::Hea
 /// installed entry lie. Callers: the daemon tick and `clauth mcp` startup,
 /// mirroring the claude plugin's detached heal. Success and failure both log
 /// through `logline!`, never stdout.
-pub(crate) fn heal_detached() {
+///
+/// `saved_auto_update` is the persisted `[update]` table's `auto_update`,
+/// supplied by the caller from the config it just loaded.
+pub(crate) fn heal_detached(saved_auto_update: bool) {
     // The plugin is linux and macos only (its entrypoints are POSIX shell), so
     // there is nothing to heal on Windows.
     if cfg!(windows) {
         return;
     }
     // This heal is a network update (herdr's install fetches from GitHub), so
-    // the same opt-out that gates clauth's own binary update gates it, before
-    // the throttle claim so a disabled box never even claims an attempt.
-    if !crate::update::updates_enabled() {
+    // the same shared gate that governs clauth's own binary update gates it —
+    // the saved toggle AND `CLAUTH_NO_UPDATE` — before the throttle claim so
+    // a disabled box never even claims an attempt.
+    if !crate::update::updates_enabled(saved_auto_update) {
         return;
     }
     let Some(claim) = HEAL_THROTTLE.claim(crate::usage::now_ms()) else {

@@ -18,6 +18,8 @@ use crate::profile::{
     reload_fingerprint, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
+#[cfg(unix)]
+use crate::testutil::{git_shim, heal_env, lightweight_tag, stateful_heal_shim};
 use crate::usage::{
     FetchLeg, PendingSwitchTarget, ProfileActivity, mark_activity, mark_fetch_activity, now_ms,
 };
@@ -206,6 +208,75 @@ fn tick_heals_a_broken_plugin_registration() {
     assert!(
         !fake.log().is_empty(),
         "one tick over a broken registration must reach the heal"
+    );
+}
+
+/// The tick's herdr leg is the herdr-heal call site twin: one tick over a
+/// stale registry reaches the fake herdr install when the saved `[update]`
+/// toggle is on, and — after the tick's own reload picks a freshly persisted
+/// `auto_update = false` up — spawns nothing, leaving the throttle floor
+/// unclaimed (the re-enabled tick after it still installs).
+#[cfg(unix)]
+#[test]
+fn tick_herdr_heal_follows_the_saved_update_toggle() {
+    use std::ffi::OsStr;
+
+    use crate::testutil::join_background_tasks;
+
+    let home = HomeSandbox::new();
+    let stale = crate::herdr::plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(
+        &home,
+        &shim,
+        &stale,
+        &stale,
+        &tags,
+        &[("HERDR_SHIM_STATE", OsStr::new("1"))],
+    );
+    // The claude heal shares the tick; its throttle is armed so this test
+    // stays spawn-free beside the herdr heal it pins.
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::reset_heal_throttle_for_test();
+
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    // Saved off, written AFTER the daemon snapshot so the tick's reload is
+    // what picks it up.
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.update.auto_update = false;
+    save_app_state(&state).expect("persist off toggle");
+
+    daemon.tick();
+    join_background_tasks();
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "a tick after a reload with the saved toggle off reinstalls nothing"
+    );
+
+    // The saved-off tick must not have claimed the throttle: back on (again
+    // through the tick's reload), the very next tick installs.
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.update.auto_update = true;
+    save_app_state(&state).expect("persist on toggle");
+
+    daemon.tick();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "a tick with the saved toggle on reaches the fake install"
     );
 }
 

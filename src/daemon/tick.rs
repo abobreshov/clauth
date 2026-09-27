@@ -68,8 +68,16 @@ impl super::Daemon {
         // `heal_detached`), so this never blocks the run loop.
         crate::plugin_host::heal_detached();
         // Same shape for the herdr plugin: update a stale install in the
-        // background, throttled inside its own `heal_detached`.
-        crate::herdr::heal_detached();
+        // background, throttled inside its own `heal_detached`. Its saved
+        // `[update]` toggle gates the network leg like the binary update,
+        // read off the config this tick's reload just refreshed (a poisoned
+        // config mutex falls back to the absent-table default: on).
+        let auto_update = self
+            .config
+            .lock()
+            .map(|c| c.state.update.auto_update)
+            .unwrap_or(true);
+        crate::herdr::heal_detached(auto_update);
     }
 
     /// Log once, per day and per config change, what today's day lists are

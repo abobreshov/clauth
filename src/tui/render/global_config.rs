@@ -4,7 +4,7 @@
 //! eyebrow header: appearance (`theme`, `reset display`, the `clock`
 //! notation it gates, and `home tab`), scheduler (`on mismatch`, `refresh`
 //! cadence, `refresh spent` toggle, `context nudge`, `auto-start queue`,
-//! `rotation`), auto-switch (`weekly limit`,
+//! `rotation`, `auto-update`), auto-switch (`weekly limit`,
 //! `switch mode` = burn-aware, `walk order` (issue #86), the burn-aware
 //! `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
@@ -61,6 +61,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
+            auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
             any_auto_start: cfg.profiles.iter().any(|p| p.auto_start),
@@ -214,6 +215,7 @@ struct RowState {
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
+    auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
     /// Whether ANY account has opted into `auto_start` — the queue toggle is
@@ -334,6 +336,14 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "rotate the login before it expires"
         } else {
             "rotate the login only when a request rejects it"
+        }),
+        // The on-state hint names the env override plus the timing: the check
+        // runs at launch (and the daemon's herdr leg at its next reload), so
+        // toggling never cancels a live process.
+        GlobalConfigRow::AutoUpdate => String::from(if rows.auto_update {
+            "check for a newer release on launch, unless CLAUTH_NO_UPDATE=1"
+        } else {
+            "no update check runs until this is turned back on"
         }),
         GlobalConfigRow::RefreshSpentAccounts => String::from(if rows.refresh_spent {
             "keep checking accounts that are already at 100%"
@@ -509,6 +519,10 @@ fn detail_row(
             let options = [("lazy", !rows.preemptive), ("preemptive", rows.preemptive)];
             cycle_row(arrow, "rotation", &options, selected)
         }
+        // Never dimmed, never gated: the row edits the persisted value even
+        // while `CLAUTH_NO_UPDATE=1` overrides it (the env var stays
+        // authoritative until it goes, and the row renders what is saved).
+        GlobalConfigRow::AutoUpdate => toggle_row(arrow, "auto-update", rows.auto_update, selected),
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
         }

@@ -10,6 +10,8 @@ use clap::{CommandFactory, Parser as _};
 
 use crate::cli::{Cli, Command, HerdrCommand, HerdrConfigCommand};
 use crate::profile::{HerdrSettings, HomeTab, PopupWidth};
+#[cfg(unix)]
+use crate::testutil::{git_shim, heal_env, lightweight_tag, stateful_heal_shim, write_shim};
 
 /// Every plan this produces has to append onto the file it was planned against
 /// and still parse, or the write turns a working herdr config into a broken one.
@@ -533,72 +535,11 @@ fn pick_release_skips_unparseable_lines_and_non_release_tags() {
     assert_eq!(pick_release(""), None);
 }
 
-/// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT`, the real
-/// git's output shape, and recording every argv into `git.log` so a test pins
-/// exactly what the code passed. The heal and `install` resolve `git` off
-/// `PATH`, so the test prepends the shim's dir.
-#[cfg(unix)]
-fn git_shim(dir: &Path) -> PathBuf {
-    write_shim(
-        dir,
-        "git",
-        "echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
-    )
-}
-
 /// One annotated release tag's `ls-remote --tags` pair, the real git's shape:
 /// the tag-object line and its peeled `^{}` commit line.
 #[cfg(unix)]
 fn annotated_tag(tag: &str, tag_object: &str, commit: &str) -> String {
     format!("{tag_object}\trefs/tags/{tag}\n{commit}\trefs/tags/{tag}^{{}}\n")
-}
-
-/// One lightweight release tag's single `ls-remote --tags` line.
-#[cfg(unix)]
-fn lightweight_tag(tag: &str, commit: &str) -> String {
-    format!("{commit}\trefs/tags/{tag}\n")
-}
-
-/// The heal's staleness truth is the installed checkout's commit, so the shim
-/// flips its `plugin list --json` answer when an install runs: `ANSWER_BEFORE`
-/// until the `installed` state file exists, then `ANSWER_AFTER` (the install
-/// leg creates it). Every other invocation logs its argv into `heal.log`.
-#[cfg(unix)]
-fn stateful_heal_shim(dir: &Path) -> PathBuf {
-    write_shim(
-        dir,
-        "herdr",
-        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then if [ -f \"$(dirname \"$0\")/installed\" ]; then echo \"$ANSWER_AFTER\"; else echo \"$ANSWER_BEFORE\"; fi; exit 0; fi; if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then : > \"$(dirname \"$0\")/installed\"; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
-    )
-}
-
-/// The heal's own env: the herdr shim, the git shim ahead of `PATH`, the
-/// list answers, and the `ls-remote --tags` body. Returns the `EnvPin` guard.
-#[cfg(unix)]
-fn heal_env<'a>(
-    home: &'a crate::testutil::HomeSandbox,
-    herdr_shim: &Path,
-    before: &str,
-    after: &str,
-    tags: &str,
-    extra: &[(&'static str, &OsStr)],
-) -> crate::testutil::EnvPin<'a> {
-    let path = format!(
-        "{}:{}",
-        home.home().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut pins: Vec<(&'static str, Option<&OsStr>)> = vec![
-        ("HERDR_BIN_PATH", Some(herdr_shim.as_os_str())),
-        ("ANSWER_BEFORE", Some(OsStr::new(before))),
-        ("ANSWER_AFTER", Some(OsStr::new(after))),
-        ("TAGS_OUTPUT", Some(OsStr::new(tags))),
-        ("PATH", Some(OsStr::new(&path))),
-    ];
-    for (key, value) in extra {
-        pins.push((key, Some(*value)));
-    }
-    crate::testutil::EnvPin::new(home, &pins)
 }
 
 /// A stale github install (installed commit differs from the newest release
@@ -944,7 +885,7 @@ fn heal_detached_reinstalls_once_and_throttles() {
     );
     reset_heal_throttle_for_test();
 
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
@@ -954,7 +895,7 @@ fn heal_detached_reinstalls_once_and_throttles() {
     );
 
     // The floor is armed by the first attempt: a second spawns nothing.
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
@@ -990,7 +931,7 @@ fn heal_detached_respects_the_update_optout() {
     );
     reset_heal_throttle_for_test();
 
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     assert!(
         !home.home().join("heal.log").exists(),
@@ -1001,13 +942,60 @@ fn heal_detached_respects_the_update_optout() {
     // claimed, the floor would refuse this second, un-gated call. It landing
     // proves the opted-out call never armed the floor.
     let _unset = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
         "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
         "an un-gated call right after an opted-out one still installs"
+    );
+}
+
+/// The saved `[update].auto_update` toggle gates the network update exactly
+/// like the env opt-out: with the env unset, a saved off must suppress the
+/// install AND leave the throttle unclaimed (the un-gated follow-up call
+/// proves the floor was never armed). Red pre-change — the old gate read the
+/// env alone, so this first call installs.
+#[cfg(unix)]
+#[test]
+fn heal_detached_respects_the_saved_update_toggle() {
+    use crate::testutil::join_background_tasks;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(
+        &home,
+        &shim,
+        &entry,
+        &entry,
+        &tags,
+        &[("HERDR_SHIM_STATE", std::ffi::OsStr::new("1"))],
+    );
+    reset_heal_throttle_for_test();
+
+    heal_detached(false);
+    join_background_tasks();
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "the saved off gates the network update"
+    );
+
+    // The gate must run BEFORE the throttle claim: if the saved-off call had
+    // claimed, the floor would refuse this second, un-gated call. It landing
+    // proves the saved-off call never armed the floor.
+    heal_detached(true);
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "an un-gated call right after a saved-off one still installs"
     );
 }
 
@@ -1032,7 +1020,7 @@ fn heal_detached_fails_closed_without_the_shim_sentinel() {
         ],
     );
 
-    heal_detached();
+    heal_detached(true);
 }
 
 /// `install`'s herdr shim: answers the plugin list with `$ANSWER` (a registry
@@ -1824,18 +1812,6 @@ fn sed_pipe(input: &str, program: &str) -> String {
 /// Writes an executable shim named `name` under `dir`, the same shape the
 /// report tests use: a probe against a slow herdr must hit the timeout arm.
 #[cfg(unix)]
-fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("shim written");
-    let mut perms = std::fs::metadata(&path)
-        .expect("shim metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("shim chmod");
-    path
-}
-
 /// The probe bound: a herdr that never answers costs the caller the timeout,
 /// never a hang. A 10 s sleep shim must resolve as no version inside roughly
 /// the 2 s bound.

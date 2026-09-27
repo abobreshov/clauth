@@ -5547,8 +5547,14 @@ fn startup() -> Option<std::fs::File> {
     if std::env::var_os(MCP_PROBE_ENV).is_none() {
         crate::plugin_host::heal_detached();
         // The herdr twin: same detached throttle, same probe-env exclusion (a
-        // probe-spawned server must not reinstall the operator's plugin).
-        crate::herdr::heal_detached();
+        // probe-spawned server must not reinstall the operator's plugin). Its
+        // network leg reads the saved `[update]` toggle fresh at startup, so a
+        // server started after the toggle changed honors it; an unreadable
+        // profiles.toml keeps the absent-table default (on).
+        let auto_update = crate::profile::load_app_state()
+            .map(|s| s.update.auto_update)
+            .unwrap_or(true);
+        crate::herdr::heal_detached(auto_update);
     }
     // Held across `block_on`, so the flock drops with the process however it dies
     // — a bare `claude` runs no clauth teardown, SIGKILL least of all.

@@ -1923,3 +1923,79 @@ mod route_harness {
 
 #[cfg(unix)]
 pub(crate) use route_harness::*;
+
+/// An executable shell shim: `#!/bin/sh` + `body`, mode 0755. The heal
+/// fixtures resolve `herdr`/`git`/`claude` off `PATH`, so a test pins their
+/// behavior by prepending the shim's dir (unix-only: shebang + exec bit).
+#[cfg(unix)]
+pub(crate) fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("shim written");
+    let mut perms = std::fs::metadata(&path)
+        .expect("shim metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("shim chmod");
+    path
+}
+
+/// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real
+/// git's output shape) and recording every argv into `git.log`.
+#[cfg(unix)]
+pub(crate) fn git_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "git",
+        "echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
+    )
+}
+
+/// One lightweight release tag's `ls-remote --tags` line. (The annotated twin
+/// — a tag-object line plus its peeled `^{}` pair — stays local to the herdr
+/// tests, its only caller.)
+#[cfg(unix)]
+pub(crate) fn lightweight_tag(tag: &str, commit: &str) -> String {
+    format!("{commit}\trefs/tags/{tag}\n")
+}
+
+/// The herdr heal shim: `plugin list --json` answers `$ANSWER_BEFORE` until an
+/// install ran, then `$ANSWER_AFTER`; every other invocation logs into
+/// `heal.log`, so a test pins exactly what the heal passed.
+#[cfg(unix)]
+pub(crate) fn stateful_heal_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then if [ -f \"$(dirname \"$0\")/installed\" ]; then echo \"$ANSWER_AFTER\"; else echo \"$ANSWER_BEFORE\"; fi; exit 0; fi; if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then : > \"$(dirname \"$0\")/installed\"; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
+    )
+}
+
+/// The herdr heal's own env: the shims ahead of `PATH`, the list answers, and
+/// the `ls-remote --tags` body. `extra` pins test-specific vars on top.
+#[cfg(unix)]
+pub(crate) fn heal_env<'a>(
+    home: &'a HomeSandbox,
+    herdr_shim: &Path,
+    before: &str,
+    after: &str,
+    tags: &str,
+    extra: &[(&'static str, &std::ffi::OsStr)],
+) -> EnvPin<'a> {
+    let path = format!(
+        "{}:{}",
+        home.home().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut pins: Vec<(&'static str, Option<&std::ffi::OsStr>)> = vec![
+        ("HERDR_BIN_PATH", Some(herdr_shim.as_os_str())),
+        ("ANSWER_BEFORE", Some(std::ffi::OsStr::new(before))),
+        ("ANSWER_AFTER", Some(std::ffi::OsStr::new(after))),
+        ("TAGS_OUTPUT", Some(std::ffi::OsStr::new(tags))),
+        ("PATH", Some(std::ffi::OsStr::new(&path))),
+    ];
+    for (key, value) in extra {
+        pins.push((key, Some(*value)));
+    }
+    EnvPin::new(home, &pins)
+}

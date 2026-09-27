@@ -753,6 +753,340 @@ fn save_app_state_does_not_resurrect_a_modelled_key_from_disk() {
     );
 }
 
+// A future nested key inside a MODELLED table must survive the next save — the
+// recursive half of `save_app_state_keeps_unknown_keys_the_file_already_holds`.
+// `[update]` rides the top-level carry only while the key is unmodelled; the
+// moment the model gains the table (this task), a future sub-key inside it
+// would be deleted by every save — the class `[herdr]`/`[serve]` already had.
+#[test]
+fn save_app_state_keeps_unknown_nested_keys_inside_a_modelled_table() {
+    let _home = HomeSandbox::new();
+
+    let mut state = AppState {
+        profiles: vec![crate::profile::ProfileName::from("holder")],
+        herdr: HerdrSettings {
+            pane_tag: false,
+            ..HerdrSettings::default()
+        },
+        serve: ServeSettings {
+            session_creation: true,
+        },
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("save non-default tables");
+    let path = app_state_path().expect("app_state_path");
+    let disk = std::fs::read_to_string(&path).expect("read state file");
+    // Append future nested keys under the modelled tables, the shape a newer
+    // clauth (or a hand-edit) would write.
+    std::fs::write(
+        &path,
+        format!(
+            "{disk}[update]\nauto_update = false\nfuture = \"keepme\"\n\
+             [herdr.extra]\nwait2 = 7\n[serve.extra]\nwait3 = true\n"
+        ),
+    )
+    .expect("write state file + future nested keys");
+
+    // A save that only adds a profile must keep every future nested key.
+    state = toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse state");
+    state
+        .profiles
+        .push(crate::profile::ProfileName::from("fixture"));
+    save_app_state(&state).expect("save again");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    let nested = |path: &[&str]| {
+        let mut cur = &parsed;
+        for key in path {
+            cur = match cur.get(*key).and_then(toml::Value::as_table) {
+                Some(t) => t,
+                None => panic!("{key:?} missing from the saved file:\n{after}"),
+            };
+        }
+        cur
+    };
+    assert_eq!(
+        nested(&["herdr", "extra"])
+            .get("wait2")
+            .and_then(toml::Value::as_integer),
+        Some(7),
+        "the future nested key under [herdr] survived:\n{after}"
+    );
+    assert_eq!(
+        nested(&["serve", "extra"])
+            .get("wait3")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "the future nested key under [serve] survived:\n{after}"
+    );
+    assert_eq!(
+        nested(&["update"])
+            .get("future")
+            .and_then(toml::Value::as_str),
+        Some("keepme"),
+        "the future nested key under [update] survived:\n{after}"
+    );
+    assert!(
+        after.contains("\"fixture\""),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// `[update]` defaults ON with the whole table omitted at the default — the
+// `preemptive_rotation` serde contract, on a table: a state file written
+// before the table existed reads as ON, an explicit OFF serializes, a partial
+// or explicitly-ON table loads, and the default renders nothing.
+#[test]
+fn update_settings_defaults_on_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(
+        state.update.auto_update,
+        "a state file predating the table must read as the new default (on)"
+    );
+    assert!(AppState::default().update.auto_update);
+
+    let partial: AppState = toml::from_str("profiles = []\n[update]\nauto_update = false\n")
+        .expect("parse partial table");
+    assert!(
+        !partial.update.auto_update,
+        "a partial table fills its key from the file"
+    );
+    let explicit_on: AppState =
+        toml::from_str("profiles = []\n[update]\nauto_update = true\n").expect("parse explicit on");
+    assert!(explicit_on.update.auto_update);
+
+    let off = AppState {
+        update: UpdateSettings { auto_update: false },
+        ..AppState::default()
+    };
+    let rendered_off = toml::to_string_pretty(&off).expect("render off state");
+    assert!(
+        rendered_off.contains("[update]") && rendered_off.contains("auto_update = false"),
+        "off must render explicitly or the next load reverts it to on, got:\n{rendered_off}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_off).expect("reparse off state");
+    assert!(
+        !reparsed.update.auto_update,
+        "the operator's off must survive save + reload"
+    );
+
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_on.contains("update"),
+        "on (default) must omit the whole [update] table, got:\n{rendered_on}"
+    );
+}
+
+// The move-to-default edge: a modelled table whose modelled key flips BACK to
+// its default renders no `[table]` block on the same save, so a carried
+// unknown sub-key has no block to splice into — it must re-attach at EOF
+// under a fresh header, never drop (round-2 review, major).
+#[test]
+fn save_app_state_carries_unknown_nested_keys_when_the_table_renders_default() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n\n[update]\nauto_update = false\nfuture = \"keepme\"\n",
+    )
+    .expect("write disk state");
+
+    let mut state = load_app_state().expect("load");
+    assert!(!state.update.auto_update, "the saved off loads");
+    // The toggle flips back on: the next render omits the whole [update] table.
+    state.update.auto_update = true;
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    assert_eq!(
+        parsed
+            .get("update")
+            .and_then(|u| u.get("future"))
+            .and_then(toml::Value::as_str),
+        Some("keepme"),
+        "the future key survives the move-to-default save:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carried key sits under the preserved-keys marker:\n{after}"
+    );
+}
+
+// The disk-side skip (round-3 review, blocker): a disk table holding ONLY an
+// unmodelled sub-key parses with the model's table at its default, so the
+// round-trip renders no block and classifies nothing — and the top-level carry
+// excludes the table because the SAVE renders it (non-default). The sub-key
+// must survive via the nested path, classified against the render's own keys.
+#[test]
+fn save_app_state_carries_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nfuture = \"keepme\"\n")
+        .expect("write disk state");
+
+    let mut state = load_app_state().expect("load");
+    assert!(
+        !state.serve.session_creation,
+        "the table loads at its default"
+    );
+    // The save renders [serve] non-default, so the render writes the block.
+    state.serve.session_creation = true;
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    assert_eq!(
+        parsed
+            .get("serve")
+            .and_then(|s| s.get("future"))
+            .and_then(toml::Value::as_str),
+        Some("keepme"),
+        "the sub-key survives the all-unmodelled-disk-table save:\n{after}"
+    );
+    assert_eq!(
+        parsed["serve"]["session_creation"],
+        toml::Value::Boolean(true),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// The config.toml twin of the disk-side skip: a disk `[models]` holding ONLY
+// an unmodelled key parses with ModelSettings at its default (every field
+// skip-if-none), so the round-trip classifies nothing, and a save whose
+// profile HAS a model renders the block — the key must survive.
+#[test]
+fn save_profile_keeps_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() {
+    let _home = HomeSandbox::new();
+    let mut profile = Profile::new("cfgnested".to_string(), None, None);
+    profile.models.default = Some("claude-opus".to_string());
+    save_profile(&profile).expect("save");
+
+    let config_path =
+        profile_config_path(&crate::profile::ProfileName::from("cfgnested")).expect("config path");
+    // Overwrite the disk file so [models] holds ONLY the unmodelled key: the
+    // shape a hand-edit or a newer clauth leaves when the model's own fields
+    // are unset in the file.
+    std::fs::write(
+        &config_path,
+        "base_url = \"https://api.example.com\"\n\n[models]\nfuture_model = \"keepme\"\n",
+    )
+    .expect("write all-unmodelled models table");
+
+    profile.disabled = true;
+    save_profile(&profile).expect("save the disable");
+
+    let after = std::fs::read_to_string(&config_path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    assert_eq!(
+        parsed["models"]["future_model"],
+        toml::Value::String("keepme".into()),
+        "the unmodelled sub-key survives beside the rendered [models] block:\n{after}"
+    );
+    assert_eq!(
+        parsed["models"]["default"],
+        toml::Value::String("claude-opus".into()),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// The splice walk must not read `[`-leading content of a multi-line string as
+// a table header: the serializer renders a multi-line value as `key = """` on
+// its own line with the closer riding the last content line, so a value like
+// `opus = """\na\n[evil] = 1"""` puts a `[`-leading line inside the literal,
+// and a false header there fires the leave-block flush INSIDE it — the
+// modelled value corrupts and the carried key lands as string text (round-2
+// review, minor; doc re-shaped in round 3 to the serializer's measured form).
+// Direct unit on the merge, hand-built doc.
+#[test]
+fn merge_nested_carried_keys_never_reads_a_multiline_string_as_a_header() {
+    let rendered = "[models]\nopus = \"\"\"\na\n[evil] = 1\"\"\"\n";
+    let nested = vec![(
+        "models".to_string(),
+        "future".to_string(),
+        toml::Value::Integer(7),
+    )];
+    let out = merge_nested_carried_keys(rendered.to_string(), &nested);
+    let parsed: toml::Table = toml::from_str(&out).expect("output parses");
+    assert_eq!(
+        parsed["models"]["opus"],
+        toml::Value::String("a\n[evil] = 1".into()),
+        "the modelled value is byte-identical:\n{out}"
+    );
+    assert_eq!(
+        parsed["models"]["future"],
+        toml::Value::Integer(7),
+        "the carried key lands as a key, not string text:\n{out}"
+    );
+}
+
+// A dotted sub-header `[t.s]` of the same root is NOT the table's block: the
+// walk must end the splice-capable region there, so a pending scalar never
+// lands after it (it would scope to `t.s`) — and a table with no bare block
+// re-attaches at EOF (round-2 review, nit). Direct unit, hand-built doc.
+#[test]
+fn merge_nested_carried_keys_treats_a_dotted_subheader_as_end_of_block() {
+    let rendered = "[a]\nx = 1\n[t.s]\ny = 2\n";
+    let nested = vec![("t".to_string(), "wait".to_string(), toml::Value::Integer(7))];
+    let out = merge_nested_carried_keys(rendered.to_string(), &nested);
+    let parsed: toml::Table = toml::from_str(&out).expect("output parses");
+    assert_eq!(parsed["a"]["x"], toml::Value::Integer(1), "{out}");
+    assert_eq!(parsed["t"]["s"]["y"], toml::Value::Integer(2), "{out}");
+    assert_eq!(
+        parsed["t"]["wait"],
+        toml::Value::Integer(7),
+        "the scalar scopes to [t], never to [t.s] or [a]:\n{out}"
+    );
+    assert!(
+        out.contains("[t]\nwait = 7"),
+        "the no-block table re-attaches at EOF under a fresh header:\n{out}"
+    );
+}
+
+// The odd-count entry rule breaks on two measured serializer shapes (round-3
+// review, major): a single-line BASIC string ending in a `'''` run
+// (`key = "a'''"`) and a single-line LITERAL holding `"""` (`'p"""q'`) each
+// contain one delimiter occurrence, so line-wise counting read them as
+// multi-line openers — the following header vanished into string state and
+// the carry re-attached a SECOND table at EOF, a file that no longer parses.
+// Direct units on the merge, hand-built docs.
+#[test]
+fn merge_nested_carried_keys_never_opens_string_state_on_a_single_line_value() {
+    for (rendered, value) in [
+        (
+            "[models]\nopus = \"a'''\"\n\n[herdr]\npane_tag = false\n",
+            "a'''",
+        ),
+        (
+            "[models]\ntitle = 'p\"\"\"q'\n\n[herdr]\npane_tag = false\n",
+            "p\"\"\"q",
+        ),
+    ] {
+        let nested = vec![(
+            "herdr".to_string(),
+            "future".to_string(),
+            toml::Value::Integer(7),
+        )];
+        let out = merge_nested_carried_keys(rendered.to_string(), &nested);
+        let parsed: toml::Table = toml::from_str(&out).expect("output parses");
+        assert_eq!(
+            parsed["models"]
+                .get("opus")
+                .or_else(|| parsed["models"].get("title")),
+            Some(&toml::Value::String(value.into())),
+            "the modelled value is byte-identical:\n{out}"
+        );
+        assert_eq!(
+            parsed["herdr"]["future"],
+            toml::Value::Integer(7),
+            "the carried key lands inside the render's own [herdr] block:\n{out}"
+        );
+    }
+}
+
 // The reset-display pair (issue #39) renders as its own on-disk vocabulary, so
 // these pin the literal keys AND values rather than round-tripping through the
 // same enum both ways: a renamed variant would keep a round-trip green while
@@ -4070,12 +4404,14 @@ fn a_serve_table_round_trips() {
     );
 }
 
-/// A key inside `[serve]` that `ServeSettings` does not model is dropped on the
-/// next save WHILE the table renders (its modelled key is non-default), the
-/// same as a stray `[herdr]` key: the table is a closed struct, not a carried
-/// map. The default-table case carries the whole table — see the sibling test.
+/// A key inside `[serve]` that `ServeSettings` does not model now SURVIVES the
+/// next save while the table renders (its modelled key is non-default) — the
+/// recursive carry, the `[update]`-task class fix: a future nested key of a
+/// modelled table is carried inside that table's block, exactly like a future
+/// top-level key. The default-table case carries the whole table — see the
+/// sibling test.
 #[test]
-fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
+fn a_stray_serve_key_survives_while_the_table_renders_non_default() {
     let _home = HomeSandbox::new();
     let path = app_state_path().expect("app_state_path");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
@@ -4090,13 +4426,19 @@ fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
     save_app_state(&state).expect("save");
 
     let after = std::fs::read_to_string(&path).expect("read");
-    assert!(
-        !after.contains("stray"),
-        "the stray key is dropped:\n{after}"
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed.get("serve").and_then(|serve| serve.get("stray")),
+        Some(&toml::Value::String("gone".into())),
+        "the future nested key survives inside the [serve] table:\n{after}"
     );
     assert!(
         after.contains("session_creation = true"),
         "the modelled key survives:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carried key sits under the preserved-keys marker:\n{after}"
     );
 }
 

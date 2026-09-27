@@ -244,9 +244,9 @@ pub(crate) enum ConfigRow {
     /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/fable/subagent inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
-    /// snapshot. ⏎ edits its VALUE. There is no removal action: an emptied value
-    /// saves as an empty string, so the key stays in `settings.json` until the
-    /// account's `config.toml` is edited by hand.
+    /// snapshot. ⏎ edits its VALUE. An emptied value REMOVES the key — the
+    /// unset, never a blank string — so the entry drops from `settings.json`
+    /// on the next settings apply (`commit_env_value`).
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
@@ -444,6 +444,13 @@ pub(crate) enum GlobalConfigRow {
     /// spent account until its window resets — a fetch-leg optimization only,
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
+    /// Background self-update (`AppState.update.auto_update`) — ON by default.
+    /// The binary updater reads it at next launch, the daemon's herdr leg on
+    /// its next reload, a new MCP server at startup (`check on launch`; no
+    /// live process is cancelled). The row renders the persisted value and
+    /// stays editable even under `CLAUTH_NO_UPDATE=1`, which still disables
+    /// every leg until the env var goes. ENUMERATED on/off, ⏎ mirrors space.
+    AutoUpdate,
     /// Whether the `auto_start` auto-start kick is interleaved across accounts, so
     /// their 5h windows open `5h / N` apart instead of all at once
     /// (`AppState.auto_start_queue`, default OFF — for one account the queue is
@@ -2284,7 +2291,7 @@ impl App {
 
         // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
-        let update_handle = update::spawn(update_sender);
+        let update_handle = update::spawn(update_sender, config.state.update.auto_update);
 
         // Status feed worker: streams incidents over `status_events`; a `()` on
         // `status_refresh` triggers a manual refetch. The channels are always
@@ -5096,7 +5103,7 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 18] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 19] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
@@ -5107,6 +5114,7 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 18] = [
     GlobalConfigRow::ContextNudge,
     GlobalConfigRow::AutoStartQueue,
     GlobalConfigRow::PreemptiveRotation,
+    GlobalConfigRow::AutoUpdate,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::WalkOrder,
@@ -5133,7 +5141,8 @@ impl GlobalConfigRow {
             | GlobalConfigRow::RefreshSpentAccounts
             | GlobalConfigRow::ContextNudge
             | GlobalConfigRow::AutoStartQueue
-            | GlobalConfigRow::PreemptiveRotation => "scheduler",
+            | GlobalConfigRow::PreemptiveRotation
+            | GlobalConfigRow::AutoUpdate => "scheduler",
             GlobalConfigRow::WeeklyThreshold
             | GlobalConfigRow::BurnAware
             | GlobalConfigRow::WalkOrder
@@ -5233,6 +5242,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
             }
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
+        GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
         // Inert while no account has `auto_start` on (rendered dimmed): a
         // queue with no possible member spaces nothing, so it stays a true
@@ -5637,6 +5647,21 @@ fn toggle_preemptive_rotation(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip the background self-update (`[update].auto_update`, default on). Same
+/// persistence shape as `toggle_preemptive_rotation`; `check on launch` timing
+/// — the binary updater reads the flag at next launch, the daemon's herdr leg
+/// on its next reload, a new MCP server at startup. The row stays live under
+/// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
+/// env var keeps overriding it until it goes.
+fn toggle_auto_update(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.update.auto_update = !cfg.state.update.auto_update;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
