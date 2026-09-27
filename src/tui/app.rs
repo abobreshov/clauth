@@ -8898,7 +8898,18 @@ fn commit_rename(app: &mut App) {
 /// must read no stale `[ key rejected ]` pill and the throttler attribution
 /// cannot accuse the new endpoint with the old provider's streak. The OAuth
 /// fetch status joins them because the render merges it over the third-party
-/// one — either left standing would still read as the stale verdict.
+/// one — either left standing would still read as the stale verdict. The
+/// config handle's `Profile.fetch_status` copy retires with them: that copy
+/// is the render's read, and only the next tick's `apply_usage` refreshes it
+/// from the cleared stores, so the pre-tick frame would flash the retired
+/// pill without it. The handle write is unconditional: a poison-skipped
+/// clear keeps its store entry, but that entry is dead weight — `apply_usage`
+/// reads these stores with `.lock().ok()` and skips a poisoned one, so the
+/// next tick can never re-copy it. `None` here is the stable outcome in
+/// every poison placement; a gated write would strand the stale pill on the
+/// handle indefinitely where the skipped store is the merge's third-party
+/// fallback (the OAuth arm's cleared entry misses `contains_key`, the
+/// poisoned fallback reads as `None`, and nothing rewrites the field).
 fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
     if let Ok(mut m) = app.third_party_status.lock() {
         m.remove(name.as_str());
@@ -8908,6 +8919,21 @@ fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
     }
     if let Ok(mut m) = app.usage_status.lock() {
         m.remove(name.as_str());
+    }
+    // All three store guards are dropped above, so this keeps the documented
+    // order (stores 280/290/350 before Config 400). The write is the outcome
+    // the store→handle sync in `apply_usage` would derive from the cleared
+    // stores (OAuth entry, else third-party entry, else None) — written in
+    // place, since re-reading the stores under the config guard would invert
+    // that order. And unconditional: a poison-skipped clear leaves its entry
+    // in a store `apply_usage` skips (`.lock().ok()`), so the entry is dead
+    // weight and `None` is stable in every placement — a gated write would
+    // strand the stale pill where the skipped store is the merge's
+    // third-party fallback (the OAuth arm misses, the poisoned arm reads as
+    // `None`, nothing rewrites the handle).
+    let mut cfg = app.config();
+    if let Some(p) = cfg.find_mut(name) {
+        p.fetch_status = None;
     }
 }
 

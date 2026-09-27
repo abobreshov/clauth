@@ -293,19 +293,13 @@ fn build_usage_lines(
     }
 
     if profile.usage.is_none() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", oauth_empty_msg(profile)),
-            theme::faint(),
-        )));
+        lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
         return lines;
     }
 
     let mut stats = collect_stats(profile, reset_fmt);
     if stats.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", oauth_empty_msg(profile)),
-            theme::faint(),
-        )));
+        lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
         return lines;
     }
 
@@ -1455,6 +1449,19 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
     }
 }
 
+/// The OAuth empty-body terminal messages, wrapped through the shared greedy
+/// wrapper like the third-party arm's (`build_tp_rows`) — stack, don't
+/// truncate. The OAuth body keeps its 2-cell indent on every segment, so the
+/// wrap width is the interior minus the indent (`tooltip_lines`' lead shape),
+/// or indent + segment would overrun the pane edge.
+fn oauth_empty_lines(msg: &str, inner_w: u16) -> Vec<Line<'static>> {
+    const INDENT_W: usize = 2;
+    wrap_words(msg, usize::from(inner_w).saturating_sub(INDENT_W).max(8))
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(format!("  {seg}"), theme::faint())))
+        .collect()
+}
+
 /// Render provider-agnostic third-party stats. The header (plan + status) was
 /// already pushed by the caller; only the stats body goes here.
 ///
@@ -1580,10 +1587,18 @@ fn build_tp_rows(
     // report so a real integration can be added. Subtle, below everything.
     if stats.best_effort && (has_bars || !stats.rows.is_empty()) {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "looks wrong? report at github.com/uwuclxdy/clauth/issues",
-            theme::faint(),
-        )));
+        // Stack, don't truncate: the URL is the only in-app report pointer,
+        // so the footer routes through the shared greedy wrapper like the
+        // terminal arms above — a mid-URL clip at the 41-cell narrow
+        // interior would send the report nowhere.
+        lines.extend(
+            wrap_words(
+                "looks wrong? report at github.com/uwuclxdy/clauth/issues",
+                usize::from(inner_w),
+            )
+            .into_iter()
+            .map(|seg| Line::from(Span::styled(seg, theme::faint()))),
+        );
     }
 
     lines

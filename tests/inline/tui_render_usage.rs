@@ -2877,3 +2877,115 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
         "the wrapped head keeps the diagnosis: {rows:?}"
     );
 }
+
+/// R6: the OAuth no-login fix copy survives a 45-column pane. The 43-cell
+/// `not logged in, use + login on the setup tab` message used to render as
+/// one unwrapped `Line` behind a 2-cell indent (45 cells in the 41-cell
+/// interior: 45 cols − 2 border − 2 block padding) and clip its ` tab` tail;
+/// it now wraps through the shared `panes::wrap_words` path like the
+/// third-party arm, at the interior minus the 2-cell indent (greedy wrap at
+/// 39: `… the setup` / `tab`), the indent surviving on both segments.
+#[test]
+fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["oau"]);
+
+    // A credential-less profile: no login, no usage, no endpoint — the OAuth
+    // arm's terminal `oauth_empty_msg` body.
+    let oau = crate::testutil::blank_profile(&ProfileName::from("oau"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("oau")],
+            ..AppState::default()
+        },
+        profiles: vec![oau],
+    });
+    app.profile_cursor = 0;
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    // Border `│` + 1 block-padding cell + the 2-cell indent = 3 leading cells.
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("│   not logged in, use + login on the setup")),
+        "the wrapped head keeps the diagnosis and its 2-cell indent: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.starts_with("│   tab")),
+        "the clipped ` tab` tail must wrap onto its own indented line: {rows:?}"
+    );
+}
+
+/// R7: the best-effort report footer survives a 45-column pane. The 56-cell
+/// `looks wrong? report at github.com/uwuclxdy/clauth/issues` line used to
+/// render as one unwrapped `Line` and clip mid-`uwuclxdy` at the 41-cell
+/// interior (45 cols − 2 border − 2 block padding), dropping the tail of the
+/// only in-app report pointer; it now wraps through the shared
+/// `panes::wrap_words` path like the terminal arms (greedy wrap at 41:
+/// `looks wrong? report at` / `github.com/uwuclxdy/clauth/issues`), the URL
+/// surviving whole on its own segment.
+#[test]
+fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["unk"]);
+
+    // An unrecognised endpoint: `provider` stays None, the generic api-key
+    // pair routes the body through the third-party arm
+    // (`usage_cache_is_third_party`), and `best_effort` bars are exactly the
+    // shape the report footer qualifies.
+    let mut unk = crate::testutil::blank_profile(&ProfileName::from("unk"));
+    unk.base_url = Some("https://generic.example.com/anthropic".to_string());
+    unk.api_key = Some("k".to_string());
+    unk.third_party_usage = Some(ThirdPartyStats {
+        is_available: true,
+        rows: vec![],
+        bars: vec![UsageBar {
+            label: "quota".to_string(),
+            pct: 42.0,
+            resets_at: None,
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: true,
+    });
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("unk")],
+            ..AppState::default()
+        },
+        profiles: vec![unk],
+    });
+    app.profile_cursor = 0;
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("│ github.com/uwuclxdy/clauth/issues")),
+        "the 33-cell report URL must wrap whole onto its own line, never clip mid-url: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("│ looks wrong? report at")),
+        "the wrapped head keeps the report invite: {rows:?}"
+    );
+}

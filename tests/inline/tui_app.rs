@@ -1901,6 +1901,205 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
     );
 }
 
+/// R6: the endpoint re-key retires the stale `[ key rejected ]` verdict in
+/// the config handle's profile copy SAME-FRAME. The shared clear drops the
+/// three name-keyed stores, but the frame reads `Profile.fetch_status` from
+/// the config handle, and only the next 80 ms tick's `apply_usage` copies
+/// the cleared stores back — so the frame(s) drawn immediately after the
+/// commit flashed the retired pill. The clear now retires the handle copy
+/// too (the same assignment `apply_usage` derives from the cleared stores),
+/// so the frame right after the commit reads none: no `apply_usage` between
+/// the edit and the assertion.
+#[test]
+fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
+    use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+
+    let mut api = crate::testutil::blank_profile(&ProfileName::from("api"));
+    api.provider = Some(Provider::Zai);
+    api.api_key = Some("old-key".to_string());
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("api")],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+
+    // The rejected-key verdict lives in the third-party status store and the
+    // tick copies it into the handle — the populated state the frame renders
+    // the `[ key rejected ]` pill from.
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("api".to_string(), FetchStatus::AuthExpired);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+
+    // Re-key through the real producer (the Setup endpoint editor's ⏎).
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://new.example.com");
+    commit_config_field(&mut app, ConfigRow::BaseUrl);
+    app.config_draft.as_mut().expect("draft").api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("api"),
+            "the dead-key status store entry goes with the re-key"
+        );
+    }
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the frame right after the re-key reads no stale [ key rejected ] pill"
+    );
+}
+
+/// R8: a poison-skipped status-store clear cannot strand the stale pill on
+/// the handle. The store clears are poison-tolerant — a store lock poisoned
+/// at the clear instant keeps its entry — but that entry is dead weight:
+/// `apply_usage` reads these stores with `.lock().ok()` and skips a poisoned
+/// one, so nothing re-copies it. The unconditional handle write retires the
+/// pill the instant the credential is repaired, and the next tick's merge
+/// cannot resurrect it from the surviving entry (the healthy OAuth store's
+/// cleared entry misses the `contains_key` arm and the poisoned third-party
+/// fallback reads as `None`).
+#[test]
+fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
+    use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+
+    let mut api = crate::testutil::blank_profile(&ProfileName::from("api"));
+    api.provider = Some(Provider::Zai);
+    api.api_key = Some("old-key".to_string());
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("api")],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+
+    // The rejected-key verdict lives in both status stores; the third-party
+    // one (rank 280) is the clear we poison, the OAuth-side one (350) the
+    // clear that still succeeds — the skipped clear must not be able to
+    // strand the stale pill on the handle.
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("api".to_string(), FetchStatus::AuthExpired);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("api".to_string(), FetchStatus::AuthExpired);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+
+    // Poison it the only way a mutex gets poisoned: panic while holding it
+    // (the lockorder.rs / oauth.rs fixtures' shape). The store stays poisoned
+    // for the rest of the test, so the clear below hits it exactly as a
+    // panic-at-the-clear-instant would.
+    let poisoner = Arc::clone(&app.third_party_status);
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = poisoner.lock().expect("lock the store");
+        panic!("deliberate: poison the third_party_status store");
+    }));
+    assert!(poisoned.is_err(), "precondition: the closure panicked");
+
+    // Re-key through the real producer (the Setup endpoint editor's ⏎) —
+    // the round-6 flash test's exact sequence.
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://new.example.com");
+    commit_config_field(&mut app, ConfigRow::BaseUrl);
+    app.config_draft.as_mut().expect("draft").api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("api"),
+            "the OAuth-side status entry goes with the re-key"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("api"),
+            "the old provider's streak cannot outlive the re-key"
+        );
+    }
+    // The poison-skipped store still holds its entry (`lock` recovers it
+    // through `into_inner`, the repo's documented idiom) — the dead weight
+    // the next tick's merge cannot reach.
+    {
+        let m = app
+            .third_party_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            m.contains_key("api"),
+            "precondition: the poisoned store's entry survives the skipped clear"
+        );
+    }
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the handle retires the pill even when a poisoned store keeps the stale entry"
+    );
+    // The next tick's merge cannot resurrect the retired pill: the healthy
+    // OAuth store's cleared entry misses the `contains_key` arm and the
+    // poisoned third-party fallback reads as `None`.
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next tick does not resurrect the pill from the surviving entry"
+    );
+}
+
 /// R3-F2: an Alibaba console re-login retires the stale `console login
 /// expired` verdict — the shared clear, not a wait for the queued fetch.
 #[test]
