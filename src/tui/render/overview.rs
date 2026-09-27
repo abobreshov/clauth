@@ -423,7 +423,7 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         if row.broken {
-            Span::styled("×", theme::danger())
+            Span::styled(theme::dead_credential_glyph(), theme::danger())
         } else {
             Span::raw(" ")
         },
@@ -548,7 +548,10 @@ fn render_overview_row(
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if cfg.is_auth_broken(&profile.name) {
-        spans.push(Span::styled("×", hue(theme::danger())));
+        spans.push(Span::styled(
+            theme::dead_credential_glyph(),
+            hue(theme::danger()),
+        ));
         spans.push(Span::raw(" "));
     } else if token_danger {
         spans.push(Span::styled("⊘", hue(theme::danger())));

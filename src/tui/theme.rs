@@ -239,6 +239,13 @@ pub(crate) fn edit_glyph() -> &'static str {
     "✎"
 }
 
+/// Compact blocked-reason marker for a dead login credential — `AuthBroken`
+/// and `KeyRejected` deliberately share it (the detail pill and the help-modal
+/// legend carry which credential class failed). Same on both tiers.
+pub(crate) fn dead_credential_glyph() -> &'static str {
+    "×"
+}
+
 // ── Style helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) fn base() -> Style {

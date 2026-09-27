@@ -1604,9 +1604,11 @@ pub(crate) fn start_walk(
 /// fingerprint; a live body clears the record); on a restart the live set is
 /// empty and on a leg panic it is cleared while the durable record persists, so
 /// the durable verdict is the authoritative read where no live set exists. Used
-/// only where no live set exists — the CLI's [`start_block`] and the durable set
-/// [`durable_key_rejected`] builds for the startup one-shot and the hook replay.
-fn third_party_key_rejected(profile: &Profile, name: &ProfileName) -> bool {
+/// where no live set exists — the CLI's [`start_block`], the durable set
+/// [`durable_key_rejected`] builds for the startup one-shot and the hook
+/// replay, and the TUI's construction/reload seed for its live `ThirdPartyBroken`
+/// mirror.
+pub(crate) fn third_party_key_rejected(profile: &Profile, name: &ProfileName) -> bool {
     profile.console.is_none()
         && profile.provider != Some(crate::providers::Provider::Alibaba)
         && crate::usage::profile_credential_fingerprint(profile)

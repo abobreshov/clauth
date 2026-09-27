@@ -19,7 +19,7 @@ use super::format::{
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
     draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
-    section_box, section_box_verbatim,
+    section_box, section_box_verbatim, wrap_words,
 };
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
@@ -1503,7 +1503,14 @@ fn build_tp_rows(
                 _ => "loading",
             }
         };
-        lines.push(Line::from(Span::styled(msg, theme::faint())));
+        // Stack, don't truncate: the fix copy must survive a narrow pane, so
+        // every terminal message routes through the shared greedy wrapper
+        // (`panes::wrap_words`) instead of clipping its tail at the pane edge.
+        lines.extend(
+            wrap_words(msg, usize::from(inner_w))
+                .into_iter()
+                .map(|seg| Line::from(Span::styled(seg, theme::faint()))),
+        );
         return lines;
     };
 

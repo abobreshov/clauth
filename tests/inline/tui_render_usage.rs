@@ -2830,3 +2830,50 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
         "the hint names z.ai as the throttler: {rows:?}"
     );
 }
+
+/// F4: the key-rejection fix copy survives a 45-column pane. The 46-cell
+/// no-cache line used to render as one unwrapped `Line` and clip its tail at
+/// the 41 interior cells; it now wraps through the shared `panes::wrap_words`
+/// path (greedy wrap at 41: `… on the` / `setup tab`), so the full repair
+/// instruction stays on screen.
+#[test]
+fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    zai.fetch_status = Some(FetchStatus::AuthExpired);
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.profile_cursor = 0;
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    assert!(
+        rows.iter().any(|r| r.starts_with("│ setup tab")),
+        "the clipped tail `setup tab` must wrap onto its own line: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("api key rejected, re-enter it")),
+        "the wrapped head keeps the diagnosis: {rows:?}"
+    );
+}

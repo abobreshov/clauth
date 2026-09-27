@@ -459,9 +459,14 @@ pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::
 /// enters on a key-rejection
 /// outcome and leaves the moment any other outcome lands. A lapsed Alibaba
 /// console session is NOT this — its api key still serves, only its usage
-/// reading is blind. Written/cleared only by the third-party leg; read by the
-/// scans, the TUI/daemon key-rejected helpers (chain walks and day notices),
-/// and both switch drains.
+/// reading is blind. Written/cleared by the third-party leg; the TUI's
+/// stood-down seed is the second writer — `app.rs` `durable_key_rejected_seed`
+/// at construction/reload plus the once-per-second stat-gated
+/// `sync_broken_verdicts` re-sync, which union-adds names the durable record
+/// still matches and removes seed entries the record no longer does (add-only
+/// from the seed's side, still fingerprint-intersected at every read); read by
+/// the scans, the TUI/daemon key-rejected helpers (chain walks and day
+/// notices), and both switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 /// Session-scoped (in-memory) map of third-party profiles suppressed from the
 /// timer, each recorded against the credential fingerprint it failed under

@@ -1839,6 +1839,14 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
+    /// Per-name stat of the durable key-rejection record the last time
+    /// [`sync_broken_verdicts`] checked it (`None` = the record was absent).
+    /// The stat is the read gate: a per-second stat per profile is cheap, a
+    /// per-second read of every record is not.
+    pub(crate) broken_verdict_mtimes: HashMap<String, Option<std::time::SystemTime>>,
+    /// [`sync_broken_verdicts`]'s once-per-second gate (`None` = run on the
+    /// first tick).
+    pub(crate) last_broken_verdict_sync: Option<Instant>,
     pub(crate) tab: Tab,
     /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
     /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
@@ -2229,6 +2237,11 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
+        // Seed the live mirror from the durable verdict so a fingerprint-bound
+        // key rejection survives a restart (see `durable_key_rejected_seed`).
+        if let Ok(mut broken) = third_party_broken.lock() {
+            broken.extend(Self::durable_key_rejected_seed(&config));
+        }
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
@@ -2357,6 +2370,8 @@ impl App {
             third_party_status,
             third_party_streaks,
             third_party_broken,
+            broken_verdict_mtimes: HashMap::new(),
+            last_broken_verdict_sync: None,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
@@ -2441,6 +2456,25 @@ impl App {
         };
         app.refresh_unsaved_live_login();
         app
+    }
+
+    /// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
+    /// one `(name, fingerprint)` per profile whose record matches the
+    /// credential it holds right now (`fallback::third_party_key_rejected` —
+    /// never a lapsed Alibaba console session, which stays usage-only). This
+    /// is what keeps a fingerprint-bound key rejection visible after a TUI
+    /// restart or in a stood-down TUI until a fetch recreates it; the
+    /// intersection in [`App::key_rejected_names`] still drops the name the
+    /// moment the credential changes.
+    fn durable_key_rejected_seed(config: &AppConfig) -> HashMap<String, u64> {
+        config
+            .profiles
+            .iter()
+            .filter(|p| crate::fallback::third_party_key_rejected(p, &p.name))
+            .filter_map(|p| {
+                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp))
+            })
+            .collect()
     }
 
     /// The live key-rejected member set, read once per render (never per walk
@@ -2976,12 +3010,13 @@ impl App {
             // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
             // them while config is held inverts the global lock order (same shape
             // as `refresh_tokens`).
-            let (tokens, third_party, names) = {
+            let (tokens, third_party, names, broken_seed) = {
                 let cfg = self.config();
                 let tokens = collect_tokens(&cfg);
                 let third_party = collect_third_party_entries(&cfg.profiles);
                 let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
-                (tokens, third_party, names)
+                let broken_seed = Self::durable_key_rejected_seed(&cfg);
+                (tokens, third_party, names, broken_seed)
             };
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
@@ -2993,6 +3028,17 @@ impl App {
                     .third_party_tokens
                     .lock()
                     .expect("third_party_tokens mutex poisoned") = third_party;
+                // Union-add the durable seed: it can only ADD names whose record
+                // matches the CURRENT fingerprint, and a re-keyed name still
+                // drops at the intersection in `key_rejected_names`. A recovered
+                // name can flicker back in for at most one sync interval — the
+                // fetcher's error arm updates the live map before it clears the
+                // durable record, so a sync landing in that gap re-reads the
+                // still-standing record — and the next `sync_broken_verdicts`
+                // pass drops it again.
+                if let Ok(mut broken) = self.third_party_broken.lock() {
+                    broken.extend(broken_seed);
+                }
             }
             self.session_tokens = collect_session_tokens(&names);
             self.refresh_unsaved_live_login();
@@ -8846,6 +8892,25 @@ fn commit_rename(app: &mut App) {
     }
 }
 
+/// Drop one profile's name-keyed fetch-status + streak chrome — the shared
+/// clear every credential-replacing path runs: a repaired or repointed
+/// credential retires the old provider's verdicts, so the next frame
+/// must read no stale `[ key rejected ]` pill and the throttler attribution
+/// cannot accuse the new endpoint with the old provider's streak. The OAuth
+/// fetch status joins them because the render merges it over the third-party
+/// one — either left standing would still read as the stale verdict.
+fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
+    if let Ok(mut m) = app.third_party_status.lock() {
+        m.remove(name.as_str());
+    }
+    if let Ok(mut m) = app.third_party_streaks.lock() {
+        m.remove(name.as_str());
+    }
+    if let Ok(mut m) = app.usage_status.lock() {
+        m.remove(name.as_str());
+    }
+}
+
 fn commit_endpoint(app: &mut App) {
     let Some(d) = app.config_draft.as_ref() else {
         return;
@@ -8872,6 +8937,7 @@ fn commit_endpoint(app: &mut App) {
             // rejection verdict reads the AppConfig profile fingerprint, never
             // this list, so a stale entry cannot keep the name key-rejected.
             app.refresh_tokens();
+            clear_profile_status_chrome(app, &name);
             // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
@@ -9310,6 +9376,9 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            // The repoint retires the old provider's verdicts — the shared
+            // clear keeps its streak from accusing the new endpoint.
+            clear_profile_status_chrome(app, &target);
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
                 app.config_draft = Some(build_draft_existing(app, &target));
@@ -9589,6 +9658,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    clear_profile_status_chrome(app, &name);
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -9636,6 +9706,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    clear_profile_status_chrome(app, &name);
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -9792,6 +9863,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    // No leg ever fetches a keyless profile, so a stale
+                    // `[ key rejected ]` verdict would render forever — the
+                    // shared clear retires it with the credential.
+                    clear_profile_status_chrome(app, &name);
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
@@ -9893,6 +9968,14 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 return;
             }
             app.refresh_tokens();
+            // The live login replaced the stored credential, so the old
+            // credential's verdicts must not survive it — the shared clear,
+            // not a wait for the next OAuth fetch.
+            clear_profile_status_chrome(app, &ProfileName::from(active));
+            // AUTH-1: the fresh login is the documented recovery for a revoked
+            // chain, so a standing auth_broken quarantine is stale — same lift
+            // every sibling fresh-login path runs.
+            oauth::mark_auth_broken(&app.config, &ProfileName::from(active), false);
             app.toast(
                 ToastKind::Success,
                 format!("saved live credentials into '{active}'"),
@@ -10408,6 +10491,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            clear_profile_status_chrome(app, &ProfileName::from(session.name.clone()));
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
@@ -10470,8 +10554,11 @@ fn apply_console_login(
         Ok(()) => {
             // The stored session is what the usage leg fetches with, and
             // `store_console_login` drops the cache the old one filled, so ask
-            // for the figures the new one can actually read.
+            // for the figures the new one can actually read. The stale
+            // `console login expired` verdict goes with the old session via
+            // the shared clear — it must not survive until the queued fetch.
             app.refresh_tokens();
+            clear_profile_status_chrome(app, &name);
             app.manual_refresh_one(&name);
             // The window is the surprising part and the CLI's own summary leads
             // with it: the 48h runs from the aliyun browser sign-in, so a login
@@ -10572,6 +10659,7 @@ pub(crate) fn on_tick(app: &mut App) {
     // Before the plugin refresh, which folds the tally into its runtime row and
     // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
+    sync_broken_verdicts(app);
     poll_codex_rows(app);
     poll_plugin_refresh(app);
     poll_daemon_health(app);
@@ -10656,6 +10744,88 @@ fn poll_live_sessions(app: &mut App) {
     app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
     app.live_sessions = tally;
+}
+
+/// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`
+/// mirror, at most once a second, gated per profile on the record's stat (an
+/// mtime move, or the file appearing/disappearing). This is the stood-down
+/// TUI's heal path: the fetcher (another process) clears or rewrites
+/// `third_party_auth.json` under a credential the local mirror still marks,
+/// and the config never changes, so the reload seed cannot see it. Both
+/// directions ride the same stat walk — a record appearing seeds the name, a
+/// record gone drops it. The seed's own shape gate
+/// (`fallback::third_party_key_rejected`) is the ONE gate the insert branch
+/// runs: a `ConsoleExpired` outcome also writes the record under a
+/// still-matching fingerprint, and a lapsed Alibaba console session is
+/// usage-only — it must never render as key-rejected, so a profile the
+/// predicate refuses never inserts and any entry it already has drops. Reads
+/// the record only when the stat moved; the per-second cost is one stat per
+/// credentialed profile, the same discipline `poll_live_sessions` applies.
+fn sync_broken_verdicts(app: &mut App) {
+    const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_broken_verdict_sync
+        .is_some_and(|t| t.elapsed() < SYNC_INTERVAL)
+    {
+        return;
+    }
+    app.last_broken_verdict_sync = Some(Instant::now());
+
+    // The credentialed profiles plus their fingerprints, collected under the
+    // config guard so the stat walk below is lock-free; the mirror lock (295)
+    // ranks outside Config (400), so the update happens after the guard drops.
+    // The clone carries what the shared shape predicate reads — the predicate
+    // itself is the gate, never a reimplementation of its fields.
+    let credentialed: Vec<(Profile, u64)> = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .filter_map(|p| {
+                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.clone(), fp))
+            })
+            .collect()
+    };
+
+    let changed: Vec<(Profile, Option<std::time::SystemTime>, u64)> = credentialed
+        .into_iter()
+        .filter_map(|(profile, fp)| {
+            let name = profile.name.to_string();
+            let stat = crate::profile_cache::profile_cache_path(
+                &ProfileName::from(name.clone()),
+                crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+            )
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+            // `Some(&stat)` doubles as the changed check: an unseen name has no
+            // entry (always "changed"), and a seen one skips while the stat
+            // matches — including two `None`s for a record that never existed.
+            if app.broken_verdict_mtimes.get(&name) == Some(&stat) {
+                return None;
+            }
+            Some((profile, stat, fp))
+        })
+        .collect();
+    if changed.is_empty() {
+        return;
+    }
+
+    if let Ok(mut broken) = app.third_party_broken.lock() {
+        for (profile, stat, fp) in changed {
+            // The insert branch runs the seed's own predicate: the record must
+            // match the credential the profile holds RIGHT NOW, on a profile
+            // shape that can be key-rejected at all. Everything the predicate
+            // refuses — a cleared record, a re-keyed one, or a lapsed Alibaba
+            // console session — drops the entry.
+            if crate::fallback::third_party_key_rejected(&profile, &profile.name) {
+                broken.insert(profile.name.to_string(), fp);
+            } else {
+                broken.remove(profile.name.as_str());
+            }
+            app.broken_verdict_mtimes
+                .insert(profile.name.to_string(), stat);
+        }
+    }
 }
 
 /// Plugin tab live refresh: re-run the cheap local checks (session counts + link
@@ -10886,6 +11056,10 @@ fn poll_credentials_divergence(app: &mut App) {
         match result {
             Ok(()) => {
                 app.refresh_tokens();
+                // AUTH-1: an adopted first login is a fresh login — lift a
+                // standing auth_broken quarantine like the sibling fresh-login
+                // paths do.
+                oauth::mark_auth_broken(&app.config, &active, false);
                 app.last_reload_fp = reload_fingerprint();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));

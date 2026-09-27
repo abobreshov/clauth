@@ -1334,6 +1334,975 @@ fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
     );
 }
 
+// ── F2: durable key-rejection seeding ────────────────────────────────────────
+
+/// F2: a fingerprint-bound key rejection survives a TUI restart. The durable
+/// `third_party_auth.json` verdict (written by the fetching process, read by
+/// every no-live-set surface) seeds the in-memory key-rejected set at
+/// construction, so the chain/overview/day-list renders see the rejection
+/// before any fetch recreates it.
+#[test]
+fn the_durable_auth_verdict_seeds_the_key_rejected_set_at_construction() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from("zai"), fingerprint),
+        "fixture control: the durable record landed"
+    );
+
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "the durable verdict must survive a restart with no fetch behind it"
+    );
+}
+
+/// F2: the same seed lands on a config reload — a stood-down TUI picks up a
+/// rejection another process recorded after a config write.
+#[test]
+fn the_durable_auth_verdict_seeds_the_key_rejected_set_on_reload() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("persist profile config");
+
+    let mut app = app_with(vec![zai.clone()]);
+
+    // The record lands AFTER construction, so the reload leg alone can seed it.
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("zai")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+
+    let reloaded = app.reload_if_state_changed();
+    assert!(
+        reloaded,
+        "the reload branch must run so the seed is exercised"
+    );
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "a reload seeds the rejection another process recorded"
+    );
+}
+
+// ── F3: endpoint/key edits clear stale status chrome ─────────────────────────
+
+/// F3: a successful endpoint/API-key edit clears the edited profile's
+/// name-keyed status + streak chrome, so the next frame shows no stale
+/// `[ key rejected ]` pill or old-provider throttler attribution.
+#[test]
+fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.profile_cursor = 0;
+    // Stale chrome the repair must clear: the dead-key verdict, a deep 429
+    // streak, and an OAuth-side status entry (the hybrid's other leg).
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+    // Precondition control: the merge the next frame reads shows the stale
+    // key-rejected verdict before the edit.
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::Fresh);
+
+    super::enter_config_detail(&mut app);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.active = Some(super::ConfigRow::ApiKey);
+        d.api_key = super::InputState::new("k2");
+    }
+    super::commit_endpoint(&mut app);
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the dead-key status goes with the repaired credential"
+        );
+    }
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the OAuth-side status goes with the repaired credential"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's streak cannot accuse the new credential"
+        );
+    }
+
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a repaired key"
+    );
+}
+
+/// R2-F2: a stood-down TUI's seeded key-rejection heals when the fetcher
+/// (another process) clears the durable record under the SAME credential — no
+/// config change, so the reload seed never sees it. The once-per-second
+/// verdict sync notices the record's disappearance and drops the mirror entry.
+#[test]
+fn the_seeded_key_rejection_heals_when_another_process_clears_the_record() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+
+    let mut app = app_with(vec![zai]);
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "precondition: the construction seed marks the rejected member"
+    );
+
+    // The fetcher healed the credential: the durable record is gone while the
+    // credential (and its fingerprint) is unchanged.
+    crate::profile_cache::clear_auth_expired(&ProfileName::from("zai"));
+    assert!(
+        !crate::profile_cache::auth_expired_matches(&ProfileName::from("zai"), fingerprint),
+        "fixture control: the record is really gone"
+    );
+
+    super::on_tick(&mut app);
+    assert!(
+        !app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "the healed member must leave the key-rejected set without a config change"
+    );
+}
+
+/// R2-F2: a rejection recorded by another process AFTER construction seeds
+/// the mirror on the cadence — the fixture writes the record file directly,
+/// the way the fetcher's durable writer does.
+#[test]
+fn a_record_written_by_another_process_seeds_the_key_rejected_set_on_the_cadence() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    let mut app = app_with(vec![zai]);
+    assert!(
+        !app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "precondition: nothing rejected yet"
+    );
+
+    // The fetcher recorded a rejection under this credential; write the
+    // record file directly, as the fetcher's durable writer would.
+    let path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("zai"),
+        crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+    )
+    .expect("the record path resolves");
+    std::fs::write(&path, format!("{{\"credential\":{fingerprint}}}")).expect("write the record");
+
+    super::on_tick(&mut app);
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "a rejection recorded by another process must appear without a config change"
+    );
+}
+
+/// R2-F3: a captured-login overwrite retires the old provider's verdicts the
+/// same way a credential edit does — one shared clear helper, not a second
+/// spelling. The pre-overwrite frame reads the stale `[ key rejected ]`
+/// verdict; the post-overwrite frame reads nothing.
+#[test]
+fn a_capture_overwrite_clears_the_stale_status_chrome() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::Fresh);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: None,
+                base_url: None,
+                api_key: None,
+                account_uuid: None,
+            }),
+            "zai".to_string(),
+            false,
+        ),
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the dead-key status goes with the overwritten credential"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's streak cannot accuse the new credential"
+        );
+    }
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the OAuth-side status goes with the overwritten credential"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after an overwrite"
+    );
+}
+
+/// R3-F1: the sync's insert branch runs the seed's own shape gate. A
+/// `ConsoleExpired` outcome writes the durable record under a still-matching
+/// fingerprint, but a lapsed Alibaba console session is usage-only and must
+/// never render as key-rejected. The construction seed (which shares the
+/// predicate) is the control: it already leaves the name alone.
+#[test]
+fn a_console_lapse_record_never_seeds_the_key_rejected_set() {
+    use crate::profile::{AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "dead".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![qwen.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&qwen).expect("save the profile");
+
+    // The record the leg writes for `ConsoleExpired` — bound to the same
+    // fingerprint the profile still carries.
+    let fingerprint = crate::usage::profile_credential_fingerprint(&qwen)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("qwen"), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from("qwen"), fingerprint),
+        "fixture control: the console-lapse record landed"
+    );
+
+    let mut app = app_with(vec![qwen]);
+    assert!(
+        !app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "control: the construction seed's shape gate leaves the lapsed console alone"
+    );
+
+    super::on_tick(&mut app);
+    assert!(
+        !app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "the cadence must not seed a console lapse as key-rejected"
+    );
+}
+
+/// R3-F1: the same shape gate drops a mirror entry that already exists for a
+/// console-lapsing profile — the insert branch requires the predicate, so a
+/// name the predicate refuses must leave on the cadence.
+#[test]
+fn a_console_lapse_drops_a_pre_existing_mirror_entry_on_the_cadence() {
+    use crate::profile::{AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "dead".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![qwen.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&qwen).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&qwen)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("qwen"), fingerprint);
+
+    let mut app = app_with(vec![qwen]);
+    app.third_party_broken
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), fingerprint);
+    assert!(
+        app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "precondition: the planted mirror entry is visible through the intersection"
+    );
+
+    super::on_tick(&mut app);
+    assert!(
+        !app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "a name the shape gate refuses must drop from the mirror on the cadence"
+    );
+}
+
+/// R3-F2: a blanked third-party api key retires the old provider's verdicts —
+/// no leg ever fetches a keyless profile, so a stale `[ key rejected ]` would
+/// render forever without the shared clear.
+#[test]
+fn a_blanked_key_clears_the_stale_status_chrome() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::Fresh);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::BlankCredentials("zai".to_string()),
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the dead-key status goes with the blanked credential"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's streak cannot outlive the blanked key"
+        );
+    }
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the OAuth-side status goes with the blanked credential"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a blanked key"
+    );
+}
+
+/// R3-F2: an Alibaba console re-login retires the stale `console login
+/// expired` verdict — the shared clear, not a wait for the queued fetch.
+#[test]
+fn a_console_relogin_clears_the_stale_verdict() {
+    use crate::profile::{AppConfig, AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "dead".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&qwen).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("qwen")],
+            ..AppState::default()
+        },
+        profiles: vec![qwen],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), 9);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("qwen"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale console verdict is what the frame reads"
+    );
+
+    super::apply_console_login(
+        &mut app,
+        super::LoginSession {
+            name: "qwen".to_string(),
+            is_new: false,
+            generation: 0,
+            url: None,
+            stage: super::LoginStage::WaitingBrowser,
+            method: super::LoginMethod::Browser,
+            paste: None,
+            paste_field: None,
+        },
+        crate::alibaba_login::ConsoleLoginOutcome {
+            console: ConsoleCredential {
+                token: "fresh".to_string(),
+                site: ConsoleSite::International,
+                region: "ap-southeast-1".to_string(),
+            },
+        },
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("qwen"),
+            "the stale console verdict goes with the fresh session"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("qwen"),
+            "the old session's streak cannot outlive the re-login"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("qwen"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale verdict after a console re-login"
+    );
+}
+
+/// R3-F2: applying a preset repoints the base_url — the old provider's streak
+/// must go with the shared clear, or the throttler hint can accuse the new
+/// endpoint with the old provider's evidence.
+#[test]
+fn a_preset_apply_clears_the_old_providers_streak() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::RateLimited);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1);
+    assert!(
+        app.third_party_streaks.lock().unwrap().contains_key("zai"),
+        "precondition: the old provider's deep streak is on the books"
+    );
+
+    super::apply_preset_to(&mut app, "zai", "DeepSeek");
+
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the repointed endpoint must not inherit the old provider's streak"
+        );
+    }
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's fetch status goes with the repoint"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a preset repoint"
+    );
+}
+
+/// R4: the divergence resolver's Overwrite choice snapshots the LIVE login
+/// into the active profile's stored credential — a credential replacement, so
+/// the OAuth leg's stale verdict must retire with it, not survive until the
+/// next fetch. The choice is driven through the modal's real Enter router
+/// (`handle_divergence_key`), the live UI path, with the stale verdict
+/// already on the books.
+#[test]
+fn a_divergence_overwrite_clears_the_stale_status_chrome() {
+    use super::{Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_app_state, save_profile};
+    use crate::testutil::key;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Stored `rt-work` vs the live file's `rt-live`: a diverged active
+    // profile, the state the resolver exists for.
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    // The OAuth leg's stale verdict on the active profile, applied through
+    // the store — the pill the frame reads before the overwrite.
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("work".to_string(), FetchStatus::AuthExpired);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+
+    // The live UI path: the poll flags the banner, `d` opens the resolver,
+    // Enter fires the Overwrite choice (cursor 0, no sibling).
+    force_poll(&mut app);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "precondition: the resolver opened on the diverged profile"
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .and_then(|p| p.refresh_token()),
+        Some("rt-live"),
+        "the overwrite replaces the stored credential with the live one"
+    );
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("work"),
+            "the OAuth-side verdict goes with the overwritten credential"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a divergence overwrite"
+    );
+}
+
+/// R5: the divergence resolver's Overwrite choice stores a fresh live OAuth
+/// login — the documented recovery for a revoked chain — so a standing
+/// name-bound `auth_broken` quarantine must lift with it (AUTH-1), like on
+/// every sibling fresh-login path. Without the lift a repaired member keeps
+/// rendering the `[ auth broken ]` chrome and stays out of chain walks
+/// forever: the poll skips the dead refresh, so nothing else clears it.
+/// The choice is driven through the modal's real Enter router
+/// (`handle_divergence_key`), the live UI path.
+#[test]
+fn a_divergence_overwrite_lifts_the_auth_broken_quarantine() {
+    use super::{Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_app_state, save_profile};
+    use crate::testutil::key;
+    use crate::tui::app::App;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Stored `rt-work` vs the live file's `rt-live`: a diverged active
+    // profile carrying a persisted quarantine row — the state the finding
+    // names.
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        auth_broken: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            auth_broken: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    {
+        let persisted = crate::profile::load_config().expect("reload").state;
+        assert!(
+            persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+            "precondition: the quarantine row is persisted"
+        );
+    }
+    assert!(
+        app.config().is_auth_broken(&ProfileName::from("work")),
+        "precondition: the frame renders the auth-broken chrome"
+    );
+
+    // The live UI path: the poll flags the banner, `d` opens the resolver,
+    // Enter fires the Overwrite choice (cursor 0, no sibling).
+    force_poll(&mut app);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "precondition: the resolver opened on the diverged profile"
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .and_then(|p| p.refresh_token()),
+        Some("rt-live"),
+        "the overwrite replaces the stored credential with the live one"
+    );
+    assert!(
+        !app.config().is_auth_broken(&ProfileName::from("work")),
+        "the next frame renders no [ auth broken ] chrome after an overwrite"
+    );
+    let persisted = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+        "the persisted quarantine row goes with the overwritten credential"
+    );
+}
+
+/// R5: the first-login adopt stores a fresh live OAuth login the same way —
+/// the poll adopts it silently on a credential-less active profile (the
+/// shell `Profile::new` state `BlankCredentials` stores), so a standing
+/// `auth_broken` quarantine must lift with it (AUTH-1), like on every
+/// sibling fresh-login path. Driven through the real poll the live caller
+/// uses (`poll_credentials_divergence`), no direct call to
+/// `adopt_first_login`.
+#[test]
+fn an_adopted_first_login_lifts_the_auth_broken_quarantine() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_app_state, save_profile};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // A credential-less (blanked) active profile: no stored credentials.json,
+    // a standing quarantine row, and a fresh live login CC just wrote.
+    let work = Profile::new("work".to_string(), None, None);
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        auth_broken: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            auth_broken: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    {
+        let persisted = crate::profile::load_config().expect("reload").state;
+        assert!(
+            persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+            "precondition: the quarantine row is persisted"
+        );
+    }
+    assert!(
+        app.config().is_auth_broken(&ProfileName::from("work")),
+        "precondition: the frame renders the auth-broken chrome"
+    );
+
+    // The real adopt path: the poll sees the fresh live login on the
+    // credential-less active profile and adopts it silently.
+    force_poll(&mut app);
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .and_then(|p| p.refresh_token()),
+        Some("rt-live"),
+        "the poll adopts the first login into the stored credential"
+    );
+    assert!(
+        !app.config().is_auth_broken(&ProfileName::from("work")),
+        "the next frame renders no [ auth broken ] chrome after an adopt"
+    );
+    let persisted = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+        "the persisted quarantine row goes with the adopted login"
+    );
+}
+
 #[test]
 fn config_rows_hybrid_shows_the_logout_row_for_its_oauth_pair() {
     use super::{ConfigRow, config_rows};

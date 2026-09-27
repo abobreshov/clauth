@@ -348,8 +348,8 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
         BlockedReason::Canceled => ("⊖", theme::danger()),
-        BlockedReason::AuthBroken => ("×", theme::danger()),
-        BlockedReason::KeyRejected => ("×", theme::danger()),
+        BlockedReason::AuthBroken => (theme::dead_credential_glyph(), theme::danger()),
+        BlockedReason::KeyRejected => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
