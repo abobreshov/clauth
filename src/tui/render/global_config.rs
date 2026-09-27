@@ -341,9 +341,9 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         // runs at launch (and the daemon's herdr leg at its next reload), so
         // toggling never cancels a live process.
         GlobalConfigRow::AutoUpdate => String::from(if rows.auto_update {
-            "check for a newer release on launch, unless CLAUTH_NO_UPDATE=1"
+            "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
         } else {
-            "no update check runs until this is turned back on"
+            "no update checks"
         }),
         GlobalConfigRow::RefreshSpentAccounts => String::from(if rows.refresh_spent {
             "keep checking accounts that are already at 100%"
