@@ -1167,7 +1167,10 @@ enum AbsentSource {
 /// item written first, any reload the link triggers reads the new login.
 ///
 /// `?`-fatal: a failure here leaves both layers on the old account, and every
-/// write is idempotent, so retrying the switch re-runs it.
+/// write is idempotent, so retrying the switch re-runs it. The inverse - this
+/// write landing and the publish below failing - leaves the item switched
+/// while the link is not: live sessions never re-read (no mtime moved), fresh
+/// ones resolve the item, and a retry completes the switch.
 #[cfg(target_os = "macos")]
 fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
     // CLA-SPLIT: callers pass the already-resolved install source so the
