@@ -451,6 +451,12 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
         spans.push(gap(widths));
         spans.push(cell(row.seven_day.as_ref(), widths.seven_day));
     }
+    // The chip trails the columns — after the live slot's width, so a dim
+    // reset count can never sit under `live` and read as a session count.
+    if widths.live > 0 {
+        spans.push(gap(widths));
+        spans.push(Span::raw(" ".repeat(widths.live)));
+    }
     if let Some(count) = row.resets {
         spans.push(gap(widths));
         spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
