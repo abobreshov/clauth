@@ -873,6 +873,10 @@ pub(crate) enum ActionMenuAction {
     /// minted. Offered only for a recognised third-party endpoint, since that
     /// is the only case clauth knows a page for.
     OpenProviderConsole,
+    /// `clauth daemon`, detached from the TUI, offered while none runs.
+    StartDaemon,
+    /// `--replace`'s termination with no successor, offered while one runs.
+    StopDaemon,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -899,6 +903,13 @@ pub(crate) enum ActionMenuAction {
     TokensShowOthers,
     ToggleCountCache,
     ReloadTokenStats,
+}
+
+/// What a `start daemon` / `stop daemon` worker reports, once.
+#[derive(Debug)]
+pub(crate) enum DaemonControlResult {
+    Start(std::result::Result<crate::daemon::StartOutcome, String>),
+    Stop(std::result::Result<crate::daemon::DaemonStop, String>),
 }
 
 /// State for the action-menu modal.
@@ -1003,6 +1014,8 @@ impl ActionMenuAction {
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
             Self::OpenProviderConsole => "open provider console",
+            Self::StartDaemon => "start daemon",
+            Self::StopDaemon => "stop daemon",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -1952,6 +1965,13 @@ pub(crate) struct App {
     /// instead would render `Absent` — "no daemon runs" — as fact for the whole
     /// first interval, and the first paint happens before any `on_tick`.
     pub(crate) last_daemon_probe: Instant,
+    /// A `start daemon` / `stop daemon` worker is running; the action menu
+    /// offers neither verb until its outcome lands. UI-thread-only.
+    pub(crate) daemon_control_busy: bool,
+    /// Those workers' outcomes; drained in `on_tick`.
+    pub(crate) daemon_control_rx: std::sync::mpsc::Receiver<DaemonControlResult>,
+    /// Sender side; cloned into each worker.
+    pub(crate) daemon_control_tx: std::sync::mpsc::Sender<DaemonControlResult>,
     /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
     /// switch one-shot runs only if THIS instance holds it.
     pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -2345,6 +2365,7 @@ impl App {
             crate::pricing::spawn(pricing_sender, pricing_refresh_rx);
         }
 
+        let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
@@ -2421,6 +2442,9 @@ impl App {
             status_refresh,
             daemon_health: crate::daemon::daemon_health(),
             last_daemon_probe: Instant::now(),
+            daemon_control_busy: false,
+            daemon_control_rx,
+            daemon_control_tx,
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
             plugin: PluginState::default(),
             token_stats: None,
@@ -3431,9 +3455,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('a') => {
             app.disarm_quit();
-            if app.tab == Tab::Overview && claude_rows_hidden(app) {
-                return;
-            }
             let state = build_action_menu(app);
             if !state.items.is_empty() {
                 app.modals.push(Modal::ActionMenu(state));
@@ -6996,7 +7017,11 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
-            context = push_account_scope(app, &mut scoped);
+            // The codex filter hides the claude rows the cursor is bound to,
+            // so nothing may act on the row under it.
+            if app.harness_filter.shows_claude() {
+                context = push_account_scope(app, &mut scoped);
+            }
             actions.push(RefreshAll);
             actions.push(NewAccount);
         }
@@ -7060,7 +7085,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             }
         }
         // Fallback: every action the chain and its detail rows carry is bound to
-        // a key of its own (⏎, ⇧↑↓, space, +/-), so `a` offers nothing.
+        // a key of its own (⏎, ⇧↑↓, space, +/-).
         Tab::Fallback => {}
         Tab::Config => {}
         Tab::Status => {
@@ -7069,8 +7094,15 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(OpenIncidentLink);
             }
         }
-        // Plugin: no action menu — `r` re-runs checks, `f` fixes, ⏎/esc navigate.
+        // Plugin: `r` re-runs checks, `f` fixes, ⏎/esc navigate.
         Tab::Plugin => {}
+    }
+    // Every tab: the daemon verb that applies, none while one is in flight.
+    if !app.daemon_control_busy {
+        actions.push(match app.daemon_health {
+            crate::daemon::DaemonHealth::Absent => StartDaemon,
+            crate::daemon::DaemonHealth::Stale | crate::daemon::DaemonHealth::Fresh => StopDaemon,
+        });
     }
 
     ActionMenuState::new(scoped, actions, context)
@@ -7264,6 +7296,8 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             toggle_focused_account_disabled(app);
         }
         ActionMenuAction::OpenProviderConsole => open_provider_console(app),
+        ActionMenuAction::StartDaemon => start_daemon(app),
+        ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
@@ -7280,6 +7314,110 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::TokensShowOthers => set_token_filter(app, TokenFilter::Others),
         ActionMenuAction::ToggleCountCache => toggle_count_cache(app),
         ActionMenuAction::ReloadTokenStats => reload_token_stats(app),
+    }
+}
+
+/// Where the daemon's start and stop toasts send the user when either fails.
+const DAEMON_LOG_HINT: &str = "see ~/.clauth/daemon.log";
+
+/// The action menu's `start daemon`: spawn `<this binary> daemon` detached,
+/// then report, off the UI thread, whether a daemon came up. The worker stays
+/// to reap the child, so a daemon this TUI started and stops never lingers as
+/// a zombie while the TUI runs.
+fn start_daemon(app: &mut App) {
+    let exe = match daemon_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+            return;
+        }
+    };
+    let tx = app.daemon_control_tx.clone();
+    app.daemon_control_busy = true;
+    app.toast(ToastKind::Info, "starting daemon");
+    spawn_worker(move || match crate::daemon::spawn_detached(&exe) {
+        Ok(mut child) => {
+            let outcome = crate::daemon::await_start(
+                &mut child,
+                crate::daemon::START_WAIT,
+                DAEMON_CONTROL_POLL,
+            );
+            let _ = tx.send(DaemonControlResult::Start(Ok(outcome)));
+            let _ = child.wait();
+        }
+        Err(e) => {
+            let _ = tx.send(DaemonControlResult::Start(Err(format!("{e:#}"))));
+        }
+    });
+}
+
+/// The binary `start daemon` runs: this one, as installed. A test build's
+/// binary is the test harness, which would take `daemon` as a filter and run
+/// the suite's daemon tests as its "daemon", so a test build refuses.
+fn daemon_exe() -> std::io::Result<std::path::PathBuf> {
+    if cfg!(test) {
+        return Err(std::io::Error::other("a test build starts no daemon"));
+    }
+    std::env::current_exe().map(|exe| crate::platform::installed_exe_path(&exe))
+}
+
+/// The action menu's `stop daemon`: `--replace`'s termination, which can wait
+/// out two bounded passes, so it runs off the UI thread.
+fn stop_daemon(app: &mut App) {
+    let tx = app.daemon_control_tx.clone();
+    app.daemon_control_busy = true;
+    app.toast(ToastKind::Info, "stopping daemon");
+    spawn_worker(move || {
+        let outcome = crate::daemon::stop_running().map_err(|e| format!("{e:#}"));
+        let _ = tx.send(DaemonControlResult::Stop(outcome));
+    });
+}
+
+/// How often the start worker re-checks its child.
+const DAEMON_CONTROL_POLL: Duration = Duration::from_millis(50);
+
+/// Toast each daemon start/stop outcome, re-arm the menu's verb, and re-probe
+/// the header chip at once rather than at the next throttled probe.
+fn drain_daemon_control(app: &mut App) {
+    use crate::daemon::{DaemonStop, StartOutcome};
+    while let Ok(result) = app.daemon_control_rx.try_recv() {
+        app.daemon_control_busy = false;
+        match result {
+            DaemonControlResult::Start(Ok(StartOutcome::Holding)) => {
+                app.toast(ToastKind::Success, "daemon started");
+            }
+            DaemonControlResult::Start(Ok(StartOutcome::Exited)) => app.toast(
+                ToastKind::Danger,
+                format!("daemon exited at start\n{DAEMON_LOG_HINT}"),
+            ),
+            DaemonControlResult::Start(Ok(StartOutcome::NotYet)) => app.toast(
+                ToastKind::Warning,
+                format!(
+                    "daemon not up after {}s\n{DAEMON_LOG_HINT}",
+                    crate::daemon::START_WAIT.as_secs()
+                ),
+            ),
+            DaemonControlResult::Start(Err(e)) => {
+                app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+            }
+            DaemonControlResult::Stop(Ok(DaemonStop::Stopped)) => {
+                app.toast(ToastKind::Success, "daemon stopped");
+            }
+            DaemonControlResult::Stop(Ok(DaemonStop::NotRunning)) => {
+                app.toast(ToastKind::Info, "no daemon was running");
+            }
+            DaemonControlResult::Stop(Ok(DaemonStop::Replaced)) => {
+                app.toast(
+                    ToastKind::Warning,
+                    "daemon stopped\nanother daemon took over",
+                );
+            }
+            DaemonControlResult::Stop(Err(e)) => {
+                app.toast(ToastKind::Danger, format!("daemon stop failed\n{e}"));
+            }
+        }
+        app.daemon_health = crate::daemon::daemon_health();
+        app.last_daemon_probe = Instant::now();
     }
 }
 
@@ -10720,6 +10858,7 @@ pub(crate) fn on_tick(app: &mut App) {
     sync_broken_verdicts(app);
     poll_codex_rows(app);
     poll_plugin_refresh(app);
+    drain_daemon_control(app);
     poll_daemon_health(app);
 
     warn_day_claim_notices(app);

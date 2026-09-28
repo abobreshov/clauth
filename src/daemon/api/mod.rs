@@ -30,6 +30,7 @@ pub(crate) mod chain;
 pub(crate) mod create;
 pub(crate) mod devices;
 mod events;
+pub(crate) mod gateway;
 pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;

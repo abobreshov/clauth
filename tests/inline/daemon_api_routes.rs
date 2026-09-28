@@ -393,6 +393,8 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/sessions/{id}", Access::View),
             ("POST", "/panes/{id}/prompt", Access::Control),
             ("POST", "/panes/{id}/keys", Access::Control),
+            ("GET", "/gateway", Access::View),
+            ("HEAD", "/gateway", Access::View),
         ]
     );
 }
@@ -983,6 +985,17 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    let gateway = call(&ctx, &req("GET", "/api/v1/gateway", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/gateway",
+        200,
+        &gateway,
+        &mut driven,
+        &mut produced,
+    );
+
     // The sessions routes: the listing over the still-empty store, then the
     // captured transcript paged under the fixture id. A record is the one
     // free-form body besides the document's own: documented as a bare object
@@ -1494,6 +1507,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("GET", "/gateway"),
     ] {
         let resp = call(&ctx, &req(method, &concrete(path), None, ""));
         check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
@@ -1545,6 +1559,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("GET", "/gateway"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -1967,6 +1982,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("GET", "/gateway"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#

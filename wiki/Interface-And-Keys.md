@@ -56,13 +56,13 @@ The day picker on a Fallback card's `preferred days` row shows each weekday as `
 
 On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out.
 
-The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, the keys bound to the Claude Code selection (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd>, <kbd>⏎</kbd>, <kbd>a</kbd>) do nothing and a toast says `claude rows are hidden, press c`. <kbd>n</kbd>, <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
+The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, the keys bound to the Claude Code selection (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd>, <kbd>⏎</kbd>) do nothing and a toast says `claude rows are hidden, press c`; <kbd>a</kbd> opens the tab-wide entries alone. <kbd>n</kbd>, <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
 
 ## Action menus
 
-<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so a screen whose <kbd>⏎</kbd> is the whole story carries no menu: Config, Fallback and Plugin have none. The footer only advertises <kbd>a</kbd> where something would open.
+<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so on Config, Fallback and Plugin, where every action already has a key, it holds only the daemon entry every tab ends on. The footer only advertises <kbd>a</kbd> where something would open.
 
-Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab.
+Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab, and the last one on the daemon.
 
 | Tab | Account | Tab-wide |
 |-----|---------|----------|
@@ -71,10 +71,13 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
 | Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` | none |
 | Status | none | `refresh status`, `open in browser` |
+| every tab | none | `start daemon` / `stop daemon`, last |
+
+`start daemon` shows while no daemon runs and starts `clauth daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.clauth/daemon.log`. It starts the plain daemon, so it serves no REST API; for the clauth app, run `clauth daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `clauth daemon --replace` does, taking the shunt gateway down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint clauth knows a key page for, so an OAuth account's menu is one entry shorter.
 
-The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is what works on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account to duplicate or save, so the menu is `apply preset` alone, stamping the draft's endpoint and model fields.
+The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is what works on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account to duplicate or save, so its account entry is `apply preset` alone, stamping the draft's endpoint and model fields.
 
 | Entry | Does |
 |-------|------|

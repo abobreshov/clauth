@@ -10,6 +10,7 @@ mod completions;
 mod daemon;
 mod fallback;
 mod format;
+mod gateway;
 mod harness;
 mod herdr;
 mod hook_context;

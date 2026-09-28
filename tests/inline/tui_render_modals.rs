@@ -500,7 +500,7 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 9].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 10].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "╭─ ACTIONS ───────────── acct ─╮".to_string(),
             "│                              │".to_string(),
@@ -510,6 +510,7 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
             "│  ──────────────────────────  │".to_string(),
             "│    refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
+            "│    start daemon           s  │".to_string(),
             "│                              │".to_string(),
         ],
     );
@@ -532,12 +533,13 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 6].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 7].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "╭─ ACTIONS ────────────────────╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
+            "│    start daemon           s  │".to_string(),
             "│                              │".to_string(),
             "╰──────────────────────────────╯".to_string(),
         ],
@@ -545,8 +547,9 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
 }
 
 /// A menu that is scoped end to end (the Setup tab, whose three actions all
-/// work on the account being configured) still names that account, and still
-/// draws no rule — there is no second group to hold off.
+/// work on the account being configured, while a daemon start or stop holds
+/// the daemon verb back) still names that account, and still draws no rule —
+/// there is no second group to hold off.
 #[test]
 fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     use crate::tui::app::{ConfigFocus, handle_key};
@@ -564,6 +567,7 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     // ⏎ on the account list is what seeds the draft the menu titles itself with.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.config_focus, ConfigFocus::Actions);
+    app.daemon_control_busy = true;
 
     let (rows, left, right) = render_action_menu(&app, 60, 20);
     let slice =

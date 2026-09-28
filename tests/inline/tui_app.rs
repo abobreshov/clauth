@@ -3744,6 +3744,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("disable account", Some('d')),
             ("refresh all accounts", Some('f')),
             ("new account", Some('n')),
+            ("start daemon", Some('s')),
         ]
     );
 
@@ -3757,6 +3758,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("refresh all accounts", Some('f')),
             ("toggle estimates", Some('e')),
             ("toggle pace marker", Some('p')),
+            ("start daemon", Some('s')),
         ]
     );
 
@@ -3768,9 +3770,167 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
         entries(&empty),
         [
             ("refresh all accounts", Some('f')),
-            ("new account", Some('n'))
+            ("new account", Some('n')),
+            ("start daemon", Some('s')),
         ]
     );
+}
+
+/// Every tab's menu ends on the one daemon verb that applies: `start daemon`
+/// with no daemon up, `stop daemon` with one up, fresh or stale, and neither
+/// while a start or stop is in flight. It rides the tab-global group.
+#[test]
+fn every_tab_offers_the_daemon_verb_that_applies() {
+    use super::{Tab, build_action_menu};
+    use crate::daemon::DaemonHealth;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let daemon_verbs = |app: &super::App| -> Vec<&'static str> {
+        build_action_menu(app)
+            .items
+            .iter()
+            .map(|i| i.label)
+            .filter(|l| l.ends_with(" daemon"))
+            .collect()
+    };
+
+    for tab in Tab::ALL {
+        app.tab = tab;
+        for (health, verb) in [
+            (DaemonHealth::Absent, "start daemon"),
+            (DaemonHealth::Stale, "stop daemon"),
+            (DaemonHealth::Fresh, "stop daemon"),
+        ] {
+            app.daemon_health = health;
+            app.daemon_control_busy = false;
+            let menu = build_action_menu(&app);
+            assert_eq!(
+                menu.items.last().map(|i| i.label),
+                Some(verb),
+                "{tab:?} with the daemon {health:?}"
+            );
+            assert!(
+                menu.scoped_len < menu.items.len(),
+                "{tab:?}: the verb is tab-global, never under the account's name"
+            );
+            assert_eq!(
+                daemon_verbs(&app),
+                [verb],
+                "{tab:?}: only the verb that applies"
+            );
+            app.daemon_control_busy = true;
+            assert!(
+                daemon_verbs(&app).is_empty(),
+                "{tab:?}: no verb while one is in flight"
+            );
+        }
+    }
+}
+
+/// Each start/stop outcome lands as its own toast, frees the menu's verb, and
+/// re-probes the header chip at once rather than a throttled second later.
+#[test]
+fn daemon_control_outcomes_toast_and_rearm_the_verb() {
+    use super::{DaemonControlResult as R, ToastKind};
+    use crate::daemon::{DaemonHealth, DaemonStop, StartOutcome};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let cases = [
+        (
+            R::Start(Ok(StartOutcome::Holding)),
+            ToastKind::Success,
+            "daemon started",
+        ),
+        (
+            R::Start(Ok(StartOutcome::Exited)),
+            ToastKind::Danger,
+            "daemon exited at start\nsee ~/.clauth/daemon.log",
+        ),
+        (
+            R::Start(Ok(StartOutcome::NotYet)),
+            ToastKind::Warning,
+            "daemon not up after 5s\nsee ~/.clauth/daemon.log",
+        ),
+        (
+            R::Start(Err("no such file".to_string())),
+            ToastKind::Danger,
+            "daemon start failed\nno such file",
+        ),
+        (
+            R::Stop(Ok(DaemonStop::Stopped)),
+            ToastKind::Success,
+            "daemon stopped",
+        ),
+        (
+            R::Stop(Ok(DaemonStop::NotRunning)),
+            ToastKind::Info,
+            "no daemon was running",
+        ),
+        (
+            R::Stop(Ok(DaemonStop::Replaced)),
+            ToastKind::Warning,
+            "daemon stopped\nanother daemon took over",
+        ),
+        (
+            R::Stop(Err("wedged".to_string())),
+            ToastKind::Danger,
+            "daemon stop failed\nwedged",
+        ),
+    ];
+    for (result, kind, body) in cases {
+        app.daemon_control_busy = true;
+        app.daemon_health = DaemonHealth::Fresh;
+        app.daemon_control_tx.send(result).expect("send");
+        super::drain_daemon_control(&mut app);
+        let toast = app.toasts.back().expect("a toast");
+        assert_eq!((toast.kind, toast.body.as_str()), (kind, body));
+        assert!(!app.daemon_control_busy, "{body:?} frees the verb");
+        assert_eq!(
+            app.daemon_health,
+            DaemonHealth::Absent,
+            "{body:?} re-probed the chip (no daemon in the sandbox)"
+        );
+    }
+}
+
+/// The menu's verbs reach their workers and the tick lands their outcome. A
+/// test build refuses to start a daemon, since its binary is the test harness,
+/// and says so; the stop runs the real termination, which finds no daemon in
+/// the sandbox.
+#[test]
+fn the_daemon_verbs_reach_their_workers() {
+    use super::{ActionMenuAction, dispatch_action_menu_action, join_test_workers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartDaemon);
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("daemon start failed\na test build starts no daemon")
+    );
+    assert!(
+        !app.daemon_control_busy,
+        "a refused start leaves the verb armed"
+    );
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StopDaemon);
+    assert!(
+        app.daemon_control_busy,
+        "the stop holds the verb back while it runs"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("stopping daemon")
+    );
+    join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        app.toasts.iter().any(|t| t.body == "no daemon was running"),
+        "the tick drains the worker's outcome"
+    );
+    assert!(!app.daemon_control_busy);
 }
 
 /// Usage `r` and the action menu's "refresh usage" share one gate. A generic
@@ -8518,7 +8678,8 @@ fn tokens_action_menu_sets_and_swaps_the_model_filter() {
             "show claude models",
             "show other models",
             "toggle cache counting",
-            "reload stats"
+            "reload stats",
+            "start daemon",
         ]
     );
 
@@ -10843,8 +11004,9 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
                 ("duplicate account", Some('d')),
                 ("save as preset", Some('s')),
                 ("apply preset", Some('p')),
+                ("start daemon", Some('t')),
             ],
-            "{focus:?} carries the account-scoped trio",
+            "{focus:?} carries the account-scoped trio, then the daemon verb",
         );
         assert_eq!(menu.scoped_len, 3, "all three act on the account");
         assert_eq!(menu.context.as_deref(), Some("acct"));
@@ -10859,8 +11021,8 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
             .iter()
             .map(|i| (i.label, i.hotkey))
             .collect::<Vec<_>>(),
-        [("apply preset", Some('p'))],
-        "`+ new` offers apply preset only",
+        [("apply preset", Some('p')), ("start daemon", Some('s'))],
+        "`+ new` offers apply preset, then the daemon verb",
     );
     assert_eq!(menu.scoped_len, 1);
     assert_eq!(menu.context, None, "the draft has no name yet");
@@ -13269,9 +13431,10 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
 
 // ── the codex-only view disarms every key bound to the claude selection ──────
 
-/// With the claude rows hidden, reorder, cursor, switch and the action menu
-/// would act on a row the screen does not show. Each is inert with a toast
-/// saying why, and every filter that shows the claude rows (`All` and `Claude`
+/// With the claude rows hidden, reorder, cursor, switch and the action menu's
+/// account group would act on a row the screen does not show. The keys are
+/// inert with a toast saying why, the menu opens with its tab-global actions
+/// alone, and every filter that shows the claude rows (`All` and `Claude`
 /// alike) re-arms all four.
 #[test]
 fn the_codex_only_view_disarms_the_claude_selection_keys() {
@@ -13325,7 +13488,19 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     assert!(app.modals.is_empty(), "enter pushes no confirm");
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
-    assert!(app.modals.is_empty(), "`a` opens no action menu");
+    let Some(Modal::ActionMenu(menu)) = app.modals.last() else {
+        panic!("`a` opens the tab-global actions");
+    };
+    assert_eq!(
+        (menu.scoped_len, menu.context.as_deref()),
+        (0, None),
+        "no entry acts on the hidden row"
+    );
+    assert_eq!(
+        menu.items.iter().map(|i| i.label).collect::<Vec<_>>(),
+        ["refresh all accounts", "new account", "start daemon"]
+    );
+    app.modals.clear();
 
     // Every filter showing the claude rows re-arms all four keys; each pass
     // reorders from cursor 0, so the order flips back and forth.
@@ -13350,8 +13525,8 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
 
         handle_key(app, crate::testutil::key(KeyCode::Char('a')));
         assert!(
-            matches!(app.modals.last(), Some(Modal::ActionMenu(_))),
-            "{filter:?}: `a` re-armed: the action menu is up"
+            matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.scoped_len == 3),
+            "{filter:?}: `a` re-armed: the menu carries the account's group"
         );
         app.modals.clear();
     };

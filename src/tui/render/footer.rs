@@ -84,9 +84,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect(),
     };
 
-    // `a` opens nothing where the context carries no action of its own (the
-    // whole Fallback tab, a Setup text row). Reading the real menu keeps the
-    // hint honest per row instead of leaving each arm's literal to drift.
+    // `a` opens nothing where the menu is empty: a tab with no action of its
+    // own while a daemon start or stop is in flight. Reading the real menu
+    // keeps the hint honest per row instead of leaving each arm's literal to
+    // drift.
     if build_action_menu(app).items.is_empty() {
         hints.retain(|(key, _)| *key != "a");
     }
@@ -205,10 +206,12 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         ("a", "actions"),
                         ("?", "help"),
                     ],
-                    // The reveal chip has no `a` actions, so it isn't advertised.
-                    Some(ConfigRow::ModelOverrideAdd) => {
-                        &[("↑↓", "row"), ("↵", "add override"), ("?", "help")]
-                    }
+                    Some(ConfigRow::ModelOverrideAdd) => &[
+                        ("↑↓", "row"),
+                        ("↵", "add override"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ],
                     _ => &[
                         ("↑↓", "row"),
                         ("↵", "edit / toggle"),
@@ -234,10 +237,16 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                     ("↑↓", "row"),
                     ("space", "cycle"),
                     ("↵", "custom"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             } else {
-                &[("↑↓", "row"), ("space/↵", "cycle / toggle"), ("?", "help")]
+                &[
+                    ("↑↓", "row"),
+                    ("space/↵", "cycle / toggle"),
+                    ("a", "actions"),
+                    ("?", "help"),
+                ]
             }
         }
         Tab::Status => match app.status.focus {
@@ -252,7 +261,7 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         },
         Tab::Plugin => plugin_hints(app),
         Tab::Fallback => match fallback_hint(app) {
-            FallbackHint::Empty => &[("?", "help")],
+            FallbackHint::Empty => &[("a", "actions"), ("?", "help")],
             FallbackHint::ChainMember => &[
                 ("↑↓", "move"),
                 ("⇧↑↓", "reorder"),
@@ -260,7 +269,12 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("a", "actions"),
                 ("?", "help"),
             ],
-            FallbackHint::ChainAdd => &[("↑↓", "move"), ("↵", "add"), ("?", "help")],
+            FallbackHint::ChainAdd => &[
+                ("↑↓", "move"),
+                ("↵", "add"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             FallbackHint::DetailThreshold => &[
                 ("↑↓", "row"),
                 ("+", "raise"),
@@ -310,7 +324,12 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             FallbackHint::DetailRemoveArmed => {
                 &[("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")]
             }
-            FallbackHint::DetailAdd => &[("↑↓", "pick"), ("↵", "add"), ("?", "help")],
+            FallbackHint::DetailAdd => &[
+                ("↑↓", "pick"),
+                ("↵", "add"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
         },
     };
 
@@ -366,6 +385,7 @@ fn plugin_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("↵", "detail"),
                     ("r", "refresh"),
                     ("f", "fix"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             } else {
@@ -373,6 +393,7 @@ fn plugin_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("↑↓", "row"),
                     ("↵", "detail"),
                     ("r", "refresh"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             }
@@ -397,10 +418,16 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                 ("↑↓", "scroll"),
                 ("r", "refresh"),
                 ("f", "fix"),
+                ("a", "actions"),
                 ("?", "help"),
             ]
         } else {
-            &[("↑↓", "scroll"), ("r", "refresh"), ("?", "help")]
+            &[
+                ("↑↓", "scroll"),
+                ("r", "refresh"),
+                ("a", "actions"),
+                ("?", "help"),
+            ]
         };
     }
     // `r` and `f` keep working while the options rows hold the cursor, so they
@@ -415,6 +442,7 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("↵", "type"),
                     ("r", "refresh"),
                     ("f", "fix"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             } else {
@@ -424,6 +452,7 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("-", "lower"),
                     ("↵", "type"),
                     ("r", "refresh"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             }
@@ -435,6 +464,7 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("space/↵", "rewrite row"),
                     ("r", "refresh"),
                     ("f", "fix"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             } else {
@@ -442,6 +472,7 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("↑↓", "row"),
                     ("space/↵", "rewrite row"),
                     ("r", "refresh"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             }
@@ -450,9 +481,20 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
         // no-op there.
         Some(HerdrOption::DelegateRowText) => {
             if fix {
-                &[("↑↓", "row"), ("r", "refresh"), ("f", "fix"), ("?", "help")]
+                &[
+                    ("↑↓", "row"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("a", "actions"),
+                    ("?", "help"),
+                ]
             } else {
-                &[("↑↓", "row"), ("r", "refresh"), ("?", "help")]
+                &[
+                    ("↑↓", "row"),
+                    ("r", "refresh"),
+                    ("a", "actions"),
+                    ("?", "help"),
+                ]
             }
         }
         _ => {
@@ -462,6 +504,7 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("space/↵", "cycle / toggle"),
                     ("r", "refresh"),
                     ("f", "fix"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             } else {
@@ -469,6 +512,7 @@ fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
                     ("↑↓", "row"),
                     ("space/↵", "cycle / toggle"),
                     ("r", "refresh"),
+                    ("a", "actions"),
                     ("?", "help"),
                 ]
             }

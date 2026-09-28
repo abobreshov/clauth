@@ -13,6 +13,7 @@
 //! two schedulers from double-firing.
 
 pub(crate) mod api;
+pub(crate) mod gateway;
 pub(crate) mod log_rotate;
 mod probe;
 mod status_json;
@@ -23,6 +24,8 @@ use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health, singleton_held};
+/// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
+pub(crate) use probe::{DaemonStop, stop_running};
 #[cfg(test)]
 pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
 /// Small daemon state types + the backoff schedule, re-exported so callers keep
@@ -86,6 +89,9 @@ const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 /// held for life by whichever instance (daemon or a TUI) is the current usage
 /// fetcher. See [`FetchLease`](probe::FetchLease).
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
+/// The daemon's log beside `status.json`: its stderr and stdout when the TUI
+/// starts it. The run loop caps it by this name.
+const LOG_FILE: &str = "daemon.log";
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
 /// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
@@ -253,6 +259,104 @@ fn listener_setup(
     })
 }
 
+/// The TUI's `start daemon`: `<exe> daemon` detached from the caller, its
+/// output appended to [`LOG_FILE`] (append mode, which the size cap's
+/// in-place trim needs), its cwd `~/.clauth` so it pins no directory the
+/// caller ran in. On unix it leads its own process group, so the caller's
+/// Ctrl-C and the terminal's hangup, which reach only the foreground group,
+/// never reach it; on Windows it runs on a hidden console of its own, so
+/// closing the caller's console window does not end it, the console programs
+/// it starts (the gateway, its PowerShell probes) share that hidden console
+/// instead of each opening a window, and it leaves the caller's job object
+/// where that job allows it, so a host closing the job (sshd ending a
+/// session) does not end it either. A clauth session home the caller inherited
+/// is scrubbed ([`crate::runtime::scrub_clauth_homes`]): the daemon outlives
+/// that session and its tree.
+pub(crate) fn spawn_detached(exe: &std::path::Path) -> Result<std::process::Child> {
+    let dir = clauth_dir()?;
+    mkdir_700(&dir).context("failed to create ~/.clauth")?;
+    let log_path = dir.join(LOG_FILE);
+    let log = crate::profile::open_append_600(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("daemon")
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().context("failed to share the daemon log")?)
+        .stderr(log);
+    crate::runtime::scrub_clauth_homes(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Process creation flags (winbase.h): a console with no window, its
+        // own Ctrl+C group, and out of the caller's job object, which a host
+        // such as sshd closes with every process in it. A job that forbids
+        // breakaway refuses the whole spawn, so that one retries inside it.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let detached = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        command.creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB);
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                command.creation_flags(detached);
+            }
+            spawned => {
+                return spawned.with_context(|| format!("failed to run {} daemon", exe.display()));
+            }
+        }
+    }
+    command
+        .spawn()
+        .with_context(|| format!("failed to run {} daemon", exe.display()))
+}
+
+/// How long the TUI's `start daemon` waits for its child to hold the
+/// singleton. `serve` claims it before any shared-tree work, so this is
+/// headroom, not an expected duration.
+pub(crate) const START_WAIT: Duration = Duration::from_secs(5);
+
+/// What a [`spawn_detached`] child did within the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartOutcome {
+    /// A daemon holds the singleton: this child, or one that won the race to
+    /// it (this child then exits as redundant, the same end state).
+    Holding,
+    /// The child exited and nothing holds the singleton.
+    Exited,
+    /// Neither, when the wait ran out.
+    NotYet,
+}
+
+/// Watch a [`spawn_detached`] child until a daemon holds the singleton, the
+/// child exits, or `wait` passes. An unreadable lock counts as not held yet.
+pub(crate) fn await_start(
+    child: &mut std::process::Child,
+    wait: Duration,
+    poll: Duration,
+) -> StartOutcome {
+    let deadline = Instant::now() + wait;
+    loop {
+        if singleton_held().unwrap_or(false) {
+            return StartOutcome::Holding;
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return StartOutcome::Exited;
+        }
+        if Instant::now() >= deadline {
+            return StartOutcome::NotYet;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
@@ -299,7 +403,7 @@ pub(crate) fn serve(
         StartMode::Replace => probe::claim_by_replacing(&dir)?,
         _ => claim_singleton(&dir, mode == StartMode::Standby)?,
     };
-    let (_lock, promoted) = match claim {
+    let (lock, promoted) = match claim {
         Claim::Active(lock) => (lock, false),
         Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
         Claim::Redundant => {
@@ -353,6 +457,19 @@ pub(crate) fn serve(
             daemon.live_stores(),
         )?;
     }
+
+    // After the listener, the last start step that can fail, so a start that
+    // dies leaves no gateway behind; before `run`, which never returns, so
+    // the supervisor (or the signal watcher holding it) lives as long as the
+    // process. A standby reaches this only once promoted: the gateway runs
+    // under the singleton's holder alone.
+    let _supervisor = match gateway::start(Arc::clone(&daemon.gateway), &lock) {
+        Ok(supervisor) => gateway::stop_on_signal(supervisor),
+        Err(e) => {
+            logline!("clauth daemon: {e:#}; the shunt gateway is not supervised");
+            None
+        }
+    };
 
     logline!(
         "clauth daemon: running (status → {})",
@@ -733,6 +850,8 @@ pub(crate) struct LiveStores {
     pub(crate) pending_switch: PendingSwitch,
     pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     pub(crate) kick_blocks: KickBlocks,
+    /// The gateway supervisor's published slot.
+    pub(crate) gateway: gateway::GatewayHandle,
 }
 
 #[cfg(test)]
@@ -749,6 +868,7 @@ impl Default for LiveStores {
             pending_switch: Arc::new(RankedMutex::new(Default::default())),
             auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            gateway: gateway::new_handle(),
         }
     }
 }
@@ -764,6 +884,7 @@ pub(crate) struct LiveSnapshot {
     pending_switch: Option<String>,
     queue_anchor: Option<i64>,
     queue_blocked: Vec<ProfileName>,
+    gateway: Option<gateway::GatewaySlot>,
 }
 
 impl LiveStores {
@@ -830,6 +951,7 @@ impl LiveStores {
             pending_switch,
             queue_anchor,
             queue_blocked,
+            gateway: gateway::published(&self.gateway),
         }
     }
 }
@@ -845,6 +967,7 @@ impl LiveSnapshot {
             pending_switch: self.pending_switch.as_deref(),
             queue_anchor: self.queue_anchor,
             queue_blocked: &self.queue_blocked,
+            gateway: self.gateway.as_ref(),
         }
     }
 }
@@ -906,6 +1029,8 @@ struct Daemon {
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
     status_path: PathBuf,
+    /// The slot the gateway supervisor publishes, read by every status write.
+    gateway: gateway::GatewayHandle,
 }
 
 impl Daemon {
@@ -946,6 +1071,7 @@ impl Daemon {
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
             status_path,
+            gateway: gateway::new_handle(),
         }
     }
 
@@ -1051,7 +1177,7 @@ impl Daemon {
         // boot, tick 0) so a pre-fix crash-loop log or a busy period can't grow it
         // unbounded. The check is a cheap stat that no-ops well
         // under the cap.
-        let log_path = self.status_path.with_file_name("daemon.log");
+        let log_path = self.status_path.with_file_name(LOG_FILE);
         let mut ticks: u64 = 0;
         loop {
             if ticks.is_multiple_of(LOG_ROTATE_EVERY_TICKS) {
@@ -1133,6 +1259,7 @@ impl Daemon {
             pending_switch: Arc::clone(&self.pending_switch),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             kick_blocks: Arc::clone(&self.kick_blocks),
+            gateway: Arc::clone(&self.gateway),
         }
     }
 

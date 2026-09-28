@@ -72,6 +72,7 @@ fn build_status_top_level_shape_and_active() {
             "clauth_version",
             "codex_fallback_chain",
             "codex_wrap_off",
+            "gateway",
             "generated_at",
             "pending_switch",
             "profiles",
@@ -344,6 +345,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         pending_switch: Some("home"),
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -388,6 +390,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         pending_switch: None,
         queue_anchor: Some(anchor),
         queue_blocked: &[],
+        gateway: None,
     };
     let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
         v["profiles"]
@@ -493,6 +496,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -775,6 +779,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -844,6 +849,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -870,6 +876,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1053,6 +1060,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 90_000, Some(&live), false);
     assert_eq!(
@@ -1097,6 +1105,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1119,6 +1128,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -1149,6 +1159,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -1605,6 +1616,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         pending_switch: None,
         queue_anchor: Some(anchor),
         queue_blocked: &blocked,
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -1717,6 +1729,7 @@ fn status_body_matches_legacy_json_bytes() {
         codex_wrap_off: true,
         refresh_interval_ms: 300_000,
         clauth_version: "9.9.9".to_string(),
+        gateway: None,
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -1808,7 +1821,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","profiles":["#,
+        r#""clauth_version":"9.9.9","gateway":null,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -1842,13 +1855,14 @@ fn status_body_matches_legacy_json_bytes() {
         codex_wrap_off: false,
         refresh_interval_ms: 60_000,
         clauth_version: "9.9.9".to_string(),
+        gateway: None,
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","profiles":[]}"#,
+        r#""clauth_version":"9.9.9","gateway":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2160,6 +2174,7 @@ fn status_body_never_leaks_a_credential() {
         pending_switch: Some("canary-api"),
         queue_anchor: Some(now / 1000),
         queue_blocked: &blocked,
+        gateway: None,
     };
     let body_live = build_status(&config, 300_000, Some(&live), true);
     let body_live_str =
@@ -2699,6 +2714,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -2718,6 +2734,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -2739,6 +2756,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        gateway: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(

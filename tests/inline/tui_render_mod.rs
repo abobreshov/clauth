@@ -1055,10 +1055,12 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
     );
 }
 
-/// The footer advertises `a` only where the menu has something in it. Both
-/// directions on one screen: the Setup tab's three actions all work on the
-/// focused account, and the `+ new` form carries only `apply preset` (no source
-/// account to duplicate or save) — so the hint stays up in both positions.
+/// The footer advertises `a` only where the menu has something in it. The
+/// Setup tab's three actions all work on the focused account and the `+ new`
+/// form carries only `apply preset` (no source account to duplicate or save),
+/// each beside the daemon verb, so the hint stays up in both positions; the
+/// one empty menu left, a tab with no action of its own while a daemon start
+/// or stop holds that verb back, drops it.
 #[test]
 fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     use crate::tui::app::handle_key;
@@ -1077,7 +1079,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     app.tab = Tab::Setup;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let menu = crate::tui::app::build_action_menu(&app);
-    assert_eq!(menu.items.len(), 3);
+    assert_eq!(menu.items.len(), 4);
     assert_eq!(
         menu.context.as_deref(),
         Some("acct"),
@@ -1095,7 +1097,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     app.profile_cursor = app.profile_count();
     app.config_draft = None;
     let menu = crate::tui::app::build_action_menu(&app);
-    assert_eq!(menu.items.len(), 1);
+    assert_eq!(menu.items.len(), 2);
     assert_eq!(
         menu.context, None,
         "no draft is mounted yet, so the group title is bare"
@@ -1104,6 +1106,27 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     assert!(
         out.contains("a actions"),
         "the create form's menu carries apply preset, so the key stays advertised:\n{out}"
+    );
+
+    app.tab = Tab::Config;
+    app.daemon_control_busy = true;
+    assert!(crate::tui::app::build_action_menu(&app).items.is_empty());
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("a actions"),
+        "an empty menu is never advertised:\n{out}"
+    );
+    app.daemon_control_busy = false;
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "the daemon verb alone keeps it advertised:\n{out}"
+    );
+    app.tab = Tab::Plugin;
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "the Plugin tab's menu holds the daemon verb too:\n{out}"
     );
 }
 
@@ -2174,14 +2197,14 @@ fn fallback_preferred_days_footer_hints() {
     let out = dump(&app, 120, 30);
     assert_eq!(
         footer_of(&out),
-        "←→ tabs   space preset   ↵ days   ↑↓ row   ? help   q back",
+        "←→ tabs   space preset   ↵ days   ↑↓ row   a actions   ? help   q back",
         "the row's hints"
     );
     let out = dump(&app, 45, 30);
     assert_eq!(
         footer_of(&out),
         "←→ tabs   space preset   ? help   q back",
-        "at phone width `↑↓ row` sheds before the row's own keys"
+        "at phone width `a actions` and `↑↓ row` shed before the row's own keys"
     );
 
     crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));

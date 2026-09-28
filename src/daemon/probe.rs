@@ -211,7 +211,7 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 /// Windows) and, after the escalation, before it gives up. A dying process
 /// releases its advisory flock within a handful of scheduler ticks; 5 s is
 /// generous headroom over that.
-const REPLACE_WAIT: Duration = Duration::from_secs(5);
+pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
 const REPLACE_POLL: Duration = Duration::from_millis(50);
@@ -345,10 +345,77 @@ pub(crate) fn claim_by_replacing_retry_with(
     attempts: u32,
     retry: Duration,
 ) -> Result<Claim> {
-    // Fast path: no daemon → a normal start. Retry past transient probe holds
-    // (TUI header at 1 Hz, clauth daemon --status) that take the flock and
-    // release it microseconds later — a real holder keeps its lock for the
-    // process lifetime, so anything that clears on retry was a reader.
+    // If the retry cleared the transient, try a normal claim. If a daemon wins
+    // the lock in the instant between the presence check and the claim, fall
+    // through and replace it rather than returning a silent `Redundant` (which
+    // `serve` would log and exit 0 on, leaving the operator's upgrade un-started).
+    if !held_past_probes(attempts, retry)?
+        && let Claim::Active(lock) = claim_once(dir, false)?
+    {
+        return Ok(Claim::Active(lock));
+    }
+    // The flock a dying holder released is what this waits on, so the poll is
+    // load-bearing: the first attempt races the death and normally still reads
+    // the lock held.
+    let lock = terminate_holder(wait, poll, |_| claim_active(dir))?;
+    Ok(Claim::Active(lock))
+}
+
+/// The singleton, when this process can take it now.
+fn claim_active(dir: &Path) -> Option<DaemonLock> {
+    match claim_once(dir, false) {
+        Ok(Claim::Active(lock)) => Some(lock),
+        _ => None,
+    }
+}
+
+/// What [`stop_running`] found and left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonStop {
+    /// No daemon held the singleton: nothing was signalled.
+    NotRunning,
+    /// The daemon exited and the singleton stayed free.
+    Stopped,
+    /// The daemon exited and another instance held the singleton at once: a
+    /// parked standby promoted, or a supervisor restarted it.
+    Replaced,
+}
+
+/// The TUI's `stop daemon`: the termination `--replace` sends, with no claim
+/// after it, so the box is left with no daemon rather than this process.
+pub(crate) fn stop_running() -> Result<DaemonStop> {
+    stop_running_with(REPLACE_WAIT, REPLACE_POLL, CLAIM_ATTEMPTS, CLAIM_RETRY)
+}
+
+/// [`stop_running`] with the wait and retry schedules injected, so a test can
+/// pin the escalation and the probe-collision recovery without sleeping for
+/// either.
+pub(crate) fn stop_running_with(
+    wait: Duration,
+    poll: Duration,
+    attempts: u32,
+    retry: Duration,
+) -> Result<DaemonStop> {
+    if !held_past_probes(attempts, retry)? {
+        return Ok(DaemonStop::NotRunning);
+    }
+    // Death is the event, not the free lock: a parked standby takes the flock
+    // the instant it is released, so a free-lock wait would sit out both
+    // passes and then SIGKILL a pid that is already gone.
+    terminate_holder(wait, poll, |pid| (!pid_is_clauth_daemon(pid)).then_some(()))?;
+    if held_past_probes(attempts, retry)? {
+        // The successor's own start reclaims whatever gateway was left.
+        return Ok(DaemonStop::Replaced);
+    }
+    super::gateway::stop_left_behind_gateway();
+    Ok(DaemonStop::Stopped)
+}
+
+/// Whether a daemon holds the singleton, re-tested past transient probe holds
+/// (TUI header at 1 Hz, `clauth daemon --status`) that take the flock and
+/// release it microseconds later: a real holder keeps its lock for the process
+/// lifetime, so anything that clears on retry was a reader.
+fn held_past_probes(attempts: u32, retry: Duration) -> Result<bool> {
     let mut held = true;
     for attempt in 0..attempts.max(1) {
         held = singleton_held()?;
@@ -359,17 +426,20 @@ pub(crate) fn claim_by_replacing_retry_with(
             std::thread::sleep(retry);
         }
     }
-    // If the retry cleared the transient, try a normal claim. If a daemon wins
-    // the lock in the instant between the presence check and the claim, fall
-    // through and replace it rather than returning a silent `Redundant` (which
-    // `serve` would log and exit 0 on, leaving the operator's upgrade un-started).
-    if !held && let Claim::Active(lock) = claim_once(dir, false)? {
-        return Ok(Claim::Active(lock));
-    }
+    Ok(held)
+}
+
+/// Signal the daemon the [`PID_FILE`] sidecar names until `released` answers
+/// for its pid: SIGTERM (`taskkill /F` on Windows), a bounded wait, one
+/// escalation (SIGKILL, another `/F`), a second bounded wait. Shared by
+/// `--replace` and [`stop_running`], which differ only in what counts as done.
+fn terminate_holder<T>(
+    wait: Duration,
+    poll: Duration,
+    mut released: impl FnMut(u32) -> Option<T>,
+) -> Result<T> {
     let Some(pid) = holder_pid() else {
-        anyhow::bail!(
-            "a clauth daemon is running but its pid is unreadable; kill it manually, then start"
-        );
+        anyhow::bail!("a clauth daemon is running but its pid is unreadable; kill it manually");
     };
     if !pid_is_clauth_daemon(pid) {
         anyhow::bail!(
@@ -378,19 +448,17 @@ pub(crate) fn claim_by_replacing_retry_with(
         );
     }
     let sent_term = terminate_pid(pid, false);
-    if let Some(lock) = wait_for_active(dir, wait, poll) {
-        return Ok(Claim::Active(lock));
+    if let Some(done) = poll_until(wait, poll, || released(pid)) {
+        return Ok(done);
     }
-    // The first pass didn't free the lock in time: escalate (SIGKILL on unix,
-    // another `taskkill /F` on Windows) and wait once more.
     let sent_kill = terminate_pid(pid, true);
-    if let Some(lock) = wait_for_active(dir, wait, poll) {
-        return Ok(Claim::Active(lock));
+    if let Some(done) = poll_until(wait, poll, || released(pid)) {
+        return Ok(done);
     }
     if !sent_term && !sent_kill {
         anyhow::bail!(
             "could not signal the running clauth daemon (pid {pid}): no kill tool is on PATH \
-             (`kill` on unix, `taskkill` on Windows); kill it manually, then start"
+             (`kill` on unix, `taskkill` on Windows); kill it manually"
         );
     }
     anyhow::bail!(
@@ -400,16 +468,12 @@ pub(crate) fn claim_by_replacing_retry_with(
     )
 }
 
-/// Poll the singleton lock until this process can claim it, up to `wait`. Returns
-/// the held [`DaemonLock`] on success (its pid stamped by [`DaemonLock::active`]),
-/// or `None` on timeout. The flock a dying holder released is what this waits on,
-/// so the loop is load-bearing: the first attempt races the death and normally
-/// still reads the lock held.
-fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonLock> {
+/// Ask `done` every `poll` until it answers, up to `wait`; `None` on timeout.
+fn poll_until<T>(wait: Duration, poll: Duration, mut done: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = Instant::now() + wait;
     loop {
-        if let Ok(Claim::Active(lock)) = claim_once(dir, false) {
-            return Some(lock);
+        if let Some(value) = done() {
+            return Some(value);
         }
         if Instant::now() >= deadline {
             return None;
@@ -427,7 +491,7 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.
 #[cfg(unix)]
-fn terminate_pid(pid: u32, hard: bool) -> bool {
+pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
     let mut cmd = std::process::Command::new("kill");
     cmd.args(["-s", signal, &pid.to_string()]);
@@ -441,7 +505,7 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_pid(pid: u32, hard: bool) -> bool {
+pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     // A console daemon has no window to accept the graceful WM_CLOSE, so a
     // soft taskkill can never work here: every pass is a force kill. The
     // first (soft) pass is the expected-success path and stays silenced; the

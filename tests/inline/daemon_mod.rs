@@ -2073,3 +2073,144 @@ fn the_status_writer_reads_the_schedulers_own_streak_store() {
         "the writer must read the scheduler's own streak store"
     );
 }
+
+// ── the TUI's `start daemon` ─────────────────────────────────────────────────
+
+/// A stand-in `clauth`: prints what `spawn_detached` handed it, one fact per
+/// line, to its stdout and a marker to its stderr.
+#[cfg(unix)]
+const SPAWN_PROBE: &str = r#"printf 'argv=%s\n' "$*"
+printf 'cwd=%s\n' "$(pwd -P)"
+printf 'leads=%s\n' "$( [ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ] && echo yes || echo no)"
+printf 'claude=%s\n' "${CLAUDE_CONFIG_DIR-unset}"
+printf 'codex=%s\n' "${CODEX_HOME-unset}"
+echo stderr >&2"#;
+
+/// The spawn runs `<exe> daemon` from `~/.clauth` in its own process group,
+/// appends both streams to an owner-only `daemon.log`, and drops a session
+/// home the caller inherited only when clauth built it.
+#[cfg(unix)]
+#[test]
+fn start_runs_the_daemon_detached_into_its_log() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = HomeSandbox::new();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let exe = crate::testutil::write_shim(bin.path(), "clauth", SPAWN_PROBE);
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    let runtime = clauth.join("profiles/p/runtime");
+    let codex_home = clauth.join("profiles/p/codex-home");
+    let log = clauth.join("daemon.log");
+    let run = || {
+        let status = super::spawn_detached(&exe)
+            .expect("spawn")
+            .wait()
+            .expect("wait");
+        assert!(status.success());
+    };
+
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CLAUDE_CONFIG_DIR", Some(runtime.as_os_str())),
+                ("CODEX_HOME", Some(std::ffi::OsStr::new("/custom/codex"))),
+            ],
+        );
+        run();
+    }
+    let mode = std::fs::metadata(&log).expect("log").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the log is owner-only");
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                (
+                    "CLAUDE_CONFIG_DIR",
+                    Some(std::ffi::OsStr::new("/custom/claude")),
+                ),
+                ("CODEX_HOME", Some(codex_home.as_os_str())),
+            ],
+        );
+        run();
+    }
+
+    let cwd = clauth.canonicalize().expect("canonical clauth dir");
+    let cwd = cwd.display();
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("log"),
+        format!(
+            "argv=daemon\ncwd={cwd}\nleads=yes\nclaude=unset\ncodex=/custom/codex\nstderr\n\
+             argv=daemon\ncwd={cwd}\nleads=yes\nclaude=/custom/claude\ncodex=unset\nstderr\n"
+        ),
+        "two starts append in order; each scrubs only the clauth-built home"
+    );
+}
+
+#[cfg(unix)]
+fn sh(script: &str) -> std::process::Child {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", script])
+        .spawn()
+        .expect("spawn sh")
+}
+
+#[cfg(unix)]
+#[test]
+fn start_reports_a_child_that_exits_before_holding_the_lock() {
+    let _home = HomeSandbox::new();
+    let mut child = sh("exit 3");
+    let outcome = super::await_start(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    );
+    assert_eq!(outcome, super::StartOutcome::Exited);
+}
+
+#[cfg(unix)]
+#[test]
+fn start_reports_a_held_singleton_as_up() {
+    let _home = HomeSandbox::new();
+    let _held = super::hold_daemon_lock();
+    let mut child = sh("sleep 5");
+    let outcome = super::await_start(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(outcome, super::StartOutcome::Holding);
+}
+
+/// A child that lost the race to another daemon exits as redundant; the box
+/// still has its daemon, so that reads as up, not as a failed start.
+#[cfg(unix)]
+#[test]
+fn start_reads_a_child_that_lost_the_race_as_up() {
+    let _home = HomeSandbox::new();
+    let _held = super::hold_daemon_lock();
+    let mut child = sh("exit 0");
+    let exited = child.wait().expect("the child exits");
+    assert!(exited.success());
+    let outcome = super::await_start(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    );
+    assert_eq!(outcome, super::StartOutcome::Holding);
+}
+
+#[cfg(unix)]
+#[test]
+fn start_gives_up_at_the_wait() {
+    let _home = HomeSandbox::new();
+    let mut child = sh("sleep 5");
+    let wait = Duration::from_millis(150);
+    let started = std::time::Instant::now();
+    let outcome = super::await_start(&mut child, wait, Duration::from_millis(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(outcome, super::StartOutcome::NotYet);
+    assert!(started.elapsed() >= wait);
+}

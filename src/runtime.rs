@@ -365,6 +365,22 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
             == Some(std::ffi::OsStr::new("profiles"))
 }
 
+/// Drop from `command` each session home it would inherit that names a tree
+/// clauth built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
+/// codex home. A process spawned from inside a clauth session otherwise
+/// answers as that session (`clauth which`, a `codex` run landing in another
+/// profile's home) and keeps pointing at its tree after teardown. The user's
+/// own custom dirs are theirs and stay.
+pub(crate) fn scrub_clauth_homes(command: &mut std::process::Command) {
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| is_clauth_runtime_path(Path::new(&v)))
+    {
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    }
+    if std::env::var_os("CODEX_HOME").is_some_and(|v| is_codex_home_path(Path::new(&v))) {
+        command.env_remove("CODEX_HOME");
+    }
+}
+
 /// The sessions dir paired with a runtime dir of this name, per the module's one
 /// layout rule: `runtime<rest>` ↔ `sessions<rest>`. Deliberately loose about
 /// what `<rest>` is; callers that DELETE gate on [`is_runtime_dir_name`] first.
