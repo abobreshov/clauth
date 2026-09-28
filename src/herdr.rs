@@ -490,7 +490,8 @@ pub(crate) fn daemon_bounded_output_deadline(
     run_bounded(child, timeout)
 }
 
-/// One `panes[]` entry of `herdr api snapshot`'s rect, in cells. The snapshot
+/// One of `herdr api snapshot`'s `panes[]` or `layouts[].panes[]` entries, in
+/// cells. The snapshot
 /// is the only surface that names a pane's width: `pane list` and `pane get`
 /// carry `scroll.viewport_rows` and no column count, and a WebSocket control
 /// attach without an explicit geometry imposes herdr's 120x40 default on the
@@ -534,8 +535,8 @@ struct SnapshotPane {
 }
 
 /// `herdr api snapshot`'s `(pane_id, rect)` pairs, or `None` when the stdout is
-/// not the envelope. A pane whose rect is missing is simply absent from the
-/// answer; the caller decides what that means for it.
+/// not the envelope. A pane whose rect is missing pairs with `None`; the
+/// caller decides what that means for it.
 pub(crate) fn parse_snapshot_rects(stdout: &[u8]) -> Option<Vec<(String, Option<PaneRect>)>> {
     serde_json::from_slice::<SnapshotEnvelope>(stdout)
         .ok()
