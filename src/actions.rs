@@ -1190,7 +1190,10 @@ pub(crate) fn delete_profile(
 /// failure SAVING the state after the link moved, which leaves the link on
 /// `name` and the marker where it was. That heals on the next switch to
 /// `name`: the link is checked on the already-active path too, so switching
-/// to the account the marker already names REPAIRS a slot that drifted.
+/// to the account the marker already names REPAIRS a slot that drifted. On
+/// Windows a failed repoint can leave the slot absent rather than on the old
+/// profile — the rename there replaces by remove-then-rename — and the next
+/// switch to either account re-links it.
 pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathBuf>> {
     crate::codex_profiles::CodexState::update(|state| {
         if !state.holds(name) {
@@ -1235,8 +1238,7 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     }
     if !adopt_operator_auth_slot(&slot, &store) {
         bail!(
-            "could not repoint {} at '{name}' — your codex would have stayed on \
-             '{holder}', so the switch was not made",
+            "could not repoint {} at '{name}' — the switch was not made",
             slot.display()
         );
     }
