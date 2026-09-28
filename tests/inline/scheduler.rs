@@ -11473,6 +11473,42 @@ fn apply_codex_switch_moves_the_on_disk_marker() {
     );
 }
 
+/// The daemon's auto-switch moves the operator's linked codex login with the
+/// marker, the same way a hand switch does: `apply_codex_switch` goes through
+/// `switch_codex_profile`, so bare `codex` follows the chain off a spent
+/// account instead of staying on it.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_moves_the_operator_link_with_the_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let store = |name: &str| {
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .join("auth.json")
+    };
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(&operator).expect("mkdir .codex");
+    let slot = operator.join("auth.json");
+    std::os::unix::fs::symlink(store("cx1"), &slot).expect("link the slot onto cx1");
+
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert_eq!(
+        std::fs::read_link(&slot).expect("still a link"),
+        store("cx2")
+    );
+}
+
 /// The codex chain walks at the codex file's OWN weekly line, never the claude
 /// setting: `weekly_switch_threshold = 50.0` in `codex-profiles.toml` makes a
 /// member at 60% weekly exhausted while the claude state sits at its 98

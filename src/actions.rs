@@ -1150,15 +1150,6 @@ pub(crate) fn delete_profile(
     Ok(())
 }
 
-/// `clauth <name>` resolving to a codex profile: move the codex active marker
-/// and nothing else. The state slot is the whole switch — nothing global is
-/// installed for codex, no live credentials link, no Keychain mirror; codex
-/// sessions (later in the series) bind `auth.json` at start through their own
-/// home, which is what makes this the parity map's "session-boundary" switch.
-/// Membership is re-made against the state [`CodexState::update`] loaded
-/// under the lock, so a concurrent delete can't be switched onto. A
-/// quarantined chain refuses the way a disabled claude account does: the
-/// slot would name an account no session can authenticate as.
 /// Move the codex active slot to `name` — and, when the operator's own
 /// `~/.codex/auth.json` is a link clauth installed, move that link with it.
 ///
@@ -1173,9 +1164,17 @@ pub(crate) fn delete_profile(
 /// operator's own login and an absent slot is a login they never gave us —
 /// both are left exactly as found.
 ///
+/// Membership is re-made against the state [`CodexState::update`] loaded
+/// under the lock, so a concurrent delete can't be switched onto. A
+/// quarantined chain refuses the way a disabled claude account does: the
+/// slot would name an account no session can authenticate as.
+///
 /// The link moves BEFORE the marker, inside the same state lock: if the link
-/// cannot move, the switch fails whole instead of reporting a switch that did
-/// not happen. And it is checked on the already-active path too, so switching
+/// cannot move, the switch fails before anything is written instead of
+/// reporting a switch that did not happen. The one partial outcome is a
+/// failure SAVING the state after the link moved, which leaves the link on
+/// `name` and the marker where it was. That heals on the next switch to
+/// `name`: the link is checked on the already-active path too, so switching
 /// to the account the marker already names REPAIRS a slot that drifted.
 pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathBuf>> {
     crate::codex_profiles::CodexState::update(|state| {

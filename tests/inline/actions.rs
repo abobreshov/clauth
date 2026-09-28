@@ -6382,10 +6382,18 @@ fn the_daemonless_commit_serializes_on_the_state_flock() {
 // moved again — so ccsbar showed x@computelabs.ai active while every codex the
 // operator started kept spending the account before it.
 
-/// Two codex profiles with stores, and the operator slot linked onto `linked`,
-/// the way `codex_login_capture` leaves it.
+/// The fixed `cx1`/`cx2` roster with a store each, the marker on `active`
+/// and the operator slot linked onto `linked`'s store (the way
+/// `codex_login_capture` leaves it). Only those two choices vary; both must
+/// name a roster member.
 #[cfg(unix)]
-fn two_stores_linked_onto(home: &HomeSandbox, active: &str, linked: &str) -> std::path::PathBuf {
+fn cx_pair_linked_onto(home: &HomeSandbox, active: &str, linked: &str) -> std::path::PathBuf {
+    for name in [active, linked] {
+        assert!(
+            ["cx1", "cx2"].contains(&name),
+            "{name} is not in the cx1/cx2 roster"
+        );
+    }
     write_codex_state(&format!(
         "active_profile = \"{active}\"\nprofiles = [\"cx1\", \"cx2\"]\n"
     ));
@@ -6416,7 +6424,7 @@ fn slot_points_at(slot: &std::path::Path) -> String {
 #[test]
 fn a_switch_moves_the_operator_link_clauth_installed() {
     let home = HomeSandbox::new();
-    let slot = two_stores_linked_onto(&home, "cx1", "cx1");
+    let slot = cx_pair_linked_onto(&home, "cx1", "cx1");
 
     let repointed = switch_codex_profile("cx2").expect("switch");
 
@@ -6445,7 +6453,7 @@ fn switching_to_the_active_account_repairs_a_drifted_link() {
     // The state the operator was left in: marker on cx2, link still on cx1.
     // Re-selecting cx2 must fix it — the early return used to skip everything.
     let home = HomeSandbox::new();
-    let slot = two_stores_linked_onto(&home, "cx2", "cx1");
+    let slot = cx_pair_linked_onto(&home, "cx2", "cx1");
 
     let repointed = switch_codex_profile("cx2").expect("switch");
 
@@ -6486,13 +6494,38 @@ fn an_absent_operator_slot_stays_absent() {
     assert!(!home.home().join(".codex").join("auth.json").exists());
 }
 
+/// A link clauth did not install (it points outside any profile's store) is
+/// the operator's own arrangement: a switch leaves it exactly as found.
+#[cfg(unix)]
+#[test]
+fn a_foreign_operator_link_is_never_moved_by_a_switch() {
+    let home = HomeSandbox::new();
+    write_codex_state("active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\n");
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let elsewhere = home.home().join("my-own-codex-login.json");
+    std::fs::write(&elsewhere, OPERATOR_AUTH).expect("write the operator's file");
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(&operator).expect("mkdir .codex");
+    let slot = operator.join("auth.json");
+    std::os::unix::fs::symlink(&elsewhere, &slot).expect("the operator's own link");
+
+    assert_eq!(switch_codex_profile("cx2").expect("switch"), None);
+    assert_eq!(std::fs::read_link(&slot).expect("still a link"), elsewhere);
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("read"),
+        OPERATOR_AUTH
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_link_that_cannot_follow_fails_the_switch_whole() {
     // The target has no store to point at. Moving the marker anyway would be
     // the original bug: a switch reported while codex stays where it was.
     let home = HomeSandbox::new();
-    let slot = two_stores_linked_onto(&home, "cx1", "cx1");
+    let slot = cx_pair_linked_onto(&home, "cx1", "cx1");
     std::fs::remove_file(
         profile_dir(&crate::profile::ProfileName::from("cx2"))
             .expect("dir")
