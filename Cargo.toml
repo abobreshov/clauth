@@ -16,6 +16,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
 toml = "1.1.6"
+# Format-preserving edits of the user's own `shunt.toml` (the gateway's admin
+# key entry): `toml` re-renders a document and drops its comments and layout.
+# Its deps (toml_parser, toml_writer, toml_datetime, winnow, indexmap) are
+# already in the tree via `toml`.
+toml_edit = "0.25.15"
 anyhow = "1.0.104"
 dirs = "7.0.0"
 ureq = "3.4.2"
@@ -120,6 +125,9 @@ tokio = { version = "1.53.1", features = ["test-util"] }
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.
 [target.'cfg(windows)'.dependencies]
 which = "8.0.6"
+# The store move's hard-link guard reads a file's link count on Windows; the
+# crate is already in the tree via same-file, so this floor adds no download.
+winapi-util = "0.1.11"
 
 [profile.release]
 opt-level = 3
@@ -128,10 +136,12 @@ codegen-units = 1
 strip = true
 
 [lints.rust]
-# `deny` rather than the fleet default `forbid`, because three sites are
+# `deny` rather than the fleet default `forbid`, because five sites are
 # deliberately allowed and `forbid` admits no override at all: signal delivery in
-# `start.rs`, `stderr_file_mode`'s `fcntl`/`fstat` in `daemon/log_rotate.rs`, and
-# the test sandbox's env mutation, which Rust 2024 made unsafe.
+# `start.rs`, `pid_alive`'s `kill(pid, 0)` in `runtime.rs`, `stderr_file_mode`'s
+# `fcntl`/`fstat` in `daemon/log_rotate.rs`, the inherited signal disposition read
+# in `daemon/gateway.rs`, and the test sandbox's env mutation, which Rust 2024
+# made unsafe.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
