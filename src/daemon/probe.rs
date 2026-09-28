@@ -211,7 +211,7 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 /// Windows) and, after the escalation, before it gives up. A dying process
 /// releases its advisory flock within a handful of scheduler ticks; 5 s is
 /// generous headroom over that.
-const REPLACE_WAIT: Duration = Duration::from_secs(5);
+pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
 const REPLACE_POLL: Duration = Duration::from_millis(50);
@@ -427,7 +427,7 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.
 #[cfg(unix)]
-fn terminate_pid(pid: u32, hard: bool) -> bool {
+pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
     let mut cmd = std::process::Command::new("kill");
     cmd.args(["-s", signal, &pid.to_string()]);
@@ -441,7 +441,7 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_pid(pid: u32, hard: bool) -> bool {
+pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     // A console daemon has no window to accept the graceful WM_CLOSE, so a
     // soft taskkill can never work here: every pass is a force kill. The
     // first (soft) pass is the expected-success path and stays silenced; the

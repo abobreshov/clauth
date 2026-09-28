@@ -1936,11 +1936,11 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
     }
 }
 
-/// Open a profile's series log (`usage_history.jsonl` / `wallet_history.jsonl`)
-/// for append, creating it 0o600 on Unix. The logs record per-profile usage
-/// and balance samples under `~/.clauth`, so they ride the owner-only
+/// Open an append-only log under `~/.clauth` (a profile's
+/// `usage_history.jsonl` / `wallet_history.jsonl`, the gateway's
+/// `gateway.log`), creating it 0o600 on Unix, so it rides the owner-only
 /// invariant rather than the process umask.
-fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_append_600(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -2039,7 +2039,7 @@ pub(crate) fn append_usage_sample_at(
     };
     body.push_str(&line(ts, &next_json));
 
-    match history_append_file(&path) {
+    match open_append_600(&path) {
         Ok(mut file) => {
             use std::io::Write;
             if let Err(e) = file.write_all(body.as_bytes()) {
@@ -2143,7 +2143,7 @@ pub(crate) fn append_wallet_readings_at(name: &ProfileName, stats: &ThirdPartySt
         logline!("clauth: failed to create the profile dir for {name}: {e}");
         return;
     }
-    match history_append_file(&path) {
+    match open_append_600(&path) {
         Ok(mut file) => {
             use std::io::Write;
             if let Err(e) = file.write_all(body.as_bytes()) {

@@ -13,6 +13,7 @@
 //! two schedulers from double-firing.
 
 pub(crate) mod api;
+pub(crate) mod gateway;
 pub(crate) mod log_rotate;
 mod probe;
 mod status_json;
@@ -299,7 +300,7 @@ pub(crate) fn serve(
         StartMode::Replace => probe::claim_by_replacing(&dir)?,
         _ => claim_singleton(&dir, mode == StartMode::Standby)?,
     };
-    let (_lock, promoted) = match claim {
+    let (lock, promoted) = match claim {
         Claim::Active(lock) => (lock, false),
         Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
         Claim::Redundant => {
@@ -353,6 +354,19 @@ pub(crate) fn serve(
             daemon.live_stores(),
         )?;
     }
+
+    // After the listener, the last start step that can fail, so a start that
+    // dies leaves no gateway behind; before `run`, which never returns, so
+    // the supervisor (or the signal watcher holding it) lives as long as the
+    // process. A standby reaches this only once promoted: the gateway runs
+    // under the singleton's holder alone.
+    let _supervisor = match gateway::start(Arc::clone(&daemon.gateway), &lock) {
+        Ok(supervisor) => gateway::stop_on_signal(supervisor),
+        Err(e) => {
+            logline!("clauth daemon: {e:#}; the shunt gateway is not supervised");
+            None
+        }
+    };
 
     logline!(
         "clauth daemon: running (status → {})",
@@ -733,6 +747,8 @@ pub(crate) struct LiveStores {
     pub(crate) pending_switch: PendingSwitch,
     pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     pub(crate) kick_blocks: KickBlocks,
+    /// The gateway supervisor's published slot.
+    pub(crate) gateway: gateway::GatewayHandle,
 }
 
 #[cfg(test)]
@@ -749,6 +765,7 @@ impl Default for LiveStores {
             pending_switch: Arc::new(RankedMutex::new(Default::default())),
             auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            gateway: gateway::new_handle(),
         }
     }
 }
@@ -764,6 +781,7 @@ pub(crate) struct LiveSnapshot {
     pending_switch: Option<String>,
     queue_anchor: Option<i64>,
     queue_blocked: Vec<ProfileName>,
+    gateway: Option<gateway::GatewaySlot>,
 }
 
 impl LiveStores {
@@ -830,6 +848,7 @@ impl LiveStores {
             pending_switch,
             queue_anchor,
             queue_blocked,
+            gateway: gateway::published(&self.gateway),
         }
     }
 }
@@ -845,6 +864,7 @@ impl LiveSnapshot {
             pending_switch: self.pending_switch.as_deref(),
             queue_anchor: self.queue_anchor,
             queue_blocked: &self.queue_blocked,
+            gateway: self.gateway.as_ref(),
         }
     }
 }
@@ -906,6 +926,8 @@ struct Daemon {
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
     status_path: PathBuf,
+    /// The slot the gateway supervisor publishes, read by every status write.
+    gateway: gateway::GatewayHandle,
 }
 
 impl Daemon {
@@ -946,6 +968,7 @@ impl Daemon {
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
             status_path,
+            gateway: gateway::new_handle(),
         }
     }
 
@@ -1133,6 +1156,7 @@ impl Daemon {
             pending_switch: Arc::clone(&self.pending_switch),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             kick_blocks: Arc::clone(&self.kick_blocks),
+            gateway: Arc::clone(&self.gateway),
         }
     }
 

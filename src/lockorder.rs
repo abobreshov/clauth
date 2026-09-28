@@ -248,6 +248,12 @@ pub(crate) mod rank {
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;
+        /// The managed gateway's published slot (`daemon::gateway`): the
+        /// supervisor thread replaces it, the status writer and
+        /// `GET /api/v1/gateway` clone it. A true leaf: every acquisition is
+        /// one clone or one assignment, with no IO, probe or child wait under
+        /// it.
+        GatewayPublished = 1900;
     }
 }
 

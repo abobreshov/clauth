@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::gateway::{GatewaySlot, slot_or_record};
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -90,6 +91,10 @@ pub(crate) struct LiveSignals<'a> {
     /// off their `kick_block.json` caches instead
     /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
     pub(crate) queue_blocked: &'a [ProfileName],
+    /// The gateway slot the daemon's supervisor last published. `None`
+    /// single-shot or before the supervisor's first publish, where the slot
+    /// reads the gateway record alone ([`super::gateway::unsupervised_slot`]).
+    pub(crate) gateway: Option<&'a GatewaySlot>,
 }
 
 fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -663,6 +668,12 @@ pub(crate) struct StatusBody {
     /// codex roster, which are otherwise byte-identical.
     #[serde(default)]
     pub(crate) clauth_version: String,
+    /// Additive: the managed shunt gateway, the object `GET /api/v1/gateway`
+    /// serves. `default` so a reader stays additive-tolerant of an older
+    /// writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) gateway: Option<GatewaySlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -698,6 +709,7 @@ pub(crate) fn build_status(
         codex_wrap_off: codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
+        gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         profiles,
     }
 }
