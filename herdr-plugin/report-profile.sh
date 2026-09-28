@@ -31,8 +31,10 @@ proc_root="${CLAUTH_PROC_ROOT:-/proc}"
 proc_ppid() {
     if [ -d "$proc_root" ]; then
         # comm sits in parentheses and may itself hold ") ", so cut after the
-        # LAST one: the state letter is then the first field, the ppid the
-        # second.
+        # LAST one: what follows is the state letter, then the ppid. A newline
+        # inside comm spans stat across lines; the one-line read then finds no
+        # ") " and the climb breaks off, so the pane falls back to `clauth
+        # which` while that process lives.
         _stat=
         read -r _stat 2>/dev/null <"$proc_root/$1/stat" || return 0
         _stat=${_stat##*") "}
@@ -45,7 +47,7 @@ proc_ppid() {
 }
 proc_args() {
     if [ -d "$proc_root" ]; then
-        # NUL-separated argv, joined by spaces the way ps prints it.
+        # NUL-separated argv, joined by spaces.
         _cmd=$(tr '\0\n' '  ' 2>/dev/null <"$proc_root/$1/cmdline") || return 0
         printf '%s\n' "${_cmd% }"
     else
