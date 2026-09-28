@@ -238,6 +238,11 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   token_ledger.json        # the per-day token ledger behind the Tokens tab
   clauth.log, daemon.log   # event lines from the TUI and the daemon
   clauthd.pid              # the running daemon's process id
+  gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
+  gateway-admin-token      # the gateway's admin write key, alone in its file (0600)
+  gateway-child.json       # the gateway the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop
+  gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
+  shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
   completions/             # generated shell completion scripts
   .completions_installed   # marker: completions have been installed
   conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
