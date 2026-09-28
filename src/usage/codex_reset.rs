@@ -1,10 +1,11 @@
 //! Spending a banked codex usage-limit reset (`clauth limit-reset`).
 //!
 //! The usage poll already READS the banked count off `wham/usage`
-//! (`rate_limit_reset_credits.available_count`, published as status.json
-//! `codex_reset_credits`). This module is the one place clauth SPENDS one, and
-//! only because the operator asked for it: `clauth limit-reset <name>`. Nothing
-//! here is on a timer, and nothing retries.
+//! (`rate_limit_reset_credits.available_count`, carried on `UsageInfo` as
+//! `codex_reset_credits` and shown on the Usage tab while one is available).
+//! This module is the one place clauth SPENDS one, and only because the
+//! operator asked for it: `clauth limit-reset <name>`. Nothing here is on a
+//! timer, and nothing retries.
 //!
 //! The wire is codex's own, verified against openai/codex
 //! (`backend-client/src/client/rate_limit_resets.rs`, `types.rs`, and the TUI's
@@ -111,8 +112,8 @@ impl ResetCredit {
 pub(crate) struct ResetCredits {
     #[serde(default)]
     pub(crate) credits: Vec<ResetCredit>,
-    /// The server's count — the same figure `wham/usage` carries and
-    /// `status.json` publishes, so the prompt's "1 of N" agrees with it.
+    /// The server's count — the same figure `wham/usage` carries, so the
+    /// prompt's "1 of N" agrees with it.
     #[serde(default)]
     pub(crate) available_count: i64,
 }

@@ -137,7 +137,7 @@ No refresh revives a dead chain; a new login is the only exit, and the browser f
 
 ## Use a usage-limit reset
 
-A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (`codex_reset_credits` in `status.json`); spending one is a command you run:
+A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
 
 ```sh
 clauth limit-reset work --list   # the account's resets; spends nothing

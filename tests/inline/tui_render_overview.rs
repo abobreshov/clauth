@@ -2776,7 +2776,7 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
     .expect("write codex state");
 
     let info = crate::usage::map_codex_usage(
-        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}},"rate_limit_reset_credits":{"available_count":2}}"#,
         crate::usage::now_epoch_secs(),
     )
     .expect("maps");
@@ -2784,6 +2784,16 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
         &crate::profile::ProfileName::from("cx1"),
         crate::profile_cache::USAGE_CACHE_FILE,
         &info,
+    );
+    let spent = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_after_seconds":600}},"rate_limit_reset_credits":{"available_count":0}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx2"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &spent,
     );
 
     let rows = crate::tui::app::codex_rows();
@@ -2796,10 +2806,19 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
         Some(42.0),
         "the window comes from the codex leg's own cache"
     );
+    assert_eq!(
+        rows[0].resets,
+        Some(2),
+        "the banked count rides the same cache"
+    );
     assert!(rows[1].active, "cx2 holds the codex active slot");
+    assert_eq!(
+        rows[1].resets, None,
+        "a zero count is no chip: nothing to spend"
+    );
     assert!(
-        rows[1].plan.is_none() && rows[1].five_hour.is_none(),
-        "a never-polled account shows no data rather than a fabricated reading"
+        rows[1].plan.is_some() && rows[1].five_hour.is_some(),
+        "the spent-cache account still shows its windows"
     );
 }
 
@@ -2866,6 +2885,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
             resets_at: None,
         }),
         seven_day: None,
+        resets: None,
     };
     let app = App::new(config_with(vec![], None, vec![]));
 
@@ -2894,6 +2914,36 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         live_cell_text(&narrow, &line).trim_end(),
         "",
         "no 7d cell is rendered where the column is gone, so nothing sits under live"
+    );
+}
+
+/// The banked-reset chip renders only while a reset is available, trailing the
+/// usage cells: `↺ N` names what `clauth limit-reset` would spend.
+#[test]
+fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = |resets: Option<i64>| CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets,
+    };
+    let app = App::new(config_with(vec![], None, vec![]));
+    let text = |line: ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|s| s.content.clone()).collect()
+    };
+
+    let wide = OverviewWidths::new(80, &app);
+    assert!(
+        text(render_codex_row(&row(Some(2)), &wide)).contains("↺ 2"),
+        "two banked resets render the chip"
+    );
+    assert!(
+        !text(render_codex_row(&row(None), &wide)).contains("↺"),
+        "no available reset (the constructor floors zero to None): no chip"
     );
 }
 

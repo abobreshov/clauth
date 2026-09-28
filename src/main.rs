@@ -2264,10 +2264,10 @@ fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
 /// [`cmd_limit_reset`] with the terminal check, the endpoints and the prompt
 /// injected, so the refusals and the wire run offline.
 ///
-/// On success stdout's FIRST line is the one-line summary, which the menu bar
-/// shows as it stands; every failure is the returned error. Reads the store as
-/// it stands: a stale token is reported, never refreshed from here, because
-/// the store has one writer and it is not this command.
+/// On success stdout's FIRST line is the one-line summary, readable as it
+/// stands; every failure is the returned error. Reads the store as it stands:
+/// a stale token is reported, never refreshed from here, because the store has
+/// one writer and it is not this command.
 fn limit_reset_with(
     name: &str,
     list: bool,

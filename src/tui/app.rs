@@ -1666,6 +1666,9 @@ pub(crate) struct CodexRow {
     pub(crate) plan: Option<String>,
     pub(crate) five_hour: Option<crate::usage::UsageWindow>,
     pub(crate) seven_day: Option<crate::usage::UsageWindow>,
+    /// Banked usage-limit resets off the same cache, floored at one
+    /// available: `None` (or zero) renders no chip on the row.
+    pub(crate) resets: Option<i64>,
 }
 
 /// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
@@ -1699,6 +1702,10 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
                 ),
                 five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
                 seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
+                resets: cached
+                    .as_ref()
+                    .and_then(|u| u.codex_reset_credits)
+                    .filter(|count| *count > 0),
             }
         })
         .collect()

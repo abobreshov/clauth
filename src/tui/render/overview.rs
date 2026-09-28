@@ -408,9 +408,11 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One codex account, in the claude columns: name, plan, 5h, 7d. The cursor
-/// and timer slots are kept blank and no live cell is drawn — this section is
-/// read-only, and a timer would promise a countdown the Overview cannot act on.
+/// One codex account, in the claude columns: name, plan, 5h, 7d, and a
+/// `↺ N` chip while the account holds a banked usage-limit reset (what
+/// `clauth limit-reset` spends). The cursor and timer slots are kept blank and
+/// no live cell is drawn — this section is read-only, and a timer would
+/// promise a countdown the Overview cannot act on.
 fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
@@ -448,6 +450,10 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     if widths.seven_day > 0 {
         spans.push(gap(widths));
         spans.push(cell(row.seven_day.as_ref(), widths.seven_day));
+    }
+    if let Some(count) = row.resets {
+        spans.push(gap(widths));
+        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
     Line::from(spans)
 }
