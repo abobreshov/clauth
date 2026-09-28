@@ -997,66 +997,19 @@ impl Supervisor {
         match &mut self.orphan {
             Orphan::Done => true,
             Orphan::Unchecked => {
-                let marker = match read_marker() {
-                    Ok(Some(marker)) => marker,
-                    Ok(None) => {
-                        self.orphan = Orphan::Done;
-                        return true;
-                    }
-                    Err(e) => {
-                        logline!(
-                            "clauth daemon: ignoring an unreadable gateway child marker: {e:#}"
-                        );
-                        remove_marker();
-                        self.orphan = Orphan::Done;
-                        return true;
-                    }
-                };
-                // Only a live process started when the marker says is the
-                // gateway a daemon spawned; any other pid, recycled or not,
-                // is never signalled.
-                let start = match marker.start.clone() {
-                    Some(start) if process_start_time(marker.pid).as_ref() == Some(&start) => start,
-                    _ => {
-                        remove_marker();
-                        self.orphan = Orphan::Done;
-                        return true;
-                    }
-                };
-                let deadline_ms = match marker.stop_deadline_ms {
-                    // A stop already asked for: a second SIGTERM makes shunt
-                    // skip its drain, so this only waits out the deadline.
-                    Some(deadline_ms) => deadline_ms,
-                    None => {
-                        logline!(
-                            "clauth daemon: stopping the shunt gateway a previous daemon left running (pid {})",
-                            marker.pid
-                        );
-                        terminate_pid(marker.pid, false);
-                        let deadline_ms = tick
-                            .wall_ms
-                            .saturating_add(marker.stop_bound_secs.saturating_mul(1000));
-                        let stopping = ChildMarker {
-                            stop_deadline_ms: Some(deadline_ms),
-                            ..marker.clone()
-                        };
-                        if let Err(e) = write_marker(&stopping) {
-                            logline!(
-                                "clauth daemon: failed to record the gateway's stop deadline: {e:#}"
-                            );
-                        }
-                        deadline_ms
-                    }
+                let Some(left) = stop_left_behind(tick.wall_ms) else {
+                    self.orphan = Orphan::Done;
+                    return true;
                 };
                 self.orphan = Orphan::Stopping {
-                    pid: marker.pid,
-                    start,
-                    deadline_ms,
+                    pid: left.pid,
+                    start: left.start,
+                    deadline_ms: left.deadline_ms,
                     killed: false,
                 };
                 self.set(
                     GatewaySlot {
-                        pid: Some(marker.pid),
+                        pid: Some(left.pid),
                         ..GatewaySlot::of(GatewayState::Stopping)
                     },
                     tick,
@@ -1088,7 +1041,76 @@ impl Supervisor {
             }
         }
     }
+}
 
+/// A gateway a previous daemon left running, with its stop asked for.
+struct LeftBehind {
+    pid: u32,
+    start: String,
+    deadline_ms: u64,
+}
+
+/// Ask the gateway the child marker names to stop, at most once, and say
+/// when that stop runs out; `None` when no live gateway is left (an unreadable
+/// or stale marker is dropped). Only a live process started when the marker
+/// says is the gateway a daemon spawned; any other pid, recycled or not, is
+/// never signalled.
+fn stop_left_behind(now_ms: u64) -> Option<LeftBehind> {
+    let marker = match read_marker() {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return None,
+        Err(e) => {
+            logline!("clauth daemon: ignoring an unreadable gateway child marker: {e:#}");
+            remove_marker();
+            return None;
+        }
+    };
+    let start = match marker.start.clone() {
+        Some(start) if process_start_time(marker.pid).as_ref() == Some(&start) => start,
+        _ => {
+            remove_marker();
+            return None;
+        }
+    };
+    let deadline_ms = match marker.stop_deadline_ms {
+        // A stop already asked for: a second SIGTERM makes shunt skip its
+        // drain, so this only waits out the deadline.
+        Some(deadline_ms) => deadline_ms,
+        None => {
+            logline!(
+                "clauth daemon: stopping the shunt gateway a previous daemon left running (pid {})",
+                marker.pid
+            );
+            terminate_pid(marker.pid, false);
+            let deadline_ms = now_ms.saturating_add(marker.stop_bound_secs.saturating_mul(1000));
+            let stopping = ChildMarker {
+                stop_deadline_ms: Some(deadline_ms),
+                ..marker.clone()
+            };
+            if let Err(e) = write_marker(&stopping) {
+                logline!("clauth daemon: failed to record the gateway's stop deadline: {e:#}");
+            }
+            deadline_ms
+        }
+    };
+    Some(LeftBehind {
+        pid: marker.pid,
+        start,
+        deadline_ms,
+    })
+}
+
+/// The TUI's `stop daemon`, once no daemon is left: stop the gateway the
+/// stopped daemon could not (on Windows it ends by `taskkill /F` with no
+/// chance to; on unix a SIGKILLed one never did) instead of leaving it to a
+/// next daemon start that may never come. The stop is recorded in the marker
+/// like the orphan rule's, so a later daemon still finishes a drain that
+/// outlives its deadline.
+pub(crate) fn stop_left_behind_gateway() {
+    let _ = stop_left_behind(now_ms());
+}
+
+impl Supervisor {
     /// Replace the slot, keeping `since` while the state stays the same and
     /// carrying the supervisor's restart count and last exit.
     fn set(&mut self, slot: GatewaySlot, tick: Tick) {
@@ -1621,7 +1643,8 @@ pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorT
 
 /// Windows delivers no SIGTERM to a console process: the daemon ends by
 /// `taskkill /F`, the gateway outlives it, and the next start meets it as an
-/// orphan and stops it there ([`Supervisor::reclaim`]).
+/// orphan and stops it there ([`Supervisor::reclaim`]), or the TUI's
+/// `stop daemon` does once no daemon is left ([`stop_left_behind_gateway`]).
 #[cfg(not(unix))]
 pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorThread> {
     Some(supervisor)
