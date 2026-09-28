@@ -2,7 +2,8 @@
 //!
 //! The usage poll already READS the banked count off `wham/usage`
 //! (`rate_limit_reset_credits.available_count`, carried on `UsageInfo` as
-//! `codex_reset_credits` and shown on the Usage tab while one is available).
+//! `codex_reset_credits` and shown as `↺ N` on the Overview's codex row while
+//! one is available).
 //! This module is the one place clauth SPENDS one, and only because the
 //! operator asked for it: `clauth limit-reset <name>`. Nothing here is on a
 //! timer, and nothing retries.
@@ -226,6 +227,10 @@ pub(crate) fn list_reset_credits_at(
             account_id,
             fedramp,
         )
+        .config()
+        .timeout_recv_response(None)
+        .timeout_global(Some(RESET_REQUEST_TIMEOUT))
+        .build()
         .call(),
     )
 }
