@@ -154,6 +154,12 @@ pub(crate) enum Command {
         yes: bool,
     },
 
+    /// Restore a disabled profile to every operational surface
+    Enable {
+        /// Profile to re-enable.
+        profile: String,
+    },
+
     /// Spend one of a codex account's banked usage-limit resets
     ///
     /// Reopens that account's usage windows now, the reset codex's own `/usage`
@@ -163,8 +169,8 @@ pub(crate) enum Command {
     /// cannot be given back. `--list` shows the account's resets and spends
     /// nothing. Uses the profile's stored login as it stands and never
     /// refreshes it.
-    #[command(name = "use-reset")]
-    UseReset {
+    #[command(name = "limit-reset")]
+    LimitReset {
         /// Codex profile to reset.
         profile: String,
         /// Show the account's resets and which one would be used; spend none.
@@ -173,12 +179,6 @@ pub(crate) enum Command {
         /// Skip the confirm prompt. Required on a non-TTY stdin.
         #[arg(long, short = 'y')]
         yes: bool,
-    },
-
-    /// Restore a disabled profile to every operational surface
-    Enable {
-        /// Profile to re-enable.
-        profile: String,
     },
 
     /// Serve a profile's sessions a rolling token from its usage chain
@@ -434,7 +434,7 @@ pub(crate) enum Command {
     /// for `clauth switch`'s first position.
     #[command(name = "__complete", hide = true)]
     Complete {
-        /// The codex roster instead of the claude one (for `use-reset`).
+        /// The codex roster instead of the claude one (for `limit-reset`).
         #[arg(long)]
         codex: bool,
         /// Print `~/.clauth/live_sessions/`'s file stems instead of profile

@@ -474,7 +474,7 @@ pub(crate) struct UsageInfo {
     /// Banked reset credits (`rate_limit_reset_credits.available_count`): passes
     /// the account can spend to reopen a window early. Rides the same response,
     /// so it costs no extra request. The poll only reads the count; spending one
-    /// is `clauth use-reset` ([`crate::usage::codex_reset`]), run by the operator.
+    /// is `clauth limit-reset` ([`crate::usage::codex_reset`]), run by the operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_reset_credits: Option<i64>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only

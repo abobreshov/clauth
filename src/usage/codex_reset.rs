@@ -1,9 +1,9 @@
-//! Spending a banked codex usage-limit reset (`clauth use-reset`).
+//! Spending a banked codex usage-limit reset (`clauth limit-reset`).
 //!
 //! The usage poll already READS the banked count off `wham/usage`
 //! (`rate_limit_reset_credits.available_count`, published as status.json
 //! `codex_reset_credits`). This module is the one place clauth SPENDS one, and
-//! only because the operator asked for it: `clauth use-reset <name>`. Nothing
+//! only because the operator asked for it: `clauth limit-reset <name>`. Nothing
 //! here is on a timer, and nothing retries.
 //!
 //! The wire is codex's own, verified against openai/codex
@@ -118,7 +118,7 @@ pub(crate) struct ResetCredits {
 }
 
 impl ResetCredits {
-    /// The credit `use-reset` spends. Among available credits a
+    /// The credit `limit-reset` spends. Among available credits a
     /// `codex_rate_limits` one wins, then the earliest `expires_at` (a credit with none, or one that does not parse,
     /// goes last — it is the one that can wait), then the earliest `granted_at`.
     /// A full tie keeps the server's order. `None` when nothing is available.
@@ -316,7 +316,11 @@ fn expiry(credit: &ResetCredit) -> String {
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
-pub(crate) fn use_reset_prompt(name: &str, credits: &ResetCredits, credit: &ResetCredit) -> String {
+pub(crate) fn limit_reset_prompt(
+    name: &str,
+    credits: &ResetCredits,
+    credit: &ResetCredit,
+) -> String {
     format!(
         "clauth: use a usage-limit reset on '{name}'? {} · {} · 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
@@ -326,7 +330,7 @@ pub(crate) fn use_reset_prompt(name: &str, credits: &ResetCredits, credit: &Rese
     )
 }
 
-/// `--list`: a count line, then one line per credit, the one `use-reset` would
+/// `--list`: a count line, then one line per credit, the one `limit-reset` would
 /// spend marked `*`.
 pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<String> {
     let next = credits.next_to_use().map(|c| c.id.as_str());
@@ -373,7 +377,7 @@ fn token_rejected(name: &str) -> String {
 }
 
 fn check_list_hint(name: &str) -> String {
-    format!("check `clauth use-reset {name} --list` before retrying")
+    format!("check `clauth limit-reset {name} --list` before retrying")
 }
 
 /// A failed GET. Nothing was spent, and every line says so.
@@ -437,7 +441,7 @@ pub(crate) fn outcome_line(
         )),
         ConsumeOutcome::NoCredit => Err(format!(
             "that reset on '{name}' is no longer available (used or expired meanwhile); \
-             run `clauth use-reset {name} --list` to see what is left"
+             run `clauth limit-reset {name} --list` to see what is left"
         )),
         ConsumeOutcome::Unknown(code) => Err(format!(
             "codex answered the reset request for '{name}' with an unrecognized code {:?}, \

@@ -189,7 +189,7 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
 
 /// Poll one codex account's usage at `url`. Read-only: it neither mints nor
 /// spends anything — spending a banked reset is [`super::codex_reset`]'s, and
-/// only when the operator runs `clauth use-reset`. Split from
+/// only when the operator runs `clauth limit-reset`. Split from
 /// [`fetch_codex_usage`] so tests drive the wire shape against a local stub.
 ///
 /// A 401 is the caller's signal that the access token is stale — it feeds

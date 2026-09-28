@@ -255,7 +255,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Enable { profile } => cmd_enable(&profile),
-        Command::UseReset { profile, list, yes } => cmd_use_reset(&profile, list, yes),
+        Command::LimitReset { profile, list, yes } => cmd_limit_reset(&profile, list, yes),
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
@@ -2239,14 +2239,14 @@ mod feature_coverage;
 #[path = "../tests/inline/cli.rs"]
 mod tests;
 
-/// `clauth use-reset <name> [--list] [--yes|-y]` — spend one of a codex
+/// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex
 /// account's banked usage-limit resets ([`usage::codex_reset`]). The confirm
 /// policy is [`cmd_delete`]'s: the spend is irreversible, so a non-TTY run with
 /// no `--yes` is refused, and refused before any request leaves the machine.
-fn cmd_use_reset(name: &str, list: bool, yes: bool) -> Result<()> {
+fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    use_reset_with(
+    limit_reset_with(
         name,
         list,
         yes,
@@ -2261,14 +2261,14 @@ fn cmd_use_reset(name: &str, list: bool, yes: bool) -> Result<()> {
     )
 }
 
-/// [`cmd_use_reset`] with the terminal check, the endpoints and the prompt
+/// [`cmd_limit_reset`] with the terminal check, the endpoints and the prompt
 /// injected, so the refusals and the wire run offline.
 ///
 /// On success stdout's FIRST line is the one-line summary, which the menu bar
 /// shows as it stands; every failure is the returned error. Reads the store as
 /// it stands: a stale token is reported, never refreshed from here, because
 /// the store has one writer and it is not this command.
-fn use_reset_with(
+fn limit_reset_with(
     name: &str,
     list: bool,
     yes: bool,
@@ -2281,7 +2281,7 @@ fn use_reset_with(
         let config = load_config()?;
         if let Some(claude) = config.canonical_name(name) {
             return Err(usage_error(format!(
-                "'{claude}' is a claude profile; use-reset is codex-only"
+                "'{claude}' is a claude profile; limit-reset is codex-only"
             )));
         }
         return Err(unknown_profile_error(&config, name));
@@ -2311,7 +2311,7 @@ fn use_reset_with(
     let Some(credit) = credits.next_to_use() else {
         anyhow::bail!("{}", reset::no_resets_available(&canonical));
     };
-    if !yes && !confirm(&reset::use_reset_prompt(&canonical, &credits, credit))? {
+    if !yes && !confirm(&reset::limit_reset_prompt(&canonical, &credits, credit))? {
         outln!("clauth: aborted. no reset was used on '{canonical}'.");
         return Ok(());
     }

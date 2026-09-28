@@ -139,7 +139,7 @@ fn the_absolute_reset_wins_over_the_relative_one() {
 }
 
 /// Banked reset credits ride this same body, so reading them costs no extra
-/// request. The poll only reads the count; spending one is `clauth use-reset`.
+/// request. The poll only reads the count; spending one is `clauth limit-reset`.
 #[test]
 fn banked_reset_credits_ride_the_same_body() {
     let info = map_usage(

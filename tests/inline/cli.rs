@@ -3853,35 +3853,35 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     assert_eq!(claude.as_str(), "cl1");
 }
 
-// ── use-reset ─────────────────────────────────────────────────────────────────
+// ── limit-reset ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn use_reset_takes_list_or_yes_but_not_both() {
-    let Command::UseReset { profile, list, yes } = command(&["use-reset", "cx"]) else {
+fn limit_reset_takes_list_or_yes_but_not_both() {
+    let Command::LimitReset { profile, list, yes } = command(&["limit-reset", "cx"]) else {
         panic!("must parse");
     };
     assert_eq!((profile.as_str(), list, yes), ("cx", false, false));
-    let Command::UseReset { list, yes, .. } = command(&["use-reset", "-y", "cx"]) else {
+    let Command::LimitReset { list, yes, .. } = command(&["limit-reset", "-y", "cx"]) else {
         panic!("must parse");
     };
     assert_eq!((list, yes), (false, true));
-    let Command::UseReset { list, yes, .. } = command(&["use-reset", "cx", "--list"]) else {
+    let Command::LimitReset { list, yes, .. } = command(&["limit-reset", "cx", "--list"]) else {
         panic!("must parse");
     };
     assert_eq!((list, yes), (true, false));
 
     assert_eq!(
-        parse_exit_code(&["use-reset", "cx", "--list", "--yes"]),
+        parse_exit_code(&["limit-reset", "cx", "--list", "--yes"]),
         2,
         "--list spends nothing, so there is nothing for --yes to confirm"
     );
-    assert_eq!(parse_exit_code(&["use-reset"]), 2);
-    assert_eq!(parse_exit_code(&["use-reset", "cx", "other"]), 2);
+    assert_eq!(parse_exit_code(&["limit-reset"]), 2);
+    assert_eq!(parse_exit_code(&["limit-reset", "cx", "other"]), 2);
 }
 
 /// A claude profile `cl1`, a codex profile `cx` with a stored login, and a
 /// codex profile `cy` with none.
-fn seed_use_reset_rosters() {
+fn seed_limit_reset_rosters() {
     crate::profile::save_app_state(&crate::profile::AppState {
         profiles: vec!["cl1".into()],
         ..crate::profile::AppState::default()
@@ -3918,38 +3918,38 @@ fn no_prompt(prompt: &str) -> Result<bool> {
     panic!("this path must not prompt, asked: {prompt}")
 }
 
-/// `use-reset` takes codex names alone: a claude name is refused as one (the
+/// `limit-reset` takes codex names alone: a claude name is refused as one (the
 /// codex-side twin of the claude-only verbs' refusal), an unknown name lists
 /// both rosters, and a codex name with no stored login or a dead chain is
 /// refused by name — all before any request.
 #[test]
-fn use_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_request() {
+fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_request() {
     let _home = crate::testutil::HomeSandbox::new();
-    seed_use_reset_rosters();
+    seed_limit_reset_rosters();
     let (listener, urls) = untouched_reset_urls();
 
-    let err = use_reset_with("CL1", false, true, false, &urls, no_prompt).expect_err("claude");
+    let err = limit_reset_with("CL1", false, true, false, &urls, no_prompt).expect_err("claude");
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "'cl1' is a claude profile; use-reset is codex-only"
+        "'cl1' is a claude profile; limit-reset is codex-only"
     );
 
-    let err = use_reset_with("zz", false, true, false, &urls, no_prompt).expect_err("unknown");
+    let err = limit_reset_with("zz", false, true, false, &urls, no_prompt).expect_err("unknown");
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
         "profile 'zz' not found\navailable: cl1 · codex: cx, cy"
     );
 
-    let err = use_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
+    let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
     assert_eq!(
         err.to_string(),
         "'cy' has no stored codex login to use a reset with; run `clauth login cy --codex --browser`"
     );
 
     crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
-    let err = use_reset_with("CX", true, false, false, &urls, no_prompt).expect_err("dead chain");
+    let err = limit_reset_with("CX", true, false, false, &urls, no_prompt).expect_err("dead chain");
     assert!(
         err.to_string()
             .starts_with("'cx': codex chain is broken (reused since "),
@@ -3964,12 +3964,12 @@ fn use_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_re
 /// request leaves: the delete/disable confirm policy, for a spend that cannot
 /// be given back. Exit 1, like theirs.
 #[test]
-fn use_reset_off_a_terminal_without_yes_refuses_before_any_request() {
+fn limit_reset_off_a_terminal_without_yes_refuses_before_any_request() {
     let _home = crate::testutil::HomeSandbox::new();
-    seed_use_reset_rosters();
+    seed_limit_reset_rosters();
     let (listener, urls) = untouched_reset_urls();
 
-    let err = use_reset_with("cx", false, false, false, &urls, no_prompt).expect_err("refused");
+    let err = limit_reset_with("cx", false, false, false, &urls, no_prompt).expect_err("refused");
     assert_eq!(
         err.to_string(),
         "refusing to use a reset on 'cx' without confirmation; pass --yes"
@@ -3984,9 +3984,9 @@ fn use_reset_off_a_terminal_without_yes_refuses_before_any_request() {
 /// account with nothing available fails without a consume. The request order
 /// is the proof: exactly one POST, right after the confirmed GET.
 #[test]
-fn use_reset_spends_the_credit_it_named_and_only_after_a_yes() {
+fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
     let _home = crate::testutil::HomeSandbox::new();
-    seed_use_reset_rosters();
+    seed_limit_reset_rosters();
     let two = r#"{"credits": [
         {"id": "later", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-01T00:00:00Z", "expires_at": "2027-06-01T00:00:00Z"},
         {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-02T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"}
@@ -3999,10 +3999,10 @@ fn use_reset_spends_the_credit_it_named_and_only_after_a_yes() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    use_reset_with("cx", true, false, false, &urls, no_prompt).expect("--list lists");
+    limit_reset_with("cx", true, false, false, &urls, no_prompt).expect("--list lists");
 
     let mut asked = String::new();
-    use_reset_with("cx", false, false, true, &urls, |prompt| {
+    limit_reset_with("cx", false, false, true, &urls, |prompt| {
         asked = prompt.to_string();
         Ok(false)
     })
@@ -4012,9 +4012,9 @@ fn use_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         "the prompt names the credit it will spend: {asked}"
     );
 
-    use_reset_with("cx", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
+    limit_reset_with("cx", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
 
-    let err = use_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("none left");
+    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("none left");
     assert_eq!(err.to_string(), "no usage-limit resets available on 'cx'");
 
     let seen = handle.join().expect("join stub");

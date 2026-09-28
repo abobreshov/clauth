@@ -1099,22 +1099,22 @@ fn every_shell_drops_the_manual_login_flag() {
     assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }
 
-/// `use-reset` takes codex names only, so every shell completes its profile from
+/// `limit-reset` takes codex names only, so every shell completes its profile from
 /// `__complete --codex` and none offers it the claude roster (whose names the
 /// verb always refuses).
 #[test]
-fn every_shell_completes_use_reset_from_the_codex_roster_only() {
+fn every_shell_completes_limit_reset_from_the_codex_roster_only() {
     assert!(BASH.contains(
-        r#"[ "$prev" = "use-reset" ]; then
+        r#"[ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )"#
     ));
     assert!(ZSH.contains(
-        r#"[[ "${words[2]}" == use-reset ]]; then
+        r#"[[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")"#
     ));
     assert!(FISH.contains(
-        r#"-n "__fish_seen_subcommand_from use-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
+        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
     ));
     for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         // The shared claude-roster group line in each shell.
@@ -1127,8 +1127,8 @@ fn every_shell_completes_use_reset_from_the_codex_roster_only() {
             })
             .unwrap_or_else(|| panic!("{shell}: no claude-roster profile group"));
         assert!(
-            !group.contains("use-reset"),
-            "{shell} completes use-reset from the claude roster: {group}"
+            !group.contains("limit-reset"),
+            "{shell} completes limit-reset from the claude roster: {group}"
         );
     }
 }
