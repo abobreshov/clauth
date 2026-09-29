@@ -34,7 +34,7 @@ tollgate monitors and manages your AI subscriptions and spending from one termin
 > [!IMPORTANT]
 > tollgate installs beside an existing upstream clauth. It has its own binary, data dir (`~/.tollgate`), env prefix (`TOLLGATE_`), daemon port (8453), herdr plugin id and Claude Code plugin, so neither tool overwrites the other's files.
 >
-> While `~/.clauth` exists, tollgate runs in **guest mode**: it shows clauth's accounts read-only (as `upstream:<name>`, from clauth's own status feed) and **refuses every global write** (Claude Code switches, `capture`, codex adoption, the Claude Code plugin install, `herdr install`) with one line naming guest mode. `tollgate start <profile>`, `tollgate usage`, monitors and the agent API work normally.
+> While `~/.clauth` exists, tollgate runs in **guest mode**: it shows clauth's accounts read-only (as `upstream:<name>`, from clauth's own status feed) and **refuses every global write that would change clauth's state** (Claude Code switches, `capture`, codex adoption) with one line naming guest mode. Its own additive entries still install: the Claude Code plugin, the `mcpServers.tollgate` wiring and `herdr install` touch only tollgate's keys, under clauth's lock. `tollgate start <profile>`, `tollgate usage`, monitors and the agent API work normally.
 >
 > **Importing clauth's accounts is not implemented yet.** Until it is, guest mode stays on for as long as clauth is installed, and tollgate cannot take over `~/.claude`. Details and known gaps: [Guest mode](wiki/Guest-Mode.md).
 

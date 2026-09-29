@@ -123,9 +123,12 @@ pub(crate) const GUEST_REFUSAL: &str = concat!(
 /// an import of it. Upstream then owns every global file the two share —
 /// `~/.claude/.credentials.json`, `~/.claude/settings.json`, `~/.claude.json`,
 /// `~/.codex/auth.json`, the Claude Code plugin registry, the herdr config — so
-/// this tool writes none of them: user-facing global mutations refuse with
-/// [`GUEST_REFUSAL`], background legs skip their global writes, and per-session
-/// runtimes under `~/.tollgate` keep working.
+/// this tool changes none of upstream's state in them: user-facing global
+/// mutations refuse with [`GUEST_REFUSAL`], background legs skip their global
+/// writes, and per-session runtimes under `~/.tollgate` keep working. The one
+/// exception is tollgate's OWN entries in those files (its plugin, its
+/// `mcpServers` entry, its marked herdr blocks), which `crate::guest_write`
+/// adds and removes additively under upstream's lock.
 ///
 /// Resolved through [`crate::profile::home_dir`], so a test's
 /// `testutil::HomeSandbox` decides it. In test builds a caller with no sandbox
@@ -185,6 +188,79 @@ pub(crate) fn refuse_in_guest_mode() -> anyhow::Result<()> {
         return Err(GuestRefusal.into());
     }
     Ok(())
+}
+
+/// Whether this process runs inside one of tollgate's own Claude Code
+/// sessions: its `CLAUDE_CONFIG_DIR` lies under `~/.tollgate`, which every
+/// `tollgate start` runtime and every delegate child's config dir does. An
+/// upstream clauth session (`~/.clauth/profiles/<p>/runtime-*`) and a bare
+/// `claude` (no override, or `~/.claude`) are not. The env var is the one
+/// marker every tollgate runtime carries and no other session does; the
+/// delegate session id is not used, since it inherits to whatever a delegate
+/// starts.
+pub(crate) fn in_own_session() -> bool {
+    let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) else {
+        return false;
+    };
+    let Ok(root) = crate::profile::tollgate_dir() else {
+        return false;
+    };
+    path_is_under(std::path::Path::new(&dir), &root)
+}
+
+/// `path` under `root`, lexically (no `..`) or once both resolve.
+fn path_is_under(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let lexical = path.starts_with(root)
+        && !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir);
+    lexical
+        || match (path.canonicalize(), root.canonicalize()) {
+            (Ok(path), Ok(root)) => path.starts_with(root),
+            _ => false,
+        }
+}
+
+/// Whether one of tollgate's Claude Code plugin hooks (`self-heal`,
+/// `hook-profile-changed-note`) must do nothing: guest mode, fired from a
+/// session that is not tollgate's. Guest mode lets the plugin register in the
+/// shared `~/.claude`, so upstream clauth's sessions load it too; there a
+/// tollgate note or heal is noise at best and a write into upstream's runtime
+/// at worst.
+pub(crate) fn hook_stands_down() -> bool {
+    upstream_active() && !in_own_session()
+}
+
+/// The Claude Code config dir a `claude plugin …` child of this process
+/// writes, as guest mode sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginTarget {
+    /// `~/.claude`: `CLAUDE_CONFIG_DIR` unset or empty, or naming it.
+    Home,
+    /// A runtime under `~/.tollgate`: a guest session's private copy.
+    OwnRuntime(std::path::PathBuf),
+    /// Anything else, upstream's session runtimes included.
+    Foreign(std::path::PathBuf),
+}
+
+/// Classify [`PluginTarget`] off this process's `CLAUDE_CONFIG_DIR`.
+pub(crate) fn plugin_target() -> PluginTarget {
+    let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) else {
+        return PluginTarget::Home;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let Ok(claude) = crate::profile::claude_dir() else {
+        return PluginTarget::Foreign(dir);
+    };
+    let same_as_home = dir == claude
+        || matches!((dir.canonicalize(), claude.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    if same_as_home {
+        return PluginTarget::Home;
+    }
+    match crate::profile::tollgate_dir() {
+        Ok(root) if path_is_under(&dir, &root) => PluginTarget::OwnRuntime(dir),
+        _ => PluginTarget::Foreign(dir),
+    }
 }
 
 /// Whether guest mode refuses a mutation (write or delete) of the macOS

@@ -8,7 +8,7 @@ Requires herdr 0.8.0 or newer, `tollgate` on `PATH`, and Linux or macOS. The ent
 
 ## Install
 
-The fork has published no `tollgate-v*` release tag yet, and its default branch still carries upstream's plugin (id `clauth`). `tollgate herdr install` checks the manifest id at the ref it would install before herdr runs, so today it refuses and says why. Use the dev link below until a release exists. In [guest mode](Guest-Mode) `install` is refused anyway, because herdr's `config.toml` carries upstream's plugin block.
+The fork has published no `tollgate-v*` release tag yet, and its default branch still carries upstream's plugin (id `clauth`). `tollgate herdr install` checks the manifest id at the ref it would install before herdr runs, so today it refuses and says why. Use the dev link below until a release exists. In [guest mode](Guest-Mode) `install` and `uninstall` run too. They write only tollgate's own blocks, never upstream's `# clauth herdr plugin` block, under upstream's `~/.clauth/.lock`.
 
 ### From a local checkout
 
@@ -18,7 +18,7 @@ tollgate herdr link --path ~/src/tollgate    # a repo root, its herdr-plugin/ di
 tollgate herdr unlink                        # herdr plugin unlink tollgate; the files stay
 ```
 
-`link` runs `herdr plugin link <dir>` on the checkout's `herdr-plugin/`, so a script edit is live on the next hook. Both refuse unless the manifest has id `tollgate` (the fork's history also carries upstream's tree), `link` refuses over a GitHub install or a link from another tree, and `unlink` refuses a GitHub install (`tollgate herdr uninstall` removes that). Neither writes herdr's `config.toml`, so both work in guest mode; paste the key and sidebar rows from [below](Herdr-Plugin#the-key) by hand.
+`link` runs `herdr plugin link <dir>` on the checkout's `herdr-plugin/`, so a script edit is live on the next hook. Both refuse unless the manifest has id `tollgate` (the fork's history also carries upstream's tree), `link` refuses over a GitHub install or a link from another tree, and `unlink` refuses a GitHub install (`tollgate herdr uninstall` removes that). Neither writes herdr's `config.toml`; paste the key and sidebar rows from [below](Herdr-Plugin#the-key) by hand, or let the Plugin tab's herdr fix write them (guest mode too).
 
 ### From GitHub, once a release exists
 

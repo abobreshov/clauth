@@ -4207,12 +4207,13 @@ fn an_ambiguous_native_pane_publishes_the_clear_and_keeps_a_watcher() {
     }
 }
 
-/// Guest mode (plan §4.0): herdr's config.toml belongs to upstream clauth's
-/// plugin, so `uninstall` removes only tollgate's plugin registration and
-/// leaves the file byte for byte — even a block tollgate would recognise.
+/// Guest mode (plan §4.0): herdr's config.toml is shared with upstream
+/// clauth's plugin, so `uninstall` removes tollgate's plugin registration and
+/// tollgate's own marked blocks, validated by herdr first, and nothing else.
+/// A write that would drop anything else is refused outright.
 #[cfg(unix)]
 #[test]
-fn uninstall_in_guest_mode_leaves_herdrs_config_alone() {
+fn uninstall_in_guest_mode_strips_only_tollgates_blocks() {
     let home = crate::testutil::HomeSandbox::new();
     std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME)).unwrap();
     assert!(crate::identity::upstream_active());
@@ -4238,25 +4239,26 @@ fn uninstall_in_guest_mode_leaves_herdrs_config_alone() {
         ],
     );
 
-    uninstall(false, true).expect("the plugin half runs");
+    uninstall(false, true).expect("guest uninstall");
     assert_eq!(
         std::fs::read_to_string(&path).expect("config reads"),
-        wired,
-        "the config is untouched in guest mode"
+        orig,
+        "only tollgate's blocks are gone"
     );
     let log = std::fs::read_to_string(home.home().join("calls.log")).unwrap_or_default();
     assert!(
         log.lines().any(|l| l == "plugin uninstall tollgate"),
-        "tollgate's own plugin is still removed: {log}"
+        "tollgate's own plugin is removed: {log}"
     );
     assert!(
-        !log.contains("config check"),
-        "no config candidate is validated: {log}"
+        log.contains("config check"),
+        "the stripped config is validated first: {log}"
     );
     assert!(
-        write_validated(&path, &wired, "", &shim.to_string_lossy(), "x").is_err(),
-        "the config writer itself refuses in guest mode"
+        write_validated(&path, orig, "", &shim.to_string_lossy(), "x").is_err(),
+        "a write that drops the user's lines refuses in guest mode"
     );
+    assert_eq!(std::fs::read_to_string(&path).expect("config reads"), orig);
 }
 
 // ── Untrusted ids and names in the plugin scripts ────────────────────────────
@@ -4335,4 +4337,207 @@ fn a_session_row_path_with_a_blank_and_a_quote_still_resolves() {
         "the spaced row resolves: {}",
         lines[0]
     );
+}
+
+// ── guest mode: tollgate's own blocks in upstream's shared config ───────────
+
+/// A herdr config as a machine running upstream clauth has it: the user's
+/// table, then upstream's own marked binding.
+#[cfg(unix)]
+const UPSTREAM_HERDR: &str = "# my config\n[ui]\naccent = \"cyan\"\n\n# clauth herdr plugin\n[[keys.command]]\nkey = \"prefix+a\"\ntype = \"plugin_action\"\ncommand = \"clauth.open\"\ndescription = \"clauth accounts\"\n";
+
+/// Guest mode on (`~/.clauth` with its state lock), the config staged in the
+/// sandbox, and a `herdr` shim whose `config check` passes and whose argv
+/// lands in `herdr.log`.
+#[cfg(unix)]
+fn guest_herdr(
+    home: &crate::testutil::HomeSandbox,
+    config: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let clauth = home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME);
+    std::fs::create_dir_all(&clauth).expect("upstream dir");
+    std::fs::write(clauth.join(crate::guest_write::UPSTREAM_LOCK_FILE), "").expect("lock");
+    assert!(crate::identity::upstream_active());
+    let path = home.home().join("config.toml");
+    std::fs::write(&path, config).expect("fixture written");
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "echo \"$@\" >> \"$(dirname \"$0\")/herdr.log\"; exit 0",
+    );
+    (path, shim)
+}
+
+#[cfg(unix)]
+fn herdr_log(home: &crate::testutil::HomeSandbox) -> String {
+    std::fs::read_to_string(home.home().join("herdr.log")).unwrap_or_default()
+}
+
+/// The Plugin tab's herdr fix in guest mode: tollgate's binding and row land,
+/// upstream's block and the user's table read exactly as before once
+/// tollgate's own marked blocks are set aside, and the file keeps its mode.
+#[cfg(unix)]
+#[test]
+fn guest_heal_adds_tollgates_blocks_and_keeps_upstreams() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = crate::testutil::HomeSandbox::new();
+    let (path, shim) = guest_herdr(&home, UPSTREAM_HERDR);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+
+    let notes = heal(&path, DEFAULT_KEY, shim.to_str().expect("utf8"), false).expect("heal");
+    assert!(notes.is_empty(), "nothing hand-owned: {notes:?}");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains(MARKER), "tollgate's blocks landed: {text}");
+    assert!(text.contains(r#"command = "tollgate.open""#), "{text}");
+    assert!(text.contains(r#"key = "prefix+t""#), "{text}");
+    assert_eq!(
+        strip_marked_blocks(&text).0.trim_end_matches('\n'),
+        UPSTREAM_HERDR.trim_end_matches('\n'),
+        "everything but tollgate's blocks is byte-identical"
+    );
+    toml::from_str::<toml::Value>(&text).expect("still parses");
+    assert_eq!(
+        std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+        0o640,
+        "the config keeps its mode"
+    );
+    assert!(
+        herdr_log(&home).contains("config check"),
+        "the edit was validated by herdr first: {}",
+        herdr_log(&home)
+    );
+}
+
+/// `tollgate herdr install`'s keybinding conflict check still holds in guest
+/// mode: a key upstream's block already binds is left alone, with a note.
+#[cfg(unix)]
+#[test]
+fn guest_heal_never_binds_a_key_upstream_holds() {
+    let home = crate::testutil::HomeSandbox::new();
+    let taken = UPSTREAM_HERDR.replace("prefix+a", DEFAULT_KEY);
+    let (path, shim) = guest_herdr(&home, &taken);
+
+    let notes = heal(&path, DEFAULT_KEY, shim.to_str().expect("utf8"), false).expect("heal");
+    assert!(
+        notes.iter().any(|n| n.contains("clauth.open")),
+        "the clash is named: {notes:?}"
+    );
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(!text.contains(r#"command = "tollgate.open""#), "{text}");
+    assert_eq!(
+        strip_marked_blocks(&text).0.trim_end_matches('\n'),
+        taken.trim_end_matches('\n')
+    );
+}
+
+/// Uninstall in guest mode removes tollgate's blocks (and only them) and the
+/// plugin registration; upstream's block stays.
+#[cfg(unix)]
+#[test]
+fn guest_uninstall_removes_only_tollgates_blocks() {
+    let home = crate::testutil::HomeSandbox::new();
+    let plan = plan_config(UPSTREAM_HERDR, DEFAULT_KEY, true).expect("plan");
+    let wired = with_append(UPSTREAM_HERDR, &plan.append);
+    let (path, shim) = guest_herdr(&home, &wired);
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("HERDR_BIN_PATH", Some(shim.as_os_str())),
+            ("HERDR_CONFIG_PATH", Some(path.as_os_str())),
+        ],
+    );
+
+    uninstall(false, true).expect("guest uninstall");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert_eq!(
+        text.trim_end_matches('\n'),
+        UPSTREAM_HERDR.trim_end_matches('\n'),
+        "tollgate's blocks are gone, upstream's block and the user's table stay"
+    );
+    assert!(
+        herdr_log(&home).contains("plugin uninstall tollgate"),
+        "only tollgate's registration is removed: {}",
+        herdr_log(&home)
+    );
+}
+
+/// An edit that strays outside tollgate's blocks is refused in guest mode
+/// before herdr is asked about it, and nothing is written.
+#[cfg(unix)]
+#[test]
+fn guest_write_refuses_an_edit_to_upstreams_block() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (path, shim) = guest_herdr(&home, UPSTREAM_HERDR);
+    let edited = UPSTREAM_HERDR.replace("clauth accounts", "hijacked");
+    let err = write_validated(
+        &path,
+        UPSTREAM_HERDR,
+        &edited,
+        shim.to_str().expect("utf8"),
+        "the edit",
+    )
+    .expect_err("a foreign edit is refused");
+    assert!(
+        err.to_string().contains("outside tollgate's own blocks"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        UPSTREAM_HERDR
+    );
+    assert!(herdr_log(&home).is_empty(), "herdr was never run");
+}
+
+/// The guest write holds upstream's state flock: held, the heal waits a
+/// bounded time, fails with the typed timeout, and writes nothing.
+#[cfg(unix)]
+#[test]
+fn guest_heal_waits_on_upstreams_lock() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (path, shim) = guest_herdr(&home, UPSTREAM_HERDR);
+    let held = std::fs::File::open(
+        home.home()
+            .join(crate::identity::UPSTREAM_DATA_DIR_NAME)
+            .join(crate::guest_write::UPSTREAM_LOCK_FILE),
+    )
+    .expect("open lock");
+    held.lock().expect("hold lock");
+    let _fast =
+        crate::guest_write::upstream_lock_timeout_for_test(std::time::Duration::from_millis(100));
+
+    let err = heal(&path, DEFAULT_KEY, shim.to_str().expect("utf8"), false)
+        .expect_err("a held lock fails the write");
+    assert!(
+        err.downcast_ref::<crate::guest_write::UpstreamLockTimeout>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        UPSTREAM_HERDR
+    );
+}
+
+/// A planned edit whose file changed under it (upstream's heal wrote it
+/// meanwhile) is not applied over the change.
+#[cfg(unix)]
+#[test]
+fn guest_write_refuses_a_config_that_changed_since_the_plan() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (path, shim) = guest_herdr(&home, UPSTREAM_HERDR);
+    let plan = plan_config(UPSTREAM_HERDR, DEFAULT_KEY, false).expect("plan");
+    let text = with_append(UPSTREAM_HERDR, &plan.append);
+    let moved = format!("{UPSTREAM_HERDR}\n[extra]\nx = 1\n");
+    std::fs::write(&path, &moved).expect("upstream wrote meanwhile");
+
+    let err = write_validated(
+        &path,
+        UPSTREAM_HERDR,
+        &text,
+        shim.to_str().expect("utf8"),
+        "the edit",
+    )
+    .expect_err("a moved file is not overwritten");
+    assert!(err.to_string().contains("changed while"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), moved);
 }

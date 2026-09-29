@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Guest mode
+
+- The Plugin tab's Claude Code plugin install and `mcpServers` wiring, `tollgate herdr install` / `uninstall` and the Plugin tab's herdr config fix now run in guest mode instead of refusing. They add, change or remove only tollgate's own entries: `tollgate@tollgate` in the plugin registry and `enabledPlugins`, `mcpServers.tollgate` in `~/.claude.json`, the herdr plugin `tollgate` and the herdr config blocks under tollgate's marker (the keybinding conflict check still applies).
+- Each of those writes holds upstream's `~/.clauth/.lock` (opened read-only, never created, a bounded 5 s wait, then a clear error), and is atomic with the file's mode kept. A direct edit is refused when any other key or line would change. A `claude plugin` run is snapshotted first, and any upstream key it changed or dropped is put back afterwards. herdr's config is still validated with `herdr config check`, and re-read under the lock so a file that moved since the plan is not overwritten.
+- The plugin install refuses to run under a `CLAUDE_CONFIG_DIR` (it would land in that session's config, not `~/.claude`). The plugin self-heal, its preflight and the `installed_plugins.json` repoint run again in guest mode. They write only `~/.claude` or a tollgate runtime, never an upstream session's config dir, and the repoint re-points only tollgate's own rows.
+- Upstream's sessions load the shared plugin too, so the `self-heal` and `hook-profile-changed-note` hooks do nothing in a session whose `CLAUDE_CONFIG_DIR` is not under `~/.tollgate`.
+
 ## 0.1.0 — 2026-09-29
 
 First release of tollgate, a hard fork of [clauth](https://github.com/uwuclxdy/clauth) (MIT) at upstream `b7d7cb02`, turned into a multi-provider subscription and spend monitor. Everything clauth did for Claude Code and codex accounts is kept; what changed or is new is below.

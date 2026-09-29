@@ -220,18 +220,15 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
     crate::settings_sync::sync_once().expect("sync");
     crate::claude_json::sync_once().expect("sync");
 
-    // Plugin / MCP wiring into ~/.claude refuses; the heal legs are no-ops.
-    assert!(is_guest_refusal(
-        &crate::plugin_probe::wire_mcp_server().unwrap_err()
-    ));
-    assert!(is_guest_refusal(
-        &crate::plugin_host::install().unwrap_err()
-    ));
-    crate::plugin_host::self_heal().expect("self-heal is a no-op");
-    assert!(crate::plugin_host::self_heal_line().unwrap().is_none());
+    // The plugin install and the `mcpServers` wiring are additive guest
+    // writes now (`tests/inline/guest_write.rs` pins them). The heal legs
+    // touch nothing of upstream's: the `self-heal` hook stands down outside a
+    // tollgate session, the repoint re-points only tollgate's own rows, and
+    // with nothing of tollgate's registered neither detached leg spawns (both
+    // return before the fake-claude assertion).
+    crate::plugin_host::self_heal().expect("self-heal is a no-op here");
     let repoint = crate::plugin_host::repoint_registry().unwrap();
     assert!(repoint.line.is_none() && !repoint.changed);
-    // Neither spawns anything: both return before the fake-claude assertion.
     crate::plugin_host::heal_detached();
     crate::plugin_host::preflight();
 

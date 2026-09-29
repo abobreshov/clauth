@@ -10,6 +10,16 @@
 //! a binary install) re-roots the dead ones to their `~/.claude` twins through
 //! agentgear's byte-surgical re-point.
 //!
+//! Guest mode (upstream clauth installed, plan §4.0): the registry and
+//! `settings.json` are shared with upstream, but `tollgate@tollgate`'s rows in
+//! them are tollgate's own, so the install and the heals still run — only into
+//! `~/.claude` or a tollgate runtime, never an upstream session's config dir,
+//! and each under `guest_write::guest_guarded`, which holds upstream's lock and
+//! undoes any change the `claude plugin` child made to another tool's keys.
+//! The `self-heal` hook stands down in a session that is not tollgate's
+//! (`identity::hook_stands_down`), since upstream's sessions load the plugin
+//! too.
+//!
 //! tollgate's plugin tree lives in `plugins/` (not the default `plugin/`), so the
 //! derive's `tree` attr and `build.rs`'s `assert_plugin_version_at` both name
 //! it. The tree itself stays a stock Claude Code plugin — `plugin.json` + the
@@ -42,10 +52,62 @@ pub(crate) struct TollgatePlugin;
 /// both go through here, so `Scope::User` + `Source::Embedded` live in one
 /// place and the copy-paste hint they replace has no other home to drift into.
 pub(crate) fn install() -> anyhow::Result<Outcome> {
-    // Guest mode: the Claude Code plugin registry is shared with upstream
-    // clauth, which owns every global Claude Code file until an import.
-    crate::identity::refuse_in_guest_mode()?;
-    Ok(TollgatePlugin::install(Scope::User, Source::Embedded)?)
+    // Guest mode: the registry and `settings.json` are shared with upstream
+    // clauth. tollgate's own `tollgate@tollgate` rows are additive, so the
+    // install runs under `guest_write`'s guard, which holds upstream's lock and
+    // puts back any upstream key the `claude plugin` child touched. Only
+    // `~/.claude` is a target: under a `CLAUDE_CONFIG_DIR` the child would write
+    // that session's config instead — a guest session's private plugin copy,
+    // gone at teardown, or an upstream session's runtime.
+    if crate::identity::upstream_active()
+        && let crate::identity::PluginTarget::OwnRuntime(dir)
+        | crate::identity::PluginTarget::Foreign(dir) = crate::identity::plugin_target()
+    {
+        anyhow::bail!(
+            "guest mode: CLAUDE_CONFIG_DIR is {}, so the plugin would land in that session's config, not ~/.claude; run the install from a shell outside Claude Code",
+            dir.display()
+        );
+    }
+    guarded(|| Ok(TollgatePlugin::install(Scope::User, Source::Embedded)?))
+}
+
+/// The shared registry files a `claude plugin` child writes, each with the
+/// keys tollgate owns in it: the config dir the child resolves (see
+/// [`registry_dir`]), `settings.json` and the two `plugins/` registries.
+fn guarded_files() -> Vec<(PathBuf, &'static [crate::guest_write::OwnedKey])> {
+    use crate::guest_write::{INSTALLED_PLUGINS_KEYS, KNOWN_MARKETPLACES_KEYS, SETTINGS_KEYS};
+    let Some(dir) = registry_dir() else {
+        return Vec::new();
+    };
+    vec![
+        (dir.join("settings.json"), SETTINGS_KEYS),
+        (
+            dir.join("plugins").join("installed_plugins.json"),
+            INSTALLED_PLUGINS_KEYS,
+        ),
+        (
+            dir.join("plugins").join("known_marketplaces.json"),
+            KNOWN_MARKETPLACES_KEYS,
+        ),
+    ]
+}
+
+/// Run a lifecycle leg that writes the shared registry: `run()` outside guest
+/// mode, and under `guest_write::guest_guarded` in it.
+fn guarded<T>(run: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    crate::guest_write::guest_guarded(&guarded_files(), run)
+}
+
+/// Guest mode's gate for the heal legs: `false` when the config dir a heal
+/// would write belongs to upstream (an upstream session's runtime, where
+/// tollgate's MCP server or hooks may be loaded). `~/.claude` heals under the
+/// guard; a tollgate runtime's private copy is tollgate's own.
+fn heal_allowed() -> bool {
+    !crate::identity::upstream_active()
+        || !matches!(
+            crate::identity::plugin_target(),
+            crate::identity::PluginTarget::Foreign(_)
+        )
 }
 
 /// The SessionStart hook body (`tollgate self-heal`). Repairs a broken
@@ -57,8 +119,18 @@ pub(crate) fn install() -> anyhow::Result<Outcome> {
 /// through a dead runtime tree dangles even when tollgate's own registration is
 /// healthy, so neither leg gates the other.
 pub(crate) fn self_heal() -> anyhow::Result<()> {
-    // Guest mode: the heal is a no-op (plan §4.0), quietly, since it is a hook.
-    if crate::identity::upstream_active() {
+    // Guest mode: the plugin is registered in the shared `~/.claude`, so this
+    // hook also fires in upstream clauth's sessions; there it does nothing.
+    if crate::identity::hook_stands_down() {
+        return Ok(());
+    }
+    heal_now()
+}
+
+/// The heal body the hook and the start pre-flight share: the registration
+/// heal, then the installPath convergence leg, each line printed.
+fn heal_now() -> anyhow::Result<()> {
+    if !heal_allowed() {
         return Ok(());
     }
     if let Some(line) = self_heal_line()? {
@@ -91,8 +163,10 @@ pub(crate) struct RepointOutcome {
 /// dies converges it. Rewrites and skips both name themselves in the line;
 /// `changed` separates the two for call sites that rate-limit reporting.
 pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
-    // Guest mode: `installed_plugins.json` is shared with upstream clauth.
-    if crate::identity::upstream_active() {
+    // Guest mode: `installed_plugins.json` is shared with upstream clauth, so
+    // only tollgate's own rows are re-pointed (see `registry_remap`), under the
+    // guard, and never in an upstream session's config dir.
+    if !heal_allowed() {
         return Ok(RepointOutcome {
             line: None,
             changed: false,
@@ -116,8 +190,16 @@ pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
     let profiles = tollgate.join("profiles");
     let prefix_fwd = format!("{}/", profiles.display());
     let prefix_back = format!("{}\\", profiles.display());
-    let report = agentgear::repoint_install_paths(&registry, |path: &str| {
-        registry_remap(path, &prefix_fwd, &prefix_back, &claude)
+    let guest = crate::identity::upstream_active();
+    // This leg always writes `~/.claude`'s registry, whatever
+    // `CLAUDE_CONFIG_DIR` says, so it guards that file rather than
+    // `guarded_files()`.
+    let files = [(registry.clone(), crate::guest_write::INSTALLED_PLUGINS_KEYS)];
+    let report = crate::guest_write::guest_guarded(&files, || {
+        Ok(agentgear::repoint_install_paths(
+            &registry,
+            |path: &str| registry_remap(path, &prefix_fwd, &prefix_back, &claude, guest),
+        )?)
     })?;
     let changed = report.changed();
     if report.rewritten.is_empty() && report.skipped.is_empty() {
@@ -148,8 +230,15 @@ fn registry_remap(
     prefix_fwd: &str,
     prefix_back: &str,
     claude: &Path,
+    guest: bool,
 ) -> agentgear::Remap {
     if !path.starts_with(prefix_fwd) && !path.starts_with(prefix_back) {
+        return agentgear::Remap::Keep;
+    }
+    // Guest mode: another tool's plugin row is upstream's to converge, even
+    // one recorded through a tollgate runtime. tollgate's own rows live in its
+    // marketplace's cache dir (`cache/tollgate/…`).
+    if guest && !is_own_cache_path(path) {
         return agentgear::Remap::Keep;
     }
     if Path::new(path).exists() {
@@ -181,6 +270,14 @@ fn registry_remap(
     } else {
         agentgear::Remap::Skip(format!("no twin at {}", twin.display()))
     }
+}
+
+/// Whether a recorded installPath sits in tollgate's own marketplace cache
+/// (`…/plugins/cache/tollgate/…`), either separator.
+fn is_own_cache_path(path: &str) -> bool {
+    let fwd = format!("plugins/cache/{}/", crate::identity::NAME);
+    let back = format!("plugins\\cache\\{}\\", crate::identity::NAME);
+    path.contains(&fwd) || path.contains(&back)
 }
 
 /// Skip-only reports are named once per process in the detached leg: the
@@ -219,10 +316,10 @@ pub(crate) fn reset_skip_report_for_test() {
 /// becomes a line only when the heal changed something. Split from
 /// [`self_heal`] so a test can pin the contract without a terminal.
 pub(crate) fn self_heal_line() -> anyhow::Result<Option<String>> {
-    if crate::identity::upstream_active() {
+    if !heal_allowed() {
         return Ok(None);
     }
-    let outcome = TollgatePlugin::self_heal()?;
+    let outcome = guarded(|| Ok(TollgatePlugin::self_heal()?))?;
     Ok((!matches!(outcome, Outcome::NoOp)).then(|| format!("tollgate self-heal: {outcome}")))
 }
 
@@ -235,8 +332,9 @@ pub(crate) fn self_heal_line() -> anyhow::Result<Option<String>> {
 /// nothing. A heal failure is logged and never fails the start: the session
 /// still launches, and the hook (once the plugin loads again) keeps trying.
 pub(crate) fn preflight() {
-    // Guest mode: no registry write of any kind before a start.
-    if crate::identity::upstream_active() {
+    // Guest mode: the heal runs under the guard against `~/.clauth`'s lock,
+    // and never into an upstream session's config dir.
+    if !heal_allowed() {
         return;
     }
     match repoint_registry() {
@@ -250,7 +348,7 @@ pub(crate) fn preflight() {
     if !preflight_gate() {
         return;
     }
-    if let Err(e) = self_heal() {
+    if let Err(e) = heal_now() {
         crate::logline::logline!("tollgate: plugin pre-flight heal failed: {e:#}");
     }
 }
@@ -348,8 +446,9 @@ impl HealThrottle {
 /// — never `out::outln!`: `tollgate mcp`'s stdout is a JSON-RPC stream, and one
 /// stray line corrupts the session.
 pub(crate) fn heal_detached() {
-    // Guest mode: the heal is a no-op; nothing is spawned or written.
-    if crate::identity::upstream_active() {
+    // Guest mode: never into an upstream session's config dir (`tollgate mcp`
+    // loaded there by the shared plugin); elsewhere the legs run guarded.
+    if !heal_allowed() {
         return;
     }
     match detached_repoint_line() {
