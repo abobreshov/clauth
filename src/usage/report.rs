@@ -73,6 +73,18 @@ pub(crate) fn plain_line(obs: &AccountObservation, now_secs: i64) -> String {
     if let Some(plan) = &obs.plan {
         parts.push(plan.clone());
     }
+    if let Some(health) = &obs.key_health {
+        let age = now_secs.saturating_sub(health.checked_at.secs()).max(0);
+        let age = if age < 60 {
+            "just now".to_string()
+        } else {
+            format!("{}m ago", age / 60)
+        };
+        parts.push(format!("key {} · {age}", health.state.display_name()));
+    }
+    if let Some(note) = &obs.note {
+        parts.push(super::observation::sanitize_message(note));
+    }
     // Lead window first, the rest in source order.
     let lead = lead_window(&obs.windows, now_secs);
     let ordered = lead.into_iter().chain(

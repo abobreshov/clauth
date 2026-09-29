@@ -72,11 +72,11 @@ fn the_allowlist_admits_only_the_nous_account_and_billing_reads() {
     for ok in [
         "https://portal.nousresearch.com/api/oauth/account",
         "https://portal.nousresearch.com/api/billing/state",
-        "https://portal.nousresearch.com/api/billing/subscription?x=1",
     ] {
         assert!(bearer_url_allowed(ok), "{ok}");
     }
     for bad in [
+        "https://portal.nousresearch.com/api/billing/subscription?x=1",
         "https://inference-api.nousresearch.com/v1/chat/completions",
         "https://portal.nousresearch.com/api/oauth/token",
         "https://portal.nousresearch.com/api/billing/",
@@ -412,4 +412,70 @@ fn native_and_key_request_allowlist_is_exhaustive() {
             assert!(!request_allowed(kind, &bad_req), "{kind:?} {bad}");
         }
     }
+}
+
+#[test]
+fn nous_portal_rows_use_the_actual_request_allowlist() {
+    let token = Secret::new("TOKEN-CANARY");
+    for path in [
+        "/api/oauth/account",
+        "/api/billing/state",
+        "/api/billing/subscription",
+    ] {
+        let url = format!("https://portal.nousresearch.com{path}");
+        let mut request = Request {
+            method: Method::Get,
+            url: &url,
+            auth: Auth::Bearer(&token),
+            extra: &[],
+            json_body: None,
+        };
+        assert!(request_allowed(MonitorKind::Nous, &request));
+        request.method = Method::Post;
+        assert!(!request_allowed(MonitorKind::Nous, &request));
+        request.method = Method::Get;
+        request.auth = Auth::None;
+        assert!(!request_allowed(MonitorKind::Nous, &request));
+    }
+}
+
+#[test]
+fn costs_cursors_are_bounded_encoded_data_without_query_or_path_injection() {
+    let token = Secret::new("KEY-CANARY");
+    let allowed = |url: &str| {
+        request_allowed(
+            MonitorKind::Openai,
+            &Request {
+                method: Method::Get,
+                url,
+                auth: Auth::Bearer(&token),
+                extra: &[],
+                json_body: None,
+            },
+        )
+    };
+    let base = "https://api.openai.com/v1/organization/costs?start_time=1&bucket_width=1d&limit=31";
+    let encoded = encode_cost_cursor("next/page+==").unwrap();
+    assert_eq!(encoded, "next%2Fpage%2B%3D%3D");
+    assert!(allowed(&format!("{base}&page={encoded}")));
+    for bad in [
+        "%2e%2e",
+        "%23fragment",
+        "%40evil",
+        "%5Cescape",
+        "%252F",
+        "%0A",
+        "%GG",
+        "%",
+        "%2",
+        "x&key=secret",
+    ] {
+        assert!(!allowed(&format!("{base}&page={bad}")), "{bad}");
+    }
+    assert!(!allowed(&format!("{base}&page={}", "a".repeat(257))));
+    assert!(!allowed(&format!("{base}&limit=1")));
+    assert!(!allowed(
+        "https://api.openai.com/v1/%6Drganization/costs?start_time=1&bucket_width=1d&limit=31"
+    ));
+    assert!(!allowed("https://api.openai.com/v1/models?key=x%2F"));
 }

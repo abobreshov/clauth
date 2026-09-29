@@ -229,21 +229,69 @@ fn post_form(url: &str, token: &str, body: &str) -> Result<String, ThirdPartyErr
         .send(body)
         .map_err(|_| ThirdPartyError::Network)?;
     let status = response.status().as_u16();
-    if status == 429 {
-        let retry_after = response
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::usage::parse_retry_after);
+    let observing = crate::usage::keyed_http::response_observer_active();
+    let headers = if observing {
+        response
             .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::usage::parse_retry_after);
-        return Err(ThirdPartyError::RateLimited { retry_after });
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.as_str().to_ascii_lowercase();
+                if !crate::usage::keyed_http::response_header_allowed(&name) {
+                    return None;
+                }
+                Some((name, value.to_str().ok()?.chars().take(256).collect()))
+            })
+            .take(64)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Normal errors keep their original no-body-read behavior. Capture reads
+    // the received response once, bounded, and preserves it before unwrap_payload.
+    let text = if observing {
+        response
+            .body_mut()
+            .with_config()
+            .limit(2 * 1024 * 1024)
+            .read_to_string()
+            .ok()
+    } else if status < 400 {
+        response.body_mut().read_to_string().ok()
+    } else {
+        None
+    };
+    post_form_reply(
+        crate::usage::keyed_http::Reply {
+            status,
+            headers,
+            retry_after,
+            body: text,
+        },
+        observing,
+    )
+}
+
+fn post_form_reply(
+    reply: crate::usage::keyed_http::Reply,
+    observing: bool,
+) -> Result<String, ThirdPartyError> {
+    if observing {
+        crate::usage::keyed_http::observe_response(&reply);
     }
-    if status >= 400 {
+    if reply.status == 429 {
+        return Err(ThirdPartyError::RateLimited {
+            retry_after: reply.retry_after,
+        });
+    }
+    if reply.status >= 400 {
         return Err(ThirdPartyError::Status);
     }
-    response
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| ThirdPartyError::Network)
+    reply.body.ok_or(ThirdPartyError::Network)
 }
 
 /// Peel the OneConsole envelope down to the API's own payload.

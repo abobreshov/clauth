@@ -10,7 +10,9 @@
 //! N seconds is P percent spent", never "this is the weekly one" — so the
 //! mapping below is where a duration becomes one of tollgate's two named slots.
 
+use super::observation::{QuotaWindow, Timestamp, WindowScope};
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
 
@@ -63,7 +65,33 @@ struct RawResetCredits {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+struct RawCredits {
+    #[serde(default)]
+    balance: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default)]
+    unlimited: Option<bool>,
+    #[serde(default)]
+    has_credits: Option<bool>,
+}
+fn credit_balance(raw: &serde_json::value::RawValue) -> Option<String> {
+    let text = raw.get();
+    let value = if text.starts_with('"') {
+        serde_json::from_str::<String>(text).ok()?
+    } else {
+        text.to_string()
+    };
+    super::observation::Amount::parse(&value).map(|v| v.as_str().to_string())
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct RawUsage {
+    #[serde(default)]
+    credits: Option<RawCredits>,
+    #[serde(default)]
+    spend_control: Option<Value>,
+    #[serde(default)]
+    additional_rate_limits: Option<Vec<Value>>,
+
     /// Authoritative over the id_token's `chatgpt_plan_type` claim, which goes
     /// stale the moment a plan changes (settled question 5).
     #[serde(default)]
@@ -168,7 +196,69 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
         }
     }
 
+    let codex_credits = raw.credits.as_ref().map(|v| super::fetch::CodexCredits {
+        balance: v.balance.as_deref().and_then(credit_balance),
+        unlimited: v.unlimited,
+        has_credits: v.has_credits,
+    });
+    let mut additional = Vec::new();
+    for (index, entry) in raw
+        .additional_rate_limits
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let name = entry["limit_name"]
+            .as_str()
+            .or_else(|| entry["metered_feature"].as_str())
+            .unwrap_or("Additional Codex quota");
+        let slug = entry["normal_model_slug"].as_str();
+        let identity = entry["metered_feature"]
+            .as_str()
+            .or_else(|| entry["limit_id"].as_str())
+            .or(slug)
+            .unwrap_or(name);
+        let Some(pool) = entry["rate_limit"].as_object() else {
+            continue;
+        };
+        for (key, value) in pool
+            .iter()
+            .filter(|(key, value)| key.ends_with("_window") && value.is_object())
+        {
+            let scope = slug.map_or(WindowScope::Account, |model| WindowScope::Model {
+                models: vec![model.to_string()],
+            });
+            let mut window = QuotaWindow::new(
+                format!("codex.additional.{identity}.{index}.{key}"),
+                format!("{name} {}", key.replace('_', " ")),
+                scope,
+            );
+            window.used_pct = value["used_percent"].as_f64().filter(|v| v.is_finite());
+            window.exhausted = window.used_pct.is_some_and(|v| v >= 100.0)
+                || entry["rate_limit"]["limit_reached"].as_bool() == Some(true);
+            window.window_secs = value["limit_window_seconds"].as_u64().filter(|v| *v > 0);
+            window.resets_at = value["reset_at"]
+                .as_i64()
+                .filter(|v| *v > 0)
+                .or_else(|| {
+                    value["reset_after_seconds"]
+                        .as_i64()
+                        .filter(|v| *v >= 0)
+                        .and_then(|v| now_secs.checked_add(v))
+                })
+                .map(Timestamp::from_secs);
+            additional.push(window);
+        }
+    }
     Ok(UsageInfo {
+        codex_credits,
+        codex_spend_control_reached: raw
+            .spend_control
+            .as_ref()
+            .and_then(|v| v["reached"].as_bool()),
+        codex_additional_windows: additional,
+
         plan: Some(PlanInfo {
             codex_plan: raw
                 .plan_type
@@ -201,6 +291,19 @@ pub(crate) fn fetch_codex_usage_at(
     fedramp: bool,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
+    fetch_codex_usage_at_with_capture(url, access_token, account_id, fedramp, now_secs, None)
+}
+
+pub(crate) type RawCapture<'a> = dyn Fn(u16, &str, &[(String, String)]) + 'a;
+
+fn fetch_codex_usage_at_with_capture(
+    url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+    fedramp: bool,
+    now_secs: i64,
+    capture: Option<&RawCapture<'_>>,
+) -> Result<UsageInfo, FetchError> {
     let req = super::codex_headers::apply_codex_headers(
         super::codex_headers::codex_agent().get(url),
         access_token,
@@ -209,13 +312,41 @@ pub(crate) fn fetch_codex_usage_at(
     );
     let mut response = req.call().map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
+    if status != 200 && capture.is_none() {
+        return Err(FetchError::Status(status));
+    }
+    let headers: Vec<_> = if capture.is_some() {
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.as_str().to_ascii_lowercase();
+                if !super::keyed_http::response_header_allowed(&name) {
+                    return None;
+                }
+                Some((name, value.to_str().ok()?.chars().take(256).collect()))
+            })
+            .take(64)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let body = if capture.is_some() {
+        response
+            .body_mut()
+            .with_config()
+            .limit(2 * 1024 * 1024)
+            .read_to_string()
+    } else {
+        response.body_mut().read_to_string()
+    }
+    .map_err(|_| FetchError::Network)?;
+    if let Some(capture) = capture {
+        capture(status, &body, &headers);
+    }
     if status != 200 {
         return Err(FetchError::Status(status));
     }
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| FetchError::Network)?;
     map_usage(&body, now_secs)
 }
 
@@ -226,6 +357,25 @@ pub(crate) fn fetch_codex_usage(
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
     fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, fedramp, now_secs)
+}
+
+/// Read-only native-monitor capture: callback sees the raw provider response
+/// before mapping. The caller must mask its strings before writing it.
+pub(crate) fn fetch_codex_usage_captured(
+    access_token: &str,
+    account_id: Option<&str>,
+    fedramp: bool,
+    now_secs: i64,
+    capture: &RawCapture<'_>,
+) -> Result<UsageInfo, FetchError> {
+    fetch_codex_usage_at_with_capture(
+        CODEX_USAGE_URL,
+        access_token,
+        account_id,
+        fedramp,
+        now_secs,
+        Some(capture),
+    )
 }
 
 #[cfg(test)]

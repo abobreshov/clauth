@@ -238,7 +238,7 @@ fn discover_in(
         if meta.file_type().is_symlink() {
             rows.push(skipped(
                 codex.display().to_string(),
-                "managed by a profile store (symlink)",
+                &codex_symlink_reason(&codex),
             ));
         } else if meta.is_file()
             && let Ok(mut m) = preset("codex-native")
@@ -251,7 +251,7 @@ fn discover_in(
             let reason = if explain {
                 read_shape(&codex).map_or_else(
                     || "unreadable auth shape".into(),
-                    |v| format!("fields: {}; expiry: jwt; entries: 1", fields(&v)),
+                    |v| format!("fields: {}; expiry: {}; entries: 1", fields(&v), expiry(&v)),
                 )
             } else {
                 "regular CLI login file".into()
@@ -348,6 +348,32 @@ fn discover_in(
     }
     rows
 }
+fn codex_symlink_reason(path: &Path) -> String {
+    let Ok(target) = std::fs::read_link(path) else {
+        return "auth.json is a symlink; link target unreadable".into();
+    };
+    // Inspect the stored link text only, including dangling and relative links.
+    // Never canonicalize or open the operator's upstream credential target.
+    let components: Vec<_> = target.components().collect();
+    for pair in components.windows(2) {
+        if pair[1].as_os_str() == "profiles" {
+            if pair[0].as_os_str() == ".tollgate" {
+                return "managed by tollgate's profile store (symlink)".into();
+            }
+            if pair[0].as_os_str() == ".clauth" {
+                return "managed by upstream clauth's profile store (symlink)".into();
+            }
+        }
+    }
+    "auth.json is a symlink outside tollgate and clauth profile stores".into()
+}
+fn keyring_unavailable_reason() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Secret Service unavailable; no secret read"
+    } else {
+        "Linux only in 0.1"
+    }
+}
 fn fields(v: &Value) -> String {
     v.as_object().map_or_else(
         || "non-object".into(),
@@ -355,6 +381,7 @@ fn fields(v: &Value) -> String {
     )
 }
 fn expiry(v: &Value) -> &'static str {
+    let v = v.get("tokens").unwrap_or(v);
     match v.get("expires_at").or_else(|| v.get("expiry_date")) {
         Some(Value::String(s)) if s == "rfc3339" => "rfc3339",
         Some(Value::Number(n)) if n.as_i64().is_some_and(|n| n > 10_000_000_000) => "epoch_ms",
@@ -422,10 +449,7 @@ pub(crate) fn run(json: bool, explain: bool, apply: bool, yes: bool) -> Result<(
                     ));
                 }
             }
-            Err(_) => rows.push(skipped(
-                "agy".into(),
-                "Secret Service unavailable; no secret read",
-            )),
+            Err(_) => rows.push(skipped("agy".into(), keyring_unavailable_reason())),
         }
     }
     if json {

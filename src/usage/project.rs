@@ -214,6 +214,32 @@ pub(crate) fn apply_oauth_usage(obs: &mut AccountObservation, usage: &UsageInfo,
 /// account is blocked (when no failure is set yet).
 pub(crate) fn apply_codex_usage(obs: &mut AccountObservation, usage: &UsageInfo, now_secs: i64) {
     obs.windows = usage_windows(usage, now_secs);
+    obs.windows.extend(
+        usage
+            .codex_additional_windows
+            .iter()
+            .filter(|w| is_live(w.resets_at, now_secs))
+            .cloned(),
+    );
+    if let Some(credits) = &usage.codex_credits
+        && credits.unlimited != Some(true)
+        && let Some(balance) = credits.balance.as_deref().and_then(Amount::parse)
+    {
+        obs.money.push(MoneyMeter::new(
+            "codex.credits",
+            "Codex credits",
+            MoneyKind::Balance,
+            balance,
+            "credits",
+            MoneyScope::Profile,
+        ));
+    }
+    if obs.failure.is_none() && usage.codex_spend_control_reached == Some(true) {
+        obs.failure = Some(Failure::new(
+            FailureKind::QuotaExhausted,
+            "Codex spend control reached",
+        ));
+    }
     if obs.plan.is_none() {
         obs.plan = usage.plan.as_ref().and_then(|p| p.codex_plan.clone());
     }

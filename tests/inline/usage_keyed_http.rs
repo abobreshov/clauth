@@ -199,3 +199,99 @@ fn response_header_bounds_and_exact_names() {
     server.join().unwrap();
     assert_eq!(reply.headers[0].1.len(), 256);
 }
+
+fn synthetic_reply(status: u16) -> Reply {
+    Reply {
+        status,
+        headers: vec![("content-type".into(), "application/json".into())],
+        retry_after: None,
+        body: Some("{\"value\":1}".into()),
+    }
+}
+fn recording_observer() -> (ResponseObserver, Arc<std::sync::Mutex<Vec<u16>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording = seen.clone();
+    (
+        Arc::new(move |reply| recording.lock().unwrap().push(reply.status)),
+        seen,
+    )
+}
+#[test]
+fn response_observer_records_only_inside_its_scope() {
+    let (observer, seen) = recording_observer();
+    assert!(!response_observer_active());
+    observe_response(&synthetic_reply(100));
+    let answer = with_response_observer(observer, || {
+        assert!(response_observer_active());
+        observe_response(&synthetic_reply(200));
+        42
+    });
+    assert_eq!(answer, 42);
+    assert!(!response_observer_active());
+    observe_response(&synthetic_reply(201));
+    assert_eq!(*seen.lock().unwrap(), [200]);
+}
+#[test]
+fn nested_response_observers_restore_the_outer_scope() {
+    let (outer, outer_seen) = recording_observer();
+    let (inner, inner_seen) = recording_observer();
+    with_response_observer(outer, || {
+        observe_response(&synthetic_reply(200));
+        with_response_observer(inner, || observe_response(&synthetic_reply(401)));
+        observe_response(&synthetic_reply(201));
+    });
+    assert_eq!(*outer_seen.lock().unwrap(), [200, 201]);
+    assert_eq!(*inner_seen.lock().unwrap(), [401]);
+    assert!(!response_observer_active());
+}
+#[test]
+fn response_observers_restore_on_unwind() {
+    let (outer, seen) = recording_observer();
+    with_response_observer(outer, || {
+        let (inner, inner_seen) = recording_observer();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_response_observer(inner, || {
+                observe_response(&synthetic_reply(401));
+                panic!("fixture unwind");
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(*inner_seen.lock().unwrap(), [401]);
+        observe_response(&synthetic_reply(200));
+    });
+    assert_eq!(*seen.lock().unwrap(), [200]);
+    assert!(!response_observer_active());
+}
+#[test]
+fn response_observers_are_isolated_between_threads() {
+    let (observer, seen) = recording_observer();
+    with_response_observer(observer, || {
+        std::thread::spawn(|| {
+            assert!(!response_observer_active());
+            observe_response(&synthetic_reply(401));
+        })
+        .join()
+        .unwrap();
+        observe_response(&synthetic_reply(200));
+    });
+    assert_eq!(*seen.lock().unwrap(), [200]);
+}
+#[test]
+fn response_observer_callbacks_can_install_reentrant_scopes() {
+    let nested_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let inner_seen = nested_seen.clone();
+    let observer: ResponseObserver = Arc::new(move |reply| {
+        let recording = inner_seen.clone();
+        let nested: ResponseObserver =
+            Arc::new(move |reply| recording.lock().unwrap().push(reply.status));
+        with_response_observer(nested, || {
+            observe_response(&synthetic_reply(reply.status + 1))
+        });
+    });
+    with_response_observer(observer, || {
+        observe_response(&synthetic_reply(200));
+        observe_response(&synthetic_reply(202));
+    });
+    assert_eq!(*nested_seen.lock().unwrap(), [201, 203]);
+    assert!(!response_observer_active());
+}

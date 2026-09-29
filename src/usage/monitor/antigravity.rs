@@ -182,6 +182,25 @@ impl KeyringProbe for LiveKeyring {
         }
     }
 }
+#[cfg(test)]
+thread_local! { static TEST_KEYRING: std::cell::RefCell<Option<std::rc::Rc<dyn KeyringProbe>>> = const { std::cell::RefCell::new(None) }; }
+/// Scope a fake keyring to a real cache/source refresh in this test thread.
+#[cfg(test)]
+pub(crate) fn with_test_keyring<T>(
+    probe: std::rc::Rc<dyn KeyringProbe>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::rc::Rc<dyn KeyringProbe>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_KEYRING.with(|p| *p.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = TEST_KEYRING.with(|p| p.replace(Some(probe)));
+    let _restore = Restore(previous);
+    run()
+}
+
 pub(crate) fn keyring_metadata() -> Result<KeyringMetadata, Failure> {
     if !LiveKeyring.has_owner()? {
         return Err(unavailable());
@@ -257,13 +276,17 @@ pub(crate) fn parse_blob(bytes: &[u8], now: i64) -> Result<Secret, Failure> {
         Some(value) => super::nous::value_timestamp(value).map(|t| t.secs()),
         None => crate::codex_auth::jwt_exp_ms(access.expose()).map(|ms| ms / 1000),
     };
-    if expiry.is_none_or(|exp| exp <= now.saturating_add(60)) {
-        return Err(Failure::new(
+    match expiry {
+        Some(exp) if exp > now.saturating_add(60) => Ok(access),
+        Some(_) => Err(Failure::new(
             FailureKind::AuthRequired,
             "agy's token expired; open agy for a moment",
-        ));
+        )),
+        None => Err(Failure::new(
+            FailureKind::AuthRequired,
+            "agy's token carries no expiry; open agy",
+        )),
     }
-    Ok(access)
 }
 pub(crate) fn read_token(probe: &dyn KeyringProbe, now: i64) -> Result<Secret, Failure> {
     if !probe.has_owner()? {
@@ -309,10 +332,13 @@ pub(crate) fn fetch_with(
     probe: &dyn KeyringProbe,
 ) -> Result<Reading, Failure> {
     if target.cfg.via.as_deref() == Some("cli") {
-        return Err(Failure::new(
-            FailureKind::Unavailable,
-            "agy print mode is disabled until the owner records gate AGY-CLI",
-        ));
+        if !AGY_CLI_OWNER_GATE_RECORDED {
+            return Err(Failure::new(
+                FailureKind::Unavailable,
+                "agy print mode is disabled until the owner records gate AGY-CLI",
+            ));
+        }
+        return fetch_cli(&LiveCliRunner, target.now_secs);
     }
     let token = read_token(probe, target.now_secs)?;
     let send = |host: &str, path: &str, agent: &'static str| {
@@ -380,6 +406,10 @@ impl UsageSource for AntigravitySource {
         AuthKind::NativeLogin
     }
     fn fetch(&self, target: &MonitorTarget, http: &dyn MonitorHttp) -> Result<Reading, Failure> {
+        #[cfg(test)]
+        if let Some(probe) = TEST_KEYRING.with(|p| p.borrow().clone()) {
+            return fetch_with(target, http, probe.as_ref());
+        }
         fetch_with(target, http, &LiveKeyring)
     }
 }
@@ -431,6 +461,260 @@ pub(crate) fn map_summary(value: &Value) -> Result<Reading, Failure> {
     }
     Ok(reading)
 }
+// This gate intentionally remains false until the owner records help/usage
+// captures and observes that print mode never starts a sign-in browser.
+pub(crate) const AGY_CLI_OWNER_GATE_RECORDED: bool = false;
+const MAX_CLI_BYTES: u64 = 1024 * 1024;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliCall {
+    Version,
+    Help,
+    Usage,
+}
+trait CliRunner {
+    fn stamp(&self) -> Result<Option<CliBinaryStamp>, Failure> {
+        Ok(None)
+    }
+    fn run(&self, call: CliCall) -> Result<String, Failure>;
+}
+struct LiveCliRunner;
+fn cli_command(program: &std::path::Path, call: CliCall) -> std::process::Command {
+    let mut command = crate::providers::billing_key::helper_command(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    for name in ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"] {
+        command.env_remove(name);
+    }
+    match call {
+        CliCall::Version => {
+            command.arg("--version");
+        }
+        CliCall::Help => {
+            command.args(["-p", "/help", "--output-format", "json"]);
+        }
+        CliCall::Usage => {
+            command.args(["-p", "/usage", "--output-format", "json"]);
+        }
+    }
+    command
+}
+fn run_cli_command(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<String, Failure> {
+    use std::io::Read;
+    let mut child = command
+        .spawn()
+        .map_err(|_| Failure::new(FailureKind::Unavailable, "could not run agy print mode"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Failure::new(FailureKind::Unavailable, "agy output unavailable"))?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Zeroizing::new(Vec::new());
+        let read = stdout
+            .take(MAX_CLI_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(read);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(Failure::new(
+                    FailureKind::Unavailable,
+                    "agy print mode timed out",
+                ));
+            }
+        }
+    };
+    // A killed descendant could keep its stdout descriptor alive. Do not wait
+    // for its reader after the deadline; the read remains capped and owns no key.
+    let status = status?;
+    let bytes = receiver
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output timed out"))?
+        .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output unavailable"))?;
+    if bytes.len() as u64 > MAX_CLI_BYTES {
+        return Err(Failure::new(
+            FailureKind::Unavailable,
+            "agy output exceeds 1 MiB",
+        ));
+    }
+    let output = String::from_utf8(bytes.to_vec())
+        .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output is not UTF-8"))?;
+    if sign_in_flow(&output) {
+        return Err(Failure::new(
+            FailureKind::AuthRequired,
+            "open agy and sign in",
+        ));
+    }
+    if !status.success() {
+        return Err(Failure::new(
+            FailureKind::Unavailable,
+            "agy print mode failed",
+        ));
+    }
+    Ok(output)
+}
+#[derive(Clone, PartialEq, Eq)]
+struct CliBinaryStamp {
+    path: std::path::PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+#[cfg(not(test))]
+fn cli_binary() -> Result<CliBinaryStamp, Failure> {
+    let path = std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|p| p.join("agy"))
+                .find(|p| p.is_file())
+        })
+        .or_else(|| {
+            crate::profile::home_dir()
+                .ok()
+                .map(|p| p.join(".local/bin/agy"))
+                .filter(|p| p.is_file())
+        })
+        .ok_or_else(|| Failure::new(FailureKind::Unavailable, "agy is not installed"))?;
+    let meta = std::fs::metadata(&path)
+        .map_err(|_| Failure::new(FailureKind::Unavailable, "could not inspect agy"))?;
+    Ok(CliBinaryStamp {
+        path,
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+impl CliRunner for LiveCliRunner {
+    fn stamp(&self) -> Result<Option<CliBinaryStamp>, Failure> {
+        #[cfg(test)]
+        {
+            panic!("live agy inspection in test");
+        }
+        #[cfg(not(test))]
+        {
+            cli_binary().map(Some)
+        }
+    }
+    fn run(&self, call: CliCall) -> Result<String, Failure> {
+        #[cfg(test)]
+        {
+            let _ = call;
+            panic!("live agy invocation in test");
+        }
+        #[cfg(not(test))]
+        {
+            let stamp = cli_binary()?;
+            run_cli_command(
+                cli_command(&stamp.path, call),
+                std::time::Duration::from_secs(30),
+            )
+        }
+    }
+}
+fn version_supported(output: &str) -> bool {
+    output
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .filter_map(|s| {
+            let mut parts = s.split('.');
+            Some((
+                parts.next()?.parse::<u64>().ok()?,
+                parts.next()?.parse::<u64>().ok()?,
+                parts.next()?.parse::<u64>().ok()?,
+            ))
+        })
+        .any(|v| v >= (1, 1, 11))
+}
+fn contains_usage_command(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s
+            .split_whitespace()
+            .any(|word| word.trim_matches(['"', ',', ':', '`']) == "/usage"),
+        Value::Array(a) => a.iter().any(contains_usage_command),
+        Value::Object(o) => o
+            .iter()
+            .any(|(k, v)| k == "/usage" || contains_usage_command(v)),
+        _ => false,
+    }
+}
+fn sign_in_flow(output: &str) -> bool {
+    let lowercase = output.to_ascii_lowercase();
+    ["sign in", "sign-in", "login", "https://", "http://"]
+        .iter()
+        .any(|marker| lowercase.contains(marker))
+}
+fn fetch_cli(runner: &dyn CliRunner, now: i64) -> Result<Reading, Failure> {
+    // Both probes are offline. The production caller remains behind the owner
+    // gate; tests exercise this path only with a fixture runner.
+    static PROBES: std::sync::Mutex<Vec<(CliBinaryStamp, i64)>> = std::sync::Mutex::new(Vec::new());
+    let stamp = runner.stamp()?;
+    let memoized = stamp.as_ref().is_some_and(|stamp| {
+        PROBES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(old, at)| old == stamp && now.saturating_sub(*at) < 60)
+    });
+    if !memoized {
+        let version = runner.run(CliCall::Version)?;
+        if !version_supported(&version) {
+            return Err(Failure::new(
+                FailureKind::Unavailable,
+                "agy has no print-mode /usage (requires 1.1.11)",
+            ));
+        }
+        let help: Value = serde_json::from_str(&runner.run(CliCall::Help)?).map_err(|_| {
+            Failure::new(FailureKind::Unavailable, "agy print-mode help unrecognized")
+        })?;
+        if !contains_usage_command(&help) {
+            return Err(Failure::new(
+                FailureKind::Unavailable,
+                "agy print-mode help does not list /usage",
+            ));
+        }
+        if let Some(stamp) = stamp {
+            let mut probes = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+            probes.retain(|(old, _)| old.path != stamp.path);
+            if probes.len() >= 8 {
+                probes.remove(0);
+            }
+            probes.push((stamp, now));
+        }
+    }
+    let output = runner.run(CliCall::Usage)?;
+    if sign_in_flow(&output) {
+        return Err(Failure::new(
+            FailureKind::AuthRequired,
+            "open agy and sign in",
+        ));
+    }
+    let value: Value = serde_json::from_str(&output).map_err(|_| {
+        Failure::new(
+            FailureKind::Unavailable,
+            "agy usage schema awaits owner capture",
+        )
+    })?;
+    let mut reading = map_summary(&value)?;
+    let root = value.get("response").unwrap_or(&value);
+    reading.plan = root["paidTier"]["name"]
+        .as_str()
+        .or_else(|| root["currentTier"]["name"].as_str())
+        .map(str::to_string);
+    reading.plan_checked_at = Some(now);
+    Ok(reading)
+}
+
 #[cfg(test)]
 #[path = "../../../tests/inline/usage_monitor_antigravity.rs"]
 mod tests;

@@ -596,3 +596,31 @@ fn providers_list_lane4_sources_and_native_auth() {
         );
     }
 }
+
+#[test]
+fn openapi_links_accounts_to_optional_health_note_and_attribution() {
+    let doc: serde_json::Value =
+        serde_json::from_slice(&openapi_document_bytes().unwrap()).unwrap();
+    let schemas = &doc["components"]["schemas"];
+    assert_eq!(
+        schemas["AccountsBody"]["properties"]["accounts"]["items"]["$ref"],
+        "#/components/schemas/AccountObservation"
+    );
+    let observation = &schemas["AccountObservation"];
+    assert!(observation["properties"].get("key_health").is_some());
+    assert!(observation["properties"].get("note").is_some());
+    let required = observation["required"].as_array().unwrap();
+    assert!(
+        !required
+            .iter()
+            .any(|name| name == "key_health" || name == "note")
+    );
+    assert_eq!(schemas["Timestamp"]["type"], "string");
+    assert_eq!(schemas["Timestamp"]["format"], "date-time");
+    assert!(
+        schemas["QuotaWindow"]["properties"]
+            .get("attribution")
+            .is_some()
+    );
+    assert_eq!(schemas["Amount"]["type"], "string");
+}

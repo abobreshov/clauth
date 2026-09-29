@@ -975,6 +975,8 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway),
+    // Shared cache observation schema, also used by the local agent API.
+    components(schemas(crate::usage::observation::AccountObservation)),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

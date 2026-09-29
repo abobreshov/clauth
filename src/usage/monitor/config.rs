@@ -370,6 +370,12 @@ impl MonitorConfig {
         {
             bail!("monitor '{id}': via must be keyring or cli");
         }
+        if self.kind == MonitorKind::Antigravity
+            && self.via.as_deref() == Some("cli")
+            && !super::antigravity::AGY_CLI_OWNER_GATE_RECORDED
+        {
+            bail!("monitor '{id}': via = \"cli\" is disabled until the owner records gate AGY-CLI");
+        }
         if self
             .probe_model
             .as_ref()

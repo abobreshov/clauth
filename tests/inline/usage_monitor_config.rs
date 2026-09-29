@@ -404,3 +404,15 @@ fn fingerprint_covers_new_keys() {
         assert_ne!(base, changed.fingerprint(), "{field}");
     }
 }
+
+#[test]
+fn antigravity_cli_configuration_is_refused_until_owner_gate_is_recorded() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = MonitorConfig::new("agy", MonitorKind::Antigravity);
+    config.via = Some("keyring".into());
+    config.validate().unwrap();
+    config.via = Some("cli".into());
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("AGY-CLI"));
+    assert!(error.contains("disabled"));
+}

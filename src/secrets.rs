@@ -423,6 +423,18 @@ fn prefix(value: &str) -> &'static str {
     }
     ""
 }
+fn stored_confirmation(name: &str, value: &str) -> String {
+    let vendor = prefix(value);
+    let suffix = if vendor.is_empty() {
+        String::new()
+    } else {
+        format!(", {vendor}…")
+    };
+    format!(
+        "tollgate: stored {name} ({} chars{suffix}) in ~/.tollgate/secrets.env; the daemon picks it up within 10s",
+        value.chars().count()
+    )
+}
 fn list_output(json: bool) -> Result<String> {
     let values = load_entries(false)?;
     if json {
@@ -485,8 +497,9 @@ pub(crate) fn dispatch(command: SecretCommand) -> Result<()> {
                     }
                 }
                 Zeroizing::new(
-                    String::from_utf8(bytes.to_vec())
-                        .map_err(|_| anyhow::anyhow!("secret must be UTF-8"))?,
+                    std::str::from_utf8(&bytes)
+                        .map_err(|_| anyhow::anyhow!("secret must be UTF-8"))?
+                        .to_owned(),
                 )
             } else {
                 Zeroizing::new(rpassword::prompt_password(format!(
@@ -501,16 +514,7 @@ pub(crate) fn dispatch(command: SecretCommand) -> Result<()> {
                 values.insert(name.clone(), Secret::new(value.as_str()));
                 Ok(())
             })?;
-            let vendor = prefix(&value);
-            let suffix = if vendor.is_empty() {
-                String::new()
-            } else {
-                format!(", {vendor}…")
-            };
-            outln!(
-                "tollgate: stored {name} ({} chars{suffix}) in ~/.tollgate/secrets.env; the daemon picks it up within 10s",
-                value.chars().count()
-            );
+            outln!("{}", stored_confirmation(&name, &value));
             if std::env::var(&name).is_ok_and(|v| !v.trim().is_empty()) {
                 errln!(
                     "note: ${name} is also set in this environment; tollgate processes started from it use that value (--prefer-store uses the stored one)"

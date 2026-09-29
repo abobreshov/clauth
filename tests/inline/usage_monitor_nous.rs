@@ -265,7 +265,7 @@ fn portal_statuses_become_typed_failures() {
 }
 
 #[test]
-fn an_api_key_account_reports_money_unavailable_without_a_request() {
+fn nous_key_without_probe_makes_no_call() {
     let mut cfg = MonitorConfig::new("nous-key", MonitorKind::Nous);
     cfg.api_key_env = Some("NOUS_API_KEY".into());
     let target = resolve_target(&cfg, std::path::Path::new("/"), now(), &|_| {
@@ -274,9 +274,277 @@ fn an_api_key_account_reports_money_unavailable_without_a_request() {
     let http = FakeHttp::offline();
     let r = source_for(cfg.kind).fetch(&target, &http).unwrap();
     assert!(r.money.is_empty() && r.windows.is_empty());
-    let v = r.verdict.unwrap();
-    assert_eq!(v.kind, FailureKind::Unavailable);
-    assert!(v.message.contains("no balance endpoint"));
+    assert!(r.verdict.is_none());
+    assert_eq!(r.key_health.unwrap().state, KeyHealthState::Unknown);
+    assert_eq!(r.note.as_deref(), Some(KEY_NOTE));
     assert!(http.calls().is_empty());
     assert_eq!(source_for(cfg.kind).auth_kind(&target), AuthKind::ApiKey);
+}
+
+fn key_target(model: Option<&str>) -> MonitorTarget {
+    let mut cfg = MonitorConfig::new("nous-key", MonitorKind::Nous);
+    cfg.api_key_env = Some("NOUS_TEST_KEY".into());
+    cfg.probe = true;
+    cfg.probe_model = model.map(str::to_owned);
+    resolve_target(&cfg, std::path::Path::new("/unused"), now(), &|_| {
+        Some("KEY-CANARY".into())
+    })
+}
+fn probe_reply(status: u16, body: &str) -> HttpReply {
+    HttpReply {
+        status,
+        body: body.into(),
+        headers: Vec::new(),
+        retry_after_secs: None,
+    }
+}
+#[test]
+fn probe_sends_one_token_to_a_free_model() {
+    let target = key_target(Some("hermes-test:free"));
+    let http = FakeHttp {
+        send_reply: Box::new(|kind, req| {
+            assert_eq!(kind, MonitorKind::Nous);
+            assert_eq!(req.method, Method::Post);
+            assert_eq!(
+                req.url,
+                "https://inference-api.nousresearch.com/v1/chat/completions"
+            );
+            assert!(matches!(req.auth, Auth::Bearer(k) if k.expose() == "KEY-CANARY"));
+            let body: Value = serde_json::from_slice(req.json_body.unwrap()).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"model":"hermes-test:free","messages":[{"role":"user","content":"."}],"max_tokens":1,"stream":false})
+            );
+            Ok(probe_reply(200, "{}"))
+        }),
+        ..FakeHttp::offline()
+    };
+    let reading = NousSource.fetch(&target, &http).unwrap();
+    assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Valid);
+    assert_eq!(http.calls().len(), 1);
+    assert!(!http.calls()[0].contains("portal"));
+}
+#[test]
+fn probe_refuses_a_non_free_model_at_send() {
+    let target = key_target(Some("hermes-paid"));
+    let http = FakeHttp::offline();
+    let error = NousSource.fetch(&target, &http).unwrap_err();
+    assert!(error.message.contains(":free"));
+    assert!(http.calls().is_empty());
+}
+#[test]
+fn auto_model_comes_from_the_public_list_without_credentials() {
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            if req.method == Method::Get {
+                assert!(matches!(req.auth, Auth::None));
+                Ok(probe_reply(
+                    200,
+                    r#"{"data":[{"id":"z:free"},{"id":"a:paid"},{"id":"b:free"}]}"#,
+                ))
+            } else {
+                let body: Value = serde_json::from_slice(req.json_body.unwrap()).unwrap();
+                assert_eq!(body["model"], "b:free");
+                Ok(probe_reply(200, "{}"))
+            }
+        }),
+        ..FakeHttp::offline()
+    };
+    let reading = NousSource.fetch(&key_target(None), &http).unwrap();
+    assert_eq!(reading.probe_model.as_deref(), Some("b:free"));
+    assert_eq!(reading.probe_model_at, Some(now()));
+    assert_eq!(http.calls().len(), 2);
+}
+#[test]
+fn probe_headers_map_credits_paid_access_and_rate_windows() {
+    let headers: Vec<(String, String)> =
+        serde_json::from_str(include_str!("../fixtures/nous_probe_headers.json")).unwrap();
+    let reading = map_probe_headers(&headers, now());
+    assert_eq!(reading.money.len(), 4);
+    let meter = |id: &str| reading.money.iter().find(|m| m.meter_id == id).unwrap();
+    assert!((meter("total_usable").amount.to_f64() - 13.15).abs() < 1e-9);
+    assert!(!meter("total_usable").additive);
+    assert_eq!(meter("rollover").amount.to_f64(), -0.5);
+    assert_eq!(meter("subscription").amount.to_f64(), 7.9);
+    assert_eq!(meter("top_up").amount.to_f64(), 5.25);
+    assert_eq!(
+        reading.verdict.as_ref().unwrap().kind,
+        FailureKind::QuotaExhausted
+    );
+    assert_eq!(
+        reading.verdict.unwrap().message,
+        "Nous credits depleted (free models still work)"
+    );
+    assert_eq!(reading.windows.len(), 2);
+    assert_eq!(reading.windows[0].id, "nous.rpm");
+    assert_eq!(reading.windows[0].used_pct, Some(60.0));
+    assert_eq!(reading.windows[1].id, "nous.tpm");
+}
+#[test]
+fn probe_401_reports_the_conflated_verdict() {
+    let http = FakeHttp {
+        send_reply: Box::new(|_, _| Ok(probe_reply(401, "{}"))),
+        ..FakeHttp::offline()
+    };
+    let reading = NousSource
+        .fetch(&key_target(Some("test:free")), &http)
+        .unwrap();
+    assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Invalid);
+    let verdict = reading.verdict.unwrap();
+    assert_eq!(verdict.kind, FailureKind::AuthRequired);
+    assert_eq!(
+        verdict.message,
+        "Nous says the key is invalid, blocked or out of funds"
+    );
+}
+#[test]
+fn probe_404_repicks_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let gets = AtomicUsize::new(0);
+    let posts = AtomicUsize::new(0);
+    let http = FakeHttp {
+        send_reply: Box::new(move |_, req| {
+            if req.method == Method::Get {
+                let id = if gets.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "old:free"
+                } else {
+                    "new:free"
+                };
+                Ok(probe_reply(
+                    200,
+                    &serde_json::json!({"data":[{"id":id}]}).to_string(),
+                ))
+            } else {
+                let body: Value = serde_json::from_slice(req.json_body.unwrap()).unwrap();
+                let first = posts.fetch_add(1, Ordering::SeqCst) == 0;
+                assert_eq!(body["model"], if first { "old:free" } else { "new:free" });
+                if first {
+                    Ok(probe_reply(
+                        404,
+                        r#"{"error":{"message":"model not found"}}"#,
+                    ))
+                } else {
+                    Ok(probe_reply(200, "{}"))
+                }
+            }
+        }),
+        ..FakeHttp::offline()
+    };
+    let reading = NousSource.fetch(&key_target(None), &http).unwrap();
+    assert_eq!(reading.probe_model.as_deref(), Some("new:free"));
+    assert_eq!(http.calls().len(), 4);
+}
+#[test]
+fn auto_model_cache_expires_after_24_hours() {
+    let mut target = key_target(None);
+    target.previous = Some(Reading {
+        probe_model: Some("cached:free".into()),
+        probe_model_at: Some(now() - 86399),
+        ..Reading::default()
+    });
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            assert_eq!(req.method, Method::Post);
+            let body: Value = serde_json::from_slice(req.json_body.unwrap()).unwrap();
+            assert_eq!(body["model"], "cached:free");
+            Ok(probe_reply(200, "{}"))
+        }),
+        ..FakeHttp::offline()
+    };
+    assert_eq!(
+        NousSource.fetch(&target, &http).unwrap().probe_model_at,
+        Some(now() - 86399)
+    );
+    target.previous.as_mut().unwrap().probe_model_at = Some(now() - 86400);
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            Ok(if req.method == Method::Get {
+                probe_reply(200, r#"{"data":[{"id":"fresh:free"}]}"#)
+            } else {
+                probe_reply(200, "{}")
+            })
+        }),
+        ..FakeHttp::offline()
+    };
+    assert_eq!(
+        NousSource
+            .fetch(&target, &http)
+            .unwrap()
+            .probe_model
+            .as_deref(),
+        Some("fresh:free")
+    );
+}
+#[test]
+fn probe_429_preserves_retry_after_and_calls_no_portal() {
+    let http = FakeHttp {
+        send_reply: Box::new(|_, _| {
+            let mut r = probe_reply(429, "{}");
+            r.retry_after_secs = Some(1200);
+            Ok(r)
+        }),
+        ..FakeHttp::offline()
+    };
+    let error = NousSource
+        .fetch(&key_target(Some("test:free")), &http)
+        .unwrap_err();
+    assert_eq!(error.kind, FailureKind::RateLimited);
+    assert_eq!(error.retry_after, Some(Timestamp::from_secs(now() + 1200)));
+    assert_eq!(http.calls().len(), 1);
+}
+
+#[test]
+fn explicit_model_404_is_not_retried_or_replaced() {
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            assert_eq!(req.method, Method::Post);
+            Ok(probe_reply(
+                404,
+                r#"{"error":{"message":"model not found"}}"#,
+            ))
+        }),
+        ..FakeHttp::offline()
+    };
+    assert!(
+        NousSource
+            .fetch(&key_target(Some("explicit:free")), &http)
+            .is_err()
+    );
+    assert_eq!(http.calls().len(), 1);
+}
+#[test]
+fn probe_404_retries_no_more_than_once() {
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            Ok(if req.method == Method::Get {
+                probe_reply(200, r#"{"data":[{"id":"model:free"}]}"#)
+            } else {
+                probe_reply(404, r#"{"error":{"code":"model_not_found"}}"#)
+            })
+        }),
+        ..FakeHttp::offline()
+    };
+    assert!(NousSource.fetch(&key_target(None), &http).is_err());
+    assert_eq!(http.calls().len(), 4);
+}
+#[test]
+fn nous_probe_missing_key_never_reads_hermes_or_calls_network() {
+    let mut target = key_target(Some("test:free"));
+    target.api_key = None;
+    target.key = None;
+    let http = FakeHttp::offline();
+    assert_eq!(
+        NousSource.fetch(&target, &http).unwrap_err().kind,
+        FailureKind::AuthRequired
+    );
+    assert!(http.calls().is_empty());
+}
+#[test]
+fn probe_ttl_floor_is_900s() {
+    let mut target = key_target(None);
+    target.cfg.ttl_secs = Some(899);
+    assert!(target.cfg.validate().is_err());
+    target.cfg.ttl_secs = Some(900);
+    assert!(target.cfg.validate().is_ok());
+    assert_eq!(target.cfg.ttl_ms(), 900_000);
 }

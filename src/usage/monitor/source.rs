@@ -170,6 +170,10 @@ impl MonitorTarget {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub(crate) struct Reading {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key_health: Option<crate::usage::observation::KeyHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plan_checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) probe_model: Option<String>,
@@ -177,6 +181,10 @@ pub(crate) struct Reading {
     pub(crate) probe_model_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) costs_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_observed_at: Option<i64>,
     pub(crate) plan: Option<String>,
     pub(crate) windows: Vec<QuotaWindow>,
     pub(crate) money: Vec<MoneyMeter>,
@@ -205,30 +213,11 @@ pub(crate) fn source_for(kind: MonitorKind) -> &'static dyn UsageSource {
         MonitorKind::Grok => &super::grok::GrokSource,
         MonitorKind::Antigravity => &super::antigravity::AntigravitySource,
         MonitorKind::CodexNative => &super::codex_native::CodexNativeSource,
-        MonitorKind::Openai | MonitorKind::GoogleAi => &PendingKeySource,
+        MonitorKind::Openai => &super::openai::OpenaiSource,
+        MonitorKind::GoogleAi => &super::google_ai::GoogleAiSource,
         MonitorKind::OllamaCloud | MonitorKind::OpenRouter | MonitorKind::Provider => {
             &ProviderSource
         }
-    }
-}
-
-struct PendingKeySource;
-impl UsageSource for PendingKeySource {
-    fn source_id(&self, target: &MonitorTarget) -> SourceId {
-        if target.cfg.kind == MonitorKind::Openai {
-            SourceId::OpenaiApi
-        } else {
-            SourceId::GoogleAi
-        }
-    }
-    fn auth_kind(&self, _: &MonitorTarget) -> AuthKind {
-        AuthKind::ApiKey
-    }
-    fn fetch(&self, _: &MonitorTarget, _: &dyn MonitorHttp) -> Result<Reading, Failure> {
-        Err(Failure::new(
-            FailureKind::Unavailable,
-            "key monitor available in slice 2",
-        ))
     }
 }
 
@@ -243,6 +232,11 @@ pub(crate) fn skeleton(cfg: &MonitorConfig, target: &MonitorTarget) -> AccountOb
         cfg.display_label(),
     );
     obs.disabled = !cfg.enabled;
+    obs.note = match cfg.kind {
+        MonitorKind::Openai => Some(super::openai::NOTE.into()),
+        MonitorKind::GoogleAi => Some(super::google_ai::NOTE.into()),
+        _ => None,
+    };
     obs
 }
 
@@ -402,6 +396,20 @@ pub(crate) trait MonitorHttp: Sync {
         fedramp: bool,
         now: i64,
     ) -> Result<UsageInfo, FetchError>;
+    /// Capture callers receive the raw response through the same read-only leg.
+    fn codex_usage_captured(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+        capture: &crate::usage::codex::RawCapture<'_>,
+    ) -> Result<UsageInfo, FetchError> {
+        let usage = self.codex_usage(token, account, fedramp, now)?;
+        let body = serde_json::to_string(&usage).map_err(|_| FetchError::Parse)?;
+        capture(200, &body, &[]);
+        Ok(usage)
+    }
     /// `GET url` with `Authorization: Bearer <token>`.
     fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure>;
     /// A typed provider's usage fetch with `key`.
@@ -425,23 +433,23 @@ pub(crate) const NOUS_PORTAL_ORIGIN: &str = "https://portal.nousresearch.com";
 /// refused.
 #[cfg(test)]
 pub(crate) fn bearer_url_allowed(url: &str) -> bool {
-    let Some(path) = url.strip_prefix(NOUS_PORTAL_ORIGIN) else {
-        return false;
-    };
-    if !path.starts_with('/') || path.contains("..") || path.contains(['@', '#', '\\']) {
-        return false;
-    }
-    let path = path.split('?').next().unwrap_or("");
-    path == "/api/oauth/account"
-        || path
-            .strip_prefix("/api/billing/")
-            .is_some_and(|rest| !rest.is_empty())
+    let token = Secret::new("allowlist-test");
+    request_allowed(
+        MonitorKind::Nous,
+        &Request {
+            method: Method::Get,
+            url,
+            auth: Auth::Bearer(&token),
+            extra: &[],
+            json_body: None,
+        },
+    )
 }
 
 /// Exhaustive credential-bearing monitor request allowlist.
 pub(crate) fn request_allowed(kind: MonitorKind, req: &Request<'_>) -> bool {
     let url = req.url;
-    if url.contains(['@', '#', '\\']) || url.contains("..") || url.contains('%') {
+    if url.contains(['@', '#', '\\']) || url.contains("..") {
         return false;
     }
     let Some(rest) = url.strip_prefix("https://") else {
@@ -455,6 +463,9 @@ pub(crate) fn request_allowed(kind: MonitorKind, req: &Request<'_>) -> bool {
     }
     let tail = format!("/{tail}");
     let (path, query) = tail.split_once('?').unwrap_or((&tail, ""));
+    if host.contains('%') || path.contains('%') {
+        return false;
+    }
     let bearer = matches!(req.auth, Auth::Bearer(_));
     match kind {
         MonitorKind::Nous => {
@@ -507,26 +518,7 @@ pub(crate) fn request_allowed(kind: MonitorKind, req: &Request<'_>) -> bool {
                 && bearer
                 && host == "api.openai.com"
                 && ((path == "/v1/models" && query.is_empty())
-                    || (path == "/v1/organization/costs"
-                        && !query.is_empty()
-                        && query.split('&').all(|p| {
-                            let Some((k, v)) = p.split_once('=') else {
-                                return false;
-                            };
-                            match k {
-                                "start_time" | "limit" => {
-                                    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
-                                }
-                                "bucket_width" => v == "1d",
-                                "page" => {
-                                    !v.is_empty()
-                                        && v.bytes().all(|b| {
-                                            b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
-                                        })
-                                }
-                                _ => false,
-                            }
-                        })))
+                    || (path == "/v1/organization/costs" && costs_query_allowed(query)))
         }
         MonitorKind::GoogleAi => {
             req.method == Method::Get
@@ -540,6 +532,88 @@ pub(crate) fn request_allowed(kind: MonitorKind, req: &Request<'_>) -> bool {
         | MonitorKind::OpenRouter
         | MonitorKind::Provider => false,
     }
+}
+
+/// Opaque costs cursors accept unreserved and base64 characters only.
+/// Encode their reserved characters as data, never as another query parameter.
+pub(crate) fn encode_cost_cursor(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.len() > 256
+        || raw.contains("..")
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.~+/=".contains(&b))
+    {
+        return None;
+    }
+    let mut encoded = String::new();
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || b"_-.~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").ok()?;
+        }
+    }
+    Some(encoded)
+}
+fn cost_cursor_allowed(encoded: &str) -> bool {
+    if encoded.is_empty() || encoded.len() > 768 {
+        return false;
+    }
+    let bytes = encoded.as_bytes();
+    let mut cursor = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let Some(pair) = bytes.get(index + 1..index + 3) else {
+                return false;
+            };
+            let Some(high) = char::from(pair[0]).to_digit(16) else {
+                return false;
+            };
+            let Some(low) = char::from(pair[1]).to_digit(16) else {
+                return false;
+            };
+            cursor.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            cursor.push(bytes[index]);
+            index += 1;
+        }
+    }
+    std::str::from_utf8(&cursor)
+        .ok()
+        .and_then(encode_cost_cursor)
+        .is_some()
+}
+fn costs_query_allowed(query: &str) -> bool {
+    if query.is_empty() || query.len() > 1024 {
+        return false;
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for parameter in query.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            return false;
+        };
+        if !names.insert(name) {
+            return false;
+        }
+        let allowed = match name {
+            "start_time" | "limit" => {
+                !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+            }
+            "bucket_width" => value == "1d",
+            "page" => cost_cursor_allowed(value),
+            _ => false,
+        };
+        if !allowed {
+            return false;
+        }
+    }
+    ["start_time", "bucket_width", "limit"]
+        .iter()
+        .all(|name| names.contains(name))
 }
 
 /// The real network.
@@ -574,6 +648,23 @@ impl MonitorHttp for LiveHttp {
     ) -> Result<UsageInfo, FetchError> {
         guard_test_network("codex usage");
         crate::usage::codex::fetch_codex_usage(token.expose(), account, fedramp, now)
+    }
+    fn codex_usage_captured(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+        capture: &crate::usage::codex::RawCapture<'_>,
+    ) -> Result<UsageInfo, FetchError> {
+        guard_test_network("codex usage capture");
+        crate::usage::codex::fetch_codex_usage_captured(
+            token.expose(),
+            account,
+            fedramp,
+            now,
+            capture,
+        )
     }
     fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure> {
         self.send(
@@ -618,6 +709,7 @@ fn guard_test_network(what: &str) {
 #[cfg(test)]
 pub(crate) struct FakeHttp {
     pub(crate) calls: std::sync::Mutex<Vec<String>>,
+    pub(crate) codex_raw_reply: Option<HttpReply>,
     #[allow(clippy::type_complexity)]
     pub(crate) send_reply:
         Box<dyn Fn(MonitorKind, &Request<'_>) -> Result<HttpReply, Failure> + Sync>,
@@ -635,6 +727,7 @@ impl FakeHttp {
     pub(crate) fn offline() -> Self {
         Self {
             calls: std::sync::Mutex::new(Vec::new()),
+            codex_raw_reply: None,
             send_reply: Box::new(|_, req| panic!("unexpected request {}", req.url)),
             codex_reply: Box::new(|| panic!("unexpected codex fetch")),
             bearer_reply: Box::new(|url| panic!("unexpected bearer GET {url}")),
@@ -712,7 +805,33 @@ impl MonitorHttp for FakeHttp {
         (self.codex_reply)()
     }
 
+    fn codex_usage_captured(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+        capture: &crate::usage::codex::RawCapture<'_>,
+    ) -> Result<UsageInfo, FetchError> {
+        if let Some(raw) = &self.codex_raw_reply {
+            capture(raw.status, &raw.body, &raw.headers);
+        }
+        self.codex_usage(token, account, fedramp, now)
+    }
     fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure> {
+        assert!(
+            request_allowed(
+                MonitorKind::Nous,
+                &Request {
+                    method: Method::Get,
+                    url,
+                    auth: Auth::Bearer(token),
+                    extra: &[],
+                    json_body: None,
+                }
+            ),
+            "bearer request not allowlisted: {url}"
+        );
         if let Ok(mut c) = self.calls.lock() {
             c.push(format!("GET {url} bearer={}", token.expose()));
         }

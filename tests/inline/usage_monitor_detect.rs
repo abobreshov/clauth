@@ -82,3 +82,59 @@ fn auth_shape_parser_skips_refresh_and_unknown_values() {
     assert_eq!(shape.0["unknown"], Value::Null);
     assert_eq!(expiry(&shape.0["providers"]["nous"]), "rfc3339");
 }
+
+#[test]
+fn codex_detect_explain_reports_absent_when_jwt_has_no_exp() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".codex");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        include_str!("../fixtures/codex_native_no_exp.json"),
+    )
+    .unwrap();
+    let rows = discover(home.home(), &BTreeSet::new(), &[], true);
+    assert_eq!(rows[0].preset, "codex-native");
+    assert!(rows[0].reason.contains("expiry: absent"));
+    assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
+}
+#[test]
+fn codex_detect_explain_reports_jwt_only_when_exp_exists() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".codex");
+    std::fs::create_dir_all(&dir).unwrap();
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":1900000000}"#);
+    std::fs::write(
+        dir.join("auth.json"),
+        serde_json::json!({"tokens":{"access_token":format!("header.{payload}.signature")}})
+            .to_string(),
+    )
+    .unwrap();
+    let rows = discover(home.home(), &BTreeSet::new(), &[], true);
+    assert!(rows[0].reason.contains("expiry: jwt"));
+}
+#[test]
+#[cfg(unix)]
+fn codex_detect_classifies_dangling_profile_links_without_reading_targets() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".codex");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (target, expected) in [
+        ("../.tollgate/profiles/test/auth.json", "tollgate's"),
+        ("../.clauth/profiles/test/auth.json", "upstream clauth's"),
+        ("../other/auth.json", "outside tollgate and clauth"),
+    ] {
+        let path = dir.join("auth.json");
+        std::os::unix::fs::symlink(target, &path).unwrap();
+        let rows = discover(home.home(), &BTreeSet::new(), &[], true);
+        assert_eq!(rows[0].state, "skipped");
+        assert!(rows[0].reason.contains(expected), "{}", rows[0].reason);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn non_linux_detect_uses_the_linux_only_message() {
+    assert_eq!(keyring_unavailable_reason(), "Linux only in 0.1");
+}

@@ -439,3 +439,35 @@ fn native_monitors_and_secrets_leave_guest_operator_files_unchanged() {
         b"LOCK-CANARY"
     );
 }
+// Slice-1 review: refusal must also apply on the active guest path.
+#[cfg(unix)]
+#[test]
+fn guest_codex_native_refuses_upstream_profile_store_symlink() {
+    use crate::usage::monitor::{
+        codex_native::CodexNativeSource,
+        config::{MonitorConfig, MonitorKind},
+        source::{FakeHttp, UsageSource, resolve_target},
+    };
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    assert!(upstream_active());
+    let upstream = home.home().join(".clauth/profiles/operator/auth.json");
+    std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+    std::fs::write(&upstream, UPSTREAM_CODEX_AUTH).unwrap();
+    let global = home.home().join(".codex/auth.json");
+    std::fs::remove_file(&global).unwrap();
+    std::os::unix::fs::symlink(&upstream, &global).unwrap();
+    let cfg = MonitorConfig::new("native", MonitorKind::CodexNative);
+    let target = resolve_target(&cfg, home.home(), 1900000000, &|_| None);
+    let http = FakeHttp::offline();
+    let failure = CodexNativeSource.fetch(&target, &http).unwrap_err();
+    assert_eq!(
+        failure.kind,
+        crate::usage::observation::FailureKind::Unavailable
+    );
+    assert!(failure.message.contains("upstream:operator"));
+    assert!(http.calls().is_empty());
+    assert_eq!(std::fs::read(&upstream).unwrap(), UPSTREAM_CODEX_AUTH);
+    assert_eq!(std::fs::read_link(&global).unwrap(), upstream);
+    assert!(upstream_active());
+}

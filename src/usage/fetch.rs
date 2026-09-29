@@ -445,8 +445,26 @@ impl PlanInfo {
     }
 }
 
+/// Native Codex credit units: never interpreted as dollars.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub(crate) struct CodexCredits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) balance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unlimited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) has_credits: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct UsageInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_credits: Option<CodexCredits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_spend_control_reached: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) codex_additional_windows: Vec<super::observation::QuotaWindow>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plan: Option<PlanInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1245,6 +1263,9 @@ fn assemble_usage(
                 // Codex-only readings: the claude body carries neither.
                 codex_limit_reached: None,
                 codex_reset_credits: None,
+                codex_credits: None,
+                codex_spend_control_reached: None,
+                codex_additional_windows: Vec::new(),
                 open_at: None,
                 fetched_at: None,
             })

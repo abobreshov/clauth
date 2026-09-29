@@ -22,9 +22,11 @@ pub(crate) mod cli;
 pub(crate) mod codex_native;
 pub(crate) mod config;
 pub(crate) mod detect;
+pub(crate) mod google_ai;
 pub(crate) mod grok;
 pub(crate) mod nous;
 pub(crate) mod observe;
+pub(crate) mod openai;
 pub(crate) mod poll;
 pub(crate) mod source;
 

@@ -1191,3 +1191,17 @@ fn every_visible_subcommand_is_completed_in_every_shell() {
     }
     assert!(missing.is_empty(), "not completed: {missing:#?}");
 }
+
+#[test]
+fn fish_monitor_kind_has_one_registration_with_kind_values() {
+    let lines: Vec<_> = FISH
+        .lines()
+        .filter(|line| {
+            line.contains("__fish_seen_subcommand_from monitor")
+                && (line.contains("-l kind ") || line.contains("-a --kind "))
+        })
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("-l kind -x"));
+    assert!(lines[0].contains("codex_native"));
+}

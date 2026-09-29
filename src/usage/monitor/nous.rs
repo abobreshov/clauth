@@ -18,8 +18,8 @@
 //! **Usage.** `GET https://portal.nousresearch.com/api/oauth/account` with
 //! the token as Bearer, on the monitoring allowlist
 //! ([`super::source::bearer_url_allowed`]). An api-key account
-//! (`NOUS_API_KEY`) has no balance endpoint, so it reports money
-//! `Unavailable` without fetching.
+//! (`NOUS_API_KEY`) makes no call by default. An explicit probe sends
+//! one token only to a `:free` inference model, never to the portal.
 //!
 //! **Mapping.** `subscription` → a `subscription` window labelled `Monthly
 //! credits`: `used_pct = (monthly_credits − credits_remaining) /
@@ -31,6 +31,8 @@
 //! `current_period_end`, start derived), `top_up` (purchased credits),
 //! `rollover` and `total_usable` (both non-additive: never summed).
 
+use super::config::MonitorKind;
+use crate::usage::keyed_http::{Auth, Method, Request};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -38,8 +40,8 @@ use super::source::{
     HttpReply, MonitorHttp, MonitorTarget, NOUS_PORTAL_ORIGIN, Reading, Secret, UsageSource,
 };
 use crate::usage::observation::{
-    Amount, AuthKind, Failure, FailureKind, MoneyKind, MoneyMeter, MoneyScope, Period, PeriodKind,
-    QuotaWindow, SourceId, Timestamp, WindowScope,
+    Amount, AuthKind, Failure, FailureKind, KeyHealth, KeyHealthState, MoneyKind, MoneyMeter,
+    MoneyScope, Period, PeriodKind, QuotaWindow, SourceId, Timestamp, WindowScope,
 };
 
 /// The account read.
@@ -69,21 +71,240 @@ impl UsageSource for NousSource {
 
     fn fetch(&self, target: &MonitorTarget, http: &dyn MonitorHttp) -> Result<Reading, Failure> {
         if target.key_env.is_some() {
-            // An `sk-nous-…` key reads inference only; the portal has no
-            // balance endpoint for it (nous_account.py:431-461).
-            return Ok(Reading {
-                verdict: Some(Failure::new(
-                    FailureKind::Unavailable,
-                    "Nous API keys have no balance endpoint; money unavailable",
-                )),
-                ..Reading::default()
-            });
+            return fetch_key(target, http);
         }
         let token = read_hermes_token(&target.hermes_home, target.now_secs)?;
         let reply = http.get_bearer(&format!("{NOUS_PORTAL_ORIGIN}{NOUS_ACCOUNT_PATH}"), &token)?;
         check_status(&reply, target.now_secs)?;
         map_account(&reply.body)
     }
+}
+
+const INFERENCE_ORIGIN: &str = "https://inference-api.nousresearch.com";
+const KEY_NOTE: &str =
+    "Nous API keys have no read endpoint; enable probe for key health (one free 1-token call)";
+const MODEL_TTL_SECS: i64 = 86_400;
+fn health(state: KeyHealthState, now: i64) -> KeyHealth {
+    KeyHealth {
+        state,
+        checked_at: Timestamp::from_secs(now),
+    }
+}
+fn fetch_key(target: &MonitorTarget, http: &dyn MonitorHttp) -> Result<Reading, Failure> {
+    if !target.cfg.probe {
+        return Ok(Reading {
+            key_health: Some(health(KeyHealthState::Unknown, target.now_secs)),
+            note: Some(KEY_NOTE.into()),
+            ..Reading::default()
+        });
+    }
+    let key = target.api_key.as_ref().ok_or_else(|| {
+        Failure::new(
+            FailureKind::AuthRequired,
+            "Nous API key missing from environment or store",
+        )
+    })?;
+    let auto = target.cfg.probe_model.is_none();
+    let (mut model, mut model_at) = match target.cfg.probe_model.as_ref() {
+        Some(model) => (model.clone(), None),
+        None => match target
+            .previous
+            .as_ref()
+            .and_then(|r| r.probe_model.as_ref().zip(r.probe_model_at))
+            .filter(|(m, at)| {
+                m.ends_with(":free")
+                    && *at <= target.now_secs
+                    && target.now_secs.saturating_sub(*at) < MODEL_TTL_SECS
+            }) {
+            Some((model, at)) => (model.clone(), Some(at)),
+            None => (pick_free_model(http)?, Some(target.now_secs)),
+        },
+    };
+    for attempt in 0..2 {
+        // Independent send-time guard: even malformed config or cache can never
+        // make the health probe send a request to a paid model.
+        if !model.ends_with(":free") {
+            return Err(Failure::new(
+                FailureKind::AuthRequired,
+                "Nous probe model must end :free",
+            ));
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "." }],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+        .map_err(|_| {
+            Failure::new(
+                FailureKind::Unavailable,
+                "could not construct Nous free probe",
+            )
+        })?;
+        let reply = http.send(
+            MonitorKind::Nous,
+            &Request {
+                method: Method::Post,
+                url: &format!("{INFERENCE_ORIGIN}/v1/chat/completions"),
+                auth: Auth::Bearer(key),
+                extra: &[],
+                json_body: Some(&body),
+            },
+        )?;
+        if auto && attempt == 0 && reply.status == 404 && model_not_found(&reply.body) {
+            model = pick_free_model(http)?;
+            model_at = Some(target.now_secs);
+            continue;
+        }
+        let mut reading = match reply.status {
+            200 => map_probe_headers(&reply.headers, target.now_secs),
+            401 => Reading {
+                key_health: Some(health(KeyHealthState::Invalid, target.now_secs)),
+                verdict: Some(Failure::new(
+                    FailureKind::AuthRequired,
+                    "Nous says the key is invalid, blocked or out of funds",
+                )),
+                ..Reading::default()
+            },
+            429 => {
+                let mut failure =
+                    Failure::new(FailureKind::RateLimited, "rate limited by Nous inference");
+                failure.retry_after = reply.retry_after_secs.map(|s| {
+                    Timestamp::from_secs(
+                        target
+                            .now_secs
+                            .saturating_add(i64::try_from(s).unwrap_or(i64::MAX)),
+                    )
+                });
+                return Err(failure);
+            }
+            403 => Reading {
+                key_health: Some(health(KeyHealthState::Blocked, target.now_secs)),
+                verdict: Some(Failure::new(
+                    FailureKind::AuthRequired,
+                    "Nous says the key is invalid, blocked or out of funds",
+                )),
+                ..Reading::default()
+            },
+            status => {
+                return Err(Failure::new(
+                    FailureKind::Unavailable,
+                    &format!("Nous free probe answered HTTP {status}"),
+                ));
+            }
+        };
+        if auto {
+            reading.probe_model = Some(model);
+            reading.probe_model_at = model_at;
+        }
+        return Ok(reading);
+    }
+    Err(Failure::new(
+        FailureKind::Unavailable,
+        "Nous free model is no longer available",
+    ))
+}
+fn model_not_found(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    error.get("code").and_then(Value::as_str) == Some("model_not_found")
+        || error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|m| {
+                let m = m.to_ascii_lowercase();
+                m.contains("model") && m.contains("not found")
+            })
+}
+fn pick_free_model(http: &dyn MonitorHttp) -> Result<String, Failure> {
+    let reply = http.send(
+        MonitorKind::Nous,
+        &Request {
+            method: Method::Get,
+            url: &format!("{INFERENCE_ORIGIN}/v1/models"),
+            auth: Auth::None,
+            extra: &[],
+            json_body: None,
+        },
+    )?;
+    if reply.status != 200 {
+        return Err(Failure::new(
+            FailureKind::Unavailable,
+            "Nous public model listing unavailable",
+        ));
+    }
+    let value: Value = serde_json::from_str(&reply.body).map_err(|_| {
+        Failure::new(
+            FailureKind::InvalidResponse,
+            "Nous public model listing unreadable",
+        )
+    })?;
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .filter(|m| m.ends_with(":free"))
+        .min()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Failure::new(
+                FailureKind::Unavailable,
+                "Nous public model listing has no free model",
+            )
+        })
+}
+fn map_probe_headers(headers: &[(String, String)], now: i64) -> Reading {
+    let mut reading = Reading {
+        key_health: Some(health(KeyHealthState::Valid, now)),
+        windows: super::openai::rate_windows(headers, "nous", now),
+        ..Reading::default()
+    };
+    for (id, label, suffix, additive) in [
+        (
+            "total_usable",
+            "Total usable credits",
+            "remaining-micros",
+            false,
+        ),
+        (
+            "subscription",
+            "Subscription credits",
+            "subscription-remaining-micros",
+            true,
+        ),
+        (
+            "top_up",
+            "Top-up credits",
+            "purchased-remaining-micros",
+            true,
+        ),
+        ("rollover", "Rollover credits", "rollover-micros", false),
+    ] {
+        let name = format!("x-nous-credits-{suffix}");
+        if let Some(value) = headers
+            .iter()
+            .find(|(n, _)| n == &name)
+            .and_then(|(_, v)| v.parse::<i64>().ok())
+        {
+            reading
+                .money
+                .push(meter(id, label, Amount::from_minor(value, 6), additive));
+        }
+    }
+    if headers
+        .iter()
+        .any(|(n, v)| n == "x-nous-credits-paid-access" && v.eq_ignore_ascii_case("false"))
+    {
+        reading.verdict = Some(Failure::new(
+            FailureKind::QuotaExhausted,
+            "Nous credits depleted (free models still work)",
+        ));
+    }
+    reading
 }
 
 // ── the Hermes token ───────────────────────────────────────────────────────────

@@ -169,3 +169,37 @@ fn plain_line_shows_the_pace_of_a_dated_window() {
     assert!(line.contains("5h 62% ↑ 12 pts ahead (2h 30m ("), "{line}");
     assert!(line.ends_with("  mid"), "{line}");
 }
+
+#[test]
+fn key_health_and_note_render_on_cards() {
+    use crate::usage::observation::{KeyHealth, KeyHealthState};
+    let mut o = bare(Origin::Monitor, "google-ai", SourceId::GoogleAi);
+    o.freshness = Freshness::Fresh;
+    o.key_health = Some(KeyHealth {
+        state: KeyHealthState::Valid,
+        checked_at: Timestamp(NOW - 180),
+    });
+    o.note = Some("spend and quota not available for API keys".into());
+    let ctx = crate::usage::cards::CardCtx {
+        width: 100,
+        now_secs: NOW,
+        offset_secs: 0,
+        guest_mode: false,
+    };
+    let lines: Vec<_> = crate::usage::cards::account_body(&o, &ctx)
+        .iter()
+        .map(|l| crate::usage::cards::plain_text(l))
+        .collect();
+    assert!(
+        lines.iter().any(|l| l.contains("key valid · 3m ago")),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains(o.note.as_ref().unwrap())));
+    assert!(plain_line(&o, NOW).contains("key valid · 3m ago"));
+    let json = serde_json::to_value(&o).unwrap();
+    assert_eq!(json["key_health"]["state"], "valid");
+    assert_eq!(
+        json["key_health"]["checked_at"],
+        Timestamp(NOW - 180).to_rfc3339()
+    );
+}

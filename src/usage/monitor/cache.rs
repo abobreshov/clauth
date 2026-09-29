@@ -219,26 +219,34 @@ pub(crate) fn refresh_one(
             next.hold_until_ms = None;
         }
         Err(failure) => {
-            // A quota 429 (Ollama's "usage limit reached") is still a 429:
-            // held the same way, so a spent window is not re-polled.
-            if matches!(
-                failure.kind,
-                FailureKind::RateLimited | FailureKind::QuotaExhausted
-            ) {
-                let retry_ms = failure
-                    .retry_after
-                    .and_then(|t| u64::try_from(t.secs()).ok())
-                    .map(|s| s.saturating_mul(1000));
-                let hold = if cfg.kind == super::config::MonitorKind::Antigravity {
-                    15 * 60_000
-                } else {
-                    RATE_LIMIT_HOLD_MS
-                };
-                let floor = now_ms.saturating_add(hold);
-                next.hold_until_ms = Some(retry_ms.map_or(floor, |r| r.max(floor)));
-            }
             next.failure = Some(failure);
         }
+    }
+
+    // Key-health checks carry their verdict alongside the reading, so a
+    // rate-limited response can retain its health and still stop retries.
+    let verdict = next.failure.as_ref().or_else(|| {
+        next.reading
+            .as_ref()
+            .and_then(|reading| reading.verdict.as_ref())
+    });
+    if let Some(failure) = verdict.filter(|failure| {
+        matches!(
+            failure.kind,
+            FailureKind::RateLimited | FailureKind::QuotaExhausted
+        )
+    }) {
+        let retry_ms = failure
+            .retry_after
+            .and_then(|t| u64::try_from(t.secs()).ok())
+            .map(|s| s.saturating_mul(1000));
+        let hold = if cfg.kind == super::config::MonitorKind::Antigravity {
+            15 * 60_000
+        } else {
+            RATE_LIMIT_HOLD_MS
+        };
+        let floor = now_ms.saturating_add(hold);
+        next.hold_until_ms = Some(retry_ms.map_or(floor, |r| r.max(floor)));
     }
 
     if let Some(notifier) = deps.notifier {

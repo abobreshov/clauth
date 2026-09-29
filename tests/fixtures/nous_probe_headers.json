@@ -1,0 +1,13 @@
+[
+  ["x-nous-credits-remaining-micros", "13150000"],
+  ["x-nous-credits-subscription-remaining-micros", "7900000"],
+  ["x-nous-credits-purchased-remaining-micros", "5250000"],
+  ["x-nous-credits-rollover-micros", "-500000"],
+  ["x-nous-credits-paid-access", "false"],
+  ["x-ratelimit-limit-requests", "100"],
+  ["x-ratelimit-remaining-requests", "40"],
+  ["x-ratelimit-reset-requests", "6m0s"],
+  ["x-ratelimit-limit-tokens", "1000"],
+  ["x-ratelimit-remaining-tokens", "800"],
+  ["x-ratelimit-reset-tokens", "20ms"]
+]

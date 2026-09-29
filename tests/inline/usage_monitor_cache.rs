@@ -391,3 +391,94 @@ fn remove_deletes_the_cache_and_lock() {
     assert!(!cache_path("or").unwrap().exists());
     assert!(load("or").is_none());
 }
+
+#[test]
+fn key_health_rate_limit_verdict_is_cached_and_holds_for_retry_after() {
+    use crate::usage::observation::KeyHealthState;
+    let _home = HomeSandbox::new();
+    let mut m = MonitorConfig::new("google-key", MonitorKind::GoogleAi);
+    m.api_key_env = Some("OR_KEY".into());
+    let mut http = FakeHttp::offline();
+    http.send_reply = Box::new(|_, _| {
+        Ok(super::super::source::HttpReply {
+            status: 429,
+            body: "{}".into(),
+            headers: vec![],
+            retry_after_secs: Some(1800),
+        })
+    });
+    let cache = refreshed(refresh_one(&m, &deps(&http, T0), true).unwrap());
+    assert!(cache.failure.is_none());
+    assert_eq!(cache.hold_until_ms, Some(T0 + 1_800_000));
+    let reading = cache.reading.as_ref().unwrap();
+    assert_eq!(
+        reading.key_health.as_ref().unwrap().state,
+        KeyHealthState::Unknown
+    );
+    assert_eq!(
+        reading.verdict.as_ref().unwrap().kind,
+        FailureKind::RateLimited
+    );
+    assert!(
+        reading
+            .note
+            .as_ref()
+            .unwrap()
+            .contains("spend and quota not available")
+    );
+    assert!(matches!(
+        refresh_one(&m, &deps(&http, T0 + 1000), true).unwrap(),
+        RefreshOutcome::Held(_)
+    ));
+    assert_eq!(http.calls().len(), 1);
+}
+// Slice-1 review: exercise the real cache floor, not only the source's hint.
+#[test]
+fn agy_rate_limit_cache_hold_has_a_fifteen_minute_floor() {
+    use crate::usage::monitor::antigravity::{KeyringMetadata, KeyringProbe, with_test_keyring};
+    struct Probe;
+    impl KeyringProbe for Probe {
+        fn has_owner(&self) -> Result<bool, Failure> {
+            Ok(true)
+        }
+        fn metadata(&self) -> Result<KeyringMetadata, Failure> {
+            Ok(KeyringMetadata {
+                unlocked: 1,
+                locked: 0,
+            })
+        }
+        fn secret(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, Failure> {
+            Ok(zeroize::Zeroizing::new(
+                br#"{"access_token":"FIXTURE","expiry":2000000000}"#.to_vec(),
+            ))
+        }
+    }
+    let _home = HomeSandbox::new();
+    let monitor = MonitorConfig::new("agy", MonitorKind::Antigravity);
+    let mut http = FakeHttp::offline();
+    // Deliver a short RateLimited hint directly through the transport seam.
+    // This deliberately bypasses the source's own 900-second normalization,
+    // proving the cache itself enforces its independent fifteen-minute floor.
+    http.send_reply = Box::new(|_, _| {
+        let mut failure = Failure::new(FailureKind::RateLimited, "fixture rate limit");
+        failure.retry_after = Some(crate::usage::observation::Timestamp::from_secs(
+            (T0 / 1000 + 1) as i64,
+        ));
+        Err(failure)
+    });
+    let cache = with_test_keyring(std::rc::Rc::new(Probe), || {
+        refreshed(refresh_one(&monitor, &deps(&http, T0), false).unwrap())
+    });
+    assert_eq!(
+        cache.failure.as_ref().unwrap().kind,
+        FailureKind::RateLimited
+    );
+    assert!(cache.hold_until_ms.unwrap() >= T0 + 15 * 60_000);
+    assert!(matches!(
+        refresh_one(&monitor, &deps(&http, T0 + 15 * 60_000 - 1), true).unwrap(),
+        RefreshOutcome::Held(_)
+    ));
+    assert!(!is_due(&monitor, Some(&cache), T0 + 15 * 60_000 - 1));
+    assert!(is_due(&monitor, Some(&cache), T0 + 15 * 60_000));
+    assert_eq!(http.calls().len(), 2);
+}

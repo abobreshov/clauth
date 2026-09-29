@@ -413,3 +413,53 @@ fn console_url_tracks_matches_base_url_in_both_directions() {
         assert_eq!(console_url(rejected), None, "so it has no page: {rejected}");
     }
 }
+#[test]
+fn capture_observes_raw_console_body_before_envelope_parsing() {
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let raw = ok_envelope(r#"{"per1WeekPercentage":0.25,"unparsed-field":"SHAPE-CANARY"}"#);
+    let reply = crate::usage::keyed_http::Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        retry_after: None,
+        body: Some(raw.clone()),
+    };
+    let body = crate::usage::keyed_http::with_response_observer(
+        Arc::new(move |reply| recorder.lock().unwrap().push(reply.clone())),
+        || post_form_reply(reply, true),
+    )
+    .unwrap();
+    assert_eq!(body, raw);
+    let observed = seen.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].body.as_deref(), Some(raw.as_str()));
+    assert_eq!(observed[0].headers[0].0, "content-type");
+}
+#[test]
+fn capture_observes_received_console_errors_without_changing_verdict() {
+    use std::sync::{Arc, Mutex};
+    for status in [401, 429, 500] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let reply = crate::usage::keyed_http::Reply {
+            status,
+            headers: vec![],
+            retry_after: Some(std::time::Duration::from_secs(30)),
+            body: Some(r#"{"error":"fixture"}"#.into()),
+        };
+        let result = crate::usage::keyed_http::with_response_observer(
+            Arc::new(move |reply| recorder.lock().unwrap().push(reply.clone())),
+            || post_form_reply(reply, true),
+        );
+        if status == 429 {
+            assert!(matches!(result, Err(ThirdPartyError::RateLimited { .. })));
+        } else {
+            assert!(matches!(result, Err(ThirdPartyError::Status)));
+        }
+        let observed = seen.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].status, status);
+        assert!(observed[0].body.is_some());
+    }
+}

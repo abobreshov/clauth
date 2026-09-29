@@ -61,3 +61,37 @@ fn codex_native_401_does_not_refresh() {
     assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
     assert_eq!(http.calls.lock().unwrap().len(), 1);
 }
+// Slice-1 review: native and profile legs share the exact same projection.
+#[test]
+fn codex_native_windows_equal_the_profile_leg_projection() {
+    let home = crate::testutil::HomeSandbox::new();
+    let tool = home.home().join(".codex");
+    std::fs::create_dir(&tool).unwrap();
+    std::fs::write(
+        tool.join("auth.json"),
+        serde_json::json!({"tokens":{"access_token":jwt(2000000000),"account_id":"fixture"}})
+            .to_string(),
+    )
+    .unwrap();
+    let now = 1900000000;
+    let usage=crate::usage::map_codex_usage(r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_at":2000000000},"secondary_window":{"used_percent":75,"limit_window_seconds":604800,"reset_at":2000000001}}}"#,now).unwrap();
+    let mut profile = AccountObservation::new(
+        "codex:fixture".into(),
+        SourceId::Codex,
+        AuthKind::Subscription,
+        Origin::Profile,
+        "Fixture",
+    );
+    crate::usage::project::apply_codex_usage(&mut profile, &usage, now);
+    let cfg = super::super::config::MonitorConfig::new(
+        "native",
+        super::super::config::MonitorKind::CodexNative,
+    );
+    let target = super::super::source::resolve_target(&cfg, home.home(), now, &|_| None);
+    let mut http = super::super::source::FakeHttp::offline();
+    http.codex_reply = Box::new(move || Ok(usage.clone()));
+    let native = CodexNativeSource.fetch(&target, &http).unwrap();
+    assert_eq!(native.windows, profile.windows);
+    assert_eq!(native.windows.len(), 2);
+    assert_eq!(native.plan, profile.plan);
+}

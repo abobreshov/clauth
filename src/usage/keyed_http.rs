@@ -18,7 +18,8 @@
 //!   sequential monitor poll, the usage scheduler) for as long as the socket
 //!   lives.
 
-use std::sync::LazyLock;
+use std::cell::RefCell;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 /// Largest response body a key-bearing read accepts (plan §4.2: 2 MiB).
@@ -68,6 +69,36 @@ pub(crate) struct Reply {
     pub(crate) body: Option<String>,
 }
 
+/// An owned observer only sees replies, never a request or credential.
+pub(crate) type ResponseObserver = Arc<dyn Fn(&Reply) + Send + Sync>;
+thread_local! {
+    static RESPONSE_OBSERVER: RefCell<Option<ResponseObserver>> = const { RefCell::new(None) };
+}
+/// Install an observer for synchronous work on this thread. Nested scopes and
+/// unwinding restore their predecessor without affecting any other thread.
+pub(crate) fn with_response_observer<T>(observer: ResponseObserver, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ResponseObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let displaced = RESPONSE_OBSERVER.with(|slot| slot.replace(self.0.take()));
+            drop(displaced);
+        }
+    }
+    let _restore = Restore(RESPONSE_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    f()
+}
+pub(crate) fn response_observer_active() -> bool {
+    RESPONSE_OBSERVER.with(|slot| slot.borrow().is_some())
+}
+/// Notify outside the RefCell borrow: observers can safely install nested
+/// scopes, or synchronously cause another response to be observed.
+pub(crate) fn observe_response(reply: &Reply) {
+    let observer = RESPONSE_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(reply);
+    }
+}
+
 /// `GET url` with `Authorization: Bearer <bearer>` over [`agent`]. `None` when
 /// no usable answer arrived: a transport failure, a deadline, or a redirect
 /// (refused, never followed).
@@ -96,10 +127,6 @@ pub(crate) enum Method {
     Post,
 }
 #[derive(Debug, Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "API key and unauthenticated transport land in slice 2"
-)]
 pub(crate) enum Auth<'a> {
     None,
     Bearer(&'a crate::usage::monitor::source::Secret),
@@ -192,12 +219,14 @@ pub(crate) fn send(agent: &ureq::Agent, req: &Request<'_>) -> Option<Reply> {
         .limit(MAX_BODY_BYTES)
         .read_to_string()
         .ok();
-    Some(Reply {
+    let reply = Reply {
         status,
         headers,
         retry_after,
         body,
-    })
+    };
+    observe_response(&reply);
+    Some(reply)
 }
 
 #[cfg(test)]
