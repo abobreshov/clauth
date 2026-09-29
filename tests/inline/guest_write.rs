@@ -542,6 +542,132 @@ fn non_guest_install_is_unguarded() {
     );
 }
 
+// ── tollgate plugin uninstall ─────────────────────────────────────────────
+
+/// Install tollgate's plugin (through the fake CLI) and wire its manual MCP
+/// entry, so an uninstall has both halves to remove.
+#[cfg(unix)]
+fn install_both(home: &HomeSandbox) {
+    crate::plugin_host::install().expect("install");
+    crate::plugin_probe::wire_mcp_server().expect("wire");
+    let cj = read(&home.home().join(".claude.json"));
+    assert!(cj["mcpServers"]["tollgate"].is_object());
+}
+
+/// `tollgate plugin uninstall` in guest mode, against a CLI that rewrites the
+/// shared files from nothing: `tollgate@tollgate` and `mcpServers.tollgate`
+/// are gone, and every one of upstream's keys is exactly where it was.
+#[cfg(unix)]
+#[test]
+fn plugin_uninstall_removes_only_tollgates_entries_in_guest_mode() {
+    use crate::testutil::{ConfigDirSandbox, EnvPin, FakeClaude};
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    let claude = home.home().join(".claude");
+    let _config = ConfigDirSandbox::new(&home, &claude);
+    let fake = FakeClaude::new(&home);
+    install_both(&home);
+    let _clobber = EnvPin::new(&home, &[("CLAUDE_SHIM_CLOBBER", Some("1".as_ref()))]);
+    let before = foreign_views(home.home());
+    let before_claude_json =
+        foreign_view(&read(&home.home().join(".claude.json")), CLAUDE_JSON_KEYS);
+
+    let done = crate::plugin_host::uninstall().expect("uninstall");
+    assert_eq!(done.plugin, agentgear::Outcome::Removed);
+    assert!(done.mcp_entry);
+    assert!(
+        fake.log()
+            .lines()
+            .any(|l| l == "plugin uninstall tollgate@tollgate -y --scope user"),
+        "{}",
+        fake.log()
+    );
+    assert_eq!(
+        foreign_views(home.home()),
+        before,
+        "upstream's keys survive"
+    );
+    let cj = read(&home.home().join(".claude.json"));
+    assert_eq!(foreign_view(&cj, CLAUDE_JSON_KEYS), before_claude_json);
+    assert!(cj["mcpServers"].get("tollgate").is_none());
+    assert!(
+        cj["mcpServers"]["clauth"].is_object(),
+        "upstream's MCP entry stays"
+    );
+    let settings = read(&claude.join("settings.json"));
+    assert!(
+        settings["enabledPlugins"]
+            .get("tollgate@tollgate")
+            .is_none()
+    );
+    assert_eq!(settings["enabledPlugins"]["clauth@clauth"], json!(true));
+    let installed = read(&claude.join("plugins").join("installed_plugins.json"));
+    assert!(installed["plugins"].get("tollgate@tollgate").is_none());
+    assert!(installed["plugins"]["clauth@clauth"].is_array());
+    assert!(
+        crate::plugin_host::uninstall_line(&done).contains("mcpServers.tollgate removed"),
+        "{}",
+        crate::plugin_host::uninstall_line(&done)
+    );
+}
+
+/// The uninstall keeps the owned-keys guard outside guest mode too (the
+/// retire and rollback flows run it after the import): a foreign key the CLI
+/// drops is put back. A second uninstall is a no-op that creates nothing.
+#[cfg(unix)]
+#[test]
+fn plugin_uninstall_is_guarded_outside_guest_mode_and_idempotent() {
+    use crate::testutil::{ConfigDirSandbox, EnvPin, FakeClaude};
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    std::fs::create_dir_all(claude.join("plugins")).unwrap();
+    std::fs::write(claude.join("settings.json"), UPSTREAM_SETTINGS).unwrap();
+    std::fs::write(
+        claude.join("plugins").join("installed_plugins.json"),
+        UPSTREAM_INSTALLED,
+    )
+    .unwrap();
+    let _config = ConfigDirSandbox::new(&home, &claude);
+    let _fake = FakeClaude::new(&home);
+    assert!(!crate::identity::upstream_active());
+    install_both(&home);
+    let before = foreign_view(&read(&claude.join("settings.json")), SETTINGS_KEYS);
+    let _clobber = EnvPin::new(&home, &[("CLAUDE_SHIM_CLOBBER", Some("1".as_ref()))]);
+    crate::plugin_host::uninstall().expect("uninstall");
+    assert_eq!(
+        foreign_view(&read(&claude.join("settings.json")), SETTINGS_KEYS),
+        before
+    );
+    assert!(
+        read(&home.home().join(".claude.json"))
+            .get("mcpServers")
+            .is_none(),
+        "the emptied parent goes"
+    );
+    let again = crate::plugin_host::uninstall().expect("second uninstall");
+    assert!(!again.mcp_entry);
+    assert_eq!(
+        foreign_view(&read(&claude.join("settings.json")), SETTINGS_KEYS),
+        before
+    );
+}
+
+/// Under another session's `CLAUDE_CONFIG_DIR` the uninstall refuses and
+/// runs nothing.
+#[cfg(unix)]
+#[test]
+fn plugin_uninstall_refuses_a_session_config_dir() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude};
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".tollgate/profiles/work/runtime-1-0");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let _config = ConfigDirSandbox::new(&home, &runtime);
+    let fake = FakeClaude::new(&home);
+    let err = crate::plugin_host::uninstall().unwrap_err();
+    assert!(err.to_string().contains("CLAUDE_CONFIG_DIR"), "{err}");
+    assert!(fake.log().is_empty(), "no `claude` ran: {}", fake.log());
+}
+
 // ── the hooks ────────────────────────────────────────────────────────────
 
 #[test]

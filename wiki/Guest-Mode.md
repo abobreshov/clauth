@@ -6,12 +6,12 @@ tollgate is a fork of [clauth](https://github.com/uwuclxdy/clauth) and is built 
 
 Guest mode is on when `~/.clauth` exists and `~/.tollgate/import-journal.json` does not record a completed import. It is decided on every run; there is no flag or setting.
 
-The import that would end it (`tollgate import clauth`) is **not implemented yet**. Until it ships, guest mode ends only when `~/.clauth` is gone. Hand-writing an import journal is not a supported way out: nothing would have moved upstream's accounts, and both tools would then write the same files.
+To end it, [import clauth](Import): run `tollgate import clauth --dry-run` to see what would move and what blocks it, then `tollgate import clauth`. The import moves upstream's accounts into `~/.tollgate` and hands tollgate the global files, and `tollgate import rollback` undoes it. `tollgate import status` reads the journal. Hand-writing an import journal is not a supported way out: nothing would have moved upstream's accounts, and both tools would then write the same files.
 
 How to tell:
 
-- the TUI header shows a `[ guest ]` pill after the version
-- `tollgate usage --json`, `GET /v1/usage` and `GET /v1/health` carry `"guest_mode": true`
+- the TUI header shows a `[ guest ]` pill after the version, and the footer names `import: tollgate import clauth --dry-run`
+- `tollgate usage --json`, `GET /v1/usage` and `GET /v1/health` carry `"guest_mode": true`; `GET /v1/health` and `GET /v1/status` also carry the import's state
 - `tollgate status --json` carries `"guest_mode": true` (the one-shot print only; the daemon's `status.json` does not)
 
 ## What works
@@ -53,7 +53,7 @@ Because the plugin now sits in the shared `~/.claude`, upstream's Claude Code se
 These print one line and exit 1:
 
 ```
-tollgate: upstream clauth manages ~/.claude on this machine (guest mode). Use 'tollgate start <profile>' for a per-session account, or import clauth first (not yet available).
+tollgate: upstream clauth manages ~/.claude on this machine (guest mode). Use 'tollgate start <profile>' for a per-session account, or run 'tollgate import clauth --dry-run' to import clauth.
 ```
 
 | Refused | Why |
@@ -94,6 +94,5 @@ These keep the two tools apart on any machine where both are installed:
 - An isolated guest session's transcripts are still rescued into `~/.claude/projects` at teardown, and `tollgate sessions` / `resume` list only `~/.claude/projects`, not the guest store.
 - A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before guest mode is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - `tollgate list` and `tollgate status --json` print each profile's `base_url` unredacted. `usage --json` and the local agent API redact endpoints.
-- There is no import, and so no supported way to hand the global files from upstream to tollgate.
 
-The migration design (the import transaction, rollback, retiring upstream) is in [the plan](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/multi-provider-redesign-plan.md), section 4.0.
+Handing the global files from upstream to tollgate is [the import](Import); its design is in [the import spec](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/specs/import-clauth.md) and [the plan](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/multi-provider-redesign-plan.md), section 4.0.

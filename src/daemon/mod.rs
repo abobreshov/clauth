@@ -20,6 +20,10 @@ mod status_json;
 mod tick;
 mod types;
 
+/// Whether upstream clauth's refresher holds its leases (the import fence
+/// holds them for its whole transaction, and its tests read this).
+#[cfg(test)]
+pub(crate) use probe::upstream_refresher_active;
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).

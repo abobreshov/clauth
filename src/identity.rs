@@ -94,11 +94,7 @@ pub(crate) const UPSTREAM_NAME: &str = "clauth";
 /// The upstream tool's data directory name under `$HOME` (`~/.clauth`).
 pub(crate) const UPSTREAM_DATA_DIR_NAME: &str = ".clauth";
 
-/// The upstream tool's herdr plugin id.
-#[allow(
-    dead_code,
-    reason = "read by the coexistence / import work (plan §4.0)"
-)]
+/// The upstream tool's herdr plugin id (the import's G2 edit uninstalls it).
 pub(crate) const UPSTREAM_HERDR_PLUGIN_ID: &str = "clauth";
 
 /// The upstream tool's Claude Code plugin key.
@@ -115,7 +111,9 @@ pub(crate) const GUEST_REFUSAL: &str = concat!(
     tool_name!(),
     ": upstream clauth manages ~/.claude on this machine (guest mode). Use '",
     tool_name!(),
-    " start <profile>' for a per-session account, or import clauth first (not yet available)."
+    " start <profile>' for a per-session account, or run '",
+    tool_name!(),
+    " import clauth --dry-run' to import clauth."
 );
 
 /// Guest mode (plan §4.0, the "guest mode (pre-import)" coexistence row): the
@@ -165,6 +163,109 @@ fn import_completed(path: &std::path::Path) -> bool {
                 .map(|s| s == "complete")
         })
         .unwrap_or(false)
+}
+
+/// Where an `import clauth` stands, read off the journal's top-level `state`
+/// (spec `docs/specs/import-clauth.md` §3.2). For the status surfaces and the
+/// interrupted-import warning only: guest mode is decided by
+/// [`import_completed`] alone, and this never overrides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportState {
+    /// No journal: no import was ever attempted here.
+    None,
+    /// The M0 pre-phase ran (global edits before the fence); nothing moved.
+    Pre,
+    /// The transaction is moving stores (M4 onward), or crashed doing so.
+    InProgress,
+    /// Committed: guest mode is off.
+    Complete,
+    /// A rollback started and has not finished.
+    RollingBack,
+    /// A rollback finished.
+    RolledBack,
+    /// An automatic reversal finished after a refusal.
+    Aborted,
+    /// A journal exists but does not parse or names no known state.
+    Unreadable,
+}
+
+impl ImportState {
+    /// The journal's spelling of the state (`unreadable` is this reader's own).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ImportState::None => "none",
+            ImportState::Pre => "pre",
+            ImportState::InProgress => "in_progress",
+            ImportState::Complete => "complete",
+            ImportState::RollingBack => "rolling_back",
+            ImportState::RolledBack => "rolled_back",
+            ImportState::Aborted => "aborted",
+            ImportState::Unreadable => "unreadable",
+        }
+    }
+
+    /// Parse a journal `state` value; `None` for anything else.
+    pub(crate) fn from_journal(s: &str) -> Option<Self> {
+        Some(match s {
+            "pre" => ImportState::Pre,
+            "in_progress" => ImportState::InProgress,
+            "complete" => ImportState::Complete,
+            "rolling_back" => ImportState::RollingBack,
+            "rolled_back" => ImportState::RolledBack,
+            "aborted" => ImportState::Aborted,
+            _ => return None,
+        })
+    }
+
+    /// Whether an import stopped part-way and needs `--resume` or a rollback.
+    pub(crate) fn is_interrupted(self) -> bool {
+        matches!(
+            self,
+            ImportState::Pre | ImportState::InProgress | ImportState::RollingBack
+        )
+    }
+}
+
+/// The import journal's state under this home's data dir. Never takes a lock
+/// and never writes.
+pub(crate) fn import_state() -> ImportState {
+    let Ok(dir) = crate::profile::tollgate_dir() else {
+        return ImportState::None;
+    };
+    import_state_at(&dir.join(IMPORT_JOURNAL_FILE))
+}
+
+/// The import's state and completion instant, for the local API's `import`
+/// block (spec §2.5). Read without a lock; never writes.
+pub(crate) fn import_summary() -> (ImportState, Option<String>) {
+    let state = import_state();
+    let completed_at = crate::profile::tollgate_dir()
+        .ok()
+        .and_then(|dir| std::fs::read(dir.join(IMPORT_JOURNAL_FILE)).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|v| {
+            v.get("completed_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    (state, completed_at)
+}
+
+/// [`import_state`] for the journal at `path`.
+pub(crate) fn import_state_at(path: &std::path::Path) -> ImportState {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ImportState::None,
+        Err(_) => return ImportState::Unreadable,
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("state")
+                .and_then(serde_json::Value::as_str)
+                .and_then(ImportState::from_journal)
+        })
+        .unwrap_or(ImportState::Unreadable)
 }
 
 /// The refusal a user-facing global mutation raises in guest mode. Its own

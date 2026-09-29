@@ -237,6 +237,30 @@ pub(crate) struct HealthBody {
     schema_version: u32,
     /// Upstream clauth owns `~/.claude` on this machine (plan §4.0).
     guest_mode: bool,
+    /// Where an `import clauth` of upstream's accounts stands.
+    import: ImportBlock,
+}
+
+/// The `import` block of `GET /v1/health` and `GET /v1/status` (import spec
+/// §2.5): the import journal's state, read without a lock.
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct ImportBlock {
+    /// `none`, `pre`, `in_progress`, `complete`, `rolling_back`,
+    /// `rolled_back`, `aborted`, or `unreadable` for a journal that does not
+    /// parse.
+    state: &'static str,
+    /// RFC 3339 instant the import committed; `null` until it has.
+    completed_at: Option<String>,
+}
+
+impl ImportBlock {
+    pub(crate) fn current() -> Self {
+        let (state, completed_at) = crate::identity::import_summary();
+        Self {
+            state: state.as_str(),
+            completed_at,
+        }
+    }
 }
 
 /// `GET /v1/accounts`.
@@ -394,6 +418,7 @@ fn health() -> Response {
             version: env!("CARGO_PKG_VERSION").to_string(),
             schema_version: SCHEMA_VERSION,
             guest_mode: crate::identity::upstream_active(),
+            import: ImportBlock::current(),
         },
     )
 }
@@ -505,7 +530,7 @@ fn providers() -> Response {
     get,
     path = "/v1/status",
     responses(
-        (status = 200, description = "the `~/.tollgate/status.json` feed, redacted (built on the spot when no daemon has published a parseable one)", body = crate::daemon::StatusBody),
+        (status = 200, description = "the `~/.tollgate/status.json` feed, redacted (built on the spot when no daemon has published a parseable one), plus an `import` object shaped like `ImportBlock`", body = crate::daemon::StatusBody),
         (status = 401, description = R401, body = ErrorBody),
         (status = 405, description = R405, body = ErrorBody),
         (status = 503, description = "no parseable feed on disk and the config does not load (`status_unavailable`)", body = ErrorBody)
@@ -537,6 +562,11 @@ fn status(ctx: &Ctx) -> Response {
         }
     };
     redact_status(&mut value);
+    if let (serde_json::Value::Object(map), Ok(block)) =
+        (&mut value, serde_json::to_value(ImportBlock::current()))
+    {
+        map.insert("import".to_string(), block);
+    }
     match serde_json::to_vec(&value) {
         // Tagged off the bytes actually served, never the file's.
         Ok(bytes) => {

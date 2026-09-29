@@ -468,6 +468,18 @@ pub(crate) fn guest_guarded<T>(
     if !crate::identity::upstream_active() {
         return run();
     }
+    owned_keys_guarded(files, run)
+}
+
+/// [`guest_guarded`]'s snapshot-and-restore in EVERY mode, for a child whose
+/// whole job is to touch only tollgate's own keys (`tollgate plugin
+/// uninstall`): a foreign key it changed or dropped is put back whether or
+/// not upstream is installed. Upstream's lock is taken only in guest mode
+/// ([`upstream_lock`]).
+pub(crate) fn owned_keys_guarded<T>(
+    files: &[(PathBuf, &'static [OwnedKey])],
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let _lock = upstream_lock()?;
     let snapshots = files
         .iter()

@@ -71,6 +71,65 @@ pub(crate) fn install() -> anyhow::Result<Outcome> {
     guarded(|| Ok(TollgatePlugin::install(Scope::User, Source::Embedded)?))
 }
 
+/// What `tollgate plugin uninstall` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Uninstalled {
+    /// agentgear's outcome for `tollgate@tollgate` (`Removed`, or `NoOp`
+    /// when it was not installed).
+    pub(crate) plugin: Outcome,
+    /// Whether `mcpServers.tollgate` was removed from `~/.claude.json`.
+    pub(crate) mcp_entry: bool,
+}
+
+/// `tollgate plugin uninstall`: remove `tollgate@tollgate` (agentgear's
+/// uninstall: `claude plugin uninstall` + the refcount-gated marketplace
+/// remove) and the manual `mcpServers.tollgate` wiring, and nothing else.
+///
+/// Both halves run under `guest_write`'s owned-keys guard in EVERY mode, not
+/// only guest mode: the `claude plugin` child is snapshot-and-restored so a
+/// foreign key it changes (upstream clauth's `clauth@clauth` rows above all)
+/// is put back, and the `~/.claude.json` edit is refused if it would change
+/// anything but tollgate's entry. The import's retire and rollback flows
+/// and an owner undoing an install all need exactly that and no more. Only
+/// `~/.claude` is a target: under a `CLAUDE_CONFIG_DIR` the child would edit
+/// that session's config instead.
+pub(crate) fn uninstall() -> anyhow::Result<Uninstalled> {
+    if let crate::identity::PluginTarget::OwnRuntime(dir)
+    | crate::identity::PluginTarget::Foreign(dir) = crate::identity::plugin_target()
+    {
+        anyhow::bail!(
+            "CLAUDE_CONFIG_DIR is {}, so the uninstall would edit that session's config, not ~/.claude; run it from a shell outside Claude Code",
+            dir.display()
+        );
+    }
+    let plugin = uninstall_plugin()?;
+    let mcp_entry = crate::plugin_probe::unwire_mcp_server()?;
+    Ok(Uninstalled { plugin, mcp_entry })
+}
+
+/// The plugin half of [`uninstall`] alone: `tollgate@tollgate` and its
+/// marketplace, under the owned-keys guard, `mcpServers` left as it is. The
+/// undo of the import's retire step R2, which installed only the plugin.
+pub(crate) fn uninstall_plugin() -> anyhow::Result<Outcome> {
+    crate::guest_write::owned_keys_guarded(&guarded_files(), || {
+        Ok(TollgatePlugin::uninstall(Scope::User)?)
+    })
+}
+
+/// The one line `tollgate plugin uninstall` prints.
+pub(crate) fn uninstall_line(u: &Uninstalled) -> String {
+    let plugin = match u.plugin {
+        Outcome::NoOp => "tollgate@tollgate was not installed".to_string(),
+        ref other => format!("tollgate@tollgate {other}"),
+    };
+    let mcp = if u.mcp_entry {
+        "mcpServers.tollgate removed from ~/.claude.json"
+    } else {
+        "no mcpServers.tollgate in ~/.claude.json"
+    };
+    format!("tollgate plugin uninstall: {plugin}; {mcp}")
+}
+
 /// The shared registry files a `claude plugin` child writes, each with the
 /// keys tollgate owns in it: the config dir the child resolves (see
 /// [`registry_dir`]), `settings.json` and the two `plugins/` registries.

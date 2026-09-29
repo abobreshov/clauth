@@ -17,6 +17,7 @@ mod herdr;
 mod hook_context;
 mod hook_note;
 mod identity;
+mod import;
 mod jobs_cli;
 mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
@@ -203,6 +204,19 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
+            // The import's refusals: 3 = blocked, nothing changed; 4 = the
+            // journal needs a person. A blocked dry-run already printed its
+            // blockers inside the report.
+            if let Some(blocked) = e.downcast_ref::<crate::import::ImportBlocked>() {
+                if !blocked.printed {
+                    errln!("{blocked}");
+                }
+                return exit_codes::IMPORT_BLOCKED;
+            }
+            if let Some(attention) = e.downcast_ref::<crate::import::ImportNeedsAttention>() {
+                errln!("{attention}");
+                return exit_codes::IMPORT_NEEDS_ATTENTION;
+            }
             // Guest mode's refusal is a complete sentence that already names
             // the tool and the way forward; an `Error:` debug chain around it
             // adds nothing.
@@ -222,6 +236,82 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
     }
 }
 
+/// The per-command exit codes beyond 0/1/2 (spec import-clauth.md §2.2).
+/// Named here so a second command's code 3 can sit beside the import's
+/// without either reading as the other.
+pub(crate) mod exit_codes {
+    /// `tollgate import`: a refusal before anything changed.
+    pub(crate) const IMPORT_BLOCKED: i32 = 3;
+    /// `tollgate import`: the journal needs attention.
+    pub(crate) const IMPORT_NEEDS_ATTENTION: i32 = 4;
+}
+
+/// `tollgate import <cmd>` (spec docs/specs/import-clauth.md §2.1).
+fn cmd_import(cmd: cli::ImportCommand) -> Result<()> {
+    match cmd {
+        cli::ImportCommand::Clauth {
+            dry_run,
+            json,
+            rename,
+            adopt_live,
+            yes,
+            resume,
+        } => {
+            if dry_run && resume {
+                return Err(usage_error(
+                    "tollgate import clauth: --dry-run and --resume do not combine",
+                ));
+            }
+            let opts = import::Options {
+                renames: import::Options::parse_renames(&rename)?,
+                adopt_live,
+            };
+            if dry_run {
+                import::cmd_dry_run(&opts, json)
+            } else {
+                import::cmd_run(&opts, json, yes, resume)
+            }
+        }
+        cli::ImportCommand::Rollback {
+            yes,
+            json,
+            adopt_live,
+        } => import::cmd_rollback(adopt_live, json, yes),
+        cli::ImportCommand::Status { json } => import::cmd_status(json),
+        cli::ImportCommand::Retire { yes, step } => import::cmd_retire(&step, yes),
+    }
+}
+
+/// `tollgate plugin <cmd>`.
+fn cmd_plugin(cmd: cli::PluginCommand) -> Result<()> {
+    match cmd {
+        cli::PluginCommand::Install => {
+            let outcome = plugin_host::install()?;
+            outln!("tollgate plugin install: {outcome}");
+            Ok(())
+        }
+        cli::PluginCommand::Uninstall => {
+            let removed = plugin_host::uninstall()?;
+            outln!("{}", plugin_host::uninstall_line(&removed));
+            Ok(())
+        }
+    }
+}
+
+/// Whether the interrupted-import check may resolve the home: always in a
+/// real run; in a test only under a `HomeSandbox`, so a dispatch test never
+/// reads the operator's real `~/.tollgate`.
+fn interrupted_check_allowed() -> bool {
+    #[cfg(test)]
+    {
+        crate::profile::home_override_active()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     // `--theme` is a root-level global, so it parses ahead of any subcommand
     // and is accepted (and ignored) on the non-TUI paths.
@@ -229,6 +319,17 @@ fn dispatch(cli: Cli) -> Result<()> {
         ThemeArg::Full => tui::theme::Tier::Full,
         ThemeArg::Compatible => tui::theme::Tier::Compatible,
     });
+
+    // An interrupted import names itself on every command (spec §2.3),
+    // on stderr. Shell completion's hidden helper is spared: its stderr
+    // lands in the middle of the user's prompt line.
+    if !matches!(cli.command, Some(Command::Complete { .. }))
+        && interrupted_check_allowed()
+        && let Ok(paths) = import::Paths::resolve()
+        && let Some(line) = import::journal::interrupted_warning(&paths)
+    {
+        errln!("{line}");
+    }
 
     let Some(command) = cli.command else {
         use std::io::IsTerminal as _;
@@ -347,6 +448,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Import { cmd } => cmd_import(cmd),
+        Command::Plugin { cmd } => cmd_plugin(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }

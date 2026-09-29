@@ -2189,6 +2189,17 @@ pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
         .join(format!("{name}.lock")))
 }
 
+/// Upstream clauth's rotation-lock file for `name`
+/// (`~/.clauth/rotation-locks/<name>.lock`, upstream 0.16.0's own
+/// `rotation_lock_path`). Only the import fence takes it, raw and under one
+/// `ImportFence` rank, never through [`RotationGuard`].
+pub(crate) fn upstream_rotation_lock_path(name: &str) -> Result<PathBuf> {
+    Ok(crate::profile::home_dir()?
+        .join(crate::identity::UPSTREAM_DATA_DIR_NAME)
+        .join("rotation-locks")
+        .join(format!("{name}.lock")))
+}
+
 /// Cross-process advisory lock serializing a token rotation against a
 /// `tollgate start` session acquire for the SAME profile.
 ///

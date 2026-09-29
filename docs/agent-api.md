@@ -113,12 +113,12 @@ these optional filters:
 
 | Route | Body |
 |---|---|
-| `GET /v1/health` | `{ok, version, schema_version, guest_mode}` |
+| `GET /v1/health` | `{ok, version, schema_version, guest_mode, import}` |
 | `GET /v1/accounts` | `{schema_version, accounts: [AccountObservation…]}` |
 | `GET /v1/accounts/{id}` | `{schema_version, account: AccountObservation}`, or `404 account_not_found` |
 | `GET /v1/usage` | `{schema_version, generated_at, guest_mode, accounts}`, the same envelope as `tollgate usage --json` |
 | `GET /v1/providers` | `{schema_version, providers: [{source, display_name, auth_kinds, configured, accounts}]}` |
-| `GET /v1/status` | the `~/.tollgate/status.json` feed, parsed and redacted (never the file's raw bytes), with an `ETag` of the body served; built on the spot when no daemon has written a parseable one |
+| `GET /v1/status` | the `~/.tollgate/status.json` feed, parsed and redacted (never the file's raw bytes), plus `import`, with an `ETag` of the body served; built on the spot when no daemon has written a parseable one |
 | `GET /v1/openapi.json` | the OpenAPI 3.1 document for all of the above |
 
 **Filters.** `/v1/accounts` and `/v1/usage` take these query parameters. Values
@@ -200,6 +200,12 @@ always present: an absent value is `null`, an empty list is `[]`.
   - `subscription_inactive`
 - **`guest_mode: true`** means upstream clauth owns `~/.claude` on this machine,
   and tollgate is only watching.
+- **`import`** is `{state, completed_at}`: where a `tollgate import clauth` of
+  upstream's accounts stands. `state` is one of `none`, `pre`, `in_progress`,
+  `complete`, `rolling_back`, `rolled_back`, `aborted`, or `unreadable` for a
+  journal that does not parse; `completed_at` is the RFC 3339 instant it
+  committed, else `null`. There is no write route: the import runs only from
+  the CLI.
 
 **Versioning.** Adding a field does not bump `schema_version`, so ignore keys
 you do not know. A breaking change bumps the version. Refuse any

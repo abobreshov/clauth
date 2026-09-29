@@ -688,6 +688,14 @@ pub(crate) enum HomeTab {
     Plugin,
 }
 
+/// The D4 alias hook for a `home_tab` value carried across from another
+/// tool's `profiles.toml` (the import's roster merge): maps a tab name that
+/// tool spells differently onto this one's. Identity today: upstream clauth
+/// 0.16.0 names its tabs exactly as tollgate does.
+pub(crate) fn home_tab_alias(raw: &str) -> &str {
+    raw
+}
+
 impl HomeTab {
     /// Every main tab, in the cycle order the `home tab` row steps through.
     pub(crate) const ALL: [HomeTab; 8] = [
@@ -2395,6 +2403,55 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
+    }
+}
+
+/// The import journal's durable write (spec `docs/specs/import-clauth.md`
+/// §3.2): create `.<name>.tmp.<pid>.<seq>` at 0600, write, `fsync` it, rename
+/// it over `path`, then `fsync` the directory, so a crash leaves either the
+/// old bytes or the new ones on disk and the rename itself is durable.
+/// Refuses to create the parent: the caller owns where the file lives.
+pub(crate) fn write_durable_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let tmp = tmp_sibling(path);
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let written = (|| {
+        use std::io::Write;
+        let mut f = opts.open(&tmp)?;
+        f.write_all(content.as_ref())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_dir(dir)
+}
+
+/// `fsync` a directory, making a rename or unlink inside it durable. A no-op
+/// off Unix, where a directory cannot be opened for syncing.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 

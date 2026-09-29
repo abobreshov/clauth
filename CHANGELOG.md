@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Import
+
+- `tollgate import clauth` moves an upstream clauth 0.16.0 install into `~/.tollgate` and ends guest mode. `--dry-run` shows everything it would do and changes nothing, not even a lock file; the real run asks once (`--yes` skips it; a non-interactive stdin without `--yes` exits 2) and then runs one journaled transaction. [Importing clauth](wiki/Import.md).
+- Refresh chains move by rename, never by copy, so each keeps one inode; a move across filesystems is refused. Live slots are repointed or captured in the same step.
+- The global edits are journaled with their prior values: upstream's plugin off in `settings.json` (G1), upstream's own `clauth herdr uninstall --yes` with herdr's config backed up (G2), upstream's `apiKeyHelper` and `permissions.allow` MCP tool names rewritten to tollgate's (G3), and `installed_plugins.json` paths under `~/.clauth/profiles/` repointed (G4). No value from `settings.json`'s `env`, a credential or a `config.toml` reaches the journal, a backup or the report.
+- The import refuses while any Claude Code session, clauth process, other tollgate process (Hermes sessions included) or live session marker exists, and re-checks after the prompt. It holds upstream's and tollgate's leases, rotation locks and state locks for the whole transaction, and nothing inside that hold prompts, spawns a process or uses the network.
+- Any failure before the commit reverses every step automatically: exit 3 when nothing had moved yet, exit 1 after a store moved. An interrupted import is named on every command's stderr; `--resume` continues it and `tollgate import rollback` undoes it (stores before the upstream binary; upstream's herdr plugin reinstalled at its recorded commit only after the locks are released). `tollgate import status` reads the journal. Exit 4 means the journal needs you.
+- `tollgate import retire` is the checklist after a committed import: upstream's plugin wiring out (r1), `tollgate@tollgate` in (r2), tollgate's herdr plugin in (r3), and the `.bashrc` completion line swapped (r4). Each step is journaled, and a rollback undoes them first.
+- `tollgate plugin install` and `tollgate plugin uninstall`. The uninstall removes only `tollgate@tollgate` and `mcpServers.tollgate`, under the owned-keys guard in every mode.
+- `GET /v1/health` and `GET /v1/status` carry `import: {state, completed_at}`; the TUI's guest-mode footer and the guest refusal name `tollgate import clauth --dry-run`.
+
 ### Guest mode
 
 - The Plugin tab's Claude Code plugin install and `mcpServers` wiring, `tollgate herdr install` / `uninstall` and the Plugin tab's herdr config fix now run in guest mode instead of refusing. They add, change or remove only tollgate's own entries: `tollgate@tollgate` in the plugin registry and `enabledPlugins`, the `tollgate` marketplace declaration in `settings.json`'s `extraKnownMarketplaces`, `mcpServers.tollgate` in `~/.claude.json`, the herdr plugin `tollgate` and the herdr config blocks under tollgate's marker (the keybinding conflict check still applies).
@@ -90,7 +101,7 @@ The pre-release review and how each finding was settled: [docs/tollgate-code-rev
 
 ### Known gaps
 
-- **No import yet.** `tollgate import clauth` is designed but not implemented, so guest mode cannot end while clauth is installed.
+- **No import yet.** `tollgate import clauth` is designed but not implemented, so guest mode cannot end while clauth is installed. (Closed in Unreleased: see Import above.)
 - **Old credential links survive guest mode.** A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before `~/.clauth` appeared is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - **Guest sessions still link the operator's read-mostly `~/.claude` content.** `CLAUDE.md`, `commands/`, `agents/`, `skills/`, `hooks/`, `output-styles/` and `keybindings.json` stay linked under real links, so an edit the session is asked to make there (a `#` memory note, `/agents`) lands in `~/.claude`. A passthrough `--continue` is not seeded into the guest store.
 - **macOS guest Keychain guard not built on macOS yet.** The default-item refusal is tested on Linux through its predicate; `keychain.rs` itself has not been compiled for macOS since the change. Nor have the macOS- and Windows-only helper spawns that now scrub monitoring keys; their command builders are compiled and tested on Linux.

@@ -3267,3 +3267,24 @@ fn the_overview_footer_names_enter_on_a_read_only_row() {
     assert!(on_extra.contains("↵ usage"), "{on_extra}");
     assert!(!on_extra.contains("reorder"), "{on_extra}");
 }
+
+/// Import spec §2.5: in guest mode the footer names the way out
+/// (`import: tollgate import clauth --dry-run`), and it is the first hint a
+/// narrow row sheds. Off guest mode it never shows.
+#[test]
+fn guest_footer_names_the_import_command() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = narrow_app();
+    app.tab = Tab::Usage;
+    let wide = dump(&app, 200, 30);
+    assert!(!wide.contains("import clauth"), "{wide}");
+    app.guest_mode = true;
+    let wide = dump(&app, 200, 30);
+    assert!(
+        wide.contains("import: tollgate import clauth --dry-run"),
+        "{wide}"
+    );
+    let narrow = dump(&app, 45, 38);
+    assert!(!narrow.contains("import clauth"), "{narrow}");
+    assert!(narrow.contains("q quit"), "{narrow}");
+}

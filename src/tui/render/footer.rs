@@ -18,6 +18,9 @@ use super::format::spinner_frame;
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
+/// The guest-mode footer hint: the command that ends guest mode.
+pub(crate) const GUEST_IMPORT_HINT: (&str, &str) = ("import:", "tollgate import clauth --dry-run");
+
 /// A typed field's whole grammar: `q` is data there, so it gets no hint. Esc
 /// puts the field back to its saved value, and says so in the field's own
 /// terms, since beside a login in flight a bare `cancel` reads as the login's.
@@ -90,6 +93,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // drift.
     if build_action_menu(app).items.is_empty() {
         hints.retain(|(key, _)| *key != "a");
+    }
+
+    // Guest mode names its way out, the `[ guest ]` pill's footer line
+    // (import spec §2.5): last, so it is the first hint a narrow row sheds.
+    if app.guest_mode && owner.is_none() {
+        hints.push(GUEST_IMPORT_HINT);
     }
 
     shed_to_width(&mut hints, area.width as usize);
