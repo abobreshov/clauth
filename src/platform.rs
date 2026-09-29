@@ -26,6 +26,17 @@ pub(crate) fn installed_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
 /// so it never blocks or leaks output into tollgate's own stdout/stderr.
 pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
     use anyhow::Context;
+    open_url_command(url)
+        .spawn()
+        .with_context(|| format!("failed to open browser for {url}"))?;
+    Ok(())
+}
+
+/// The browser-launch command [`open_url`] spawns: detached stdio, and no
+/// monitoring or billing key in its env
+/// ([`crate::providers::billing_key::scrub_helper_env`]) — the browser and
+/// whatever it starts are not tollgate's to hand a key to.
+pub(crate) fn open_url_command(url: &str) -> std::process::Command {
     use std::process::{Command, Stdio};
 
     #[cfg(target_os = "macos")]
@@ -48,10 +59,9 @@ pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
     cmd.arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to open browser for {url}"))?;
-    Ok(())
+        .stderr(Stdio::null());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
+    cmd
 }
 
 /// Put `text` on the LOCAL terminal's clipboard through OSC 52, the escape

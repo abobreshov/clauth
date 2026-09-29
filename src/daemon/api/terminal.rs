@@ -274,6 +274,7 @@ pub(crate) fn real_terminal_spawn() -> TerminalSpawn {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         crate::herdr::strip_session_env(&mut cmd);
+        crate::providers::billing_key::scrub_helper_env(&mut cmd);
         let mut child = cmd.spawn()?;
         let stdin = child
             .stdin

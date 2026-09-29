@@ -262,9 +262,10 @@ fn fqdn() -> Result<String> {
         bail!("{failure}");
     }
     let (program, args) = FQDN_COMMAND;
-    let out = std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).stdin(std::process::Stdio::null());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
+    let out = cmd
         .output()
         .with_context(|| format!("could not run `{program}` to determine this host's FQDN"))?;
     if !out.status.success() {

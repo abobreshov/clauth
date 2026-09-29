@@ -1857,3 +1857,12 @@ fn humanize_duration_five_minutes_and_up_stays_coarse() {
     assert_eq!(humanize_duration(90 * 60), "1h 30m");
     assert_eq!(humanize_duration(25 * 3600), "1d 1h");
 }
+
+/// The shared usage agent has an end-to-end deadline: a server that sends its
+/// headers and then stalls the body cannot freeze the caller.
+#[test]
+fn the_shared_usage_agent_has_a_finite_end_to_end_deadline() {
+    let t = http_agent().config().timeouts();
+    assert_eq!(t.global, Some(crate::usage::keyed_http::CALL_DEADLINE));
+    assert_eq!(t.recv_body, Some(crate::usage::keyed_http::CALL_DEADLINE));
+}

@@ -140,31 +140,22 @@ pub(crate) trait UsageHttp {
     fn get(&self, url: &str, bearer: &str) -> Result<HttpReply, ThirdPartyError>;
 }
 
-/// The shared usage agent ([`crate::usage::http_agent`]): short timeouts,
-/// statuses on the `Ok` side.
+/// The key-bearing transport ([`crate::usage::keyed_http`]): no redirects, a
+/// 2 MiB body cap, an end-to-end deadline, statuses on the `Ok` side.
 pub(crate) struct LiveHttp;
 
 impl UsageHttp for LiveHttp {
     fn get(&self, url: &str, bearer: &str) -> Result<HttpReply, ThirdPartyError> {
-        let mut response = crate::usage::http_agent()
-            .get(url)
-            .header("Authorization", &format!("Bearer {bearer}"))
-            .header("Accept", "application/json")
-            .call()
-            .map_err(|_| ThirdPartyError::Network)?;
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::usage::parse_retry_after);
+        // The key-bearing transport: no redirect followed (a 3xx is no
+        // answer), a 2 MiB body cap, and an end-to-end deadline.
+        let reply =
+            crate::usage::keyed_http::get_bearer(url, bearer).ok_or(ThirdPartyError::Network)?;
         // An error body is read for the 429 classification; one that fails to
         // read is empty, which classifies as a plain rate limit.
-        let body = response.body_mut().read_to_string().unwrap_or_default();
         Ok(HttpReply {
-            status,
-            retry_after,
-            body,
+            status: reply.status,
+            retry_after: reply.retry_after,
+            body: reply.body.unwrap_or_default(),
         })
     }
 }

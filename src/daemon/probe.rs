@@ -497,6 +497,7 @@ pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
     let mut cmd = std::process::Command::new("kill");
     cmd.args(["-s", signal, &pid.to_string()]);
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     // A soft-pass refusal (a dead pid's ESRCH) is expected noise: silence it.
     // The hard pass stays loud — its failure is the diagnosis the generic
     // wedged-process bail lacks.

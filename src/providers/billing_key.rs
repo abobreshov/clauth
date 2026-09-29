@@ -175,6 +175,24 @@ pub(crate) fn scrub_billing_env(command: &mut std::process::Command) {
     }
 }
 
+/// [`scrub_billing_env`] for a helper the daemon or the CLI spawns that is
+/// neither a session nor the gateway: `notify-send`, the browser opener,
+/// herdr, git, `ps` / `kill`, the FQDN lookup, the MCP probe. The process
+/// that holds a monitoring or billing key in its env to read balances hands
+/// none of them on — not a monitor's `api_key_env`, not a `billing_key_env`.
+///
+/// Test builds skip the scrub when no `HomeSandbox` is live: its name list
+/// is read from `~/.tollgate`, which a test must never resolve to the
+/// operator's real home, and a test that spawns a fixture helper without a
+/// sandbox holds no referenced key to strip.
+pub(crate) fn scrub_helper_env(command: &mut std::process::Command) {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return;
+    }
+    scrub_billing_env(command);
+}
+
 #[cfg(test)]
 #[path = "../../tests/inline/providers_billing_key.rs"]
 mod tests;

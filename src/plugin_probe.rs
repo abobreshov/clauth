@@ -168,6 +168,7 @@ fn probe_command() -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     cmd
 }
 

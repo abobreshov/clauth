@@ -612,19 +612,15 @@ pub(crate) enum ThirdPartyError {
 // ── HTTP ────────────────────────────────────────────────────────────────────────
 
 fn get_json(url: &str, api_key: &str) -> Result<String, ThirdPartyError> {
-    let mut response = crate::usage::http_agent()
-        .get(url)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .call()
-        .map_err(|_| ThirdPartyError::Network)?;
-    let status = response.status().as_u16();
+    // The key-bearing transport: no redirect followed (a 3xx is no answer), a
+    // 2 MiB body cap, and an end-to-end deadline.
+    let reply =
+        crate::usage::keyed_http::get_bearer(url, api_key).ok_or(ThirdPartyError::Network)?;
+    let status = reply.status;
     if status == 429 {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::usage::parse_retry_after);
-        return Err(ThirdPartyError::RateLimited { retry_after });
+        return Err(ThirdPartyError::RateLimited {
+            retry_after: reply.retry_after,
+        });
     }
     if status == 401 {
         // The api key is dead for this host and no refresh path exists, so
@@ -637,10 +633,7 @@ fn get_json(url: &str, api_key: &str) -> Result<String, ThirdPartyError> {
     if status >= 400 {
         return Err(ThirdPartyError::Status);
     }
-    response
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| ThirdPartyError::Network)
+    reply.body.ok_or(ThirdPartyError::Network)
 }
 
 // ── Disk cache ──────────────────────────────────────────────────────────────────

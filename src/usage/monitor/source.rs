@@ -13,7 +13,6 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -381,21 +380,6 @@ pub(crate) fn bearer_url_allowed(url: &str) -> bool {
             .is_some_and(|rest| !rest.is_empty())
 }
 
-/// Largest response body a monitor reads (plan §4.2: 2 MiB).
-const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
-
-/// A dedicated agent: status codes on the `Ok` side, and NO redirects, so a
-/// bearer can never follow a 30x off the allowlisted origin.
-static MONITOR_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(8)))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .build()
-        .into()
-});
-
 /// The real network.
 pub(crate) struct LiveHttp;
 
@@ -408,29 +392,18 @@ impl MonitorHttp for LiveHttp {
             ));
         }
         guard_test_network(url);
-        let mut response = MONITOR_AGENT
-            .get(url)
-            .header("Authorization", &format!("Bearer {}", token.expose()))
-            .header("Accept", "application/json")
-            .call()
-            .map_err(|_| Failure::new(FailureKind::Unavailable, "could not reach the source"))?;
-        let status = response.status().as_u16();
-        let retry_after_secs = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::usage::parse_retry_after)
-            .map(|d| d.as_secs());
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_BODY_BYTES)
-            .read_to_string()
-            .map_err(|_| Failure::new(FailureKind::Unavailable, "could not read the response"))?;
+        // The shared key-bearing transport (plan §4.2): no redirect is ever
+        // followed, the body is capped at 2 MiB, and the call has an
+        // end-to-end deadline so a stalled body cannot freeze the poll.
+        let reply = crate::usage::keyed_http::get_bearer(url, token.expose())
+            .ok_or_else(|| Failure::new(FailureKind::Unavailable, "could not reach the source"))?;
+        let body = reply
+            .body
+            .ok_or_else(|| Failure::new(FailureKind::Unavailable, "could not read the response"))?;
         Ok(HttpReply {
-            status,
+            status: reply.status,
             body,
-            retry_after_secs,
+            retry_after_secs: reply.retry_after.map(|d| d.as_secs()),
         })
     }
 

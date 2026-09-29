@@ -705,31 +705,110 @@ pub(crate) fn sanitize_message(raw: &str) -> String {
 /// For text a person reads whole (a config error) that must still never
 /// carry a key.
 pub(crate) fn redact_credentials(raw: &str) -> String {
-    fn tokenish(w: &str) -> bool {
-        let core = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        let alphabet = |c: char| c.is_ascii_alphanumeric() || "-_.=+/".contains(c);
-        let lower = core.to_ascii_lowercase();
-        (core.len() >= 32 && core.chars().all(alphabet))
-            || ((lower.starts_with("sk-") || lower.starts_with("sess-") || lower.starts_with("ey"))
-                && core.len() >= 16
-                && core.chars().all(alphabet))
-    }
     let cleaned: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let mut out: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut redact_next = false;
     for word in cleaned.split_whitespace() {
-        if redact_next || tokenish(word) {
-            out.push("[redacted]");
+        if tokenish(word) {
+            out.push("[redacted]".to_string());
             redact_next = false;
             continue;
         }
-        redact_next = word.eq_ignore_ascii_case("bearer");
+        // After a `Bearer`, the next word's first run is the credential; the
+        // punctuation around it (`abc"}`) is kept.
+        let (word, pending) = redact_embedded(word, redact_next);
+        redact_next = pending;
         out.push(word);
     }
     out.join(" ")
+}
+
+/// A token-alphabet character: what keys, JWTs and base64/hex runs are made of.
+fn token_alphabet(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-_.=+/".contains(c)
+}
+
+/// `w` with its non-alphanumeric edges trimmed.
+fn token_core(w: &str) -> &str {
+    w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+}
+
+/// A credential-shaped word: a 32+-char run of token alphabet, or an
+/// `sk-` (`sk-or-`, `sk-ant-`, `sk-nous-` …) / `sess-` / JWT (`ey…`) key of 16+.
+fn tokenish(w: &str) -> bool {
+    let core = token_core(w);
+    let lower = core.to_ascii_lowercase();
+    (core.len() >= 32 && core.chars().all(token_alphabet))
+        || ((lower.starts_with("sk-") || lower.starts_with("sess-") || lower.starts_with("ey"))
+            && core.len() >= 16
+            && core.chars().all(token_alphabet))
+}
+
+/// A credential embedded in punctuation (`{"token":"sk-…"}`, `key=…`,
+/// `"Bearer abc"`): each token-alphabet run inside `word` is judged on its
+/// own. A run is redacted when it is a prefixed key, or a 32+ run mixing
+/// letters and digits (hex, base64; a plain URL path of words is kept), or
+/// when it follows a `Bearer` run. Returns the word with those runs masked
+/// (the punctuation around them kept) and whether a trailing `Bearer` asks
+/// for the next word to be masked too. `after_bearer` says the previous word
+/// ended in one.
+fn redact_embedded(word: &str, mut after_bearer: bool) -> (String, bool) {
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(first) = rest.chars().next() {
+        let in_alphabet = token_alphabet(first);
+        let end = rest
+            .find(|c: char| token_alphabet(c) != in_alphabet)
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(end);
+        rest = tail;
+        if !in_alphabet {
+            out.push_str(run);
+            continue;
+        }
+        let core = token_core(run);
+        if core.is_empty() {
+            out.push_str(run);
+            continue;
+        }
+        let mixed = core.chars().any(|c| c.is_ascii_digit())
+            && core.chars().any(|c| c.is_ascii_alphabetic());
+        let lower = core.to_ascii_lowercase();
+        let prefixed = lower.starts_with("sk-") || lower.starts_with("sess-");
+        let credential = after_bearer || (tokenish(core) && (prefixed || mixed));
+        let lead = run.len()
+            - run
+                .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+                .len();
+        // A prefixed key glued to its name by `=` (`api_key=sk-…`): `=` is
+        // token alphabet (base64 padding), so the run starts with the name.
+        let glued = (!credential)
+            .then(|| {
+                core.match_indices('=').map(|(i, _)| i + 1).find(|&i| {
+                    let tail = &core[i..];
+                    let lower = tail.to_ascii_lowercase();
+                    (lower.starts_with("sk-") || lower.starts_with("sess-")) && tokenish(tail)
+                })
+            })
+            .flatten();
+        if credential {
+            // The whole run: base64 padding (`=`) is part of the secret.
+            out.push_str("[redacted]");
+            after_bearer = false;
+        } else if let Some(at) = glued {
+            out.push_str(&run[..lead + at]);
+            out.push_str("[redacted]");
+            out.push_str(&run[lead + core.len()..]);
+            after_bearer = false;
+        } else {
+            out.push_str(run);
+            after_bearer = core.eq_ignore_ascii_case("bearer");
+        }
+    }
+    (out, after_bearer)
 }
 
 // ── Quota windows ──────────────────────────────────────────────────────────────
