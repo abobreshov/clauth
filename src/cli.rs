@@ -391,12 +391,23 @@ pub(crate) enum Command {
     /// codex profiles and monitoring sources — read from the on-disk usage
     /// caches, never fetched. `--json` prints the stable envelope agents read:
     /// `{schema_version: 1, generated_at, guest_mode, accounts: [...]}`, money
-    /// as exact decimal strings and times as RFC 3339. Without it, one line
-    /// per account.
+    /// as exact decimal strings and times as RFC 3339. Without it, a report of
+    /// metric cards grouped by provider, coloured from the palette on a
+    /// terminal and plain under NO_COLOR, off a terminal, or with --plain.
     Usage {
-        /// Emit the stable JSON envelope instead of one line per account.
-        #[arg(long)]
+        /// Emit the stable JSON envelope instead of the text report.
+        #[arg(long, conflicts_with_all = ["plain", "waybar"])]
         json: bool,
+        /// The text report without colour.
+        #[arg(long)]
+        plain: bool,
+        /// One `{text, tooltip, class, percentage}` JSON line for a Waybar
+        /// custom module (`return-type: json`).
+        #[arg(long, conflicts_with = "plain")]
+        waybar: bool,
+        /// Repeat every N seconds until interrupted.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
         /// Also include disabled profiles, hidden by default.
         #[arg(long)]
         all: bool,

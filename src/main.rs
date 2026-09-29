@@ -302,17 +302,23 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Usage {
             json,
+            plain,
+            waybar,
+            watch,
             all,
             account,
             provider,
-        } => usage::report::run(
+        } => usage::pretty::run(&usage::pretty::UsageArgs {
             json,
-            &usage::collect::CollectOpts {
+            plain,
+            waybar,
+            watch,
+            opts: usage::collect::CollectOpts {
                 include_disabled: all,
                 account,
                 provider,
             },
-        ),
+        }),
         Command::Status {
             json: _,
             all,

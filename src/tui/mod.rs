@@ -31,9 +31,25 @@ pub(crate) fn run(config: AppConfig, herdr_mode: bool) -> Result<()> {
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool) -> Result<()> {
+    // Palette (plan §4.5): resolve `palette` against the Omarchy theme files
+    // before the first paint, then let the tick reload it live.
+    let palette_setting = config.state.palette_setting();
+    let palette = crate::profile::home_dir()
+        .ok()
+        .map(|home| (theme::init_palette(palette_setting, &home), home));
     let mut application = app::App::new(config)
         .with_herdr_mode(herdr_mode)
         .with_guest_mode(crate::identity::upstream_active());
+    if let Some((resolved, home)) = palette {
+        if let Some(why) = resolved.error {
+            application.toast(
+                app::ToastKind::Warning,
+                format!("omarchy theme colours unreadable, using catppuccin\n{why}"),
+            );
+        }
+        application =
+            application.with_palette_watch(theme::PaletteWatch::new(palette_setting, home));
+    }
     // Non-blocking reconcile: fast path runs inline; verdict sequenced via
     // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile
     // settles — neither blocks the first paint.

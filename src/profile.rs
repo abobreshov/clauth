@@ -621,6 +621,16 @@ pub(crate) enum ThemeName {
     Compatible,
 }
 
+/// Palette stored in `profiles.toml`: `palette = "auto" | "omarchy" |
+/// "catppuccin"`. `theme` stays the colour depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PaletteName {
+    Auto,
+    Omarchy,
+    Catppuccin,
+}
+
 /// How a usage window's reset renders across the TUI (`AppState.reset_display`,
 /// issue #39). `Relative` is the shipped default and the pre-setting behavior,
 /// byte for byte.
@@ -951,6 +961,11 @@ pub(crate) struct AppState {
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeName>,
+    /// Which palette colours render with: `palette = "auto"` (the default:
+    /// Omarchy when its `colors.toml` exists, else Catppuccin), `"omarchy"`
+    /// or `"catppuccin"`. Independent of `theme`, which is colour depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) palette: Option<PaletteName>,
     /// Shape of every reset countdown in the TUI. `None` = the
     /// [`ResetDisplay`] default, so an untouched profiles.toml carries neither
     /// this key nor [`AppState::clock_format`] and renders exactly as it did
@@ -1103,6 +1118,16 @@ impl AppState {
         self.home_tab.unwrap_or_default()
     }
 
+    /// The effective palette (unset = `auto`).
+    pub(crate) fn palette_setting(&self) -> crate::tui::theme::PaletteSetting {
+        use crate::tui::theme::PaletteSetting;
+        match self.palette {
+            None | Some(PaletteName::Auto) => PaletteSetting::Auto,
+            Some(PaletteName::Omarchy) => PaletteSetting::Omarchy,
+            Some(PaletteName::Catppuccin) => PaletteSetting::Catppuccin,
+        }
+    }
+
     /// The effective weekly exhaustion line: the configured value when it sits
     /// inside [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
     /// DEFAULT (a reset, not a clamp-to-nearest-bound: fail-safe high beats
@@ -1242,6 +1267,7 @@ impl Default for AppState {
             refresh_spent_accounts: true,
             auto_start_queue: false,
             theme: None,
+            palette: None,
             reset_display: None,
             clock_format: None,
             home_tab: None,

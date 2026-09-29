@@ -94,11 +94,31 @@ struct HeaderState {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let items = app.config().profiles.len();
+    let profiles = app.config().profiles.len();
+    let items = profiles + app.usage_extras.len();
     let (selector, detail) = master_detail(area, items);
 
-    draw_profile_selector(frame, selector, app, app.profile_cursor, true);
-    draw_usage_detail(frame, detail, app);
+    // Monitoring / upstream accounts ride below the profiles on the rail and
+    // render through the shared metric-card layout.
+    if app.usage_extras.is_empty() {
+        draw_profile_selector(frame, selector, app, app.profile_cursor, true);
+        draw_usage_detail(frame, detail, app);
+        return;
+    }
+    // With no profile to rest on, the rail's first row is the first extra.
+    let extra = app
+        .usage_extra_cursor
+        .or((profiles == 0).then_some(0))
+        .and_then(|i| app.usage_extras.get(i).map(|o| (i, o)));
+    let sel = match extra {
+        Some((i, _)) => profiles + i,
+        None => app.profile_cursor.min(profiles.saturating_sub(1)),
+    };
+    super::cards::draw_usage_rail(frame, selector, app, sel);
+    match extra {
+        Some((_, obs)) => super::cards::draw_observation_detail(frame, detail, obs, app.guest_mode),
+        None => draw_usage_detail(frame, detail, app),
+    }
 }
 
 /// Which reading source the shown profile's stuck judgment took — the one that

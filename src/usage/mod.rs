@@ -11,10 +11,14 @@ pub(crate) mod codex_reset;
 // read-time derivations, the projections of today's caches onto it, the
 // collector with its source hooks, and `tollgate usage`. Reached by path
 // (`crate::usage::observation::…`), not re-exported item by item.
+// The metric-card layout (plan §4.5) the CLI report and the TUI share, and the
+// `tollgate usage` text / Waybar sinks over it.
+pub(crate) mod cards;
 pub(crate) mod collect;
 pub(crate) mod derive;
 mod fetch;
 pub(crate) mod observation;
+pub(crate) mod pretty;
 pub(crate) mod project;
 pub(crate) mod report;
 mod scheduler;
