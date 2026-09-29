@@ -112,6 +112,7 @@ fn disk_cache_roundtrips_stats() {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     };
     crate::testutil::register_names(&["tp-cache-test"]);
     crate::profile_cache::write_profile_cache(
@@ -259,6 +260,7 @@ fn throttle_key_known_provider_uses_canonical_origin() {
         ThirdPartyTarget::Known {
             provider: Provider::DeepSeek,
             console: None,
+            billing_key_env: None,
         }
         .throttle_key(),
         "https://api.deepseek.com"
@@ -267,6 +269,7 @@ fn throttle_key_known_provider_uses_canonical_origin() {
         ThirdPartyTarget::Known {
             provider: Provider::Zai,
             console: None,
+            billing_key_env: None,
         }
         .throttle_key(),
         "https://api.z.ai"
@@ -275,6 +278,7 @@ fn throttle_key_known_provider_uses_canonical_origin() {
         ThirdPartyTarget::Known {
             provider: Provider::OpenRouter,
             console: None,
+            billing_key_env: None,
         }
         .throttle_key(),
         "https://openrouter.ai"

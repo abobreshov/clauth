@@ -474,8 +474,23 @@ pub(crate) fn apply_third_party(
     stats: &ThirdPartyStats,
     now_secs: i64,
 ) {
-    obs.windows = third_party_windows(stats, now_secs);
-    obs.money = third_party_money(stats);
+    match &stats.observed {
+        // A typed provider's meters from its raw JSON numbers: exact, so the
+        // rounded display rows are not re-parsed (OpenRouter v2).
+        Some(observed) => {
+            obs.windows = observed
+                .windows
+                .iter()
+                .filter(|w| is_live(w.resets_at, now_secs))
+                .cloned()
+                .collect();
+            obs.money = observed.money.clone();
+        }
+        None => {
+            obs.windows = third_party_windows(stats, now_secs);
+            obs.money = third_party_money(stats);
+        }
+    }
     if obs.plan.is_none() {
         obs.plan = stats.plan.clone();
     }

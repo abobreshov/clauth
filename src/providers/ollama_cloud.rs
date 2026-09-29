@@ -318,6 +318,7 @@ pub(crate) fn parse_usage(body: &str) -> Result<ThirdPartyStats, ThirdPartyError
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     })
 }
 

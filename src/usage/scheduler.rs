@@ -332,7 +332,12 @@ impl ThirdPartyEntry {
         let mut hasher = Sha256::new();
         field(&mut hasher, self.api_key.as_bytes());
         match &self.target {
-            crate::providers::ThirdPartyTarget::Known { provider, console } => {
+            // `billing_key_env` is deliberately not hashed: it names a
+            // monitoring credential whose failures never mark the inference
+            // key dead, so it must not reset that key's suppression record.
+            crate::providers::ThirdPartyTarget::Known {
+                provider, console, ..
+            } => {
                 field(&mut hasher, b"known");
                 // A literal per variant, NOT `display_name`: that is user-facing
                 // copy and may be reworded, which would silently reset every
@@ -2783,6 +2788,10 @@ fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry>
         crate::providers::ThirdPartyTarget::Known {
             provider,
             console: p.console.clone(),
+            // A NAME read off config.toml, never the value (OpenRouter only).
+            billing_key_env: (provider == crate::providers::Provider::OpenRouter)
+                .then(|| crate::providers::billing_key::billing_key_env(&p.name))
+                .flatten(),
         }
     } else {
         crate::providers::ThirdPartyTarget::Generic {

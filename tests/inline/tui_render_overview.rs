@@ -280,6 +280,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         }),
         usage_stale: false,
     }
@@ -335,6 +336,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         }),
         usage_stale: false,
     }

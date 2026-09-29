@@ -97,6 +97,7 @@ fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
         plan: data.level.clone(),
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 

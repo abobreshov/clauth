@@ -191,6 +191,7 @@ fn wallet_rows_stats(amount: f64) -> crate::providers::ThirdPartyStats {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 

@@ -190,6 +190,7 @@ fn provider_metadata_for_both_transports() {
     let target = ThirdPartyTarget::Known {
         provider: cloud,
         console: None,
+        billing_key_env: None,
     };
     assert_eq!(target.throttle_key(), "https://ollama.com");
 
@@ -470,6 +471,7 @@ fn the_daemon_arm_says_usage_needs_a_key_without_a_request() {
     let target = ThirdPartyTarget::Known {
         provider: Provider::OllamaDaemon,
         console: None,
+        billing_key_env: None,
     };
     let s = fetch_third_party_usage(&target, "", None).unwrap();
     assert!(s.bars.is_empty());

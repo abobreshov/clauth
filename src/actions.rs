@@ -892,29 +892,19 @@ pub(crate) fn edit_profile_preferred_days(
     })
 }
 
-/// Apply a preset (`base_url` + `models`) in a single locked transaction. A
-/// preset never carries the api key, so the account's own credential is
-/// preserved. Building the full profile state and writing it once — one lock
-/// acquisition, one disk write, one live-settings re-apply — means a failure
-/// leaves the account on its prior state rather than half-stamped (new endpoint,
-/// old models) the way chaining [`edit_profile_endpoint`] +
-/// [`edit_profile_model`] would. Test-only now: the Setup tab applies presets
-/// through [`edit_profile_preset_with_env`], which this is with no env.
-#[cfg(test)]
+/// Apply a preset (`base_url` + `models` + its env switches) in a single
+/// locked transaction. A preset never carries the api key, so the account's
+/// own credential is preserved. Building the full profile state and writing it
+/// once — one lock acquisition, one disk write, one live-settings re-apply —
+/// means a failure leaves the account on its prior state rather than
+/// half-stamped (new endpoint, old models) the way chaining
+/// [`edit_profile_endpoint`] + [`edit_profile_model`] would.
+///
+/// `env` is filtered through [`crate::presets::PRESET_ENV_ALLOWLIST`] whatever
+/// the caller passes, and each surviving entry is added only where the account
+/// has no value for that key: an operator's own setting always wins, and
+/// nothing is ever removed.
 pub(crate) fn edit_profile_preset(
-    config: &mut AppConfig,
-    name: &ProfileName,
-    base_url: Option<String>,
-    models: ModelSettings,
-) -> Result<()> {
-    edit_profile_preset_with_env(config, name, base_url, models, &BTreeMap::new())
-}
-
-/// [`edit_profile_preset`] plus a built-in preset's env allowlist (the Ollama
-/// Cloud preset's telemetry knobs), in the same transaction. Each entry is
-/// added only where the account has no value for that key: an operator's own
-/// setting always wins, and nothing is ever removed.
-pub(crate) fn edit_profile_preset_with_env(
     config: &mut AppConfig,
     name: &ProfileName,
     base_url: Option<String>,
@@ -925,8 +915,8 @@ pub(crate) fn edit_profile_preset_with_env(
         let profile = config.find_mut(name).context("profile not found")?;
         profile.base_url = base_url;
         profile.models = models;
-        for (k, v) in env {
-            profile.env.entry(k.clone()).or_insert_with(|| v.clone());
+        for (k, v) in crate::presets::allowlisted_env(env.clone()) {
+            profile.env.entry(k).or_insert(v);
         }
         // Re-derive the provider exactly like `edit_profile_endpoint`: a stale
         // value here keeps (or blocks) third-party fetches against the wrong
@@ -1850,16 +1840,45 @@ pub(crate) fn create_blank_profile(
     api_key: Option<String>,
     model: Option<String>,
 ) -> Result<()> {
+    let models = ModelSettings {
+        default: model,
+        ..ModelSettings::default()
+    };
+    create_blank_profile_with(config, name, base_url, api_key, models, &BTreeMap::new())
+}
+
+/// [`create_blank_profile`] with a full model block (every tier override the
+/// `+ new` form holds, e.g. stamped from a preset) and preset env switches
+/// (filtered through [`crate::presets::PRESET_ENV_ALLOWLIST`]). Blank model
+/// values are dropped.
+pub(crate) fn create_blank_profile_with(
+    config: &mut AppConfig,
+    name: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    models: ModelSettings,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
     with_state_lock(|_held| {
         let mut profile = Profile::new(name, base_url, api_key);
         // Part of the same single save as the profile itself — a chained
         // edit-after-create would leave a saved-but-model-less profile behind
         // when the second write fails, reported as a flat "create failed".
-        profile.models.default = model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        let clean = |m: Option<String>| {
+            m.as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+        };
+        profile.models = ModelSettings {
+            default: clean(models.default),
+            opus: clean(models.opus),
+            sonnet: clean(models.sonnet),
+            haiku: clean(models.haiku),
+            fable: clean(models.fable),
+            subagent: clean(models.subagent),
+        };
+        profile.env = crate::presets::allowlisted_env(env.clone());
         save_profile(&profile)?;
         config.add(profile);
         save_app_state(&config.state)

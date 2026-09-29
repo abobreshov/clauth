@@ -27,6 +27,7 @@ fn a_mismatched_usage_cache_read_returns_none() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     assert!(

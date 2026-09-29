@@ -49,6 +49,7 @@ fn third_party_stats(
         plan: plan.map(str::to_string),
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 

@@ -24,8 +24,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
     capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
-    create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset_with_env,
+    create_blank_profile_with, create_profile_from_login, delete_profile, duplicate_profile,
+    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
     find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
     rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
     snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
@@ -503,6 +503,11 @@ pub(crate) struct ConfigDraft {
     /// editable until then. Dropped with the draft; never set on an existing
     /// account's draft.
     pub(crate) captured_login: Option<DraftLogin>,
+    /// Env switches a preset stamped onto a `+ new` draft
+    /// ([`crate::presets::Preset::env`], allowlisted), committed with the
+    /// create. Empty on an existing account's draft, which applies a preset
+    /// straight to disk instead.
+    pub(crate) preset_env: std::collections::BTreeMap<String, String>,
 }
 
 impl ConfigDraft {
@@ -7660,6 +7665,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         relogin_chain: false,
         overrides_expanded: false,
         captured_login: None,
+        preset_env: std::collections::BTreeMap::new(),
     }
 }
 
@@ -7686,6 +7692,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         relogin_chain: false,
         overrides_expanded: false,
         captured_login: None,
+        preset_env: std::collections::BTreeMap::new(),
     }
 }
 
@@ -9165,6 +9172,15 @@ fn commit_new_account(app: &mut App) {
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
     let model = d.model.trimmed_some();
+    let models = crate::profile::ModelSettings {
+        default: model.clone(),
+        opus: d.opus_model.trimmed_some(),
+        sonnet: d.sonnet_model.trimmed_some(),
+        haiku: d.haiku_model.trimmed_some(),
+        fable: d.fable_model.trimmed_some(),
+        subagent: d.subagent_model.trimmed_some(),
+    };
+    let preset_env = d.preset_env.clone();
     // A draft-held mint only makes sense for an OAuth create; a typed base url
     // flipped the form to API mode (login row hidden), so the mint is dropped.
     // The live-login stash commits in BOTH modes — a live setup can be an
@@ -9201,7 +9217,16 @@ fn commit_new_account(app: &mut App) {
                 login.credentials,
                 login.account_uuid,
             ),
-            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model),
+            // Every model row the form holds rides the create, so a preset's
+            // per-tier pins (OpenRouter's, Alibaba's) are not dropped.
+            None => create_blank_profile_with(
+                &mut cfg,
+                name.clone(),
+                base_url,
+                api_key,
+                models,
+                &preset_env,
+            ),
         }
     };
     match result {
@@ -9532,7 +9557,7 @@ fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
 }
 
 /// Stamp `preset` onto `target`. A saved account is written in a single locked
-/// transaction ([`edit_profile_preset_with_env`]) so a failure leaves the whole profile on
+/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
 /// its prior state. On `+ new` (cursor past the roster) the target names the
 /// unsaved draft, not a profile on disk — the preset's fields are written into
 /// the draft's input buffers directly and committed when the create form fires.
@@ -9557,7 +9582,7 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
     let target = ProfileName::from(target);
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset_with_env(
+        edit_profile_preset(
             &mut cfg,
             &target,
             preset.base_url.clone(),
@@ -9610,6 +9635,7 @@ fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
             *field = InputState::new(m);
         }
     }
+    draft.preset_env.extend(preset.env.clone());
     let name = preset.name.clone();
     app.toast(
         ToastKind::Success,

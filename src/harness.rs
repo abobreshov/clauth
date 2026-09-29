@@ -107,6 +107,9 @@ impl HarnessEngine for ClaudeEngine {
         // The CODEX_HOME half is the cross-harness one; the caller pins
         // CLAUDE_CONFIG_DIR itself right after.
         crate::runtime::scrub_tollgate_homes(command);
+        // Monitoring credentials (an OpenRouter management key) never reach
+        // a session: only the daemon's usage leg reads them.
+        crate::providers::billing_key::scrub_billing_env(command);
     }
 }
 
@@ -180,6 +183,7 @@ impl HarnessEngine for CodexEngine {
         // session would answer as the ancestor claude session (the runtime
         // claim deliberately outranks the codex arm).
         crate::runtime::scrub_tollgate_homes(command);
+        crate::providers::billing_key::scrub_billing_env(command);
     }
 }
 

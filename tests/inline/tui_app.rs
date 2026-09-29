@@ -2261,6 +2261,98 @@ fn a_preset_apply_clears_the_old_providers_streak() {
     );
 }
 
+/// OpenRouter preset v2 applied to a saved account: the tier pins replace the
+/// old `openrouter/auto` default, the allowlisted env switch lands beside the
+/// account's own env, and the api key stays where it was (helper-served).
+#[test]
+fn the_openrouter_preset_stamps_tiers_and_its_env_switch_onto_an_account() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut or = crate::testutil::blank_profile(&ProfileName::from("or"));
+    or.api_key = Some("sk-or-v1-placeholder".to_string());
+    or.base_url = Some("https://openrouter.ai/api".to_string());
+    or.provider = Some(crate::providers::Provider::OpenRouter);
+    or.models.default = Some("openrouter/auto".to_string());
+    or.env.insert("MY_OWN".to_string(), "keep".to_string());
+    crate::profile::save_profile(&or).expect("save the profile");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("or")],
+            ..AppState::default()
+        },
+        profiles: vec![or],
+    });
+
+    super::apply_preset_to(&mut app, "or", "OpenRouter");
+
+    let reloaded = crate::profile::load_profile(&ProfileName::from("or")).expect("reload");
+    assert_eq!(reloaded.models.default, None, "openrouter/auto is dropped");
+    assert_eq!(
+        reloaded.models.opus.as_deref(),
+        Some("~anthropic/claude-opus-latest[1m]")
+    );
+    assert_eq!(
+        reloaded.models.subagent.as_deref(),
+        Some("~anthropic/claude-opus-latest[1m]")
+    );
+    assert_eq!(
+        reloaded
+            .env
+            .get("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(reloaded.env.get("MY_OWN").map(String::as_str), Some("keep"));
+    assert!(!reloaded.env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+    assert_eq!(reloaded.api_key.as_deref(), Some("sk-or-v1-placeholder"));
+}
+
+/// The `+ new` form: a stamped preset's tier pins and env switch ride the
+/// create instead of being dropped with the draft.
+#[test]
+fn a_new_account_stamped_from_the_openrouter_preset_keeps_its_pins() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0;
+    app.config_draft = Some(super::build_draft_new());
+
+    super::apply_preset_to(&mut app, "", "OpenRouter");
+    {
+        let d = app.config_draft.as_mut().expect("draft");
+        d.name = super::InputState::new("or-new");
+        d.api_key = super::InputState::new("sk-or-v1-placeholder");
+    }
+    super::commit_new_account(&mut app);
+
+    let p = crate::profile::load_profile(&ProfileName::from("or-new")).expect("created");
+    assert_eq!(p.base_url.as_deref(), Some("https://openrouter.ai/api"));
+    assert_eq!(p.models.default, None);
+    assert_eq!(
+        p.models.sonnet.as_deref(),
+        Some("~anthropic/claude-sonnet-latest[1m]")
+    );
+    assert_eq!(
+        p.models.haiku.as_deref(),
+        Some("~anthropic/claude-haiku-latest")
+    );
+    assert_eq!(
+        p.env
+            .get("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(p.env.len(), 1, "nothing but the allowlisted switch");
+}
+
 /// R4: the divergence resolver's Overwrite choice snapshots the LIVE login
 /// into the active profile's stored credential — a credential replacement, so
 /// the OAuth leg's stale verdict must retire with it, not survive until the
@@ -9839,6 +9931,7 @@ fn wire_wallet_stats(amount: f64) -> crate::providers::ThirdPartyStats {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 

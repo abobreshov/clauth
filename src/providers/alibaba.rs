@@ -344,6 +344,7 @@ fn stats(
             .filter(|p| !p.is_empty()),
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 

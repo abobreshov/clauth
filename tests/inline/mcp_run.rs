@@ -1085,6 +1085,9 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
 
 #[test]
 fn delegate_env_strips_inherited_provider_routing() {
+    // The scrub reads the configured profiles' monitoring-credential env
+    // names (`providers::billing_key`), so it needs a home.
+    let _home = crate::testutil::HomeSandbox::new();
     let mut cmd = Command::new("claude");
     apply_delegate_env(
         &mut cmd,
@@ -1124,6 +1127,9 @@ fn delegate_env_strips_inherited_provider_routing() {
 
 #[test]
 fn delegate_env_strips_active_profile_custom_env() {
+    // The scrub reads the configured profiles' monitoring-credential env
+    // names (`providers::billing_key`), so it needs a home.
+    let _home = crate::testutil::HomeSandbox::new();
     // the active profile's custom env keys are scrubbed from the inherited
     // process env too, so a delegate aimed at profile B drops profile A's
     // custom `[env]`. Mirrors the settings.json channel (active_env_keys).
@@ -1147,6 +1153,9 @@ fn delegate_env_strips_active_profile_custom_env() {
 
 #[test]
 fn delegate_env_caller_reauthority_and_tollgate_keys_win() {
+    // The scrub reads the configured profiles' monitoring-credential env
+    // names (`providers::billing_key`), so it needs a home.
+    let _home = crate::testutil::HomeSandbox::new();
     let mut caller = HashMap::new();
     // a caller may deliberately re-route by re-adding a stripped key,
     caller.insert(
@@ -5097,6 +5106,7 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
             plan: Some("pro".to_string()),
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     assert_eq!(
@@ -5122,6 +5132,7 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     assert_eq!(
@@ -5212,6 +5223,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
 
@@ -5237,6 +5249,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     assert_eq!(
@@ -5308,6 +5321,7 @@ fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     assert_eq!(
@@ -5532,6 +5546,7 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     assert_eq!(
