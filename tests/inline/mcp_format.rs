@@ -74,6 +74,7 @@ fn switch_profile_refusal_answers_prose_in_one_block() {
 
     let prose = drive(TollgateServer::new().switch_profile(Parameters(SwitchArgs {
         name: "ghost".to_string(),
+        session: None,
     })));
     assert_eq!(prose.is_error, Some(true));
     let text = assert_one_prose_block(&prose);

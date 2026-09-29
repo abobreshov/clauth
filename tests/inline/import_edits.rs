@@ -285,6 +285,7 @@ fn g3_rewrites_the_upstream_helper_and_permissions_allow_and_rollback_reverses_b
     let after = read_json(&settings);
     let want = crate::claude::build_api_key_helper_command(
         &exe,
+        crate::claude::HelperForm::Profile,
         &crate::profile::ProfileName::from("me".to_string()),
     );
     assert_eq!(after["apiKeyHelper"], Value::String(want));

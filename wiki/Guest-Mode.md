@@ -58,11 +58,15 @@ tollgate: upstream clauth manages ~/.claude on this machine (guest mode). Use 't
 
 | Refused | Why |
 |---------|-----|
-| every Claude Code switch: `tollgate switch <name>`, the bare `tollgate <name>`, the TUI's switch, the MCP `switch_profile` tool, the daemon's REST `POST /api/v1/switch` (answered `409`) | a switch relinks `~/.claude/.credentials.json` and rewrites `settings.json`. A codex switch still runs, but moves only tollgate's own marker and leaves `~/.codex/auth.json` alone |
+| every global Claude Code switch: `tollgate switch <name>`, the bare `tollgate <name>`, the TUI's switch, the MCP `switch_profile` tool without `session`, the daemon's REST `POST /api/v1/switch` (answered `409`) | a switch relinks `~/.claude/.credentials.json` and rewrites `settings.json`. A codex switch still runs, but moves only tollgate's own marker and leaves `~/.codex/auth.json` alone. Moving one live session (below) is not a global switch and is allowed |
 | `wrap_off` / switch-off-all | clears the same slot |
 | `tollgate capture` | adopts the login in `~/.claude/.credentials.json`, which upstream owns |
 | `tollgate login <name> --codex`, with or without `--browser` | the capture replaces `~/.codex/auth.json` with a link into tollgate's store; either flow mints a second codex chain beside upstream's |
 | the Claude browser OAuth login, `tollgate login <name> --setup-token`, and the TUI's login | each mints a second Claude login for an account upstream already holds |
+
+## Moving a live session
+
+Moving one `tollgate start` session between accounts works in guest mode ([Auto-switch](Auto-Switch#moving-a-live-session-by-hand)): `tollgate switch <sid> <profile>`, `--relaunch`, the TUI's `m` key and the MCP `switch_profile` tool with `session`. An API-key hot swap writes only under `~/.tollgate`: the session's registry row and its key-helper ack in `~/.tollgate/live_sessions/`, the target's liveness marker, and a touch of the session's own runtime `settings.json`. The session's key helper is `tollgate __tollgate-api-key --session <sid>`, written only to that runtime `settings.json`. Settings sync stays off, so the helper line never reaches `~/.claude/settings.json`. A relaunch resumes the conversation from the guest transcript store, and the new start is a guest start too. The version check runs `claude --version` only.
 
 ## What is skipped silently
 

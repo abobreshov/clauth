@@ -12,7 +12,7 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, NamePromptForm, PresetPickerForm, Tab,
+    LoginStage, Modal, MoveSessionForm, NamePromptForm, PresetPickerForm, Tab,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -36,6 +36,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
+        Modal::MoveSession(form) => draw_move_session(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
     }
 }
@@ -602,6 +603,41 @@ fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
     frame.set_cursor_position((cx, cy));
 }
 
+/// The Overview's `m` modal: one row per live claude session, `sid · now-on ·
+/// executor · state`, where now-on is the member the session is served by.
+fn draw_move_session(frame: &mut Frame<'_>, area: Rect, form: &MoveSessionForm) {
+    let last = form.sessions.len().saturating_sub(1);
+    let cursor = form.cursor.min(last);
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!("moves a live session onto '{}'.", form.target),
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+    for (i, session) in form.sessions.iter().enumerate() {
+        let state = match session.state {
+            crate::hot_swap::SwapState::Requested => "requested",
+            crate::hot_swap::SwapState::Swapping => "swapping…",
+            crate::hot_swap::SwapState::Stalled => "stalled",
+            crate::hot_swap::SwapState::Served => "served",
+        };
+        lines.push(option_line(
+            i == cursor,
+            format!(
+                "{} \u{b7} {} \u{b7} {} \u{b7} {state}",
+                session.sid, session.now_on, session.executor
+            ),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "api-key sessions hot-swap; others get the relaunch command",
+        theme::dim(),
+    )));
+    draw_modal(frame, area, "MOVE SESSION", lines);
+}
+
 /// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
 /// tail so the two groups read apart without a second rule.
 fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm) {
@@ -644,6 +680,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{2191} \u{2193}", "move cursor"),
                 ("\u{21b5}", "switch to selected account (confirm)"),
                 ("shift \u{2191} \u{2193}", "reorder account up / down"),
+                ("m", "move a live session onto this account"),
             ][..],
         )],
         Tab::Usage => vec![(
@@ -820,7 +857,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their
-/// own to document them: the Overview row's leading `●` and `⇄`, the Overview
+/// own to document them: the Overview row's leading `●` and its `⇄` / `…`, the Overview
 /// chain's projected-switch `↲`, and every blocked-reason marker on the
 /// Fallback chain.
 ///
@@ -839,6 +876,10 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         (
             Span::styled("\u{21c4}", theme::dim()),
             "a live session here follows the fallback chain",
+        ),
+        (
+            Span::styled("\u{2026}", theme::dim()),
+            "a live session here is mid api-key hot swap",
         ),
         (switch_mark(), "the chain switches to this account next"),
         reason(BlockedReason::Disabled, DIAG_DISABLED),

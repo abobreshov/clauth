@@ -114,8 +114,8 @@ these optional filters:
 | Route | Body |
 |---|---|
 | `GET /v1/health` | `{ok, version, schema_version, guest_mode, import}` |
-| `GET /v1/accounts` | `{schema_version, accounts: [AccountObservation…]}` |
-| `GET /v1/accounts/{id}` | `{schema_version, account: AccountObservation}`, or `404 account_not_found` |
+| `GET /v1/accounts` | `{schema_version, accounts: [AccountObservation…], live_sessions: [LiveSessionView…]}` |
+| `GET /v1/accounts/{id}` | `{schema_version, account: AccountObservation, live_sessions: [LiveSessionView…]}` (only the sessions whose committed or served member is this account), or `404 account_not_found` |
 | `GET /v1/usage` | `{schema_version, generated_at, guest_mode, accounts}`, the same envelope as `tollgate usage --json` |
 | `GET /v1/providers` | `{schema_version, providers: [{source, display_name, auth_kinds, configured, accounts}]}` |
 | `GET /v1/status` | the `~/.tollgate/status.json` feed, parsed and redacted (never the file's raw bytes), plus `import`, with an `ETag` of the body served; built on the spot when no daemon has written a parseable one |
@@ -206,6 +206,38 @@ always present: an absent value is `null`, an empty list is `[]`.
   journal that does not parse; `completed_at` is the RFC 3339 instant it
   committed, else `null`. There is no write route: the import runs only from
   the CLI.
+
+### A LiveSessionView
+
+`live_sessions` lists every running `tollgate start` session, oldest first,
+with where it stands in a switch. It is read from the session's registry row
+and its key-helper ack, with no lock and no write. A row whose supervisor
+process is gone is left out.
+
+```json
+{"session_id":"4242-0","harness":"claude","start_profile":"or-main","executor":"api_key",
+ "relaunch_reason":null,"requested_member":null,
+ "committed":{"member":"or-alt","generation":2,"at_ms":1759140000000},
+ "served":{"member":"or-main","generation":1,"at_ms":1759139990000},
+ "state":"swapping","idle":true}
+```
+
+- **`executor`** is how the session moves between accounts: `oauth` (its
+  credential link is repointed), `api_key` (an in-class hot swap: only the key
+  its key helper prints changes), or `relaunch_only` (only
+  `tollgate switch <sid> <p> --relaunch` moves it; `relaunch_reason` says
+  why). It is `null` for a codex session, whose `committed` and `served` are
+  `null` too.
+- **`committed`** is the member the session has switched to, and **`served`**
+  the member its requests authenticate as. For an API-key session, `served` is
+  the member its key helper last printed a key for. The two differ while a
+  hot swap is in flight, and attribution uses `served`.
+- **`state`** is `requested` (a switch was asked for and not committed yet),
+  `swapping` (committed, not served yet), `stalled` (the key helper ran for
+  the commit and failed; Claude Code keeps the previous key until it is
+  rejected) or `served`. The state depends only on recorded helper runs, not
+  on elapsed time: a session that has made no request since its commit stays
+  `swapping` and carries `"idle": true`.
 
 **Versioning.** Adding a field does not bump `schema_version`, so ignore keys
 you do not know. A breaking change bumps the version. Refuse any

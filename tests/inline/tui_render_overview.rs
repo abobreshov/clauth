@@ -3550,3 +3550,47 @@ fn without_read_only_rows_the_empty_state_is_unchanged() {
     assert!(text.contains("n to create one"), "{text}");
     assert!(!text.contains("tollgate accounts"), "{text}");
 }
+
+/// Hot-swap spec test 66: an api-key session committed from `main` to `spare`
+/// whose key helper has not served the commit yet counts on `main` (its
+/// requests still authenticate there) and marks the cell `…` instead of `⇄`,
+/// even beside a chain follower. `spare` shows nothing until the helper
+/// serves it.
+#[test]
+fn the_live_cell_marks_a_swapping_session() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            profile("spare", 95.0, 20.0, 3600),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    let mut swapping = live_row("4242-0", "main", false).with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(
+            &crate::testutil::api_key_profile("main", "https://openrouter.ai/api", "k"),
+            true,
+        ),
+    );
+    swapping.current_member = Some("spare".into());
+    swapping.key_generation = Some(1);
+    swapping.committed_at = Some(1);
+    app.live_sessions =
+        crate::live_sessions::LiveTally::of([swapping, live_row("4242-1", "main", true)]);
+
+    let widths = OverviewWidths::new(160, &app);
+    let main = render_overview_row(&app, 0, &widths, false, false);
+    let spare = render_overview_row(&app, 1, &widths, false, false);
+    assert_eq!(
+        live_cell_text(&widths, &main),
+        "2  \u{2026}",
+        "the swap in flight outranks the chain follower's mark"
+    );
+    assert_eq!(
+        live_cell_text(&widths, &spare),
+        "    ",
+        "the committed member is not served yet"
+    );
+}

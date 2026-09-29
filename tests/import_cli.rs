@@ -6,7 +6,7 @@
 //! named on every command, and the status read works on a fresh home.
 //!
 //! Every run points `HOME` at a tempdir fixture and pins `PATH` to the
-//! built binary's own directory plus the system dirs, so no real home, no
+//! built binary alone plus the system dirs, so no real home, no
 //! real `clauth` and no real `claude` is ever in reach. The read-only proof
 //! runs the dry-run inside bubblewrap with the WHOLE filesystem bound
 //! read-only, the operator's real home masked by an empty tmpfs, and its own
@@ -31,8 +31,23 @@ fn bin_dir() -> PathBuf {
     bin().parent().expect("bin dir").to_path_buf()
 }
 
+/// A directory that holds only a `tollgate` link to the built binary, so the
+/// run sees itself as the installed binary on `PATH`. The build directory
+/// itself stays off `PATH`: a stale `clauth` build artifact can sit beside
+/// `tollgate` there, and the survey would resolve it as upstream's binary.
+fn path_dir() -> PathBuf {
+    let dir = bin_dir().join("import-cli-path");
+    std::fs::create_dir_all(&dir).unwrap();
+    match std::os::unix::fs::symlink(bin(), dir.join("tollgate")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("linking tollgate into {}: {e}", dir.display()),
+    }
+    dir
+}
+
 fn stub_path() -> String {
-    format!("{}:/usr/bin:/bin", bin_dir().display())
+    format!("{}:/usr/bin:/bin", path_dir().display())
 }
 
 /// `tollgate` with `HOME` at `home`, a stub `PATH`, and nothing inherited
@@ -334,7 +349,7 @@ fn dry_run_plans_the_global_edits_on_a_read_only_bind_and_runs_nothing() {
         .args(["--setenv", "PATH"])
         .arg(format!(
             "{}:{}:/usr/bin:/bin",
-            bin_dir().display(),
+            path_dir().display(),
             home.path().join("bin").display()
         ))
         .args(["--setenv", "HERDR_BIN_PATH"])

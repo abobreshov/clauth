@@ -100,6 +100,40 @@ pub(crate) struct LiveSession {
     /// rotation refusal keeps applying to it exactly as it does today.
     #[serde(default)]
     pub(crate) launch_store: Option<PathBuf>,
+    /// Session-written at registration: how this session changes account
+    /// without a restart. Absent on a row that predates the field; read it
+    /// through [`LiveSession::executor`], which derives it from the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) executor: Option<crate::hot_swap::Executor>,
+    /// Session-written at registration: the transport class of an API-key
+    /// shaped launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_class: Option<crate::hot_swap::LaunchClass>,
+    /// Session-owned (executor B): 0 at registration, +1 per commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key_generation: Option<u64>,
+    /// Session-owned (executor B): when the last commit landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) committed_at: Option<u64>,
+    /// Session-owned (executor B): the last refusal, cleared on commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) swap_refusal: Option<SwapRefusal>,
+    /// Session-written at registration: the supervisor polls `.relaunch`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) relaunch_capable: bool,
+    /// Session-written at registration: the sid this session was relaunched
+    /// from, nonce-verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) relaunched_from: Option<String>,
+}
+
+/// Executor B's last refusal of an intended member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SwapRefusal {
+    pub(crate) member: String,
+    pub(crate) code: String,
+    pub(crate) text: String,
+    pub(crate) at_ms: u64,
 }
 
 impl LiveSession {
@@ -127,7 +161,57 @@ impl LiveSession {
             current_member: None,
             last_swap_at: None,
             launch_store,
+            executor: None,
+            launch_class: None,
+            key_generation: None,
+            committed_at: None,
+            swap_refusal: None,
+            relaunch_capable: false,
+            relaunched_from: None,
         }
+    }
+
+    /// The executor this row runs under. A row without the field predates it:
+    /// a claude row is executor A (what every such session was), a codex row
+    /// has no in-session executor.
+    pub(crate) fn executor(&self) -> crate::hot_swap::Executor {
+        self.executor.clone().unwrap_or(match self.harness {
+            crate::harness::Harness::Claude => crate::hot_swap::Executor::Oauth,
+            crate::harness::Harness::Codex => crate::hot_swap::Executor::None,
+        })
+    }
+
+    /// Record the spawn-time executor choice. Executor B also starts at key
+    /// generation 0 on its launch member, so the helper and every view have a
+    /// committed point from the first request.
+    pub(crate) fn with_executor(
+        mut self,
+        executor: crate::hot_swap::Executor,
+        launch_class: Option<crate::hot_swap::LaunchClass>,
+    ) -> Self {
+        if executor == crate::hot_swap::Executor::ApiKey {
+            self.key_generation = Some(0);
+            self.current_member = Some(self.start_profile.clone());
+        }
+        self.executor = Some(executor);
+        self.launch_class = launch_class;
+        self
+    }
+
+    /// The spawn cwd (a resume's workspace) instead of the process cwd.
+    pub(crate) fn with_cwd(mut self, cwd: Option<PathBuf>) -> Self {
+        if cwd.is_some() {
+            self.cwd = cwd;
+        }
+        self
+    }
+
+    /// Mark a `tollgate start` supervisor that polls `.relaunch`, and the
+    /// session it was relaunched from.
+    pub(crate) fn with_relaunch(mut self, capable: bool, from: Option<String>) -> Self {
+        self.relaunch_capable = capable;
+        self.relaunched_from = from;
+        self
     }
 }
 
@@ -175,6 +259,26 @@ impl SessionFields<'_> {
     pub(crate) fn set_pid(&mut self, pid: u32) {
         self.0.pid = pid;
     }
+
+    /// Executor B's next key generation, stored and returned. Monotonic
+    /// across loads: it counts from what the FRESH row holds.
+    pub(crate) fn bump_key_generation(&mut self) -> u64 {
+        let next = self.0.key_generation.unwrap_or(0) + 1;
+        self.0.key_generation = Some(next);
+        next
+    }
+
+    pub(crate) fn set_committed_at(&mut self, at: u64) {
+        self.0.committed_at = Some(at);
+    }
+
+    pub(crate) fn set_swap_refusal(&mut self, refusal: SwapRefusal) {
+        self.0.swap_refusal = Some(refusal);
+    }
+
+    pub(crate) fn clear_swap_refusal(&mut self) {
+        self.0.swap_refusal = None;
+    }
 }
 
 /// Live sessions tallied by the account each one is CURRENTLY running as.
@@ -195,6 +299,10 @@ pub(crate) struct MemberSessions {
     /// The newest swap ONTO this account. `None` when no session here has ever
     /// swapped, which is also what says no `current_member` pickup lag applies.
     pub(crate) last_swap_at: Option<u64>,
+    /// How many of `sessions` are committed to another member and not served
+    /// yet (executor B's `swapping`/`stalled`). Counted on the SERVED member,
+    /// where the session's requests still authenticate.
+    pub(crate) swapping: usize,
 }
 
 impl LiveTally {
@@ -258,11 +366,29 @@ impl LiveTally {
         let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
             std::collections::BTreeMap::new();
         for row in rows {
-            let member = row.current_member.unwrap_or(row.start_profile);
+            // The SERVED member: a B session committed elsewhere still sends
+            // the previous member's key until its helper serves the commit.
+            // Only a B row has an ack worth reading.
+            let ack = (row.executor() == crate::hot_swap::Executor::ApiKey)
+                .then(|| read_helper_ack(&row.session_id))
+                .flatten();
+            let view = crate::hot_swap::SwapView::of(&row, ack.as_ref());
+            let member = view.served_member().map_or_else(
+                || {
+                    row.current_member
+                        .clone()
+                        .unwrap_or_else(|| row.start_profile.clone())
+                },
+                str::to_string,
+            );
             let slot = per_member.entry(member).or_default();
             slot.sessions += 1;
             slot.following += usize::from(row.follows_chain);
             slot.last_swap_at = slot.last_swap_at.max(row.last_swap_at);
+            slot.swapping += usize::from(matches!(
+                view.state,
+                crate::hot_swap::SwapState::Swapping | crate::hot_swap::SwapState::Stalled
+            ));
         }
         Self(per_member)
     }
@@ -335,9 +461,130 @@ pub(crate) fn list() -> Vec<LiveSession> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
+    // By NAME, not by parse failure: the registry dir also holds each
+    // session's `.helper`, `.helper.lock` and `.relaunch*` sidecars.
     entries
         .flatten()
+        .filter(|entry| is_row_file_name(&entry.file_name()))
         .filter_map(|entry| read_row(&entry.path()))
+        .collect()
+}
+
+/// `<sid>.json` with a valid session id stem, and nothing else.
+fn is_row_file_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|n| n.strip_suffix(".json"))
+        .is_some_and(is_session_id)
+}
+
+/// A sidecar of one session's row: `<sid>.<suffix>` beside `<sid>.json`.
+fn sidecar_path(session_id: &str, suffix: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        is_session_id(session_id),
+        "not a session id: {session_id:?}"
+    );
+    Ok(registry_dir()?.join(format!("{session_id}.{suffix}")))
+}
+
+/// A sidecar's path for a fixture, its registry dir created.
+#[cfg(test)]
+pub(crate) fn sidecar_path_for_test(session_id: &str, suffix: &str) -> PathBuf {
+    let path = sidecar_path(session_id, suffix).expect("sidecar path");
+    if let Some(dir) = path.parent() {
+        mkdir_700(dir).expect("registry dir");
+    }
+    path
+}
+
+/// `<sid>.helper`: the session helper's ack.
+pub(crate) fn helper_ack_path(session_id: &str) -> Result<PathBuf> {
+    sidecar_path(session_id, "helper")
+}
+
+/// `<sid>.helper.lock`: the ack's writer lock. Never renamed; removed only by
+/// teardown or GC.
+pub(crate) fn helper_lock_path(session_id: &str) -> Result<PathBuf> {
+    sidecar_path(session_id, "helper.lock")
+}
+
+/// `<sid>.relaunch` (empty suffix) or `<sid>.relaunch.<suffix>`.
+pub(crate) fn relaunch_path(session_id: &str, suffix: &str) -> Result<PathBuf> {
+    if suffix.is_empty() {
+        sidecar_path(session_id, "relaunch")
+    } else {
+        sidecar_path(session_id, &format!("relaunch.{suffix}"))
+    }
+}
+
+/// One session's helper ack, lock-free (the ack is replaced by rename).
+pub(crate) fn read_helper_ack(session_id: &str) -> Option<crate::hot_swap::HelperAck> {
+    crate::hot_swap::read_helper_ack_at(&helper_ack_path(session_id).ok()?)
+}
+
+/// Which of a session's sidecars [`remove_sidecars`] leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeepSidecars {
+    Nothing,
+    /// The relaunch exit path: the new process verifies its nonce against
+    /// `.relaunch.taken`.
+    RelaunchTaken,
+}
+
+/// The sidecar suffixes tollgate writes.
+const SIDECAR_SUFFIXES: &[&str] = &[
+    "helper",
+    "helper.lock",
+    "relaunch",
+    "relaunch.taken",
+    "relaunch.cancel",
+    "relaunch.result",
+];
+
+/// Remove a session's sidecars, NotFound ignored.
+pub(crate) fn remove_sidecars(session_id: &str, keep: KeepSidecars) {
+    for suffix in SIDECAR_SUFFIXES {
+        if keep == KeepSidecars::RelaunchTaken && *suffix == "relaunch.taken" {
+            continue;
+        }
+        let Ok(path) = sidecar_path(session_id, suffix) else {
+            return;
+        };
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logline::logline!("tollgate: removing {} failed: {e}", path.display());
+        }
+    }
+}
+
+/// One sidecar file found in the registry dir.
+pub(crate) struct Sidecar {
+    pub(crate) session_id: String,
+    pub(crate) suffix: String,
+    pub(crate) path: PathBuf,
+}
+
+/// Every sidecar in the registry: each `<sid>.<suffix>` whose suffix is one
+/// tollgate writes (a helper ack's staging file included).
+pub(crate) fn list_sidecars() -> Vec<Sidecar> {
+    let Ok(dir) = registry_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let (sid, suffix) = name.split_once('.')?;
+            let known = SIDECAR_SUFFIXES.contains(&suffix) || suffix.starts_with("helper.tmp.");
+            (known && is_session_id(sid)).then(|| Sidecar {
+                session_id: sid.to_string(),
+                suffix: suffix.to_string(),
+                path: entry.path(),
+            })
+        })
         .collect()
 }
 

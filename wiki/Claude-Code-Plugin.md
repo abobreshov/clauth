@@ -31,7 +31,7 @@ The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The ma
 | Tool | Input | Returns | Cost |
 |------|-------|---------|------|
 | `profiles` | `names` (optional, case-insensitive), `scope` (`all` default, or `session`) | every profile with live cached 5h / 7d percentages (a lapsed window drops), provider, tier, endpoint host, active flag; `scope: "session"` returns the one account this session runs on and how it resolved | none, reads the disk cache |
-| `switch_profile` | `name` | relinks the global active profile; the reply says what the switch does to THIS session | none |
+| `switch_profile` | `name`, `session` | relinks the global active profile; the reply says what the switch does to THIS session. With `session` (`"self"` or a session id) it moves that one `tollgate start` session instead | none |
 | `delegate` | see below | the target account's answer, or a `job_id` | **a real usage window on the target account** |
 | `usage` | `account` (id such as `claude:work`, or a name), `provider` (a source such as `openrouter`, or a provider name), `all` (`true` adds disabled profiles); all optional | the `tollgate usage --json` envelope, `{schema_version, generated_at, guest_mode, accounts[]}`, across every provider: profiles, codex profiles, monitors and, in guest mode, upstream clauth's accounts; money as exact decimal strings, endpoints and free text redacted | none, reads the disk caches |
 | `monitor` | `job_ids` (optional list, capped at 256), `cancel` (needs `job_ids`) | with `job_ids`: a backgrounded job's envelope, its running status, or a named reason for an absent id, one result per id; with none: the delegates tollgate is holding, live runs first | none |
@@ -67,6 +67,20 @@ Where the connect brief names a `tollgate start` session's runtime directory, it
 `switch_profile` repoints the global `~/.claude` credentials. A session running on those adopts the new account at its next token refresh, mid-task. A `tollgate start` session runs against its own profile and is unaffected; the reply says which case your session is in.
 
 To use another account without disturbing the current session, use `delegate`.
+
+### Moving one session: `session`
+
+`switch_profile({name, session})` leaves the global credentials alone and moves one running `tollgate start` session: `session: "self"` is the session the server runs in (read off its `CLAUDE_CONFIG_DIR`), or pass a session id. It is the move `tollgate switch <sid> <name>` makes ([Auto-switch](Auto-Switch#moving-a-live-session-by-hand)). It waits up to 5 seconds for an API-key session to commit, never waits for the key helper, and never relaunches. The reply names what happened, and its `state` is one of:
+
+| `state` | Meaning |
+|---------|---------|
+| `swapping` | an API-key session committed to `name`; its requests still carry the previous key (`served_member`) until Claude Code's next request runs the key helper. A failed helper run stays `swapping` with the failure as the reason |
+| `served` | the session already runs on `name` and its helper serves it |
+| `requested` | an OAuth session's move is recorded and lands at its next request, or an API-key session has not committed yet |
+| `refused` | the target is not hot-swappable (a different endpoint, model routing, env or an OAuth login beside the key), or the session could not be reached; the reason says which |
+| `relaunch_required` | the session cannot hot-swap at all; the reply carries `tollgate switch <sid> <name> --relaunch` to run in a terminal |
+
+The payload behind the prose also carries `executor` (`oauth`, `api_key`, `relaunch_only`), `committed_member`, `served_member` and `key_generation`. The session form works in [guest mode](Guest-Mode): it writes only the session's registry row. The global form keeps its guest refusal.
 
 ## API-key profiles
 

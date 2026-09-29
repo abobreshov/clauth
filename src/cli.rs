@@ -295,6 +295,21 @@ pub(crate) enum Command {
         /// Profile to point the live session at — its presence is what makes
         /// the two-name form the session form.
         profile: Option<String>,
+        /// Session form: wait (up to 65 s) until the session's key helper
+        /// serves an api-key hot swap; exit 3 when it has not.
+        #[arg(long)]
+        wait: bool,
+        /// Session form: stop the session and resume its conversation under
+        /// the profile in the same terminal.
+        #[arg(long)]
+        relaunch: bool,
+        /// With --relaunch: do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// With --relaunch: the conversation to resume, when the session's
+        /// own cannot be told apart.
+        #[arg(long, value_name = "ID")]
+        conversation: Option<String>,
     },
 
     /// Resume a session under a chosen profile
@@ -563,7 +578,12 @@ pub(crate) enum Command {
     #[command(name = crate::identity::API_KEY_HELPER_SUBCMD, hide = true)]
     ApiKey {
         /// Profile whose stored key to print.
-        profile: String,
+        #[arg(required_unless_present = "session", conflicts_with = "session")]
+        profile: Option<String>,
+        /// A live api-key session: print the key of the member its registry
+        /// row has committed, and record the run.
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
     },
 
     /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
@@ -913,15 +933,21 @@ pub(crate) enum HerdrCommand {
 
     /// Print a pane's tag text for the plugin scripts
     ///
-    /// `tollgate herdr tag [--agent <kind>] [<profile>]` prints the account's
-    /// name and lead metric on one line, then its severity class. Hidden from
-    /// help: this is the scripts' read path, not a human surface.
+    /// `tollgate herdr tag [--agent <kind>] [--session <sid>] [<profile>]`
+    /// prints the account's name and lead metric on one line, then its
+    /// severity class. Hidden from help: this is the scripts' read path, not a
+    /// human surface.
     #[command(hide = true)]
     Tag {
         /// herdr's agent id for the pane (`claude`, `codex`, `hermes`, `grok`,
         /// `agy`).
         #[arg(long, value_name = "KIND")]
         agent: Option<String>,
+        /// The pane's `tollgate start` session: the tag then grades the
+        /// account the session's requests authenticate as, and names a hot
+        /// swap in flight (`<served> → <committed> swapping…`).
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
         /// The profile the pane burns; omitted for a native pane.
         profile: Option<String>,
     },

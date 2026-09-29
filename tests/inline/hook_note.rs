@@ -2078,6 +2078,7 @@ fn an_armed_session_silences_the_reader_before_any_read() {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        ..crate::testutil::live_row("0-0", "-")
     })
     .expect("row");
 
@@ -2113,4 +2114,53 @@ fn the_runtime_dir_sid_parser_accepts_only_per_session_dirs() {
             "{bare}"
         );
     }
+}
+
+/// Hot-swap spec test 55. A main-scope fire records the `tollgate start`
+/// session it ran in (off `CLAUDE_CONFIG_DIR`), which is how `tollgate switch
+/// --relaunch` finds the conversation to resume; a subagent fire does not.
+#[test]
+fn the_hook_record_carries_the_runtime_sid() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".tollgate/profiles/a/runtime-456-7");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let fire = payload("PostToolUse", "conv-rt");
+    note_for(&fire, &watch(1, 0), &kerry);
+    let record = load_record(&record_path("conv-rt", None).expect("path")).expect("record");
+    assert_eq!(record.runtime_sid.as_deref(), Some("456-7"));
+    assert_eq!(
+        conversations_for_runtime("456-7"),
+        vec!["conv-rt".to_string()]
+    );
+    assert!(conversations_for_runtime("456-8").is_empty());
+
+    // A subagent's scope record never names the runtime.
+    let mut sub = payload("PostToolUse", "conv-rt");
+    sub.agent_id = Some("agent1".to_string());
+    note_for(&sub, &watch(1, 0), &kerry);
+    let sub_record =
+        load_record(&record_path("conv-rt", Some("agent1")).expect("path")).expect("record");
+    assert_eq!(sub_record.runtime_sid, None);
+    assert_eq!(
+        conversations_for_runtime("456-7"),
+        vec!["conv-rt".to_string()],
+        "only the main scope counts"
+    );
+}
+
+/// Outside a tollgate runtime no sid is recorded, and the record's bytes
+/// carry no key for it.
+#[test]
+fn a_fire_outside_a_runtime_records_no_sid() {
+    let home = HomeSandbox::new();
+    let foreign = home.home().join("custom-claude-dir");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &foreign);
+    note_for(&payload("PostToolUse", "conv-x"), &watch(1, 0), &kerry);
+    let path = record_path("conv-x", None).expect("path");
+    assert_eq!(load_record(&path).expect("record").runtime_sid, None);
+    assert!(
+        !std::fs::read_to_string(&path)
+            .expect("bytes")
+            .contains("runtime_sid")
+    );
 }

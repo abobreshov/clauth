@@ -1262,3 +1262,56 @@ fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
         "a tollgate runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
     );
 }
+
+/// Hot-swap spec §4.7: inside an api-key hot-swap session (executor B) the
+/// runtime dir keeps the launch profile's name for life, so the dir tier
+/// answers the member the session's key helper SERVES: the launch profile
+/// until the helper has run for a commit, then the committed member. An OAuth
+/// row, or a row that names another launch profile than the dir, keeps the
+/// dir's own answer.
+#[test]
+fn a_hot_swap_runtime_is_attributed_to_its_served_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home
+        .home()
+        .join(".tollgate/profiles/or-main/runtime-4242-0");
+    let launch = crate::testutil::api_key_profile("or-main", "https://openrouter.ai/api", "k");
+    let mut row = crate::testutil::live_row("4242-0", "or-main").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(&launch, true),
+    );
+    row.current_member = Some("or-alt".into());
+    row.key_generation = Some(1);
+    crate::live_sessions::register(&row).expect("register");
+    assert_eq!(
+        session_profile_from_config_dir(&dir).as_deref(),
+        Some("or-main"),
+        "committed, not served: still the launch member"
+    );
+
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 1,
+            member: Some("or-alt".into()),
+            served_at_ms: Some(1),
+            last_failure: None,
+        },
+    );
+    assert_eq!(
+        session_profile_from_config_dir(&dir).as_deref(),
+        Some("or-alt")
+    );
+
+    // An OAuth row in the same dir: the dir names the session.
+    let oauth = crate::live_sessions::LiveSession {
+        current_member: Some("or-alt".into()),
+        ..crate::testutil::live_row("4242-0", "or-main")
+    };
+    crate::live_sessions::register(&oauth).expect("re-register");
+    assert_eq!(
+        session_profile_from_config_dir(&dir).as_deref(),
+        Some("or-main")
+    );
+}

@@ -968,9 +968,18 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
     }
-    // `⇄` goes at the trailing cell so the count column is shared across rows
-    // and the marker lines up at the right edge.
-    let marker = if sessions.following > 0 { "⇄" } else { " " };
+    // The marker goes at the trailing cell so the count column is shared
+    // across rows and it lines up at the right edge. `…` outranks `⇄`: a
+    // session here is committed to another account by an api-key hot swap
+    // and its key helper has not served that yet, so the count is about to
+    // move (or is stuck, when the helper failed).
+    let marker = if sessions.swapping > 0 {
+        "…"
+    } else if sessions.following > 0 {
+        "⇄"
+    } else {
+        " "
+    };
     let count_w = width.saturating_sub(1);
     Span::styled(
         format!("{}{marker}", fixed(&sessions.sessions.to_string(), count_w)),

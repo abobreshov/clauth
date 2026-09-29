@@ -164,8 +164,14 @@ pub(crate) struct PaneEntry {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PaneSession {
     session_id: String,
-    /// The member the session currently holds, else its launch profile.
+    /// The member the session's requests authenticate as: for an api-key hot
+    /// swap the member its key helper last served, which trails the
+    /// committed one until the session's next request; else the member the
+    /// session currently holds, else its launch profile.
     profile: String,
+    /// Where the session is in a switch: `requested`, `swapping` (committed,
+    /// not served yet), `stalled` (its key helper failed) or `served`.
+    state: crate::hot_swap::SwapState,
     kind: SessionKind,
     follows_chain: bool,
     isolated: bool,
@@ -293,12 +299,18 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
                 None => continue,
             }
         };
+        // The SERVED member: an api-key session committed to another member
+        // still sends the previous key until its helper serves.
+        let ack = (row.executor() == crate::hot_swap::Executor::ApiKey)
+            .then(|| crate::live_sessions::read_helper_ack(&row.session_id))
+            .flatten();
+        let view = crate::hot_swap::SwapView::of(row, ack.as_ref());
         sessions.push(PaneSession {
             session_id: row.session_id.clone(),
-            profile: row
-                .current_member
-                .clone()
-                .unwrap_or_else(|| row.start_profile.clone()),
+            profile: view
+                .served_member()
+                .map_or_else(|| crate::hot_swap::attributed_member(row), str::to_string),
+            state: view.state,
             kind,
             follows_chain: row.follows_chain,
             isolated: row.isolated,

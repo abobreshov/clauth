@@ -111,6 +111,8 @@ A `⏸` marks figures past their staleness threshold, `⚠` a HIGH account (a us
 
 The severity class rides beside it as a second token, `$tollgate_severity` (`ok`, `mid`, `high`, `critical`; cleared when nothing is graded), so a sidebar rule can colour the row. The [plugin README](https://github.com/abobreshov/clauth/tree/feat/tollgate/herdr-plugin#the-usage-aware-pane-tag) has a styled row template for both.
 
+A claude pane whose `tollgate start` session the script found also passes that session: `tollgate herdr tag --agent claude --session <sid> -- <profile>`. The tag then grades the account the session's requests authenticate as. For an API-key session that has just been hot-swapped ([Auto-switch](Auto-Switch#moving-a-live-session-by-hand)), that is still the previous account until the session's key helper has served the new key. While the swap is in flight the tag names both accounts and carries no severity: `or-main → or-alt swapping…`, or `or-main → or-alt stalled` when the key helper failed. The account the script prints, and the border label, follow the same rule: the member the helper last served, read off `~/.tollgate/live_sessions/<sid>.helper`.
+
 ### Native panes
 
 `hermes`, `grok` and `agy` panes run harnesses tollgate does not launch, so they have no session row. The binary tags one with the single enabled account its harness owns (for `hermes`, a Nous monitor that reads Hermes' own login) and tags nothing when there is none or more than one: an ambiguous pane is cleared rather than tagged with a guess. No Grok or Antigravity reader ships in 0.1.0, so `grok` and `agy` panes stay untagged for now. The pane still gets a watcher, so an account that appears later tags it on the next tick.

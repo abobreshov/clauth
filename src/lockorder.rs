@@ -265,6 +265,11 @@ pub(crate) mod rank {
         /// one clone or one assignment, with no IO, probe or child wait under
         /// it.
         GatewayPublished = 1900;
+        /// A B session helper's ack lock (`live_sessions/<sid>.helper.lock`,
+        /// `hot_swap::run_session_helper`). A leaf only the helper process
+        /// takes: it holds no other lock, and nothing is taken under it but
+        /// the ack's read and rename.
+        HelperAck = 1950;
     }
 }
 

@@ -1590,7 +1590,7 @@ impl AppConfig {
 /// `default` is the `model` setting; `opus`/`sonnet`/`haiku`/`fable` are the
 /// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
 /// `CLAUDE_CODE_SUBAGENT_MODEL`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default: Option<String>,
@@ -3451,6 +3451,13 @@ enum LoadMode {
 
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     load_profile_with(name, LoadMode::Repair)
+}
+
+/// [`load_profile`] that writes, renames, deletes and locks nothing: a staged
+/// rotation it would adopt is used in memory only. For executor B's checks,
+/// which run inside the state-flock hold and must never repair a profile.
+pub(crate) fn load_profile_read_only(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, LoadMode::ReadOnly)
 }
 
 fn load_profile_with(name: &ProfileName, mode: LoadMode) -> Result<Profile> {

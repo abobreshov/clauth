@@ -443,3 +443,132 @@ fn guest_refusal_names_the_import_command() {
     );
     assert!(!GUEST_REFUSAL.contains("not yet available"));
 }
+
+/// Every file under the operator trees guest mode leaves alone: relative
+/// path → bytes (or the link target for a symlink).
+fn operator_trees(home: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, at: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(meta) = at.symlink_metadata() else {
+            return;
+        };
+        let rel = at.strip_prefix(root).unwrap().to_path_buf();
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(at).unwrap();
+            out.insert(rel, target.to_string_lossy().as_bytes().to_vec());
+        } else if meta.is_dir() {
+            out.insert(rel, b"<dir>".to_vec());
+            for entry in std::fs::read_dir(at).unwrap().flatten() {
+                walk(root, &entry.path(), out);
+            }
+        } else {
+            out.insert(rel, std::fs::read(at).unwrap());
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for top in [
+        ".claude",
+        ".claude.json",
+        UPSTREAM_DATA_DIR_NAME,
+        ".codex",
+        ".hermes",
+    ] {
+        walk(home, &home.join(top), &mut out);
+    }
+    out
+}
+
+/// Hot-swap spec test 56. In guest mode a B session's start, its hot swap,
+/// its helper and a relaunch claim write only under `~/.tollgate`: every
+/// operator tree (`~/.claude`, `~/.claude.json`, `~/.clauth`, `~/.codex`,
+/// `~/.hermes`) is byte-identical afterwards.
+#[cfg(unix)]
+#[test]
+fn a_guest_b_swap_and_relaunch_leave_every_operator_tree_byte_identical() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    std::fs::create_dir_all(home.home().join(".hermes")).unwrap();
+    std::fs::write(
+        home.home().join(".hermes").join("config.yaml"),
+        b"model: m\n",
+    )
+    .unwrap();
+    assert!(upstream_active());
+
+    const OR: &str = "https://openrouter.ai/api";
+    let a = crate::testutil::api_key_profile("g-a", OR, "sk-g-a");
+    crate::testutil::write_api_key_profile(&a);
+    crate::testutil::write_api_key_profile(&crate::testutil::api_key_profile("g-b", OR, "sk-g-b"));
+    let bin = home.home().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("claude"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", bin.display()));
+    let _path = crate::testutil::EnvPin::new(&home, &[("PATH", Some(path.as_os_str()))]);
+    let _gate = crate::hot_swap::S1GateOverride::pass(&home, &["2.1.283"]);
+    crate::hot_swap::set_cc_probe(Some(Box::new(|| Some("2.1.283 (Claude Code)".to_string()))));
+    let cwd = home.home().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let before = operator_trees(home.home());
+
+    let launch = crate::runtime::LaunchInfo {
+        hot_swap: crate::hot_swap::HotSwapPolicy::Allowed,
+        spawn_cwd: Some(cwd.clone()),
+        relaunch_capable: true,
+        relaunched_from: None,
+    };
+    let rt = crate::runtime::ProfileRuntime::acquire_with(
+        &a,
+        crate::runtime::Isolation::Shared,
+        &[],
+        false,
+        &launch,
+    )
+    .expect("a guest B start");
+    crate::hot_swap::set_cc_probe(None);
+    assert_eq!(*rt.executor(), crate::hot_swap::Executor::ApiKey);
+    let sid = rt.session_id().to_string();
+
+    // The hot swap: the session's own watchdog commits the request.
+    let request =
+        crate::sessions_cli::request_session_switch(&sid, "g-b", crate::sessions_cli::Surface::Cli)
+            .expect("request");
+    assert_eq!(
+        request.outcome,
+        crate::sessions_cli::RequestOutcome::Committed(1)
+    );
+    let mut key = Vec::new();
+    crate::hot_swap::run_session_helper(&sid, &mut key).expect("the helper serves");
+    assert_eq!(key, b"sk-g-b");
+
+    // The MCP session form moves it again: allowed in guest mode, unlike the
+    // global form, and it writes only the session's own row.
+    crate::testutil::write_api_key_profile(&crate::testutil::api_key_profile("g-c", OR, "sk-g-c"));
+    let payload = crate::mcp::session_switch_payload(&sid, "g-c");
+    assert_eq!(payload["ok"], serde_json::json!(true), "{payload}");
+    assert_eq!(payload["state"], serde_json::json!("swapping"), "{payload}");
+    assert_eq!(payload["committed_member"], serde_json::json!("g-c"));
+
+    // The relaunch, up to the claim: the conversation lives in the guest store.
+    crate::testutil::transcript_fixture(
+        &crate::relaunch::projects_store().unwrap(),
+        &cwd,
+        &["conv-guest"],
+    );
+    let prepared = crate::relaunch::prepare(&sid, "g-a", None).expect("prepared");
+    std::fs::write(
+        crate::live_sessions::relaunch_path(&sid, "").unwrap(),
+        serde_json::to_vec(&prepared.request).unwrap(),
+    )
+    .unwrap();
+    assert!(crate::relaunch::poll_claim(&sid).is_some());
+    rt.keep_relaunch_taken();
+    drop(rt);
+
+    assert_eq!(
+        operator_trees(home.home()),
+        before,
+        "a guest B session wrote into an operator tree"
+    );
+}

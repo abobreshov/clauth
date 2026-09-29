@@ -156,6 +156,7 @@ fn call_roster(server: &TollgateServer) -> String {
 fn call_switch(server: &TollgateServer, name: &str) -> String {
     block_text(&drive(server.switch_profile(Parameters(SwitchArgs {
         name: name.to_string(),
+        session: None,
     }))))
 }
 

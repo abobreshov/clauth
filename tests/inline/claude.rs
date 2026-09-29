@@ -689,8 +689,11 @@ fn build_settings_api_key_helper_shell_quotes_exe_path() {
 #[test]
 fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
     let exe = std::path::Path::new("/usr/local/bin/tollgate");
-    let cmd =
-        build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme_corp-1.0+@"));
+    let cmd = build_api_key_helper_command(
+        exe,
+        HelperForm::Profile,
+        &crate::profile::ProfileName::from("acme_corp-1.0+@"),
+    );
     assert_eq!(
         cmd, "/usr/local/bin/tollgate __tollgate-api-key acme_corp-1.0+@",
         "validated profile names must not be over-quoted"
@@ -704,7 +707,11 @@ fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
 #[test]
 fn build_settings_api_key_helper_strips_deleted_exe_marker() {
     let exe = std::path::Path::new("/home/uwuclxdy/.cargo/bin/tollgate (deleted)");
-    let cmd = build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme"));
+    let cmd = build_api_key_helper_command(
+        exe,
+        HelperForm::Profile,
+        &crate::profile::ProfileName::from("acme"),
+    );
     assert_eq!(
         cmd,
         "/home/uwuclxdy/.cargo/bin/tollgate __tollgate-api-key acme"
@@ -4672,4 +4679,98 @@ fn detach_still_detaches_a_link_into_tollgates_own_store() {
             .is_symlink(),
         "tollgate's own link is detached into a regular file"
     );
+}
+
+// ── the session helper form (hot-swap spec part 1) ───────────────────────────
+
+// 34
+#[test]
+fn the_session_helper_form_parses_to_a_session_target() {
+    assert_eq!(
+        helper_target("/usr/local/bin/tollgate __tollgate-api-key --session 4242-0"),
+        Some(HelperTarget::Session("4242-0".to_string()))
+    );
+    assert_eq!(
+        helper_target("'/home/a b/bin/tollgate' __tollgate-api-key --session 17-3"),
+        Some(HelperTarget::Session("17-3".to_string()))
+    );
+    assert_eq!(
+        helper_target("tollgate __tollgate-api-key acme"),
+        Some(HelperTarget::Profile("acme".to_string()))
+    );
+    // The builder writes exactly what the parser reads back.
+    let exe = std::path::Path::new("/usr/local/bin/tollgate");
+    let cmd = build_api_key_helper_command(
+        exe,
+        HelperForm::Session("4242-0"),
+        &crate::profile::ProfileName::from("ignored"),
+    );
+    assert_eq!(
+        cmd,
+        "/usr/local/bin/tollgate __tollgate-api-key --session 4242-0"
+    );
+    assert_eq!(
+        helper_target(&cmd),
+        Some(HelperTarget::Session("4242-0".to_string()))
+    );
+}
+
+// 35
+#[test]
+fn a_session_helper_with_extra_tokens_or_a_bad_sid_is_not_ours() {
+    for helper in [
+        "tollgate __tollgate-api-key --session 4242-0 extra",
+        "tollgate __tollgate-api-key --session ../x",
+        "tollgate __tollgate-api-key --session 4242",
+        "tollgate __tollgate-api-key --session",
+        "tollgate __tollgate-api-key --session a-b",
+        "clauth __tollgate-api-key --session 4242-0",
+        "tollgate __api-key --session 4242-0",
+    ] {
+        assert_eq!(helper_target(helper), None, "{helper}");
+    }
+}
+
+// 36
+#[test]
+fn profile_name_from_helper_resolves_a_session_target_through_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let helper = "tollgate __tollgate-api-key --session 4242-0";
+    assert_eq!(profile_name_from_helper(helper), None, "no row, no name");
+    let mut row = crate::testutil::live_row("4242-0", "start");
+    crate::live_sessions::register(&row).expect("register");
+    assert_eq!(profile_name_from_helper(helper).as_deref(), Some("start"));
+    row.current_member = Some("committed".to_string());
+    crate::live_sessions::register(&row).expect("re-register");
+    assert_eq!(
+        profile_name_from_helper(helper).as_deref(),
+        Some("committed")
+    );
+    assert_eq!(
+        profile_name_from_helper("tollgate __tollgate-api-key acme").as_deref(),
+        Some("acme")
+    );
+}
+
+/// The session form changes the helper line and nothing else: the settings a
+/// B session gets are the profile form's bytes with only `apiKeyHelper`
+/// differing.
+#[test]
+fn the_session_form_changes_only_the_helper_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::api_key_profile("or", "https://openrouter.ai/api", "sk-or");
+    let profile_form = build_claude_settings_json(None, &profile, &[]).expect("profile form");
+    let session_form =
+        build_claude_settings_json_with(None, &profile, &[], HelperForm::Session("4242-0"))
+            .expect("session form");
+    let mut a: serde_json::Value = serde_json::from_str(&profile_form).expect("parse");
+    let mut b: serde_json::Value = serde_json::from_str(&session_form).expect("parse");
+    assert!(
+        b["apiKeyHelper"]
+            .as_str()
+            .is_some_and(|h| h.ends_with("__tollgate-api-key --session 4242-0"))
+    );
+    a.as_object_mut().expect("object").remove("apiKeyHelper");
+    b.as_object_mut().expect("object").remove("apiKeyHelper");
+    assert_eq!(a, b);
 }

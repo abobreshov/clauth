@@ -366,6 +366,7 @@ pub(crate) fn plan_settings(
         } else if let Some(exe) = exe {
             let new = crate::claude::build_api_key_helper_command(
                 exe,
+                crate::claude::HelperForm::Profile,
                 &crate::profile::ProfileName::from(opts.dst_name(&p)),
             );
             let ptr = pointer(&["apiKeyHelper"]);

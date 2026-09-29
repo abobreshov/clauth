@@ -57,6 +57,11 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 | <kbd>p</kbd> | Usage: toggle the ideal-pace marker |
 | <kbd>c</kbd> | Overview: cycle the harness filter (both → claude → codex → both; the accounts panel title names the active one). Tokens: count cache reads and writes in the token totals |
 | <kbd>f</kbd> | Plugin: apply the selected row's fix |
+| <kbd>m</kbd> | Overview: move a live `tollgate start` session onto the selected account (below) |
+
+**Moving a live session (<kbd>m</kbd>).** On an Overview account row, <kbd>m</kbd> lists the running Claude Code sessions as `sid · now on · executor · state`. "Now on" is the account the session's requests authenticate as. <kbd>↑</kbd> <kbd>↓</kbd> pick one, <kbd>⏎</kbd> moves it, and <kbd>esc</kbd> closes the list. The move is the one `tollgate switch <sid> <profile>` makes ([Auto-switch](Auto-Switch#moving-a-live-session-by-hand)), and a toast reports the result: `session <sid>: swapping… onto <p>` for an API-key hot swap, `session <sid> stays on <cur>: <reason>` when the target is not hot-swappable, and `session <sid>: relaunch with 'tollgate switch <sid> <p> --relaunch'` for a session only a relaunch can move. The TUI never relaunches a session. It works in guest mode, since it writes only the session's own registry row.
+
+The Overview's `live` cell counts `tollgate start` sessions on each account. It ends in `⇄` when one of them follows the fallback chain, and in `…` while one of them is mid hot swap: committed to another account, with its key helper not yet serving the new key. Until the helper serves it, the session is counted on the account whose key it still sends.
 
 The day picker on a Fallback card's `preferred days` row shows each weekday as `[x]` or `[ ]`: <kbd>←</kbd> <kbd>→</kbd> walk the days (and do not switch tabs while it is open), <kbd>space</kbd> toggles the day and saves at once, <kbd>⏎</kbd>, <kbd>esc</kbd> or <kbd>q</kbd> leave it, and <kbd>↑</kbd> <kbd>↓</kbd> leave it and move to the row above or below. <kbd>?</kbd> and <kbd>x</kbd> keep working while it is open; every other key does nothing until you leave.
 

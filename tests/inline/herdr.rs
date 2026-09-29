@@ -4541,3 +4541,64 @@ fn guest_write_refuses_a_config_that_changed_since_the_plan() {
     assert!(err.to_string().contains("changed while"), "{err}");
     assert_eq!(std::fs::read_to_string(&path).expect("read"), moved);
 }
+
+/// Hot-swap spec test 65: a claude pane whose foreground session row resolved
+/// passes that row's session id to `herdr tag`, and the account it resolves
+/// (printed, and the profile it asks about) is the member an api-key session's
+/// key helper last SERVED, read off the `<sid>.helper` ack beside the row, not
+/// the committed `current_member`. With no ack yet the launch profile is
+/// served; an OAuth row still names its `current_member`.
+#[cfg(unix)]
+#[test]
+fn the_reporter_passes_the_row_session_to_the_tag() {
+    let setup = tag_answering_setup("claude", Some("or-main $13.67\nok\n"));
+    let sessions = setup.home.home().join(".tollgate/live_sessions");
+    let row = sessions.join("1001-0.json");
+    std::fs::write(
+        &row,
+        r#"{"session_id":"1001-0","start_profile":"or-main","harness":"claude","pid":1001,"started_at":0,"isolated":false,"follows_chain":false,"intended_member":null,"chain_cursor":null,"current_member":"or-alt","last_swap_at":null,"executor":{"kind":"api_key"},"key_generation":1}"#,
+    )
+    .expect("row written");
+    // One report, its watcher joined; the pane runs claude again for the next.
+    let report = || {
+        std::fs::write(&setup.agent_file, "claude").expect("agent written");
+        let out = chain_report_out(&setup, r#"{"agent":"claude"}"#);
+        chain_stop(&setup);
+        out
+    };
+
+    // No ack: the launch profile is what the session still serves.
+    assert_eq!(
+        report(),
+        "or-main\n",
+        "the served member, not the committed one"
+    );
+    assert_eq!(
+        tag_log(&setup).first().map(String::as_str),
+        Some("herdr tag --agent claude --session 1001-0 -- or-main"),
+        "the tag is asked with the row's session"
+    );
+
+    // The helper served the commit: the ack names the member.
+    std::fs::write(
+        sessions.join("1001-0.helper"),
+        r#"{"version":1,"generation":1,"member":"or-alt","served_at_ms":5,"last_failure":null}"#,
+    )
+    .expect("ack written");
+    assert_eq!(report(), "or-alt\n");
+
+    // An OAuth row keeps naming its current member, and still passes its sid.
+    std::fs::write(
+        &row,
+        r#"{"session_id":"1001-0","start_profile":"work","harness":"claude","pid":1001,"started_at":0,"isolated":false,"follows_chain":true,"intended_member":null,"chain_cursor":null,"current_member":"spare","last_swap_at":1}"#,
+    )
+    .expect("row rewritten");
+    assert_eq!(report(), "spare\n");
+    assert!(
+        tag_log(&setup)
+            .iter()
+            .any(|l| l == "herdr tag --agent claude --session 1001-0 -- spare"),
+        "{:?}",
+        tag_log(&setup)
+    );
+}

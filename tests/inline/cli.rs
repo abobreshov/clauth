@@ -88,13 +88,13 @@ fn a_subcommand_name_shadows_a_same_named_profile() {
 /// first value is never guessed at.
 #[test]
 fn switch_splits_the_forms_on_arity_alone() {
-    let Command::Switch { name, profile } = command(&["switch", "acme"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "acme"]) else {
         panic!("one positional must parse as the global form");
     };
     assert_eq!(name, "acme");
     assert_eq!(profile, None, "one positional is the global form");
 
-    let Command::Switch { name, profile } = command(&["switch", "4242-0"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "4242-0"]) else {
         panic!("a sid-shaped single name still parses as the global form");
     };
     assert_eq!(name, "4242-0");
@@ -103,7 +103,7 @@ fn switch_splits_the_forms_on_arity_alone() {
         "arity alone decides, never the first value's shape"
     );
 
-    let Command::Switch { name, profile } = command(&["switch", "4242-0", "spare"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "4242-0", "spare"]) else {
         panic!("two positionals must parse as the session form");
     };
     assert_eq!(name, "4242-0");
@@ -1319,7 +1319,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     ));
     assert!(matches!(command(&["self-heal"]), Command::SelfHeal));
     match command(&["__tollgate-api-key", "acme"]) {
-        Command::ApiKey { profile } => assert_eq!(profile, "acme"),
+        Command::ApiKey { profile, .. } => assert_eq!(profile.as_deref(), Some("acme")),
         other => panic!("__tollgate-api-key must parse, got {other:?}"),
     }
     assert!(matches!(command(&["run"]), Command::Run { .. }));
@@ -4166,4 +4166,301 @@ fn guest_login_still_captures_an_api_key_profile() {
         profile.base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic")
     );
+}
+
+// ── the session helper (hot-swap spec part 1) ────────────────────────────────
+
+mod session_helper {
+    use crate::hot_swap::{HelperAck, HelperFailure, run_session_helper, write_ack_for_test};
+    use crate::testutil::{HomeSandbox, api_key_profile, live_row, write_api_key_profile};
+
+    const OR: &str = "https://openrouter.ai/api";
+
+    fn members(names: &[&str]) {
+        for name in names {
+            write_api_key_profile(&api_key_profile(name, OR, &format!("sk-{name}")));
+        }
+    }
+
+    /// A B row started on `start`, committed to `member` at `generation`.
+    fn b_row(sid: &str, start: &str, member: &str, generation: u64) {
+        let mut row = live_row(sid, start).with_executor(crate::hot_swap::Executor::ApiKey, None);
+        row.current_member = Some(member.to_string());
+        row.key_generation = Some(generation);
+        crate::live_sessions::register(&row).expect("register");
+    }
+
+    fn ack_of(sid: &str) -> Option<HelperAck> {
+        crate::live_sessions::read_helper_ack(sid)
+    }
+
+    struct BrokenPipe;
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // 38
+    #[test]
+    fn the_session_helper_prints_the_committed_members_key_and_acks_its_generation() {
+        let _home = HomeSandbox::new();
+        members(&["h-a", "h-b"]);
+        b_row("4242-0", "h-a", "h-b", 1);
+        let mut out = Vec::new();
+        run_session_helper("4242-0", &mut out).expect("the helper serves");
+        assert_eq!(out, b"sk-h-b", "the bare key, no newline");
+        let ack = ack_of("4242-0").expect("acked");
+        assert_eq!(ack.generation, 1);
+        assert_eq!(ack.member.as_deref(), Some("h-b"));
+        assert!(ack.served_at_ms.is_some());
+        assert_eq!(ack.last_failure, None);
+        // A second run at the same generation writes nothing.
+        let path = crate::live_sessions::helper_ack_path("4242-0").expect("path");
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        crate::testutil::set_mtime(&path, when);
+        run_session_helper("4242-0", &mut Vec::new()).expect("serves again");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime"),
+            when,
+            "an up-to-date ack is not rewritten"
+        );
+        // Not a session id: nothing written, exit 1.
+        assert!(run_session_helper("../x", &mut Vec::new()).is_err());
+    }
+
+    // 39
+    #[test]
+    fn an_older_generation_never_overwrites_a_newer_ack() {
+        let _home = HomeSandbox::new();
+        members(&["o-a", "o-b", "o-c"]);
+        write_ack_for_test(
+            "4242-0",
+            &HelperAck {
+                version: 1,
+                generation: 3,
+                member: Some("o-c".to_string()),
+                served_at_ms: Some(10),
+                last_failure: None,
+            },
+        );
+        // An N-1 helper finishing after N: the row it read said generation 2.
+        b_row("4242-0", "o-a", "o-b", 2);
+        let mut out = Vec::new();
+        run_session_helper("4242-0", &mut out).expect("serves");
+        assert_eq!(out, b"sk-o-b");
+        let ack = ack_of("4242-0").expect("ack");
+        assert_eq!(ack.generation, 3);
+        assert_eq!(ack.member.as_deref(), Some("o-c"));
+        assert_eq!(ack.served_at_ms, Some(10));
+        // A torn ack reads as none and is rewritten by the next run.
+        std::fs::write(
+            crate::live_sessions::helper_ack_path("4242-0").expect("path"),
+            b"{\"version\":1,\"gener",
+        )
+        .expect("tear");
+        assert!(ack_of("4242-0").is_none());
+        run_session_helper("4242-0", &mut Vec::new()).expect("serves");
+        assert_eq!(ack_of("4242-0").map(|a| a.generation), Some(2));
+    }
+
+    // 40
+    #[test]
+    fn a_failed_print_writes_no_ack_but_records_last_failure() {
+        let _home = HomeSandbox::new();
+        members(&["f-a", "f-b"]);
+        b_row("4242-0", "f-a", "f-b", 1);
+        assert!(run_session_helper("4242-0", &mut BrokenPipe).is_err());
+        let ack = ack_of("4242-0").expect("the failure is recorded");
+        assert_eq!(ack.member, None, "no success was acked");
+        assert_eq!(ack.generation, 0);
+        assert_eq!(
+            ack.last_failure
+                .as_ref()
+                .map(|f| (f.generation, f.code.as_str())),
+            Some((1, "stdout_write"))
+        );
+        // The view reads it as stalled with that code.
+        let row = crate::live_sessions::get("4242-0").expect("row");
+        let mut row = row;
+        row.committed_at = Some(0);
+        let view = crate::hot_swap::SwapView::of(&row, Some(&ack));
+        assert_eq!(view.state, crate::hot_swap::SwapState::Stalled);
+        // A missing key is recorded the same way, and a success clears it.
+        write_api_key_profile(&api_key_profile("f-b", OR, ""));
+        assert!(run_session_helper("4242-0", &mut Vec::new()).is_err());
+        assert_eq!(
+            ack_of("4242-0")
+                .and_then(|a| a.last_failure)
+                .map(|f| f.code),
+            Some("no_key".to_string())
+        );
+        write_api_key_profile(&api_key_profile("f-b", OR, "sk-f-b"));
+        run_session_helper("4242-0", &mut Vec::new()).expect("serves");
+        let ack = ack_of("4242-0").expect("ack");
+        assert_eq!(ack.last_failure, None);
+        assert_eq!(ack.generation, 1);
+        // A failure never overwrites one at a higher generation.
+        write_ack_for_test(
+            "4242-0",
+            &HelperAck {
+                last_failure: Some(HelperFailure {
+                    generation: 9,
+                    code: "no_key".to_string(),
+                    at_ms: 1,
+                }),
+                ..ack
+            },
+        );
+        assert!(run_session_helper("4242-0", &mut BrokenPipe).is_err());
+        assert_eq!(
+            ack_of("4242-0")
+                .and_then(|a| a.last_failure)
+                .map(|f| f.generation),
+            Some(9)
+        );
+    }
+
+    // 40a
+    #[test]
+    fn a_reaped_row_still_serves_the_last_acked_member() {
+        let home = HomeSandbox::new();
+        members(&["r-a", "r-b"]);
+        write_ack_for_test(
+            "4242-0",
+            &HelperAck {
+                version: 1,
+                generation: 2,
+                member: Some("r-b".to_string()),
+                served_at_ms: Some(1),
+                last_failure: None,
+            },
+        );
+        let mut out = Vec::new();
+        run_session_helper("4242-0", &mut out).expect("serves the acked member");
+        assert_eq!(out, b"sk-r-b");
+
+        // No row, no ack: the start profile encoded in CLAUDE_CONFIG_DIR.
+        let runtime = crate::profile::tollgate_dir()
+            .expect("dir")
+            .join("profiles")
+            .join("r-a")
+            .join("runtime-5-0");
+        let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+        let mut out = Vec::new();
+        run_session_helper("5-0", &mut out).expect("serves the start profile");
+        assert_eq!(out, b"sk-r-a");
+        // A mismatched sid there fails `no_row`.
+        let mut out = Vec::new();
+        assert!(run_session_helper("6-0", &mut out).is_err());
+        assert!(out.is_empty(), "nothing on stdout after a failure");
+        assert_eq!(
+            ack_of("6-0").and_then(|a| a.last_failure).map(|f| f.code),
+            Some("no_row".to_string())
+        );
+    }
+
+    // 41
+    #[test]
+    fn the_session_helper_takes_no_state_flock_and_calls_no_load_profile() {
+        let _home = HomeSandbox::new();
+        members(&["n-a", "n-b"]);
+        b_row("4242-0", "n-a", "n-b", 1);
+        let lock = crate::profile::tollgate_dir()
+            .expect("dir")
+            .join(crate::lock::LOCK_FILENAME);
+        let _ = std::fs::remove_file(&lock);
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+        crate::hot_swap::HELPER_CONFIG_READS.with(|c| c.set(0));
+        run_session_helper("4242-0", &mut Vec::new()).expect("serves");
+        assert_eq!(
+            crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get),
+            0,
+            "no state flock"
+        );
+        assert!(!lock.exists(), "no `.lock` created");
+        assert_eq!(
+            crate::hot_swap::HELPER_CONFIG_READS.with(std::cell::Cell::get),
+            1,
+            "one direct config.toml read, never load_profile"
+        );
+    }
+
+    // 42
+    #[test]
+    fn the_helper_flags_conflict_and_one_is_required() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| {
+            crate::cli::Cli::try_parse_from(std::iter::once("tollgate").chain(args.iter().copied()))
+        };
+        assert!(parse(&["__tollgate-api-key", "acme", "--session", "1-0"]).is_err());
+        assert!(parse(&["__tollgate-api-key"]).is_err());
+        let Some(crate::cli::Command::ApiKey { profile, session }) =
+            parse(&["__tollgate-api-key", "--session", "1-0"])
+                .expect("parses")
+                .command
+        else {
+            panic!("the helper subcommand");
+        };
+        assert_eq!((profile, session.as_deref()), (None, Some("1-0")));
+        let Some(crate::cli::Command::ApiKey { profile, session }) =
+            parse(&["__tollgate-api-key", "acme"])
+                .expect("parses")
+                .command
+        else {
+            panic!("the helper subcommand");
+        };
+        assert_eq!((profile.as_deref(), session), (Some("acme"), None));
+    }
+}
+
+// ── the session helper serves another member only for an executor-B row ─────
+
+mod session_helper_hardening {
+    use crate::hot_swap::run_session_helper;
+    use crate::testutil::{HomeSandbox, api_key_profile, live_row, write_api_key_profile};
+
+    const OR: &str = "https://openrouter.ai/api";
+
+    /// A row another executor wrote a `current_member` into (an OAuth swap's
+    /// member) never moves the session helper's key: only executor B commits
+    /// an api-key member, so any other row serves its launch profile at
+    /// generation 0.
+    #[test]
+    fn a_non_b_row_serves_only_its_launch_profile() {
+        let _home = HomeSandbox::new();
+        for name in ["hh-a", "hh-b"] {
+            write_api_key_profile(&api_key_profile(name, OR, &format!("sk-{name}")));
+        }
+        for executor in [
+            None,
+            Some(crate::hot_swap::Executor::Oauth),
+            Some(crate::hot_swap::Executor::RelaunchOnly {
+                reason: "kill_switch".to_string(),
+            }),
+        ] {
+            let mut row = live_row("4242-0", "hh-a");
+            row.executor = executor.clone();
+            row.current_member = Some("hh-b".to_string());
+            row.key_generation = Some(3);
+            crate::live_sessions::register(&row).expect("register");
+            let mut out = Vec::new();
+            run_session_helper("4242-0", &mut out).expect("the helper serves");
+            assert_eq!(out, b"sk-hh-a", "{executor:?}: the launch profile's key");
+            let ack = crate::live_sessions::read_helper_ack("4242-0").expect("ack");
+            assert_eq!(
+                (ack.member.as_deref(), ack.generation),
+                (Some("hh-a"), 0),
+                "{executor:?}"
+            );
+            let _ = std::fs::remove_file(
+                crate::live_sessions::helper_ack_path("4242-0").expect("ack path"),
+            );
+        }
+    }
 }
