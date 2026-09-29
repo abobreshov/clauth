@@ -69,6 +69,10 @@ const MASK: &str = "[REDACTED]";
 pub(crate) enum SessionSource {
     /// The shared global store `~/.claude/projects/`.
     Global,
+    /// Guest mode's own store, `~/.tollgate/guest-claude/projects/`
+    /// (`runtime::guest_projects_store`): where a guest-mode shared session's
+    /// transcripts land and an isolated one's are rescued to.
+    Guest,
     /// A live isolated runtime's own throwaway store, tagged with its profile.
     Isolated { profile: String },
 }
@@ -703,8 +707,8 @@ fn group_by_workspace(sessions: Vec<SessionInfo>) -> Vec<WorkspaceGroup> {
 pub(crate) fn walk() -> Vec<Walked> {
     let mut by_id: HashMap<String, Walked> = HashMap::new();
 
-    if let Ok(projects) = claude_dir().map(|d| d.join("projects")) {
-        walk_store(&projects, &SessionSource::Global, &mut by_id);
+    for (projects, source) in shared_stores() {
+        walk_store(&projects, &source, &mut by_id);
     }
     for (profile, projects) in crate::runtime::live_isolated_stores() {
         walk_store(&projects, &SessionSource::Isolated { profile }, &mut by_id);
@@ -745,7 +749,8 @@ pub(crate) fn updated_iso(t: SystemTime) -> String {
 // walk that store for filenames and mtimes, then read the head of the ONE file
 // they resolved to.
 //
-// The GLOBAL store only, unlike the index. A live isolated runtime's own store
+// The SHARED stores only ([`shared_stores`]: the global store, plus the guest
+// store in guest mode), unlike the index. A live isolated runtime's own store
 // belongs to a session another process is running; `tollgate resume` and the
 // `delegate` resume both spawn against the shared store, where Claude Code would
 // answer `No conversation found` for an id that only exists in an isolated tree.
@@ -785,15 +790,34 @@ impl SessionRef {
     }
 }
 
-/// Every `*.jsonl` path in the global store, none of them opened. `depth` picks
-/// how much of it the caller means: [`WALK_MAX_DEPTH`] for every transcript the
-/// listing shows, [`TOP_LEVEL_DEPTH`] for the ones a resume can reach.
+/// The stores a SHARED session's transcripts live in, which the listing
+/// browses and a resume can reach: `~/.claude/projects/`, plus, in guest mode
+/// ([`crate::identity::upstream_active`]), tollgate's own guest store. A guest
+/// session never sees the operator's store, but it stays listed and resumable:
+/// a guest resume copies the transcript it names into the guest store first
+/// (`runtime::seed_guest_resume`), so the operator's file is never written.
+fn shared_stores() -> Vec<(PathBuf, SessionSource)> {
+    let mut stores = Vec::new();
+    if let Ok(projects) = claude_dir().map(|d| d.join("projects")) {
+        stores.push((projects, SessionSource::Global));
+    }
+    if crate::identity::upstream_active()
+        && let Ok(guest) = crate::runtime::guest_projects_store()
+    {
+        stores.push((guest, SessionSource::Guest));
+    }
+    stores
+}
+
+/// Every `*.jsonl` path in the shared stores ([`shared_stores`]), none of them
+/// opened. `depth` picks how much of it the caller means: [`WALK_MAX_DEPTH`]
+/// for every transcript the listing shows, [`TOP_LEVEL_DEPTH`] for the ones a
+/// resume can reach.
 fn global_transcripts(depth: usize) -> Vec<PathBuf> {
-    let Ok(projects) = claude_dir().map(|d| d.join("projects")) else {
-        return Vec::new();
-    };
     let mut paths = Vec::new();
-    collect_jsonl(&projects, depth, &mut paths);
+    for (projects, _) in shared_stores() {
+        collect_jsonl(&projects, depth, &mut paths);
+    }
     paths
 }
 
@@ -1120,11 +1144,28 @@ pub(crate) fn stamp_run_sessions(
     run_start: SystemTime,
 ) {
     let mut paths = Vec::new();
-    let walk_complete = collect_jsonl(projects_dir, WALK_MAX_DEPTH, &mut paths);
-    let ids: Vec<String> = run_session_ids(&paths, isolated, run_start)
-        .into_iter()
-        .filter(|id| crate::hook_note::resolved_account(id).is_none())
-        .collect();
+    let mut walk_complete = collect_jsonl(projects_dir, WALK_MAX_DEPTH, &mut paths);
+    // Guest mode: a shared run's transcripts land in the guest store, not the
+    // `~/.claude/projects` the caller names. Only the guest store's are this
+    // run's (a transcript touched in `~/.claude` meanwhile is upstream's own
+    // session), but the prune keys on EVERY shared transcript: walking one
+    // store alone would reap the other's owners.
+    let mut run_paths: Option<Vec<PathBuf>> = None;
+    if !isolated
+        && crate::identity::upstream_active()
+        && let Ok(guest) = crate::runtime::guest_projects_store()
+        && guest != projects_dir
+    {
+        let mut guest_paths = Vec::new();
+        walk_complete &= collect_jsonl(&guest, WALK_MAX_DEPTH, &mut guest_paths);
+        paths.extend(guest_paths.iter().cloned());
+        run_paths = Some(guest_paths);
+    }
+    let ids: Vec<String> =
+        run_session_ids(run_paths.as_deref().unwrap_or(&paths), isolated, run_start)
+            .into_iter()
+            .filter(|id| crate::hook_note::resolved_account(id).is_none())
+            .collect();
 
     // An isolated run never prunes and, with no ids to fold, has nothing to do
     // under the state flock; skip the acquisition.

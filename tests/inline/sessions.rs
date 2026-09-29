@@ -2589,3 +2589,100 @@ fn updated_iso_is_the_utc_machine_shape_and_clamps_pre_epoch() {
         "1970-01-01T00:00:00+00:00"
     );
 }
+
+/// Put the sandbox in guest mode: upstream clauth's data dir present, no
+/// completed import.
+fn enter_guest_mode(sb: &HomeSandbox) {
+    fs::create_dir_all(sb.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME)).unwrap();
+    assert!(crate::identity::upstream_active());
+}
+
+/// G2 follow-up: in guest mode a shared session's transcripts live in
+/// tollgate's guest store, so `tollgate sessions` lists it (tagged `Guest`) and
+/// `tollgate resume` / `info` find an id only it holds, `latest` included.
+/// Outside guest mode the guest store is nobody's shared store.
+#[test]
+fn guest_mode_lists_and_resolves_the_guest_stores_transcripts() {
+    let sb = HomeSandbox::new();
+    enter_guest_mode(&sb);
+    let op = sb.home().join(".claude/projects/-w-a/sop.jsonl");
+    let guest = crate::runtime::guest_projects_store()
+        .unwrap()
+        .join("-w-g/sguest.jsonl");
+    write_jsonl(&op, &[user_line("sop", "/w/a", "operator")]);
+    write_jsonl(&guest, &[user_line("sguest", "/w/g", "guest")]);
+    set_mtime(&op, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+    set_mtime(&guest, SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
+
+    let walked = walk();
+    let source_of = |id: &str| walked.iter().find(|w| w.id == id).map(|w| w.source.clone());
+    assert_eq!(source_of("sop"), Some(SessionSource::Global));
+    assert_eq!(source_of("sguest"), Some(SessionSource::Guest));
+    assert_eq!(find_session("sguest").map(|s| s.path), Some(guest.clone()));
+    assert_eq!(find_session("sop").map(|s| s.path), Some(op));
+    assert_eq!(
+        newest_session().map(|s| s.id),
+        Some("sguest".to_string()),
+        "the newest session on the machine is the guest one"
+    );
+
+    fs::remove_dir_all(sb.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME)).unwrap();
+    assert!(!crate::identity::upstream_active());
+    assert!(find_session("sguest").is_none());
+}
+
+/// Guest mode: a shared run stamps the transcripts it wrote into the guest
+/// store, and its prune keeps their owners — walking `~/.claude/projects`
+/// alone would reap every guest session's owner.
+#[test]
+fn a_guest_shared_run_stamps_and_keeps_the_guest_stores_owners() {
+    let sb = HomeSandbox::new();
+    enter_guest_mode(&sb);
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("gone".into(), SessionOwner::Known("A".into()));
+    store
+        .sessions
+        .insert("sguestold".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    let projects = global_projects(&sb);
+    let upstream_session = projects.join("-w-a/sop.jsonl");
+    write_jsonl(&upstream_session, &[user_line("sop", "/w/a", "operator")]);
+    let guest_store = crate::runtime::guest_projects_store().unwrap();
+    let old = guest_store.join("-w-g/sguestold.jsonl");
+    let fresh = guest_store.join("-w-g/sguestnew.jsonl");
+    write_jsonl(&old, &[user_line("sguestold", "/w/g", "old")]);
+    write_jsonl(&fresh, &[user_line("sguestnew", "/w/g", "new")]);
+    let run_start = SystemTime::now();
+    set_mtime(&old, run_start - Duration::from_secs(60));
+    set_mtime(&fresh, run_start + Duration::from_secs(1));
+    // Upstream's own session, written in `~/.claude` during this run's window.
+    set_mtime(&upstream_session, run_start + Duration::from_secs(1));
+
+    stamp_run_sessions("shared", &projects, false, run_start);
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("gone"),
+        None,
+        "a stale owner is pruned"
+    );
+    assert_eq!(
+        reloaded.sessions.get("sguestold"),
+        Some(&SessionOwner::Known("A".into())),
+        "a guest-store session's owner survives the prune"
+    );
+    assert_eq!(
+        reloaded.sessions.get("sguestnew"),
+        Some(&SessionOwner::Known("shared".into())),
+        "the run's guest-store session is stamped"
+    );
+    assert_eq!(
+        reloaded.sessions.get("sop"),
+        None,
+        "a session upstream wrote in ~/.claude meanwhile is not this run's"
+    );
+}

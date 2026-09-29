@@ -1120,3 +1120,53 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
     )
     .expect("no flag, no refusal");
 }
+
+fn strs(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The id a passthrough `--resume` names, in every spelling, and none for the
+/// value-less picker form.
+#[test]
+fn resume_id_from_args_reads_every_spelling_and_skips_the_picker() {
+    assert_eq!(
+        resume_id_from_args(&strs(&["--resume", "abc"])),
+        Some("abc")
+    );
+    assert_eq!(resume_id_from_args(&strs(&["--resume=abc"])), Some("abc"));
+    assert_eq!(
+        resume_id_from_args(&strs(&["--model", "opus", "-r", "abc"])),
+        Some("abc")
+    );
+    assert_eq!(resume_id_from_args(&strs(&["--resume"])), None);
+    assert_eq!(resume_id_from_args(&strs(&["--resume", "--verbose"])), None);
+    assert_eq!(resume_id_from_args(&strs(&["--resume="])), None);
+    assert_eq!(resume_id_from_args(&strs(&["--model", "opus"])), None);
+}
+
+/// G2 follow-up: `tollgate start p -- --resume <id>` in guest mode seeds the
+/// operator's transcript into the guest store, where the shared session looks,
+/// exactly as `tollgate resume` does, and leaves the operator's file alone.
+/// Outside guest mode it seeds nothing.
+#[test]
+fn a_guest_passthrough_resume_seeds_the_transcript_into_the_guest_store() {
+    let sb = HomeSandbox::new();
+    let transcript = sb.home().join(".claude/projects/-ws/sess-1.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, b"{\"cwd\":\"/ws\"}\n").unwrap();
+    let seeded = crate::runtime::guest_projects_store()
+        .unwrap()
+        .join("-ws/sess-1.jsonl");
+
+    seed_guest_passthrough_resume(&strs(&["--resume", "sess-1"])).unwrap();
+    assert!(!seeded.exists(), "outside guest mode nothing is seeded");
+
+    fs::create_dir_all(sb.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME)).unwrap();
+    assert!(crate::identity::upstream_active());
+    seed_guest_passthrough_resume(&strs(&["--resume", "sess-1"])).unwrap();
+    assert_eq!(fs::read(&seeded).unwrap(), b"{\"cwd\":\"/ws\"}\n");
+    assert_eq!(fs::read(&transcript).unwrap(), b"{\"cwd\":\"/ws\"}\n");
+
+    seed_guest_passthrough_resume(&strs(&["--resume", "no-such-session"]))
+        .expect("an unknown id is Claude Code's to answer");
+}

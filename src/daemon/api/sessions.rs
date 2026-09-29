@@ -63,7 +63,8 @@ pub(crate) struct SessionRow {
     /// tail held none.
     #[schema(required = true)]
     last_message: Option<String>,
-    /// `global`, or `isolated:<profile>` for a live isolated run's own store.
+    /// `global`, `guest` for guest mode's own store, or `isolated:<profile>`
+    /// for a live isolated run's own store.
     store: String,
 }
 
@@ -78,6 +79,7 @@ impl From<SessionInfo> for SessionRow {
             last_message: info.last_message,
             store: match info.source {
                 SessionSource::Global => "global".to_string(),
+                SessionSource::Guest => "guest".to_string(),
                 SessionSource::Isolated { profile } => format!("isolated:{profile}"),
             },
         }
