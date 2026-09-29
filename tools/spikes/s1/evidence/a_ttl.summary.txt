@@ -1,0 +1,42 @@
+== a_ttl
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.001 DRIVER TURN send 't1 expect A'
++   0.075 STUB1 HEAD /api/hello -> 200
++   0.146 HELPER(ctl) BEGIN pid=3503248 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.147 HELPER(ctl) sk-test-A pid=3503248
++   0.207 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.229 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.229 DRIVER TURN done 't1 expect A' after 0.2s
++   0.229 DRIVER helper key=sk-test-B
++   0.229 DRIVER TURN send 't2 within TTL, expect cached A'
++   0.254 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.258 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.258 DRIVER TURN done 't2 within TTL, expect cached A' after 0.0s
++   0.258 DRIVER sleep 4.0s past the 3 s TTL
++   4.258 DRIVER TURN send 't3 after TTL'
++   4.269 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   4.272 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.272 DRIVER TURN done 't3 after TTL' after 0.0s
++   4.273 HELPER(ctl) BEGIN pid=3503964 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++   4.274 HELPER(ctl) sk-test-B pid=3503964
++   4.472 DRIVER helper idle (0.2s)
++   4.472 DRIVER TURN send "t4 right after t3's refresh"
++   4.483 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++   4.485 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.485 DRIVER TURN done "t4 right after t3's refresh" after 0.0s
++   4.485 DRIVER helper key=sk-test-C
++   4.485 DRIVER sleep 4.0s past the 3 s TTL, no requests meanwhile
++   8.485 DRIVER TURN send 't5 after TTL'
++   8.495 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++   8.497 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   8.498 DRIVER TURN done 't5 after TTL' after 0.0s
++   8.498 HELPER(ctl) BEGIN pid=3504485 mode=ok sleep=0 readat=start key_at_start=sk-test-C
++   8.499 HELPER(ctl) sk-test-C pid=3504485
++   8.698 DRIVER helper idle (0.2s)
++   8.698 DRIVER TURN send "t6 right after t5's refresh"
++   8.707 STUB1 POST /v1/messages auth=Bearer C x-api-key=C -> 200
++   8.710 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   8.710 DRIVER TURN done "t6 right after t5's refresh" after 0.0s
++   8.727 DRIVER claude stdout closed rc=0
++   8.741 DRIVER done
+

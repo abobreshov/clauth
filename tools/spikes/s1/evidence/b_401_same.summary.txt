@@ -1,0 +1,59 @@
+== b_401_same
++   0.000 DRIVER TURN send 't1 expect A ok'
++   0.086 STUB1 HEAD /api/hello -> 200
++   0.156 HELPER(ctl) BEGIN pid=3531701 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.157 HELPER(ctl) sk-test-A pid=3531701
++   0.224 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.246 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.246 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.246 DRIVER stub1 reject=sk-test-A
++   0.246 DRIVER TURN send 't2 A rejected, helper still prints A'
++   0.273 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++   1.282 HELPER(ctl) BEGIN pid=3532054 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   1.283 HELPER(ctl) sk-test-A pid=3532054
++   1.286 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++   2.293 HELPER(ctl) BEGIN pid=3532255 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   2.295 HELPER(ctl) sk-test-A pid=3532255
++   2.298 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++   2.299 DRIVER claude api_retry attempt=3/10 status=401 delay_ms=2482
++   4.788 HELPER(ctl) BEGIN pid=3532487 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   4.788 HELPER(ctl) sk-test-A pid=3532487
++   4.791 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++   4.792 DRIVER claude api_retry attempt=4/10 status=401 delay_ms=4393
++   9.192 HELPER(ctl) BEGIN pid=3534636 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   9.193 HELPER(ctl) sk-test-A pid=3534636
++   9.196 DRIVER claude api_retry attempt=5/10 status=401 delay_ms=9881
++   9.196 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++  19.085 HELPER(ctl) BEGIN pid=3536533 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++  19.086 HELPER(ctl) sk-test-A pid=3536533
++  19.089 DRIVER claude api_retry attempt=6/10 status=401 delay_ms=19513
++  19.089 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++  38.609 HELPER(ctl) BEGIN pid=3539679 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++  38.610 HELPER(ctl) sk-test-A pid=3539679
++  38.613 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++  38.614 DRIVER claude api_retry attempt=7/10 status=401 delay_ms=33812
++  72.437 HELPER(ctl) BEGIN pid=3547938 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++  72.438 HELPER(ctl) sk-test-A pid=3547938
++  72.444 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++  72.445 DRIVER claude api_retry attempt=8/10 status=401 delay_ms=34957
++ 107.410 HELPER(ctl) BEGIN pid=3556538 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++ 107.411 HELPER(ctl) sk-test-A pid=3556538
++ 107.415 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++ 107.416 DRIVER claude api_retry attempt=9/10 status=401 delay_ms=39648
++ 147.078 HELPER(ctl) BEGIN pid=3564622 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++ 147.079 HELPER(ctl) sk-test-A pid=3564622
++ 147.082 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++ 147.084 DRIVER claude api_retry attempt=10/10 status=401 delay_ms=33814
++ 180.906 HELPER(ctl) BEGIN pid=3571180 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++ 180.907 HELPER(ctl) sk-test-A pid=3571180
++ 180.910 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++ 180.916 DRIVER claude RESULT is_error=True subtype=success result='Failed to authenticate. API Error: 401 stub rejected this key'
++ 180.916 DRIVER TURN done 't2 A rejected, helper still prints A' after 180.7s
++ 180.916 DRIVER stub1 reject=
++ 180.916 DRIVER TURN send 't3 reject lifted, expect recovery'
++ 180.935 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++ 180.940 DRIVER claude RESULT is_error=False subtype=success result='ok'
++ 180.940 DRIVER TURN done 't3 reject lifted, expect recovery' after 0.0s
++ 180.956 DRIVER claude stdout closed rc=None
++ 180.971 DRIVER done
+

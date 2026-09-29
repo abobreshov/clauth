@@ -1,0 +1,101 @@
++   0.000 DRIVER env names: CLAUDE_CODE_API_KEY_HELPER_TTL_MS CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CONFIG_DIR DISABLE_AUTOUPDATER DISABLE_ERROR_REPORTING DISABLE_TELEMETRY HOME LANG PATH TERM
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.000 DRIVER exec /home/abobreshov/.local/share/mise/installs/claude/2.1.283/claude -p --input-format stream-json --output-format stream-json --verbose --no-session-persistence --debug-file /home/abobreshov/Work/clauth/tools/spikes/s1/runs/e_span/debug.log
++   0.001 DRIVER TURN send 't1 expect A ok'
++   0.086 STUB1 {"seq": 1, "method": "HEAD", "path": "/api/hello", "status": 200}
++   0.156 HELPER(ctl) BEGIN pid=3513240 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.157 HELPER(ctl) sk-test-A pid=3513240
++   0.202 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   0.222 STUB1 {"seq": 2, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   0.222 STUB1 {"seq": 3, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "phase": "stream-end", "completed": true, "req_of": "msg_stub_1", "elapsed": 0.0}
++   0.240 DRIVER claude assistant text='ok'
++   0.244 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.244 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.244 DRIVER helper sleep=3
++   0.244 DRIVER helper readat=start
++   0.244 DRIVER sleep 4.0s past TTL
++   4.244 DRIVER TURN send 't2 triggers a 3 s refresh that snapshots A; key -> B 1 s in'
++   4.249 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   4.256 STUB1 {"seq": 4, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   4.256 STUB1 {"seq": 5, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "phase": "stream-end", "completed": true, "req_of": "msg_stub_3", "elapsed": 0.0}
++   4.257 DRIVER claude assistant text='ok'
++   4.258 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.258 DRIVER TURN done 't2 triggers a 3 s refresh that snapshots A; key -> B 1 s in' after 0.0s
++   4.260 HELPER(ctl) BEGIN pid=3513811 mode=ok sleep=3 readat=start key_at_start=sk-test-A
++   5.244 DRIVER helper key=sk-test-B
++   5.244 DRIVER TURN send 't3 while that refresh is still running (second helper started?)'
++   5.249 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   5.255 STUB1 {"seq": 6, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   5.256 STUB1 {"seq": 7, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "phase": "stream-end", "completed": true, "req_of": "msg_stub_5", "elapsed": 0.0}
++   5.257 DRIVER claude assistant text='ok'
++   5.258 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   5.258 DRIVER TURN done 't3 while that refresh is still running (second helper started?)' after 0.0s
++   7.262 HELPER(ctl) sk-test-A pid=3513811
++   7.562 DRIVER helper idle (2.3s)
++   7.562 DRIVER TURN send 't4 after the refresh printed A: expect A, not B'
++   7.567 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   7.572 STUB1 {"seq": 8, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   7.572 STUB1 {"seq": 9, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "phase": "stream-end", "completed": true, "req_of": "msg_stub_7", "elapsed": 0.0}
++   7.573 DRIVER claude assistant text='ok'
++   7.574 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   7.574 DRIVER TURN done 't4 after the refresh printed A: expect A, not B' after 0.0s
++   7.575 DRIVER helper readat=end
++   7.575 DRIVER sleep 4.0s past TTL
++  11.575 DRIVER TURN send 't5 triggers a 3 s refresh that starts on B and prints C'
++  11.579 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++  11.585 STUB1 {"seq": 10, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++  11.585 STUB1 {"seq": 11, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "phase": "stream-end", "completed": true, "req_of": "msg_stub_9", "elapsed": 0.0}
++  11.586 DRIVER claude assistant text='ok'
++  11.587 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  11.587 DRIVER TURN done 't5 triggers a 3 s refresh that starts on B and prints C' after 0.0s
++  11.590 HELPER(ctl) BEGIN pid=3514562 mode=ok sleep=3 readat=end key_at_start=sk-test-B
++  12.575 DRIVER helper key=sk-test-C
++  14.593 HELPER(ctl) sk-test-C pid=3514562
++  14.879 DRIVER helper idle (2.3s)
++  14.879 DRIVER TURN send 't6 expect C (what the helper printed)'
++  14.884 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++  14.889 STUB1 {"seq": 12, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++  14.889 STUB1 {"seq": 13, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "phase": "stream-end", "completed": true, "req_of": "msg_stub_11", "elapsed": 0.0}
++  14.890 DRIVER claude assistant text='ok'
++  14.891 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  14.891 DRIVER TURN done 't6 expect C (what the helper printed)' after 0.0s
++  14.892 DRIVER helper readat=start
++  14.892 DRIVER helper sleep=12
++  14.892 DRIVER helper key=sk-test-D
++  14.892 DRIVER sleep 4.0s past TTL
++  18.892 DRIVER TURN send 't7 triggers a 12 s refresh printing D'
++  18.896 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++  18.902 STUB1 {"seq": 14, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++  18.902 STUB1 {"seq": 15, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "phase": "stream-end", "completed": true, "req_of": "msg_stub_13", "elapsed": 0.0}
++  18.903 DRIVER claude assistant text='ok'
++  18.904 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  18.904 DRIVER TURN done 't7 triggers a 12 s refresh printing D' after 0.0s
++  18.904 DRIVER helper sleep=0
++  18.904 DRIVER sleep 3.0s
++  18.906 HELPER(ctl) BEGIN pid=3515667 mode=ok sleep=12 readat=start key_at_start=sk-test-D
++  21.904 DRIVER TURN send 't8 3 s into the slow refresh'
++  21.909 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++  21.914 STUB1 {"seq": 16, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++  21.914 STUB1 {"seq": 17, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "phase": "stream-end", "completed": true, "req_of": "msg_stub_15", "elapsed": 0.0}
++  21.915 DRIVER claude assistant text='ok'
++  21.917 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  21.917 DRIVER TURN done 't8 3 s into the slow refresh' after 0.0s
++  21.917 DRIVER sleep 4.0s
++  25.917 DRIVER TURN send 't9 7 s into the slow refresh'
++  25.923 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++  25.929 STUB1 {"seq": 18, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++  25.929 STUB1 {"seq": 19, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-C", "x-api-key": "sk-test-C", "phase": "stream-end", "completed": true, "req_of": "msg_stub_17", "elapsed": 0.0}
++  25.931 DRIVER claude assistant text='ok'
++  25.932 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  25.932 DRIVER TURN done 't9 7 s into the slow refresh' after 0.0s
++  30.909 HELPER(ctl) sk-test-D pid=3515667
++  31.142 DRIVER helper idle (5.2s)
++  31.142 DRIVER TURN send 't10 after the slow refresh printed D: expect D'
++  31.146 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++  31.151 STUB1 {"seq": 20, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-D", "x-api-key": "sk-test-D", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++  31.151 STUB1 {"seq": 21, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-D", "x-api-key": "sk-test-D", "phase": "stream-end", "completed": true, "req_of": "msg_stub_19", "elapsed": 0.0}
++  31.152 DRIVER claude assistant text='ok'
++  31.153 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  31.153 DRIVER TURN done 't10 after the slow refresh printed D: expect D' after 0.0s
++  31.170 DRIVER claude stdout closed rc=None
++  31.185 DRIVER done

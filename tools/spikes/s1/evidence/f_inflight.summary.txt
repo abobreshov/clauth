@@ -1,0 +1,30 @@
+== f_inflight
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.000 DRIVER TURN send 't1 expect A ok'
++   0.084 STUB1 HEAD /api/hello -> 200
++   0.153 HELPER(ctl) BEGIN pid=3519694 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.154 HELPER(ctl) sk-test-A pid=3519694
++   0.213 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.234 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.234 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.234 DRIVER helper key=sk-test-B
++   0.234 DRIVER sleep 4.0s past TTL
++   4.234 DRIVER stub1 delay=10
++   4.234 DRIVER TURN send 't2 10 s stream sent with stale A; its refresh adopts B; A rejected 3 s in'
++   4.246 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200 (delay 10.0s)
++   4.252 HELPER(ctl) BEGIN pid=3520150 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++   4.253 HELPER(ctl) sk-test-B pid=3520150
++   7.235 DRIVER stub1 reject=sk-test-A
++  14.247 STUB1   stream of msg_stub_3 ended completed=True after 10.0s (auth=A x-api-key=A)
++  14.250 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  14.250 DRIVER TURN done 't2 10 s stream sent with stale A; its refresh adopts B; A rejected 3 s in' after 10.0s
++  14.250 DRIVER stub1 delay=0
++  14.250 DRIVER TURN send 't3 expect B'
++  14.260 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  14.262 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  14.262 DRIVER TURN done 't3 expect B' after 0.0s
++  14.264 HELPER(ctl) BEGIN pid=3521613 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++  14.265 HELPER(ctl) sk-test-B pid=3521613
++  14.278 DRIVER claude stdout closed rc=None
++  14.294 DRIVER done
+

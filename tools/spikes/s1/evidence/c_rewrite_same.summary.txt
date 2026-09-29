@@ -1,0 +1,28 @@
+== c_rewrite_same
++   0.000 DRIVER TURN send 't1 expect A'
++   0.092 STUB1 HEAD /api/hello -> 200
++   0.165 HELPER(ctl) BEGIN pid=3578390 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.166 HELPER(ctl) sk-test-A pid=3578390
++   0.236 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.259 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.259 DRIVER TURN done 't1 expect A' after 0.3s
++   0.260 DRIVER helper key=sk-test-B
++   0.260 DRIVER settings.json edited: byte-identical atomic rewrite (temp + rename)
++   0.260 DRIVER sleep 5.0s file watcher
++   5.260 DRIVER TURN send 't2 after identical rewrite: A (cached) or B?'
++   5.281 HELPER(ctl) BEGIN pid=3579244 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++   5.282 HELPER(ctl) sk-test-B pid=3579244
++   5.285 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++   5.289 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   5.289 DRIVER TURN done 't2 after identical rewrite: A (cached) or B?' after 0.0s
++   5.289 DRIVER settings.json mtime touched (content unchanged, no rename)
++   5.289 DRIVER sleep 5.0s file watcher
++  10.289 DRIVER TURN send 't3 after mtime-only touch: A (cached) or B?'
++  10.308 HELPER(ctl) BEGIN pid=3580003 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++  10.309 HELPER(ctl) sk-test-B pid=3580003
++  10.312 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  10.315 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  10.315 DRIVER TURN done 't3 after mtime-only touch: A (cached) or B?' after 0.0s
++  10.332 DRIVER claude stdout closed rc=None
++  10.346 DRIVER done
+

@@ -1,0 +1,24 @@
+== c_helper
++   0.001 DRIVER TURN send 't1 expect A via ctl'
++   0.079 STUB1 HEAD /api/hello -> 200
++   0.151 HELPER(ctl) BEGIN pid=3506203 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.152 HELPER(ctl) sk-test-A pid=3506203
++   0.214 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.235 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.235 DRIVER TURN done 't1 expect A via ctl' after 0.2s
++   0.236 DRIVER settings.json edited: apiKeyHelper -> helper.sh ctl2 (prints sk-test-H2)
++   0.236 DRIVER sleep 5.0s file watcher
++   5.236 DRIVER TURN send 't2 after helper edit: A (cached) or H2?'
++   5.256 HELPER(ctl2) BEGIN pid=3506761 mode=ok sleep=0 readat=start key_at_start=sk-test-H2
++   5.257 HELPER(ctl2) sk-test-H2 pid=3506761
++   5.260 STUB1 POST /v1/messages auth=Bearer H2 x-api-key=H2 -> 200
++   5.263 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   5.263 DRIVER TURN done 't2 after helper edit: A (cached) or H2?' after 0.0s
++   5.263 DRIVER sleep 5.0s
++  10.263 DRIVER TURN send 't3 after helper edit: A (cached) or H2?'
++  10.273 STUB1 POST /v1/messages auth=Bearer H2 x-api-key=H2 -> 200
++  10.277 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  10.277 DRIVER TURN done 't3 after helper edit: A (cached) or H2?' after 0.0s
++  10.295 DRIVER claude stdout closed rc=0
++  10.309 DRIVER done
+

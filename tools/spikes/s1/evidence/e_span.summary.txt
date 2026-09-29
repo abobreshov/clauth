@@ -1,0 +1,71 @@
+== e_span
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.001 DRIVER TURN send 't1 expect A ok'
++   0.086 STUB1 HEAD /api/hello -> 200
++   0.156 HELPER(ctl) BEGIN pid=3513240 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.157 HELPER(ctl) sk-test-A pid=3513240
++   0.222 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.244 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.244 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.244 DRIVER helper sleep=3
++   0.244 DRIVER helper readat=start
++   0.244 DRIVER sleep 4.0s past TTL
++   4.244 DRIVER TURN send 't2 triggers a 3 s refresh that snapshots A; key -> B 1 s in'
++   4.256 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   4.258 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.258 DRIVER TURN done 't2 triggers a 3 s refresh that snapshots A; key -> B 1 s in' after 0.0s
++   4.260 HELPER(ctl) BEGIN pid=3513811 mode=ok sleep=3 readat=start key_at_start=sk-test-A
++   5.244 DRIVER helper key=sk-test-B
++   5.244 DRIVER TURN send 't3 while that refresh is still running (second helper started?)'
++   5.255 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   5.258 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   5.258 DRIVER TURN done 't3 while that refresh is still running (second helper started?)' after 0.0s
++   7.262 HELPER(ctl) sk-test-A pid=3513811
++   7.562 DRIVER helper idle (2.3s)
++   7.562 DRIVER TURN send 't4 after the refresh printed A: expect A, not B'
++   7.572 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   7.574 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   7.574 DRIVER TURN done 't4 after the refresh printed A: expect A, not B' after 0.0s
++   7.575 DRIVER helper readat=end
++   7.575 DRIVER sleep 4.0s past TTL
++  11.575 DRIVER TURN send 't5 triggers a 3 s refresh that starts on B and prints C'
++  11.585 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++  11.587 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  11.587 DRIVER TURN done 't5 triggers a 3 s refresh that starts on B and prints C' after 0.0s
++  11.590 HELPER(ctl) BEGIN pid=3514562 mode=ok sleep=3 readat=end key_at_start=sk-test-B
++  12.575 DRIVER helper key=sk-test-C
++  14.593 HELPER(ctl) sk-test-C pid=3514562
++  14.879 DRIVER helper idle (2.3s)
++  14.879 DRIVER TURN send 't6 expect C (what the helper printed)'
++  14.889 STUB1 POST /v1/messages auth=Bearer C x-api-key=C -> 200
++  14.891 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  14.891 DRIVER TURN done 't6 expect C (what the helper printed)' after 0.0s
++  14.892 DRIVER helper readat=start
++  14.892 DRIVER helper sleep=12
++  14.892 DRIVER helper key=sk-test-D
++  14.892 DRIVER sleep 4.0s past TTL
++  18.892 DRIVER TURN send 't7 triggers a 12 s refresh printing D'
++  18.902 STUB1 POST /v1/messages auth=Bearer C x-api-key=C -> 200
++  18.904 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  18.904 DRIVER TURN done 't7 triggers a 12 s refresh printing D' after 0.0s
++  18.904 DRIVER helper sleep=0
++  18.904 DRIVER sleep 3.0s
++  18.906 HELPER(ctl) BEGIN pid=3515667 mode=ok sleep=12 readat=start key_at_start=sk-test-D
++  21.904 DRIVER TURN send 't8 3 s into the slow refresh'
++  21.914 STUB1 POST /v1/messages auth=Bearer C x-api-key=C -> 200
++  21.917 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  21.917 DRIVER TURN done 't8 3 s into the slow refresh' after 0.0s
++  21.917 DRIVER sleep 4.0s
++  25.917 DRIVER TURN send 't9 7 s into the slow refresh'
++  25.929 STUB1 POST /v1/messages auth=Bearer C x-api-key=C -> 200
++  25.932 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  25.932 DRIVER TURN done 't9 7 s into the slow refresh' after 0.0s
++  30.909 HELPER(ctl) sk-test-D pid=3515667
++  31.142 DRIVER helper idle (5.2s)
++  31.142 DRIVER TURN send 't10 after the slow refresh printed D: expect D'
++  31.151 STUB1 POST /v1/messages auth=Bearer D x-api-key=D -> 200
++  31.153 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  31.153 DRIVER TURN done 't10 after the slow refresh printed D: expect D' after 0.0s
++  31.170 DRIVER claude stdout closed rc=None
++  31.185 DRIVER done
+

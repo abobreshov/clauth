@@ -1,0 +1,29 @@
+== a_default
++   0.000 DRIVER TURN send 't1 expect A'
++   0.086 STUB1 HEAD /api/hello -> 200
++   0.155 HELPER(ctl) BEGIN pid=3501256 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.157 HELPER(ctl) sk-test-A pid=3501256
++   0.217 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.239 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.239 DRIVER TURN done 't1 expect A' after 0.2s
++   0.239 DRIVER helper key=sk-test-B
++   0.239 DRIVER sleep 60.0s 1 min, inside a 5 min default
++  60.239 DRIVER TURN send 't2 at ~1 min'
++  60.252 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++  60.255 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  60.255 DRIVER TURN done 't2 at ~1 min' after 0.0s
++  60.255 DRIVER sleep 250.0s until ~5m10s after t1
++ 310.255 DRIVER TURN send 't3 at ~5m10s'
++ 310.270 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++ 310.273 DRIVER claude RESULT is_error=False subtype=success result='ok'
++ 310.273 DRIVER TURN done 't3 at ~5m10s' after 0.0s
++ 310.274 HELPER(ctl) BEGIN pid=3557763 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++ 310.275 HELPER(ctl) sk-test-B pid=3557763
++ 310.473 DRIVER helper idle (0.2s)
++ 310.473 DRIVER TURN send "t4 right after t3's refresh"
++ 310.485 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++ 310.489 DRIVER claude RESULT is_error=False subtype=success result='ok'
++ 310.489 DRIVER TURN done "t4 right after t3's refresh" after 0.0s
++ 310.508 DRIVER claude stdout closed rc=0
++ 310.521 DRIVER done
+

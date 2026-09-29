@@ -1,0 +1,66 @@
+== d_fail_401
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.001 DRIVER TURN send 't1 expect A ok'
++   0.082 STUB1 HEAD /api/hello -> 200
++   0.152 HELPER(ctl) BEGIN pid=3510350 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.153 HELPER(ctl) sk-test-A pid=3510350
++   0.219 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.240 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.240 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.241 DRIVER helper key=sk-test-B
++   0.241 DRIVER helper mode=exit1
++   0.241 DRIVER stub1 reject=sk-test-A
++   0.241 DRIVER sleep 4.0s past TTL
++   4.241 DRIVER TURN send 't2 cached A rejected and helper failing'
++   4.253 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++   4.258 HELPER(ctl) BEGIN pid=3511213 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++   4.259 HELPER(ctl) EXIT1 pid=3511213
++   5.262 HELPER(ctl) BEGIN pid=3511283 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++   5.263 HELPER(ctl) EXIT1 pid=3511283
++   5.266 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++   6.275 HELPER(ctl) BEGIN pid=3511445 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++   6.276 HELPER(ctl) EXIT1 pid=3511445
++   6.279 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++   6.280 DRIVER claude api_retry attempt=3/10 status=401 delay_ms=2228
++   8.515 HELPER(ctl) BEGIN pid=3511842 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++   8.516 HELPER(ctl) EXIT1 pid=3511842
++   8.519 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++   8.522 DRIVER claude RESULT is_error=True subtype=success result="Your apiKeyHelper script is failing · This usually means you need to re-authenticate with your provider · Run /status to see the script's error output"
++   8.522 DRIVER TURN done 't2 cached A rejected and helper failing' after 4.3s
++   8.722 DRIVER helper idle (0.2s)
++   8.722 DRIVER TURN send 't3 helper still failing'
++   8.733 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++   9.741 HELPER(ctl) BEGIN pid=3512150 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++   9.742 HELPER(ctl) EXIT1 pid=3512150
++   9.745 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++  10.754 HELPER(ctl) BEGIN pid=3512362 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++  10.755 HELPER(ctl) EXIT1 pid=3512362
++  10.758 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++  10.760 DRIVER claude RESULT is_error=True subtype=success result="Your apiKeyHelper script is failing · This usually means you need to re-authenticate with your provider · Run /status to see the script's error output"
++  10.760 DRIVER TURN done 't3 helper still failing' after 2.0s
++  10.960 DRIVER helper idle (0.2s)
++  10.961 DRIVER helper mode=ok
++  10.961 DRIVER sleep 4.0s past TTL
++  14.961 DRIVER TURN send 't4 helper recovered with B'
++  14.972 STUB1 POST /v1/messages auth=Bearer '' x-api-key='' -> 401
++  14.977 HELPER(ctl) BEGIN pid=3513008 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++  14.978 HELPER(ctl) sk-test-B pid=3513008
++  15.980 HELPER(ctl) BEGIN pid=3513119 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++  15.981 HELPER(ctl) sk-test-B pid=3513119
++  15.984 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  15.987 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  15.987 DRIVER TURN done 't4 helper recovered with B' after 1.0s
++  16.187 DRIVER helper idle (0.2s)
++  16.187 DRIVER TURN send 't5 expect B'
++  16.201 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  16.204 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  16.204 DRIVER TURN done 't5 expect B' after 0.0s
++  16.220 DRIVER claude stdout closed rc=None
++  16.235 DRIVER done
+-- claude stderr:
+apiKeyHelper failed: exited 1: helper: simulated failure
+apiKeyHelper failed: exited 1: helper: simulated failure
+apiKeyHelper failed: exited 1: helper: simulated failure
+apiKeyHelper failed: exited 1: helper: simulated failure
+apiKeyHelper failed: exited 1: helper: simulated failure
+

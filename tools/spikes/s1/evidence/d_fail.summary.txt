@@ -1,0 +1,57 @@
+== d_fail
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.001 DRIVER TURN send 't1 expect A ok'
++   0.076 STUB1 HEAD /api/hello -> 200
++   0.143 HELPER(ctl) BEGIN pid=3508494 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.144 HELPER(ctl) sk-test-A pid=3508494
++   0.211 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.235 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.235 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.235 DRIVER helper key=sk-test-B
++   0.235 DRIVER helper mode=exit1
++   0.235 DRIVER sleep 4.0s past TTL
++   4.235 DRIVER TURN send 't2 helper exits 1 (refresh)'
++   4.247 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   4.250 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.250 DRIVER TURN done 't2 helper exits 1 (refresh)' after 0.0s
++   4.252 HELPER(ctl) BEGIN pid=3509003 mode=exit1 sleep=0 readat=start key_at_start=sk-test-B
++   4.253 HELPER(ctl) EXIT1 pid=3509003
++   4.450 DRIVER helper idle (0.2s)
++   4.450 DRIVER TURN send 't3 right after the failed refresh'
++   4.459 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   4.462 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.462 DRIVER TURN done 't3 right after the failed refresh' after 0.0s
++   4.662 DRIVER helper idle (0.2s)
++   4.662 DRIVER helper mode=empty
++   4.662 DRIVER sleep 4.0s past TTL
++   8.662 DRIVER TURN send 't4 helper prints empty (refresh)'
++   8.673 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   8.675 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   8.675 DRIVER TURN done 't4 helper prints empty (refresh)' after 0.0s
++   8.678 HELPER(ctl) BEGIN pid=3509582 mode=empty sleep=0 readat=start key_at_start=sk-test-B
++   8.679 HELPER(ctl) EMPTY pid=3509582
++   8.875 DRIVER helper idle (0.2s)
++   8.875 DRIVER TURN send 't5 right after the empty refresh'
++   8.884 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   8.887 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   8.887 DRIVER TURN done 't5 right after the empty refresh' after 0.0s
++   9.087 DRIVER helper idle (0.2s)
++   9.087 DRIVER helper mode=ok
++   9.087 DRIVER sleep 4.0s past TTL
++  13.087 DRIVER TURN send 't6 helper recovered (refresh)'
++  13.097 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++  13.100 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  13.100 DRIVER TURN done 't6 helper recovered (refresh)' after 0.0s
++  13.102 HELPER(ctl) BEGIN pid=3510278 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++  13.103 HELPER(ctl) sk-test-B pid=3510278
++  13.300 DRIVER helper idle (0.2s)
++  13.300 DRIVER TURN send 't7 right after the recovered refresh: expect B'
++  13.309 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  13.312 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  13.312 DRIVER TURN done 't7 right after the recovered refresh: expect B' after 0.0s
++  13.328 DRIVER claude stdout closed rc=None
++  13.343 DRIVER done
+-- claude stderr:
+apiKeyHelper failed: exited 1: helper: simulated failure
+apiKeyHelper failed: did not return a value
+

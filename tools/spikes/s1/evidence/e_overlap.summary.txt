@@ -1,0 +1,44 @@
+== e_overlap
++   0.000 DRIVER CLAUDE_CODE_API_KEY_HELPER_TTL_MS=3000
++   0.000 DRIVER TURN send 't1 expect A ok'
++   0.079 STUB1 HEAD /api/hello -> 200
++   0.151 HELPER(ctl) BEGIN pid=3517835 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.152 HELPER(ctl) sk-test-A pid=3517835
++   0.214 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.235 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.235 DRIVER TURN done 't1 expect A ok' after 0.2s
++   0.236 DRIVER helper sleep=6
++   0.236 DRIVER helper readat=start
++   0.236 DRIVER sleep 4.0s past TTL
++   4.236 DRIVER TURN send 't2 triggers a slow (6 s) background refresh that snapshots A'
++   4.249 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   4.252 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   4.252 DRIVER TURN done 't2 triggers a slow (6 s) background refresh that snapshots A' after 0.0s
++   4.252 DRIVER sleep 0.5s
++   4.252 HELPER(ctl) BEGIN pid=3518721 mode=ok sleep=6 readat=start key_at_start=sk-test-A
++   4.752 DRIVER helper sleep=0
++   4.752 DRIVER helper key=sk-test-B
++   4.752 DRIVER stub1 reject=sk-test-A
++   4.752 DRIVER TURN send 't3 A now rejected -> 401 re-run (fast, prints B) while the slow A refresh runs'
++   4.762 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 401
++   5.771 HELPER(ctl) BEGIN pid=3518989 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++   5.772 HELPER(ctl) sk-test-B pid=3518989
++   5.775 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++   5.778 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   5.778 DRIVER TURN done 't3 A now rejected -> 401 re-run (fast, prints B) while the slow A refresh runs' after 1.0s
++  10.254 HELPER(ctl) sk-test-A pid=3518721
++  10.486 DRIVER helper idle (4.7s)
++  10.486 DRIVER slow A invocation has finished
++  10.486 DRIVER TURN send 't4 after the slow invocation printed A: B (newest) or A (stale overwrite)?'
++  10.496 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  10.499 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  10.499 DRIVER TURN done 't4 after the slow invocation printed A: B (newest) or A (stale overwrite)?' after 0.0s
++  10.499 DRIVER TURN send 't5 again'
++  10.500 HELPER(ctl) BEGIN pid=3519527 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++  10.500 HELPER(ctl) sk-test-B pid=3519527
++  10.507 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++  10.509 DRIVER claude RESULT is_error=False subtype=success result='ok'
++  10.509 DRIVER TURN done 't5 again' after 0.0s
++  10.524 DRIVER claude stdout closed rc=None
++  10.525 DRIVER done
+

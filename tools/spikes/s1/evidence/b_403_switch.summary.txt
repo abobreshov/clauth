@@ -1,0 +1,25 @@
+== b_403_switch
++   0.000 DRIVER TURN send 't1 expect A ok'
++   0.084 STUB1 HEAD /api/hello -> 200
++   0.158 HELPER(ctl) BEGIN pid=3571664 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.159 HELPER(ctl) sk-test-A pid=3571664
++   0.228 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.251 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.251 DRIVER TURN done 't1 expect A ok' after 0.3s
++   0.251 DRIVER stub1 reject_status=403
++   0.251 DRIVER helper key=sk-test-B
++   0.251 DRIVER stub1 reject=sk-test-A
++   0.251 DRIVER TURN send 't2 cached A rejected, helper now prints B'
++   0.279 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 403
++   1.288 HELPER(ctl) BEGIN pid=3571886 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++   1.289 HELPER(ctl) sk-test-B pid=3571886
++   1.292 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++   1.296 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   1.296 DRIVER TURN done 't2 cached A rejected, helper now prints B' after 1.0s
++   1.296 DRIVER TURN send 't3 expect B'
++   1.305 STUB1 POST /v1/messages auth=Bearer B x-api-key=B -> 200
++   1.308 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   1.308 DRIVER TURN done 't3 expect B' after 0.0s
++   1.324 DRIVER claude stdout closed rc=None
++   1.340 DRIVER done
+

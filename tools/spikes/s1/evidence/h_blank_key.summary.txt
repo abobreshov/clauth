@@ -1,0 +1,12 @@
+== h_blank_key
++   0.001 DRIVER extra env ANTHROPIC_API_KEY=''
++   0.001 DRIVER TURN send 't1 ANTHROPIC_API_KEY blank + helper'
++   0.087 STUB1 HEAD /api/hello -> 200
++   0.156 HELPER(ctl) BEGIN pid=3503147 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.157 HELPER(ctl) sk-test-A pid=3503147
++   0.224 STUB1 POST /v1/messages auth=Bearer A x-api-key=A -> 200
++   0.246 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.246 DRIVER TURN done 't1 ANTHROPIC_API_KEY blank + helper' after 0.2s
++   0.294 DRIVER claude stdout closed rc=0
++   0.310 DRIVER done
+

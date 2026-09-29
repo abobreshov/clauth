@@ -1,0 +1,34 @@
++   0.000 DRIVER env names: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CONFIG_DIR DISABLE_AUTOUPDATER DISABLE_ERROR_REPORTING DISABLE_TELEMETRY HOME LANG PATH TERM
++   0.000 DRIVER exec /home/abobreshov/.local/share/mise/installs/claude/2.1.283/claude -p --input-format stream-json --output-format stream-json --verbose --no-session-persistence --debug-file /home/abobreshov/Work/clauth/tools/spikes/s1/runs/b_401_switch/debug.log
++   0.001 DRIVER TURN send 't1 expect A ok'
++   0.083 STUB1 {"seq": 1, "method": "HEAD", "path": "/api/hello", "status": 200}
++   0.162 HELPER(ctl) BEGIN pid=3571279 mode=ok sleep=0 readat=start key_at_start=sk-test-A
++   0.163 HELPER(ctl) sk-test-A pid=3571279
++   0.215 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   0.239 STUB1 {"seq": 2, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   0.239 STUB1 {"seq": 3, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "phase": "stream-end", "completed": true, "req_of": "msg_stub_1", "elapsed": 0.0}
++   0.258 DRIVER claude assistant text='ok'
++   0.263 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   0.263 DRIVER TURN done 't1 expect A ok' after 0.3s
++   0.263 DRIVER stub1 reject_status=401
++   0.263 DRIVER helper key=sk-test-B
++   0.264 DRIVER stub1 reject=sk-test-A
++   0.264 DRIVER TURN send 't2 cached A rejected, helper now prints B'
++   0.269 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   0.296 STUB1 {"seq": 4, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-A", "x-api-key": "sk-test-A", "model": "claude-opus-5-5", "stream": true, "status": 401}
++   1.306 HELPER(ctl) BEGIN pid=3571475 mode=ok sleep=0 readat=start key_at_start=sk-test-B
++   1.307 HELPER(ctl) sk-test-B pid=3571475
++   1.310 STUB1 {"seq": 5, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-B", "x-api-key": "sk-test-B", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   1.310 STUB1 {"seq": 6, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-B", "x-api-key": "sk-test-B", "phase": "stream-end", "completed": true, "req_of": "msg_stub_4", "elapsed": 0.0}
++   1.312 DRIVER claude assistant text='ok'
++   1.314 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   1.314 DRIVER TURN done 't2 cached A rejected, helper now prints B' after 1.1s
++   1.314 DRIVER TURN send 't3 expect B'
++   1.319 DRIVER claude init apiKeySource=apiKeyHelper model=claude-opus-5-5[1m] version=2.1.283
++   1.324 STUB1 {"seq": 7, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-B", "x-api-key": "sk-test-B", "model": "claude-opus-5-5", "stream": true, "status": 200, "phase": "stream-start", "delay": 0.0}
++   1.324 STUB1 {"seq": 8, "method": "POST", "path": "/v1/messages?beta=true", "authorization": "Bearer:sk-test-B", "x-api-key": "sk-test-B", "phase": "stream-end", "completed": true, "req_of": "msg_stub_6", "elapsed": 0.0}
++   1.325 DRIVER claude assistant text='ok'
++   1.327 DRIVER claude RESULT is_error=False subtype=success result='ok'
++   1.327 DRIVER TURN done 't3 expect B' after 0.0s
++   1.344 DRIVER claude stdout closed rc=0
++   1.358 DRIVER done
