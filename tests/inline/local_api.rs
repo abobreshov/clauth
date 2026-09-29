@@ -733,6 +733,71 @@ fn every_get_leaves_the_home_byte_identical_even_with_a_pending_sidecar() {
     );
 }
 
+/// Hot-swap spec test 63, extending the I3 pin above: with a live api-key
+/// session mid swap and every sidecar it can leave beside its row (the helper
+/// ack and its lock, a pending relaunch request and a claimed one), every
+/// `GET` still leaves the home byte-identical, down to modes and mtimes. The
+/// `live_sessions` field reads the row and the ack and nothing else: no
+/// flock, no marker probe, no rename, no `load_config`.
+#[cfg(unix)]
+#[test]
+fn every_get_leaves_the_home_byte_identical_with_hot_swap_sidecars() {
+    let home = HomeSandbox::new();
+    seed_everything_a_repairing_load_would_touch();
+    let launch = crate::testutil::api_key_profile("solo", "https://openrouter.ai/api", "k");
+    let mut row = crate::testutil::live_row("4242-0", "solo").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(&launch, true),
+    );
+    row.pid = std::process::id();
+    row.current_member = Some("drift".into());
+    row.key_generation = Some(1);
+    row.committed_at = Some(crate::usage::now_ms());
+    crate::live_sessions::register(&row).unwrap();
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 0,
+            member: Some("solo".into()),
+            served_at_ms: Some(1),
+            last_failure: None,
+        },
+    );
+    let dir = crate::profile::tollgate_dir()
+        .unwrap()
+        .join("live_sessions");
+    std::fs::write(dir.join("4242-0.helper.lock"), b"").unwrap();
+    std::fs::write(dir.join("4242-0.relaunch"), b"{\"version\":1}").unwrap();
+    std::fs::write(dir.join("4242-0.relaunch.taken"), b"{\"version\":1}").unwrap();
+
+    let server = serve(false);
+    let token = token();
+    let before = tree_digest(home.home());
+    for path in [
+        "/v1/accounts",
+        "/v1/accounts?all=1",
+        "/v1/accounts/claude:solo",
+        "/v1/accounts/claude:drift",
+        "/v1/usage",
+        "/v1/status",
+    ] {
+        let reply = tcp(&server, "GET", path, Some(&token));
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        if path.starts_with("/v1/accounts") {
+            let sessions = reply.json()["live_sessions"].clone();
+            assert_eq!(sessions[0]["session_id"], "4242-0", "{path}: {sessions}");
+            assert_eq!(sessions[0]["state"], "swapping", "{path}");
+            assert_eq!(sessions[0]["served"]["member"], "solo", "{path}");
+        }
+    }
+    assert_eq!(
+        tree_digest(home.home()),
+        before,
+        "a GET changed something under the home"
+    );
+}
+
 // ── Host: the DNS-rebinding guard ─────────────────────────────────────────────
 
 fn with_host(host: Option<&str>, bearer: &str) -> String {

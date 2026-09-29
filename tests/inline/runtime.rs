@@ -12654,12 +12654,22 @@ fn no_surface_serialises_launch_args() {
     assert!(crate::relaunch::poll_claim(&sid).is_some());
     let row = crate::live_sessions::get(&sid).expect("row");
     let ack = crate::live_sessions::read_helper_ack(&sid);
+    let view = crate::hot_swap::SwapView::of(&row, ack.as_ref());
     let rendered = [
         serde_json::to_string(&row).expect("row"),
         serde_json::to_string(&crate::hot_swap::LiveSessionView::of(&row, ack.as_ref()))
             .expect("view"),
-        format!("{:?}", crate::hot_swap::SwapView::of(&row, ack.as_ref())),
+        format!("{view:?}"),
         crate::hot_swap::attributed_member(&row),
+        // The local API's field, the MCP session payload (its prose renders
+        // only the payload's strings), and the herdr tag: every read surface
+        // part 2 added.
+        serde_json::to_string(&crate::hot_swap::live_session_views()).expect("views"),
+        crate::mcp::session_switch_payload(&sid, "la-a").to_string(),
+        format!(
+            "{:?}",
+            crate::herdr::tag::session_tag(&[], Some("la-a"), "claude", Some(&view), 0)
+        ),
     ];
     for text in &rendered {
         assert!(!text.contains("SENTINEL"), "{text}");

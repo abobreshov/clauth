@@ -243,7 +243,7 @@ pub(crate) struct NoteRecord {
 
 /// The session id encoded in this process's `CLAUDE_CONFIG_DIR`, when that is
 /// a tollgate per-session runtime tree.
-fn runtime_sid_from_env() -> Option<String> {
+pub(crate) fn runtime_sid_from_env() -> Option<String> {
     let dir = std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR")?);
     if !crate::runtime::is_tollgate_runtime_path(&dir) {
         return None;

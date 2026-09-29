@@ -346,7 +346,12 @@ fn the_09_pane_list_tags_only_the_unambiguous_native_pane() {
 fn herdr_tag_parses_both_script_shapes_and_stays_out_of_help() {
     let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").command {
         Some(Command::Herdr {
-            cmd: HerdrCommand::Tag { agent, profile },
+            cmd:
+                HerdrCommand::Tag {
+                    agent,
+                    session: None,
+                    profile,
+                },
         }) => (agent, profile),
         other => panic!("not the tag arm: {other:?}"),
     };
@@ -365,6 +370,34 @@ fn herdr_tag_parses_both_script_shapes_and_stays_out_of_help() {
         (Some("codex".to_string()), Some("-dash".to_string())),
         "the `--` the script passes keeps a dash-leading name positional"
     );
+    // The reporter's claude arm names the pane's session too.
+    match Cli::try_parse_from([
+        "tollgate",
+        "herdr",
+        "tag",
+        "--agent",
+        "claude",
+        "--session",
+        "4242-0",
+        "--",
+        "fit",
+    ])
+    .expect("parses")
+    .command
+    {
+        Some(Command::Herdr {
+            cmd:
+                HerdrCommand::Tag {
+                    agent,
+                    session,
+                    profile,
+                },
+        }) => assert_eq!(
+            (agent.as_deref(), session.as_deref(), profile.as_deref()),
+            (Some("claude"), Some("4242-0"), Some("fit"))
+        ),
+        other => panic!("not the tag arm: {other:?}"),
+    }
 
     let help = Cli::command()
         .find_subcommand_mut("herdr")
@@ -429,4 +462,100 @@ fn the_manifests_usage_action_opens_the_usage_tab() {
     let cli = Cli::try_parse_from(&argv).expect("the entrypoint argv parses");
     assert_eq!(cli.tab, Some(crate::profile::HomeTab::Usage));
     assert!(cli.command.is_none());
+}
+
+// ── a pane's session: served member and a hot swap in flight (spec §2.5) ─────
+
+/// A B row committed from `or-main` to `or-alt`, with `ack` as its helper's
+/// last record.
+fn swap_view(ack: Option<crate::hot_swap::HelperAck>) -> crate::hot_swap::SwapView {
+    let mut row = crate::testutil::live_row("4242-0", "or-main").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(
+            &crate::testutil::api_key_profile("or-main", "https://openrouter.ai/api", "k"),
+            true,
+        ),
+    );
+    row.current_member = Some("or-alt".into());
+    row.key_generation = Some(1);
+    row.committed_at = Some(10);
+    crate::hot_swap::SwapView::of(&row, ack.as_ref())
+}
+
+// 64
+#[test]
+fn a_swapping_session_tags_the_served_member_then_the_committed_one_swapping() {
+    let mut main = obs(Origin::Profile, "or-main", SourceId::OpenRouter);
+    main.money.push(meter(MoneyKind::Balance, "13.67"));
+    let mut alt = obs(Origin::Profile, "or-alt", SourceId::OpenRouter);
+    alt.money.push(meter(MoneyKind::Balance, "2.00"));
+    let accounts = [main, alt];
+
+    // Committed, not served: both members, no severity line.
+    let swapping = swap_view(None);
+    let tag =
+        session_tag(&accounts, Some("or-alt"), "claude", Some(&swapping), NOW).expect("a tag");
+    assert_eq!(tag.text, "or-main \u{2192} or-alt swapping\u{2026}");
+    assert_eq!(
+        tag_lines(&tag),
+        ["or-main \u{2192} or-alt swapping\u{2026}"]
+    );
+
+    // The helper failed for the commit: stalled.
+    let stalled = swap_view(Some(crate::hot_swap::HelperAck {
+        version: 1,
+        generation: 0,
+        member: Some("or-main".into()),
+        served_at_ms: Some(1),
+        last_failure: Some(crate::hot_swap::HelperFailure {
+            generation: 1,
+            code: "no_key".into(),
+            at_ms: 20,
+        }),
+    }));
+    let tag = session_tag(&accounts, Some("or-alt"), "claude", Some(&stalled), NOW).expect("a tag");
+    assert_eq!(tag.text, "or-main \u{2192} or-alt stalled");
+    assert_eq!(tag.severity, None);
+
+    // Served: the committed member graded like any account.
+    let served = swap_view(Some(crate::hot_swap::HelperAck {
+        version: 1,
+        generation: 1,
+        member: Some("or-alt".into()),
+        served_at_ms: Some(20),
+        last_failure: None,
+    }));
+    let tag = session_tag(&accounts, Some("or-main"), "claude", Some(&served), NOW).expect("a tag");
+    assert_eq!(
+        tag,
+        format_tag("or-alt", &accounts[1], NOW),
+        "the account graded is the served member, whatever profile the script passed"
+    );
+
+    // No session: the profile the script resolved, as before.
+    assert_eq!(
+        session_tag(&accounts, Some("or-main"), "claude", None, NOW),
+        resolve_tag(&accounts, Some("or-main"), "claude", NOW)
+    );
+}
+
+/// `--session` names a registry row only when it is a session id with a
+/// claude row behind it: a malformed value, a missing row and a codex row all
+/// read as no session, so the tag falls back to the profile the script passed.
+#[test]
+fn a_session_flag_without_a_claude_row_is_no_session() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert!(session_view("../4242-0").is_none(), "not a session id");
+    assert!(session_view("4242-0").is_none(), "no row");
+    let codex = crate::live_sessions::LiveSession {
+        harness: crate::harness::Harness::Codex,
+        ..crate::testutil::live_row("4242-0", "cx")
+    };
+    crate::live_sessions::register(&codex).unwrap();
+    assert!(session_view("4242-0").is_none(), "a codex row");
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "fit")).unwrap();
+    assert_eq!(
+        session_view("4242-0").and_then(|v| v.served_member().map(str::to_string)),
+        Some("fit".to_string())
+    );
 }

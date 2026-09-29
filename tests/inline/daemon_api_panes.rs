@@ -358,6 +358,7 @@ fn a_delegate_pid_joins_as_delegate_after_the_own_session() {
         {
             "session_id": "3208712-0",
             "profile": "uwuclxdy",
+            "state": "served",
             "kind": "session",
             "follows_chain": false,
             "isolated": false,
@@ -366,6 +367,7 @@ fn a_delegate_pid_joins_as_delegate_after_the_own_session() {
         {
             "session_id": "3210136-0",
             "profile": "uwuclxdy",
+            "state": "served",
             "kind": "delegate",
             "follows_chain": false,
             "isolated": false,
@@ -528,6 +530,7 @@ fn a_recycled_pid_keeps_only_the_newest_row() {
         serde_json::json!([{
             "session_id": "3208712-0",
             "profile": "uwuclxdy",
+            "state": "served",
             "kind": "session",
             "follows_chain": false,
             "isolated": false,
@@ -577,6 +580,7 @@ fn a_wrapper_launched_tollgate_start_is_the_panes_session() {
         serde_json::json!([{
             "session_id": "1002-0",
             "profile": "DS5",
+            "state": "served",
             "kind": "session",
             "follows_chain": false,
             "isolated": false,
@@ -636,6 +640,7 @@ fn a_pane_with_no_foreground_job_keeps_its_row_beside_a_joined_pane() {
         serde_json::json!([{
             "session_id": "2002-0",
             "profile": "uwuclxdy",
+            "state": "served",
             "kind": "delegate",
             "follows_chain": false,
             "isolated": false,
@@ -774,4 +779,49 @@ fn the_real_no_job_wire_parses_with_no_group_and_no_processes() {
     .expect("the no-job envelope parses");
     assert_eq!(info.foreground_process_group_id, None);
     assert!(info.foreground_processes.is_empty());
+}
+
+/// Hot-swap spec §2.5 / §4.7: a pane's api-key session committed from `DS5` to
+/// `or-alt` whose key helper has not served it yet is attributed to the
+/// SERVED member with `state: "swapping"`; once the ack reaches the commit's
+/// generation it reads `or-alt`, `served`.
+#[test]
+fn a_swapping_session_joins_on_its_served_member_with_its_state() {
+    let _home = HomeSandbox::new();
+    let launch = crate::testutil::api_key_profile("DS5", "https://openrouter.ai/api", "k");
+    let mut row = crate::testutil::live_row("3001-0", "DS5").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(&launch, true),
+    );
+    row.pid = 3001;
+    row.current_member = Some("or-alt".to_string());
+    row.key_generation = Some(1);
+    row.committed_at = Some(10);
+    live_sessions::register(&row).expect("register the row");
+    let info: &'static str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":3001,"foreground_processes":[{"name":"tollgate","pid":3001}],"pane_id":"wK:pK","shell_pid":3000}}}"#;
+    let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/app","focused":false,"pane_id":"wK:pK","tab_id":"wK:tK","workspace_id":"wK"}]}}"#;
+    let answer = || {
+        let ctx = ctx(probe(
+            ran_ok(list),
+            vec![("wK:pK".to_string(), ran_ok(info))],
+        ));
+        body_json(&call(&ctx, "GET", "/api/v1/panes"))["panes"][0]["sessions"][0].clone()
+    };
+    let swapping = answer();
+    assert_eq!(swapping["profile"], "DS5", "{swapping}");
+    assert_eq!(swapping["state"], "swapping", "{swapping}");
+
+    crate::hot_swap::write_ack_for_test(
+        "3001-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 1,
+            member: Some("or-alt".to_string()),
+            served_at_ms: Some(20),
+            last_failure: None,
+        },
+    );
+    let served = answer();
+    assert_eq!(served["profile"], "or-alt", "{served}");
+    assert_eq!(served["state"], "served", "{served}");
 }

@@ -55,6 +55,7 @@ fn call_switch(name: &str) -> CallToolResult {
         server
             .switch_profile(Parameters(SwitchArgs {
                 name: name.to_string(),
+                session: None,
             }))
             .await
     })
@@ -280,4 +281,269 @@ fn valid_switch_repoints_active_through_the_blocking_task() {
         text.contains("\n\nswitch_profile & this session: "),
         "a successful switch names what it does to THIS session: {text}",
     );
+}
+
+// ── `session`: one live session, not the global link (hot-swap spec §2.3) ───
+
+mod session_form {
+    use super::*;
+    use crate::testutil::{ConfigDirSandbox, api_key_profile, write_api_key_profile};
+    use std::time::Duration;
+
+    const OR: &str = "https://openrouter.ai/api";
+
+    /// A live executor-B session of `start` with its marker held, plus the
+    /// target's marker (what the real commit stamps, which the liveness probe
+    /// reads once `current_member` moves).
+    fn b_session(sid: &str, start: &str, target: &str) -> Vec<std::fs::File> {
+        let launch = api_key_profile(start, OR, "sk-start");
+        write_api_key_profile(&launch);
+        write_api_key_profile(&api_key_profile(target, OR, "sk-target"));
+        let row = crate::testutil::live_row(sid, start).with_executor(
+            crate::hot_swap::Executor::ApiKey,
+            crate::hot_swap::LaunchClass::of(&launch, true),
+        );
+        crate::live_sessions::register(&row).expect("register");
+        [start, target]
+            .iter()
+            .map(|p| {
+                crate::runtime::hold_session_row_marker(&ProfileName::from(*p), false, sid)
+                    .expect("marker")
+            })
+            .collect()
+    }
+
+    /// Stand in for the session's executor: commit the intent once it lands.
+    fn committing_session(sid: &'static str) -> std::thread::JoinHandle<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        std::thread::spawn(move || {
+            while std::time::Instant::now() < deadline {
+                if let Some(intended) =
+                    crate::live_sessions::get(sid).and_then(|r| r.intended_member)
+                {
+                    crate::live_sessions::update_as_session(sid, |f| {
+                        f.set_current_member(intended);
+                        f.bump_key_generation();
+                        f.set_committed_at(crate::usage::now_ms());
+                    })
+                    .expect("commit");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    fn call(session: &str, name: &str) -> CallToolResult {
+        let server = TollgateServer::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            server
+                .switch_profile(Parameters(SwitchArgs {
+                    name: name.to_string(),
+                    session: Some(session.to_string()),
+                }))
+                .await
+        })
+        .expect("a tool result, never a transport error")
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("reply text")
+    }
+
+    // 58
+    #[test]
+    fn switch_profile_session_self_drives_b_and_reports_swapping() {
+        let home = HomeSandbox::new();
+        let _markers = b_session("4242-0", "mc-a", "mc-b");
+        let runtime = crate::profile::tollgate_dir()
+            .expect("tollgate dir")
+            .join("profiles/mc-a/runtime-4242-0");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let _dir = ConfigDirSandbox::new(&home, &runtime);
+
+        let session = committing_session("4242-0");
+        let result = call("self", "mc-b");
+        session.join().expect("session thread");
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+        assert_eq!(
+            text(&result),
+            "session `4242-0` committed to `mc-b` (key generation 1); swapping: its requests \
+             still authenticate as `mc-a` until Claude Code's next request runs the key helper"
+        );
+        let row = crate::live_sessions::get("4242-0").expect("row");
+        assert_eq!(row.current_member.as_deref(), Some("mc-b"));
+        assert!(
+            !claude_dir()
+                .expect("claude dir")
+                .join(".credentials.json")
+                .exists(),
+            "the session form never touches the global link"
+        );
+
+        // The payload behind the prose, once the helper served the commit.
+        crate::hot_swap::write_ack_for_test(
+            "4242-0",
+            &crate::hot_swap::HelperAck {
+                version: 1,
+                generation: 1,
+                member: Some("mc-b".to_string()),
+                served_at_ms: Some(crate::usage::now_ms()),
+                last_failure: None,
+            },
+        );
+        let payload = session_switch_payload("self", "mc-b");
+        assert_eq!(payload["ok"], serde_json::json!(true));
+        assert_eq!(payload["session"], serde_json::json!("4242-0"));
+        assert_eq!(payload["executor"], serde_json::json!("api_key"));
+        assert_eq!(payload["state"], serde_json::json!("served"));
+        assert_eq!(payload["committed_member"], serde_json::json!("mc-b"));
+        assert_eq!(payload["served_member"], serde_json::json!("mc-b"));
+        assert_eq!(payload["key_generation"], serde_json::json!(1));
+        assert_eq!(payload["requested_member"], serde_json::Value::Null);
+        assert_eq!(payload["reason"], serde_json::Value::Null);
+
+        // A failed helper run for the commit is still `swapping`, with why.
+        crate::hot_swap::write_ack_for_test(
+            "4242-0",
+            &crate::hot_swap::HelperAck {
+                version: 1,
+                generation: 0,
+                member: Some("mc-a".to_string()),
+                served_at_ms: Some(1),
+                last_failure: Some(crate::hot_swap::HelperFailure {
+                    generation: 1,
+                    code: "no_key".to_string(),
+                    at_ms: crate::usage::now_ms(),
+                }),
+            },
+        );
+        let payload = session_switch_payload("4242-0", "mc-b");
+        assert_eq!(payload["state"], serde_json::json!("swapping"));
+        assert!(
+            payload["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("no_key")),
+            "{payload}"
+        );
+    }
+
+    /// `"self"` outside a tollgate runtime is refused with why, not guessed.
+    #[test]
+    fn switch_profile_session_self_outside_a_runtime_is_refused() {
+        let home = HomeSandbox::new();
+        let _dir = ConfigDirSandbox::new(&home, &home.home().join("elsewhere"));
+        let result = call("self", "mc-b");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text(&result).contains("names no tollgate runtime"),
+            "{}",
+            text(&result)
+        );
+    }
+
+    // 59
+    #[test]
+    fn switch_profile_session_on_a_relaunch_only_row_returns_the_command() {
+        let _home = HomeSandbox::new();
+        write_api_key_profile(&api_key_profile("ro-a", OR, "sk-a"));
+        write_api_key_profile(&api_key_profile("ro-b", OR, "sk-b"));
+        let row = crate::testutil::live_row("4242-0", "ro-a").with_executor(
+            crate::hot_swap::Executor::RelaunchOnly {
+                reason: "kill_switch".to_string(),
+            },
+            None,
+        );
+        crate::live_sessions::register(&row).expect("register");
+        let _marker =
+            crate::runtime::hold_session_row_marker(&ProfileName::from("ro-a"), false, "4242-0")
+                .expect("marker");
+
+        let payload = session_switch_payload("4242-0", "ro-b");
+        assert_eq!(payload["ok"], serde_json::json!(false));
+        assert_eq!(payload["state"], serde_json::json!("relaunch_required"));
+        assert_eq!(payload["executor"], serde_json::json!("relaunch_only"));
+        assert_eq!(
+            payload["reason"],
+            serde_json::json!("TOLLGATE_HOT_SWAP=off")
+        );
+        assert_eq!(
+            payload["command"],
+            serde_json::json!("tollgate switch 4242-0 ro-b --relaunch")
+        );
+        assert!(
+            crate::live_sessions::get("4242-0")
+                .expect("row")
+                .intended_member
+                .is_none(),
+            "nothing is written for a relaunch-only row"
+        );
+
+        let result = call("4242-0", "ro-b");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            text(&result),
+            "session `4242-0` cannot hot-swap (TOLLGATE_HOT_SWAP=off); relaunch in a terminal \
+             with `tollgate switch 4242-0 ro-b --relaunch` (this tool never relaunches)"
+        );
+
+        // A session that is not running, and a name that is not a session id,
+        // are refusals that name why, and write nothing.
+        for sid in ["9999-0", "../4242-0"] {
+            let payload = session_switch_payload(sid, "ro-b");
+            assert_eq!(payload["ok"], serde_json::json!(false), "{sid}");
+            assert_eq!(payload["state"], serde_json::json!("refused"), "{sid}");
+            assert!(
+                payload["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with(&format!("no live session '{sid}'"))),
+                "{payload}"
+            );
+            let result = call(sid, "ro-b");
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                text(&result).starts_with("session switch failed: no live session"),
+                "{}",
+                text(&result)
+            );
+        }
+    }
+
+    // 60
+    #[test]
+    fn switch_profile_without_session_is_unchanged() {
+        let _home = HomeSandbox::new();
+        seed_active_plus_target();
+        let result = call_switch("target");
+        assert_ne!(result.is_error, Some(true));
+        let live: ClaudeCredentials =
+            read_json_file(&claude_dir().expect("claude dir").join(".credentials.json"))
+                .expect("read live creds");
+        assert_eq!(
+            live.refresh_token(),
+            Some("target-r"),
+            "the global relink ran"
+        );
+        assert!(
+            !crate::profile::tollgate_dir()
+                .expect("tollgate dir")
+                .join("live_sessions")
+                .exists(),
+            "no session row is read or written by the global form"
+        );
+        assert!(
+            text(&result)
+                .starts_with("switched the global active profile from `active` to `target`"),
+            "{}",
+            text(&result)
+        );
+    }
 }

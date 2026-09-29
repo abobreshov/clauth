@@ -484,7 +484,9 @@ fn a_guest_b_swap_and_relaunch_leave_every_operator_tree_byte_identical() {
     let sid = rt.session_id().to_string();
 
     // The hot swap: the session's own watchdog commits the request.
-    let request = crate::sessions_cli::request_session_switch(&sid, "g-b").expect("request");
+    let request =
+        crate::sessions_cli::request_session_switch(&sid, "g-b", crate::sessions_cli::Surface::Cli)
+            .expect("request");
     assert_eq!(
         request.outcome,
         crate::sessions_cli::RequestOutcome::Committed(1)
@@ -492,6 +494,14 @@ fn a_guest_b_swap_and_relaunch_leave_every_operator_tree_byte_identical() {
     let mut key = Vec::new();
     crate::hot_swap::run_session_helper(&sid, &mut key).expect("the helper serves");
     assert_eq!(key, b"sk-g-b");
+
+    // The MCP session form moves it again: allowed in guest mode, unlike the
+    // global form, and it writes only the session's own row.
+    crate::testutil::write_api_key_profile(&crate::testutil::api_key_profile("g-c", OR, "sk-g-c"));
+    let payload = crate::mcp::session_switch_payload(&sid, "g-c");
+    assert_eq!(payload["ok"], serde_json::json!(true), "{payload}");
+    assert_eq!(payload["state"], serde_json::json!("swapping"), "{payload}");
+    assert_eq!(payload["committed_member"], serde_json::json!("g-c"));
 
     // The relaunch, up to the claim: the conversation lives in the guest store.
     crate::testutil::transcript_fixture(

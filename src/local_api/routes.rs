@@ -12,6 +12,7 @@ use serde::Serialize;
 use super::Door;
 use crate::daemon::api::http::{ErrorBody, Request, Response};
 use crate::daemon::api::routes::decode_segment;
+use crate::hot_swap::{LiveSessionView, live_session_views};
 use crate::usage::collect::{CollectOpts, collect};
 use crate::usage::observation::{
     AccountObservation, AuthKind, SCHEMA_VERSION, SourceId, redact_credentials, sanitize_message,
@@ -246,6 +247,9 @@ pub(crate) struct AccountsBody {
     /// `AccountObservation` objects (see `tollgate usage --json`), redacted.
     #[schema(value_type = Vec<Object>)]
     accounts: Vec<AccountObservation>,
+    /// Every running `tollgate start` session, with where it is in a switch
+    /// (requested, committed, served). Additive under schema version 1.
+    live_sessions: Vec<LiveSessionView>,
 }
 
 /// `GET /v1/accounts/{id}`.
@@ -255,6 +259,8 @@ pub(crate) struct AccountBody {
     /// One `AccountObservation`, redacted.
     #[schema(value_type = Object)]
     account: AccountObservation,
+    /// The running sessions whose committed or served member is this account.
+    live_sessions: Vec<LiveSessionView>,
 }
 
 /// `GET /v1/usage`: byte for byte the `tollgate usage --json` envelope.
@@ -419,6 +425,7 @@ fn accounts(req: &Request) -> Response {
         &AccountsBody {
             schema_version: SCHEMA_VERSION,
             accounts: observations(&opts_from(req)),
+            live_sessions: live_session_views(),
         },
     )
 }
@@ -447,15 +454,39 @@ fn account(id: &str) -> Response {
         .position(|o| o.id == id)
         .or((!found.is_empty()).then_some(0));
     match pick.and_then(|i| found.into_iter().nth(i)) {
-        Some(account) => Response::serialize(
-            200,
-            &AccountBody {
-                schema_version: SCHEMA_VERSION,
-                account,
-            },
-        ),
+        Some(account) => {
+            let live_sessions = account_live_sessions(&account);
+            Response::serialize(
+                200,
+                &AccountBody {
+                    schema_version: SCHEMA_VERSION,
+                    account,
+                    live_sessions,
+                },
+            )
+        }
         None => Response::error(404, "account_not_found"),
     }
+}
+
+/// The live sessions an account's body lists: a Claude Code profile's
+/// committed or served sessions, a codex profile's sessions by launch profile
+/// (a codex row has neither), and none for a monitor or upstream account.
+fn account_live_sessions(account: &AccountObservation) -> Vec<LiveSessionView> {
+    use crate::usage::observation::Origin;
+    let Some((_, name)) = account.id.split_once(':') else {
+        return Vec::new();
+    };
+    let harness = match account.origin {
+        Origin::Profile => crate::harness::Harness::Claude,
+        Origin::CodexProfile => crate::harness::Harness::Codex,
+        _ => return Vec::new(),
+    };
+    live_session_views()
+        .into_iter()
+        .filter(|view| view.harness == harness.as_str())
+        .filter(|view| view.involves(name) || (view.served.is_none() && view.start_profile == name))
+        .collect()
 }
 
 #[utoipa::path(

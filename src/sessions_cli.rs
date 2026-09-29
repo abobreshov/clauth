@@ -327,10 +327,34 @@ fn switch_waits() -> SwitchWaits {
     SwitchWaits::PRODUCTION
 }
 
+/// Which surface asked for a session switch. The request core behaves the
+/// same for all three (none of them waits for the helper or relaunches); the
+/// surface names the asker in the log line an executor-B intent leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    Cli,
+    Tui,
+    Mcp,
+}
+
+impl Surface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Tui => "tui",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
 /// The request core every surface shares: resolve, branch on the row's
 /// executor, and for executor B write the intent and wait (5 s) for the
 /// session to commit it or refuse it.
-pub(crate) fn request_session_switch(sid: &str, profile: &str) -> Result<SwitchRequest> {
+pub(crate) fn request_session_switch(
+    sid: &str,
+    profile: &str,
+    surface: Surface,
+) -> Result<SwitchRequest> {
     let row = live_claude_row(sid)?;
     let config = load_config()?;
     let canonical = resolve_profile_name(&config, profile)?;
@@ -376,6 +400,11 @@ pub(crate) fn request_session_switch(sid: &str, profile: &str) -> Result<SwitchR
             crate::live_sessions::update_as_daemon(sid, |fields| {
                 fields.set_intended_member(canonical.as_str());
             })?;
+            crate::logline::logline!(
+                "tollgate: session {sid} asked to move onto {} (api-key hot swap, from {})",
+                canonical.as_str(),
+                surface.as_str()
+            );
             let waits = switch_waits();
             let deadline = std::time::Instant::now() + waits.commit;
             loop {
@@ -456,7 +485,7 @@ pub(crate) fn run_switch(sid: &str, profile: &str, flags: &SwitchFlags) -> Resul
     if flags.relaunch {
         return crate::relaunch::run_cli(sid, profile, flags.yes, flags.conversation.as_deref());
     }
-    let request = request_session_switch(sid, profile)?;
+    let request = request_session_switch(sid, profile, Surface::Cli)?;
     let SwitchRequest {
         sid,
         target,

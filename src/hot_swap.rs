@@ -67,13 +67,6 @@ pub(crate) enum Executor {
 
 impl Executor {
     /// The wire spelling surfaces report (`null` for [`Executor::None`]).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by `LiveSessionView`, which the local API renders in hot-swap part 2"
-        )
-    )]
     pub(crate) fn wire(&self) -> Option<&'static str> {
         match self {
             Self::Oauth => Some("oauth"),
@@ -827,7 +820,7 @@ pub(crate) fn read_helper_ack_at(path: &Path) -> Option<HelperAck> {
 // ── the view every surface reads ─────────────────────────────────────────────
 
 /// Where a session is in a switch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SwapState {
     /// A switch is asked for and not committed yet.
@@ -841,7 +834,7 @@ pub(crate) enum SwapState {
 }
 
 /// One member at one key generation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub(crate) struct SwapPoint {
     pub(crate) member: String,
     pub(crate) generation: u64,
@@ -985,35 +978,34 @@ pub(crate) fn attributed_member(row: &LiveSession) -> String {
 
 /// The serialisable per-session view the read surfaces render. Carries no
 /// claude argv (there is none on the row to carry).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the local API's `live_sessions` field renders it in hot-swap part 2"
-    )
-)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub(crate) struct LiveSessionView {
     pub(crate) session_id: String,
+    /// `claude` or `codex`.
     pub(crate) harness: String,
     pub(crate) start_profile: String,
+    /// `oauth`, `api_key` or `relaunch_only`; `null` for a codex row.
+    #[schema(required = true, value_type = Option<String>)]
     pub(crate) executor: Option<&'static str>,
+    /// The code a `relaunch_only` row registered with.
+    #[schema(required = true)]
     pub(crate) relaunch_reason: Option<String>,
+    /// A switch asked for and not committed yet.
+    #[schema(required = true)]
     pub(crate) requested_member: Option<String>,
+    /// What the session committed to; `null` for a codex row.
+    #[schema(required = true)]
     pub(crate) committed: Option<SwapPoint>,
+    /// What the session's requests authenticate as; `null` for a codex row.
+    #[schema(required = true)]
     pub(crate) served: Option<SwapPoint>,
     pub(crate) state: SwapState,
+    /// Present (`true`) only on a `swapping` view with no helper run recorded
+    /// since the commit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) idle: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the local API's `live_sessions` field renders it in hot-swap part 2"
-    )
-)]
 impl LiveSessionView {
     pub(crate) fn of(row: &LiveSession, ack: Option<&HelperAck>) -> Self {
         let view = SwapView::of(row, ack);
@@ -1033,6 +1025,49 @@ impl LiveSessionView {
             idle: view.idle,
         }
     }
+
+    /// Whether the view names `member` as committed or served: the local
+    /// API's per-account filter.
+    pub(crate) fn involves(&self, member: &str) -> bool {
+        [&self.committed, &self.served]
+            .into_iter()
+            .flatten()
+            .any(|point| point.member == member)
+    }
+}
+
+/// Every running session's view, oldest first, for the read-only surfaces.
+///
+/// Lock-free: each row and ack sidecar is one rename-atomic read, and a row
+/// whose supervisor pid is gone (a crashed session awaiting GC) is left out by
+/// a signal-0 probe, which neither writes nor takes a lock. No `load_config`.
+pub(crate) fn live_session_views() -> Vec<LiveSessionView> {
+    let mut rows: Vec<LiveSession> = crate::live_sessions::list()
+        .into_iter()
+        .filter(|row| supervisor_alive(row.pid))
+        .collect();
+    rows.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    rows.iter()
+        .map(|row| {
+            let ack = (row.executor() == Executor::ApiKey)
+                .then(|| crate::live_sessions::read_helper_ack(&row.session_id))
+                .flatten();
+            LiveSessionView::of(row, ack.as_ref())
+        })
+        .collect()
+}
+
+/// `kill(pid, 0)` on unix; every row counts elsewhere (no probe to ask).
+fn supervisor_alive(pid: u32) -> bool {
+    if cfg!(unix) {
+        crate::runtime::namespaced_keychain_ledger::pid_alive(pid)
+    } else {
+        true
+    }
 }
 
 // ── the session helper ───────────────────────────────────────────────────────
@@ -1044,8 +1079,16 @@ const ACK_LOCK_SLEEP: std::time::Duration = std::time::Duration::from_millis(20)
 /// Which member and generation a session helper run serves, from the row
 /// (rename-atomic, lock-free), else the last successful ack, else the start
 /// profile encoded in `CLAUDE_CONFIG_DIR`.
+///
+/// Only an executor-B row moves the key off its launch profile: executor B is
+/// the only writer that commits an api-key member. Any other row serves its
+/// launch profile at generation 0, so a `current_member` another executor
+/// wrote (an OAuth swap's member) never reaches this helper's stdout.
 fn helper_target(sid: &str) -> Result<(String, u64), &'static str> {
     if let Some(row) = crate::live_sessions::get(sid) {
+        if row.executor() != Executor::ApiKey {
+            return Ok((row.start_profile, 0));
+        }
         let member = row.current_member.unwrap_or(row.start_profile);
         return Ok((member, row.key_generation.unwrap_or(0)));
     }
@@ -1317,9 +1360,28 @@ pub(crate) fn runtime_settings_drift(settings: &Path, class: &LaunchClass) -> Op
 /// Move a runtime `settings.json`'s mtime without writing a byte: any change
 /// to that file drops Claude Code's cached key (S1(c)), so the next request
 /// runs the helper before it is sent.
+///
+/// The runtime copy is always a regular file tollgate wrote. A symlink there
+/// is refused rather than followed, so the touch can never reach the file it
+/// points at (the operator's `~/.claude/settings.json`, say).
 pub(crate) fn touch_settings(path: &Path) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .file_type()
+            .is_symlink(),
+        "{} is a symlink",
+        path.display()
+    );
+    let file = opts
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.set_modified(std::time::SystemTime::now())

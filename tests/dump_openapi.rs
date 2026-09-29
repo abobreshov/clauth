@@ -79,3 +79,32 @@ fn a_reader_that_left_gets_exit_0() {
         "a gone reader must not fail the dump"
     );
 }
+
+/// The served document describes each pane session's hot-swap `state` (spec
+/// §2.5, §4.7): a required property whose schema is the four-state enum, beside
+/// the `profile` it qualifies (now the served member).
+#[test]
+fn the_pane_session_schema_carries_its_swap_state() {
+    let home = tempfile::tempdir().expect("home");
+    let out = dump(home.path())
+        .output()
+        .expect("run tollgate daemon --dump-openapi");
+    assert_eq!(out.status.code(), Some(0));
+    let document: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let schemas = &document["components"]["schemas"];
+    let pane = &schemas["PaneSession"];
+    assert_eq!(
+        pane["properties"]["state"]["$ref"], "#/components/schemas/SwapState",
+        "{pane}"
+    );
+    assert!(
+        pane["required"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|v| v == "state")),
+        "{pane}"
+    );
+    assert_eq!(
+        schemas["SwapState"]["enum"],
+        serde_json::json!(["requested", "swapping", "stalled", "served"])
+    );
+}

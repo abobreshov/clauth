@@ -339,7 +339,26 @@ fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
     if !crate::profile::is_own_profile_dir(profile_dir) {
         return None;
     }
-    Some(profile_dir.file_name()?.to_str()?.to_string())
+    let start = profile_dir.file_name()?.to_str()?.to_string();
+    Some(served_member_of_runtime(dir, &start).unwrap_or(start))
+}
+
+/// Inside an api-key hot-swap session (executor B) the runtime dir keeps the
+/// launch profile's name for the session's whole life, while its key helper
+/// may already serve another member. The member the session's requests
+/// authenticate as is the SERVED one (read off the helper's ack), never the
+/// committed one: until the helper runs, Claude Code still sends the previous
+/// key. `None` for every other session, which the dir name attributes.
+fn served_member_of_runtime(dir: &Path, start: &str) -> Option<String> {
+    let sid = crate::runtime::sid_of_runtime_dir_name(dir.file_name()?.to_str()?)?;
+    let row = crate::live_sessions::get(&sid)?;
+    if row.start_profile != start || row.executor() != crate::hot_swap::Executor::ApiKey {
+        return None;
+    }
+    let ack = crate::live_sessions::read_helper_ack(&sid);
+    crate::hot_swap::SwapView::of(&row, ack.as_ref())
+        .served_member()
+        .map(str::to_string)
 }
 
 fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {

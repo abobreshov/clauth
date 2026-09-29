@@ -1178,7 +1178,7 @@ mod hot_swap_switch {
         )
         .expect("target marker");
         let session = committing_session("4242-0");
-        let request = request_session_switch("4242-0", "sw-b").expect("request");
+        let request = request_session_switch("4242-0", "sw-b", Surface::Cli).expect("request");
         session.join().expect("session thread");
         assert_eq!(request.outcome, RequestOutcome::Committed(1));
         assert_eq!(request.current, "sw-a");
@@ -1195,7 +1195,7 @@ mod hot_swap_switch {
             served_poll: Duration::from_millis(10),
         }));
         write_api_key_profile(&api_key_profile("sw-c", OR, "sk-c"));
-        let request = request_session_switch("4242-0", "sw-c").expect("request");
+        let request = request_session_switch("4242-0", "sw-c", Surface::Cli).expect("request");
         assert_eq!(request.outcome, RequestOutcome::Requested);
         set_switch_waits(None);
     }
@@ -1211,7 +1211,7 @@ mod hot_swap_switch {
             "https://api.deepseek.com/anthropic",
             "sk-ds",
         ));
-        let request = request_session_switch("4242-0", "pc-ds").expect("request");
+        let request = request_session_switch("4242-0", "pc-ds", Surface::Cli).expect("request");
         assert_eq!(
             request.outcome,
             RequestOutcome::Refused("class_differs:endpoint".to_string())
@@ -1247,7 +1247,7 @@ mod hot_swap_switch {
             "4242-0",
         )
         .expect("marker");
-        let request = request_session_switch("4242-0", "ro-b").expect("request");
+        let request = request_session_switch("4242-0", "ro-b", Surface::Cli).expect("request");
         assert_eq!(
             request.outcome,
             RequestOutcome::RelaunchRequired("kill_switch".to_string())

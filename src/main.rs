@@ -481,9 +481,11 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
         // tollgate's own plugin id, so guest mode does not gate them.
         cli::HerdrCommand::Link { path } => herdr::link::link(path.as_deref()),
         cli::HerdrCommand::Unlink => herdr::link::unlink(),
-        cli::HerdrCommand::Tag { agent, profile } => {
-            herdr::tag::run(profile.as_deref(), agent.as_deref())
-        }
+        cli::HerdrCommand::Tag {
+            agent,
+            session,
+            profile,
+        } => herdr::tag::run(profile.as_deref(), agent.as_deref(), session.as_deref()),
         cli::HerdrCommand::Config { cmd } => match cmd {
             cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },

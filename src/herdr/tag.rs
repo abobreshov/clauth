@@ -266,17 +266,77 @@ pub(crate) fn tag_lines(tag: &PaneTag) -> Vec<String> {
     lines
 }
 
-/// `tollgate herdr tag [--agent <kind>] [<profile>]`: prints [`tag_lines`], or
-/// nothing when the pane gets no tag. Always exits 0: the reporter treats an
-/// empty answer as "clear", and a predating binary answers the same.
-pub(crate) fn run(profile: Option<&str>, agent: Option<&str>) -> Result<()> {
+/// The tag for a pane whose `tollgate start` session is known.
+///
+/// The account graded is the SERVED member: an api-key hot swap committed to
+/// another member still authenticates as the previous one until its key
+/// helper runs (S1(d)). While that commit is in flight (`swapping`, or
+/// `stalled` on a helper failure) line 1 names both members and carries no
+/// severity line: `<served> → <committed> swapping…`. With no view (no row,
+/// or not a claude session) this is [`resolve_tag`] for `profile`.
+pub(crate) fn session_tag(
+    accounts: &[AccountObservation],
+    profile: Option<&str>,
+    agent: &str,
+    view: Option<&crate::hot_swap::SwapView>,
+    now_secs: i64,
+) -> Option<PaneTag> {
+    let Some(view) = view else {
+        return resolve_tag(accounts, profile, agent, now_secs);
+    };
+    let served = view.served_member().or(profile);
+    let committed = view.committed.as_ref().map(|p| p.member.as_str());
+    let word = match view.state {
+        crate::hot_swap::SwapState::Swapping => Some("swapping…"),
+        crate::hot_swap::SwapState::Stalled => Some("stalled"),
+        crate::hot_swap::SwapState::Requested | crate::hot_swap::SwapState::Served => None,
+    };
+    match (word, served, committed) {
+        (Some(word), Some(served), Some(committed)) => Some(PaneTag {
+            text: cap(&format!(
+                "{} → {} {word}",
+                clean_label(served),
+                clean_label(committed)
+            )),
+            severity: None,
+        }),
+        _ => resolve_tag(accounts, served, agent, now_secs),
+    }
+}
+
+/// The swap view of `sid`'s registry row, for a claude session only. Reads the
+/// row and its helper ack, both rename-atomic and lock-free.
+fn session_view(sid: &str) -> Option<crate::hot_swap::SwapView> {
+    if !crate::runtime::is_session_id(sid) {
+        return None;
+    }
+    let row = crate::live_sessions::get(sid)?;
+    if row.harness != crate::harness::Harness::Claude {
+        return None;
+    }
+    let ack = crate::live_sessions::read_helper_ack(sid);
+    Some(crate::hot_swap::SwapView::of(&row, ack.as_ref()))
+}
+
+/// `tollgate herdr tag [--agent <kind>] [--session <sid>] [<profile>]`: prints
+/// [`tag_lines`], or nothing when the pane gets no tag. Always exits 0: the
+/// reporter treats an empty answer as "clear", and a predating binary answers
+/// the same.
+pub(crate) fn run(profile: Option<&str>, agent: Option<&str>, session: Option<&str>) -> Result<()> {
     let accounts = collect(&CollectOpts {
         // A disabled profile still burns the pane it runs in.
         include_disabled: true,
         ..CollectOpts::default()
     });
     let now_secs = crate::usage::now_epoch_secs();
-    if let Some(tag) = resolve_tag(&accounts, profile, agent.unwrap_or(""), now_secs) {
+    let view = session.and_then(session_view);
+    if let Some(tag) = session_tag(
+        &accounts,
+        profile,
+        agent.unwrap_or(""),
+        view.as_ref(),
+        now_secs,
+    ) {
         for line in tag_lines(&tag) {
             outln!("{line}");
         }

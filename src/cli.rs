@@ -831,15 +831,21 @@ pub(crate) enum HerdrCommand {
 
     /// Print a pane's tag text for the plugin scripts
     ///
-    /// `tollgate herdr tag [--agent <kind>] [<profile>]` prints the account's
-    /// name and lead metric on one line, then its severity class. Hidden from
-    /// help: this is the scripts' read path, not a human surface.
+    /// `tollgate herdr tag [--agent <kind>] [--session <sid>] [<profile>]`
+    /// prints the account's name and lead metric on one line, then its
+    /// severity class. Hidden from help: this is the scripts' read path, not a
+    /// human surface.
     #[command(hide = true)]
     Tag {
         /// herdr's agent id for the pane (`claude`, `codex`, `hermes`, `grok`,
         /// `agy`).
         #[arg(long, value_name = "KIND")]
         agent: Option<String>,
+        /// The pane's `tollgate start` session: the tag then grades the
+        /// account the session's requests authenticate as, and names a hot
+        /// swap in flight (`<served> → <committed> swapping…`).
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
         /// The profile the pane burns; omitted for a native pane.
         profile: Option<String>,
     },

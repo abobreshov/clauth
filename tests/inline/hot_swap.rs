@@ -676,3 +676,35 @@ fn a_force_login_setting_in_the_base_or_managed_file_is_gateway_policy() {
     set_managed_settings_override(None);
     assert!(in_force, "the managed file counts too");
 }
+
+/// The commit's settings touch moves a regular file's mtime and refuses a
+/// symlink rather than follow it: the target (the operator's
+/// `~/.claude/settings.json`, say) keeps its mtime.
+#[cfg(unix)]
+#[test]
+fn the_settings_touch_refuses_a_symlink() {
+    let home = HomeSandbox::new();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let real = home.home().join("settings.json");
+    std::fs::write(&real, b"{}").expect("write");
+    crate::testutil::set_mtime(&real, old);
+    touch_settings(&real).expect("a regular file is touched");
+    let moved = std::fs::metadata(&real)
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    assert!(moved > old + std::time::Duration::from_secs(3000));
+
+    let operator = home.home().join("operator-settings.json");
+    std::fs::write(&operator, b"{}").expect("write");
+    crate::testutil::set_mtime(&operator, old);
+    let link = home.home().join("runtime-settings.json");
+    std::os::unix::fs::symlink(&operator, &link).expect("symlink");
+    assert!(touch_settings(&link).is_err(), "a symlink is refused");
+    assert_eq!(
+        std::fs::metadata(&operator)
+            .and_then(|m| m.modified())
+            .expect("mtime"),
+        old,
+        "the link's target is untouched"
+    );
+}

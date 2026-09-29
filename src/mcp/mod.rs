@@ -719,8 +719,17 @@ pub(crate) struct TollgateServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SwitchArgs {
-    /// Account to re-link the global credentials to.
+    /// Account to re-link the global credentials to, or, with `session`, the
+    /// account to move that one session onto.
     name: String,
+    /// Move ONE running `tollgate start` session instead of relinking the
+    /// global credentials: `"self"` for this session, or a session id
+    /// (`<pid>-<seq>`, as `tollgate sessions` lists). An api-key session
+    /// hot-swaps within its endpoint class; anything else answers
+    /// `relaunch_required` with the terminal command. Omit it for the global
+    /// relink.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1029,12 +1038,21 @@ caches: it spends no quota. Credentials are never included.",
         description = "Relink the global `~/.claude` credentials to another account. Whether THIS \
 session follows depends on how it reads credentials: the reply says which case it is in, and \
 `profiles({scope:\"session\"})` says so before you commit. To use another account without \
-disturbing this session, use `delegate`."
+disturbing this session, use `delegate`.\n\n\
+With `session` (`\"self\"` or a session id) it moves that one `tollgate start` session instead \
+and leaves the global credentials alone. An api-key session moves onto another account of the \
+same endpoint and model routing without a restart: the reply's `state` is `swapping` until \
+Claude Code's next request runs the key helper, then `served`. Any other session answers \
+`relaunch_required` with the `tollgate switch <sid> <profile> --relaunch` command to run in a \
+terminal; this tool never relaunches."
     )]
     async fn switch_profile(
         &self,
-        Parameters(SwitchArgs { name }): Parameters<SwitchArgs>,
+        Parameters(SwitchArgs { name, session }): Parameters<SwitchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(session) = session {
+            return switch_session_tool(session, name).await;
+        }
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         // The reply's session-effect note, resolved once: `session_auth` reads
         // the env this server was launched with, which no arm below can move.
@@ -5436,6 +5454,133 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// The `usage` tool's reply: the local API's redacted `usage --json` envelope
 /// as one compact JSON text block. Blocking cache reads only, like `profiles`.
+/// `switch_profile` with `session`: the session request core off the async
+/// worker (it polls the row for up to five seconds), rendered as prose.
+async fn switch_session_tool(session: String, name: String) -> Result<CallToolResult, ErrorData> {
+    let payload = tokio::task::spawn_blocking(move || session_switch_payload(&session, &name))
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("switch task failed: {e}"), None))?;
+    let prose = render::switch_session_prose(&payload);
+    Ok(if payload["ok"].as_bool() == Some(true) {
+        CallToolResult::success(single_block(prose))
+    } else {
+        CallToolResult::error(single_block(prose))
+    })
+}
+
+/// The session switch's payload: `{ok, session, executor, state,
+/// requested_member, committed_member, served_member, key_generation,
+/// reason}`, plus `command` on `relaunch_required`. `state` is one of
+/// `requested`, `swapping`, `served`, `refused`, `relaunch_required`.
+///
+/// `"self"` is the session this server runs in, read off `CLAUDE_CONFIG_DIR`.
+/// The request core writes only the session's own registry row, so guest
+/// mode allows it; it never waits for the key helper and never relaunches.
+pub(crate) fn session_switch_payload(session: &str, name: &str) -> serde_json::Value {
+    use crate::sessions_cli::RequestOutcome;
+    let sid = if session == "self" {
+        match crate::hook_note::runtime_sid_from_env() {
+            Some(sid) => sid,
+            None => {
+                return serde_json::json!({
+                    "ok": false,
+                    "session": session,
+                    "state": "refused",
+                    "reason": "this session is not a `tollgate start` session: its \
+                               CLAUDE_CONFIG_DIR names no tollgate runtime",
+                });
+            }
+        }
+    } else {
+        session.to_string()
+    };
+    let request = match crate::sessions_cli::request_session_switch(
+        &sid,
+        name,
+        crate::sessions_cli::Surface::Mcp,
+    ) {
+        Ok(request) => request,
+        Err(e) => {
+            return serde_json::json!({
+                "ok": false,
+                "session": sid,
+                "state": "refused",
+                "reason": format!("{e:#}"),
+            });
+        }
+    };
+    // The row as it stands after the request, for the three members.
+    let row = crate::live_sessions::get(&sid);
+    let view = row.as_ref().map(|row| {
+        let ack = crate::live_sessions::read_helper_ack(&sid);
+        crate::hot_swap::SwapView::of(row, ack.as_ref())
+    });
+    // A session already committed to the member (just now, or before this
+    // call) reports what its key helper has done since: `served` once the
+    // helper printed the new key, `swapping` until then, and a helper failure
+    // stays `swapping` with the failure as its reason.
+    let live = || {
+        use crate::hot_swap::SwapState;
+        match view.as_ref() {
+            Some(v) => match v.state {
+                SwapState::Served => ("served", None),
+                SwapState::Requested => ("requested", None),
+                SwapState::Swapping => ("swapping", None),
+                SwapState::Stalled => (
+                    "swapping",
+                    Some(format!(
+                        "its key helper failed ({}); Claude Code keeps the previous key until it \
+                         is rejected",
+                        v.stall_code.as_deref().unwrap_or("unknown")
+                    )),
+                ),
+            },
+            None => ("served", None),
+        }
+    };
+    let cc = crate::hot_swap::cached_cc_version_lockfree();
+    let (ok, state, reason) = match &request.outcome {
+        RequestOutcome::AlreadyOn | RequestOutcome::Committed(_) => {
+            let (state, reason) = live();
+            (true, state, reason)
+        }
+        RequestOutcome::IntentRecorded | RequestOutcome::Requested => (true, "requested", None),
+        RequestOutcome::Refused(code) => (
+            false,
+            "refused",
+            Some(crate::hot_swap::reason_text(code, None)),
+        ),
+        RequestOutcome::RelaunchRequired(code) => (
+            false,
+            "relaunch_required",
+            Some(crate::hot_swap::reason_text(code, cc.as_deref())),
+        ),
+    };
+    let member = |point: Option<&crate::hot_swap::SwapPoint>| point.map(|p| p.member.clone());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "session": request.sid,
+        "executor": view.as_ref().and_then(|v| v.executor.wire()),
+        "state": state,
+        "requested_member": view.as_ref().and_then(|v| v.requested_member.clone()),
+        "committed_member": view.as_ref().and_then(|v| member(v.committed.as_ref())),
+        "served_member": view.as_ref().and_then(|v| member(v.served.as_ref())),
+        "key_generation": row.as_ref().and_then(|r| r.key_generation),
+        "reason": reason,
+    });
+    if matches!(
+        request.outcome,
+        RequestOutcome::RelaunchRequired(_) | RequestOutcome::Refused(_)
+    ) {
+        payload["command"] = serde_json::json!(format!(
+            "tollgate switch {} {} --relaunch",
+            request.sid, request.target
+        ));
+    }
+    payload["target"] = serde_json::json!(request.target);
+    payload
+}
+
 fn usage_tool_result(args: &UsageArgs) -> CallToolResult {
     let report = crate::local_api::routes::usage_report(&crate::usage::collect::CollectOpts {
         include_disabled: args.all.unwrap_or(false),

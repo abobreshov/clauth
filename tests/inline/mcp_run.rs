@@ -9034,6 +9034,7 @@ fn switch_profile_refuses_a_codex_name_as_a_codex_account() {
         let result = rt
             .block_on(server.switch_profile(Parameters(SwitchArgs {
                 name: name.to_string(),
+                session: None,
             })))
             .expect("switch_profile returns a tool result, never a transport error");
         assert_eq!(result.is_error, Some(true));

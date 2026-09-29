@@ -15023,3 +15023,169 @@ fn without_read_only_rows_the_overview_cursor_is_unchanged() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!((app.profile_cursor, app.usage_extra_cursor), (0, None));
 }
+
+// ── Overview `m`: move a live session (hot-swap spec §2.2) ───────────────────
+
+/// Hot-swap spec test 67: `m` on an Overview row opens the move modal over the
+/// live claude sessions (each named with the member it is served by), and ⏎
+/// hands the pick to the shared session request core on a worker. An
+/// api-key session commits and the drain toasts `swapping…`; a relaunch-only
+/// session toasts the terminal command, and nothing is relaunched. With no
+/// live session, `m` toasts instead of opening an empty modal.
+#[test]
+fn m_moves_a_live_session_through_the_request_core() {
+    use super::{Modal, MoveCandidate, drain_session_moves, handle_key, join_test_workers};
+    use crate::testutil::{api_key_profile, key, write_api_key_profile};
+    use ratatui::crossterm::event::KeyCode;
+    use std::time::Duration;
+    const OR: &str = "https://openrouter.ai/api";
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let launch = api_key_profile("tm-a", OR, "sk-a");
+    write_api_key_profile(&launch);
+    write_api_key_profile(&api_key_profile("tm-b", OR, "sk-b"));
+    let config = crate::profile::load_config().expect("load config");
+    let target_idx = config
+        .profiles
+        .iter()
+        .position(|p| p.name.as_str() == "tm-b")
+        .expect("tm-b is on the roster");
+    let mut app = super::App::new(config);
+    app.profile_cursor = target_idx;
+    let last_toast = |app: &super::App| {
+        app.toasts
+            .back()
+            .map(|t| t.body.clone())
+            .unwrap_or_default()
+    };
+
+    // Nothing live: a toast, no modal.
+    handle_key(&mut app, key(KeyCode::Char('m')));
+    assert!(app.modals.is_empty(), "no empty modal");
+    assert_eq!(last_toast(&app), "no live claude session to move");
+
+    let row = crate::testutil::live_row("4242-0", "tm-a").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(&launch, true),
+    );
+    crate::live_sessions::register(&row).expect("register");
+    let _markers: Vec<std::fs::File> = ["tm-a", "tm-b"]
+        .iter()
+        .map(|p| {
+            crate::runtime::hold_session_row_marker(
+                &crate::profile::ProfileName::from(*p),
+                false,
+                "4242-0",
+            )
+            .expect("marker")
+        })
+        .collect();
+
+    handle_key(&mut app, key(KeyCode::Char('m')));
+    match app.modals.last() {
+        Some(Modal::MoveSession(form)) => {
+            assert_eq!(form.target, "tm-b");
+            assert_eq!(
+                form.sessions,
+                [MoveCandidate {
+                    sid: "4242-0".to_string(),
+                    now_on: "tm-a".to_string(),
+                    executor: "api_key",
+                    state: crate::hot_swap::SwapState::Served,
+                }]
+            );
+        }
+        other => panic!("the move modal is open: {other:?}"),
+    }
+
+    // The session's own executor, standing in: commit the intent once it lands.
+    let session = std::thread::spawn(|| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(intended) =
+                crate::live_sessions::get("4242-0").and_then(|r| r.intended_member)
+            {
+                crate::live_sessions::update_as_session("4242-0", |f| {
+                    f.set_current_member(intended);
+                    f.bump_key_generation();
+                    f.set_committed_at(crate::usage::now_ms());
+                })
+                .expect("commit");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "⏎ closes the modal");
+    join_test_workers();
+    session.join().expect("session thread");
+    drain_session_moves(&mut app);
+    assert_eq!(last_toast(&app), "session 4242-0: swapping… onto tm-b");
+    let moved = crate::live_sessions::get("4242-0").expect("row");
+    assert_eq!(moved.current_member.as_deref(), Some("tm-b"));
+    assert_eq!(moved.key_generation, Some(1));
+
+    // A relaunch-only session: the command, never a relaunch.
+    let ro = crate::testutil::live_row("4242-1", "tm-a").with_executor(
+        crate::hot_swap::Executor::RelaunchOnly {
+            reason: "fake_links".to_string(),
+        },
+        None,
+    );
+    crate::live_sessions::register(&ro).expect("register");
+    let _ro_marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("tm-a"),
+        false,
+        "4242-1",
+    )
+    .expect("marker");
+    handle_key(&mut app, key(KeyCode::Char('m')));
+    let Some(Modal::MoveSession(form)) = app.modals.last() else {
+        panic!("the move modal is open");
+    };
+    let pos = form
+        .sessions
+        .iter()
+        .position(|s| s.sid == "4242-1")
+        .expect("the relaunch-only session is offered");
+    for _ in 0..pos {
+        handle_key(&mut app, key(KeyCode::Down));
+    }
+    handle_key(&mut app, key(KeyCode::Enter));
+    join_test_workers();
+    drain_session_moves(&mut app);
+    assert_eq!(
+        last_toast(&app),
+        "session 4242-1: relaunch with 'tollgate switch 4242-1 tm-b --relaunch'"
+    );
+    assert!(
+        crate::live_sessions::get("4242-1")
+            .expect("row")
+            .intended_member
+            .is_none(),
+        "nothing is written for a relaunch-only session"
+    );
+
+    // The session ended between the pick and ⏎: the request core's refusal is
+    // the toast, as a danger.
+    handle_key(&mut app, key(KeyCode::Char('m')));
+    std::fs::remove_file(
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
+            .join("live_sessions/4242-0.json"),
+    )
+    .expect("the row goes");
+    handle_key(&mut app, key(KeyCode::Enter));
+    join_test_workers();
+    drain_session_moves(&mut app);
+    let toast = app.toasts.back().expect("a toast");
+    assert_eq!(toast.kind, super::ToastKind::Danger);
+    assert!(
+        toast
+            .body
+            .starts_with("session 4242-0: no live session '4242-0'"),
+        "{}",
+        toast.body
+    );
+}

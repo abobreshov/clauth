@@ -135,12 +135,26 @@ adopted_codex_profile() {
 }
 
 # The account a row names: the member a --with-fallback session swapped onto,
-# else its launch member.
+# else its launch member. An api-key hot-swap session (executor B) names the
+# member its key helper last SERVED, from the `<sid>.helper` ack beside the
+# row: a committed member the helper has not served yet is not what the
+# session's requests authenticate as.
 row_profile() {
     _row=$1
-    _p=$(sed -n 's/.*"current_member":"\([^"]*\)".*/\1/p' "$_row")
+    _p=""
+    if grep -q '"executor":{"kind":"api_key"}' "$_row" 2>/dev/null; then
+        _p=$(sed -n 's/.*"member":"\([^"]*\)".*/\1/p' "${_row%.json}.helper" 2>/dev/null)
+    else
+        _p=$(sed -n 's/.*"current_member":"\([^"]*\)".*/\1/p' "$_row")
+    fi
     [ -n "$_p" ] || _p=$(sed -n 's/.*"start_profile":"\([^"]*\)".*/\1/p' "$_row")
     printf '%s\n' "$_p"
+}
+
+# The session id a row file names (`<sid>.json`).
+row_sid() {
+    _s=${1##*/}
+    printf '%s\n' "${_s%.json}"
 }
 
 # Reads a herdr pane JSON line's own `agent` field from stdin. The nested
@@ -204,6 +218,9 @@ case "$agent" in
 esac
 
 profile=""
+# The pane's own session id, when a row resolved it: the tag then grades the
+# account that session's requests authenticate as.
+session=""
 if [ -z "$agentless" ] && [ -z "$native" ] && [ -n "$pane" ]; then
     info=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null)
     # The pane's own session is named by the foreground process group id herdr
@@ -215,7 +232,10 @@ if [ -z "$agentless" ] && [ -z "$native" ] && [ -n "$pane" ]; then
     fg_pid=$(printf '%s' "$info" | sed -n 's/.*"foreground_process_group_id":\([0-9]*\).*/\1/p')
     if [ -n "$fg_pid" ]; then
         row=$(session_row "$fg_pid")
-        [ -n "$row" ] && profile=$(row_profile "$row")
+        if [ -n "$row" ]; then
+            profile=$(row_profile "$row")
+            session=$(row_sid "$row")
+        fi
     fi
     # The pid sweep is the compat path for a process-info without the
     # foreground field. When the field is there and found no row, the pane
@@ -232,7 +252,10 @@ if [ -z "$agentless" ] && [ -z "$native" ] && [ -n "$pane" ]; then
             case "$_pargs" in 'tollgate mcp '* | 'tollgate mcp') continue ;; esac
             row=$(session_row "$pid") || continue
             profile=$(row_profile "$row")
-            [ -n "$profile" ] && break
+            if [ -n "$profile" ]; then
+                session=$(row_sid "$row")
+                break
+            fi
         done
     fi
 fi
@@ -289,9 +312,16 @@ fi
 pane_tag=$(tollgate herdr config get pane_tag 2>/dev/null || printf 'on')
 if [ "$pane_tag" = on ] && { [ -n "$profile" ] || [ -n "$tag_out" ]; }; then
     # Line 1 is the tag text, line 2 the severity class (absent when nothing
-    # is graded). The `--` keeps a profile name off clap's option parser.
+    # is graded). The `--` keeps a profile name off clap's option parser. A
+    # claude pane whose session row resolved passes that session too, so the
+    # tag grades the account the session's requests authenticate as and names
+    # an api-key hot swap in flight (`<served> → <committed> swapping…`).
     if [ -z "$tag_out" ]; then
-        tag_out=$(tollgate herdr tag --agent "$agent" -- "$profile" 2>/dev/null) || tag_out=""
+        if [ "$agent" = claude ] && [ -n "$session" ]; then
+            tag_out=$(tollgate herdr tag --agent "$agent" --session "$session" -- "$profile" 2>/dev/null) || tag_out=""
+        else
+            tag_out=$(tollgate herdr tag --agent "$agent" -- "$profile" 2>/dev/null) || tag_out=""
+        fi
     fi
     tag_text=$(printf '%s\n' "$tag_out" | sed -n 1p)
     tag_sev=$(printf '%s\n' "$tag_out" | sed -n 2p)

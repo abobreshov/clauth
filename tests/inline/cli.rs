@@ -4418,3 +4418,49 @@ mod session_helper {
         assert_eq!((profile.as_deref(), session), (Some("acme"), None));
     }
 }
+
+// ── the session helper serves another member only for an executor-B row ─────
+
+mod session_helper_hardening {
+    use crate::hot_swap::run_session_helper;
+    use crate::testutil::{HomeSandbox, api_key_profile, live_row, write_api_key_profile};
+
+    const OR: &str = "https://openrouter.ai/api";
+
+    /// A row another executor wrote a `current_member` into (an OAuth swap's
+    /// member) never moves the session helper's key: only executor B commits
+    /// an api-key member, so any other row serves its launch profile at
+    /// generation 0.
+    #[test]
+    fn a_non_b_row_serves_only_its_launch_profile() {
+        let _home = HomeSandbox::new();
+        for name in ["hh-a", "hh-b"] {
+            write_api_key_profile(&api_key_profile(name, OR, &format!("sk-{name}")));
+        }
+        for executor in [
+            None,
+            Some(crate::hot_swap::Executor::Oauth),
+            Some(crate::hot_swap::Executor::RelaunchOnly {
+                reason: "kill_switch".to_string(),
+            }),
+        ] {
+            let mut row = live_row("4242-0", "hh-a");
+            row.executor = executor.clone();
+            row.current_member = Some("hh-b".to_string());
+            row.key_generation = Some(3);
+            crate::live_sessions::register(&row).expect("register");
+            let mut out = Vec::new();
+            run_session_helper("4242-0", &mut out).expect("the helper serves");
+            assert_eq!(out, b"sk-hh-a", "{executor:?}: the launch profile's key");
+            let ack = crate::live_sessions::read_helper_ack("4242-0").expect("ack");
+            assert_eq!(
+                (ack.member.as_deref(), ack.generation),
+                (Some("hh-a"), 0),
+                "{executor:?}"
+            );
+            let _ = std::fs::remove_file(
+                crate::live_sessions::helper_ack_path("4242-0").expect("ack path"),
+            );
+        }
+    }
+}

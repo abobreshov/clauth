@@ -914,6 +914,35 @@ pub(crate) enum DaemonControlResult {
     Stop(std::result::Result<crate::daemon::DaemonStop, String>),
 }
 
+/// One live claude session the `m` modal offers to move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MoveCandidate {
+    pub(crate) sid: String,
+    /// The member the session's requests authenticate as (the served one).
+    pub(crate) now_on: String,
+    /// `oauth`, `api_key` or `relaunch_only`.
+    pub(crate) executor: &'static str,
+    pub(crate) state: crate::hot_swap::SwapState,
+}
+
+/// The Overview's `m` modal: move a live session onto the row's account.
+#[derive(Debug, Clone)]
+pub(crate) struct MoveSessionForm {
+    /// The account the session moves onto.
+    pub(crate) target: String,
+    pub(crate) sessions: Vec<MoveCandidate>,
+    pub(crate) cursor: usize,
+}
+
+/// What a session-move worker reports, once: the session request core's
+/// outcome, or its refusal text.
+#[derive(Debug)]
+pub(crate) struct SessionMoveResult {
+    pub(crate) sid: String,
+    pub(crate) target: String,
+    pub(crate) outcome: std::result::Result<crate::sessions_cli::SwitchRequest, String>,
+}
+
 /// State for the action-menu modal.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionMenuState {
@@ -1056,6 +1085,8 @@ pub(crate) enum Modal {
     ActionMenu(ActionMenuState),
     /// Custom env key collides with an existing source; overwrite/keep/cancel.
     EnvCollision(EnvCollisionForm),
+    /// Overview `m`: pick a live session to move onto the row's account.
+    MoveSession(MoveSessionForm),
     /// In-flight login progress; renders live from [`App::login`], the inline
     /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
     /// to the footer indicator — the login keeps running.
@@ -1992,6 +2023,10 @@ pub(crate) struct App {
     pub(crate) daemon_control_rx: std::sync::mpsc::Receiver<DaemonControlResult>,
     /// Sender side; cloned into each worker.
     pub(crate) daemon_control_tx: std::sync::mpsc::Sender<DaemonControlResult>,
+    /// The `m` modal's session-move outcomes; drained in `on_tick`.
+    pub(crate) session_move_rx: std::sync::mpsc::Receiver<SessionMoveResult>,
+    /// Sender side; cloned into each move worker.
+    pub(crate) session_move_tx: std::sync::mpsc::Sender<SessionMoveResult>,
     /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
     /// switch one-shot runs only if THIS instance holds it.
     pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -2385,6 +2420,7 @@ impl App {
         }
 
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
+        let (session_move_tx, session_move_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
@@ -2468,6 +2504,8 @@ impl App {
             daemon_control_busy: false,
             daemon_control_rx,
             daemon_control_tx,
+            session_move_rx,
+            session_move_tx,
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
             plugin: PluginState::default(),
             token_stats: None,
@@ -3939,8 +3977,11 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     let extra = app.overview_selected_extra();
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Up | KeyCode::Down | KeyCode::Enter if claude_rows_hidden(app) => {}
+        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Char('m')
+            if claude_rows_hidden(app) => {}
         KeyCode::Up | KeyCode::Down if shift && extra.is_some() => refuse_read_only(app),
+        KeyCode::Char('m') if extra.is_some() => refuse_read_only(app),
+        KeyCode::Char('m') => open_move_session(app),
         KeyCode::Up if shift => reorder_main_cursor(app, -1),
         KeyCode::Down if shift => reorder_main_cursor(app, 1),
         KeyCode::Up => step_overview_cursor(app, -1),
@@ -3955,6 +3996,165 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
             None => activate_main_item(app),
         },
         _ => {}
+    }
+}
+
+/// Overview `m`: open the move-a-session modal for the selected account, over
+/// every live claude session. Codex sessions have no in-session executor, and
+/// a row whose session is gone (awaiting GC) is left out by the same liveness
+/// probe the live tally reads. Nothing to move toasts instead of opening.
+fn open_move_session(app: &mut App) {
+    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
+        return;
+    };
+    let Some(target) = app.config().profiles.get(idx).map(|p| p.name.to_string()) else {
+        return;
+    };
+    let sessions = move_candidates();
+    if sessions.is_empty() {
+        app.toast(ToastKind::Info, "no live claude session to move");
+        return;
+    }
+    app.modals.push(Modal::MoveSession(MoveSessionForm {
+        target,
+        sessions,
+        cursor: 0,
+    }));
+}
+
+/// The live claude sessions, oldest first, each with the member it is served
+/// by and where it is in a switch.
+pub(crate) fn move_candidates() -> Vec<MoveCandidate> {
+    let mut rows: Vec<crate::live_sessions::LiveSession> = crate::live_sessions::list()
+        .into_iter()
+        .filter(|row| row.harness == Harness::Claude)
+        .filter(|row| {
+            let probe =
+                ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
+            crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    rows.iter()
+        .map(|row| {
+            let ack = crate::live_sessions::read_helper_ack(&row.session_id);
+            let view = crate::hot_swap::SwapView::of(row, ack.as_ref());
+            MoveCandidate {
+                sid: row.session_id.clone(),
+                now_on: view
+                    .served_member()
+                    .unwrap_or(&row.start_profile)
+                    .to_string(),
+                executor: view.executor.wire().unwrap_or("none"),
+                state: view.state,
+            }
+        })
+        .collect()
+}
+
+/// Keys on the `m` modal: ↑↓ pick, ⏎ hands the pick to the session request
+/// core on a worker (it polls up to five seconds for an api-key commit), esc/q
+/// close. The TUI never relaunches: a session that cannot hot-swap gets the
+/// terminal command in a toast.
+fn handle_move_session_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::MoveSession(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = form.sessions.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            }
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            }
+        }
+        KeyCode::Enter => {
+            let picked = form.sessions.get(form.cursor.min(last)).cloned();
+            let target = form.target.clone();
+            app.modals.pop();
+            let Some(picked) = picked else {
+                return;
+            };
+            if picked.now_on == target {
+                app.toast(
+                    ToastKind::Info,
+                    format!("session {} is already on {target}", picked.sid),
+                );
+                return;
+            }
+            let tx = app.session_move_tx.clone();
+            let sid = picked.sid;
+            spawn_worker(move || {
+                let outcome = crate::sessions_cli::request_session_switch(
+                    &sid,
+                    &target,
+                    crate::sessions_cli::Surface::Tui,
+                )
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(SessionMoveResult {
+                    sid,
+                    target,
+                    outcome,
+                });
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Toast each session-move outcome in the three shapes the hot-swap spec
+/// names: swapping, stays on (with the reason), or the relaunch command.
+fn drain_session_moves(app: &mut App) {
+    use crate::sessions_cli::RequestOutcome;
+    while let Ok(SessionMoveResult {
+        sid,
+        target,
+        outcome,
+    }) = app.session_move_rx.try_recv()
+    {
+        let relaunch =
+            format!("session {sid}: relaunch with 'tollgate switch {sid} {target} --relaunch'");
+        match outcome {
+            Ok(request) => match request.outcome {
+                RequestOutcome::Committed(_) | RequestOutcome::Requested => app.toast(
+                    ToastKind::Success,
+                    format!("session {sid}: swapping… onto {target}"),
+                ),
+                RequestOutcome::IntentRecorded => app.toast(
+                    ToastKind::Success,
+                    format!("session {sid}: moving onto {target} at its next request"),
+                ),
+                RequestOutcome::AlreadyOn => app.toast(
+                    ToastKind::Info,
+                    format!("session {sid} is already on {target}"),
+                ),
+                RequestOutcome::Refused(code) => app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "session {sid} stays on {}: {}",
+                        request.current,
+                        crate::hot_swap::reason_text(&code, None)
+                    ),
+                ),
+                RequestOutcome::RelaunchRequired(_) => app.toast(ToastKind::Warning, relaunch),
+            },
+            Err(e) => app.toast(ToastKind::Danger, format!("session {sid}: {e}")),
+        }
     }
 }
 
@@ -7107,6 +7307,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
+        Modal::MoveSession(_) => handle_move_session_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
     }
 }
@@ -11094,6 +11295,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_codex_rows(app);
     poll_plugin_refresh(app);
     drain_daemon_control(app);
+    drain_session_moves(app);
     poll_daemon_health(app);
 
     warn_day_claim_notices(app);

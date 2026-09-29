@@ -2662,6 +2662,7 @@ fn every_rest_body_schema_agrees_with_its_wire_shape() {
             "sessions": [{
                 "session_id": "1128637-0",
                 "profile": "DS5",
+                "state": "served",
                 "kind": "session",
                 "follows_chain": false,
                 "isolated": false,

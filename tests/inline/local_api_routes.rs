@@ -581,3 +581,145 @@ fn tcp_checks_the_host_before_the_token() {
     let unix = handle(&ctx, &with(None, None), Door::Unix);
     assert_eq!(unix.status, 200);
 }
+
+// ── live sessions (hot-swap spec §2.4) ───────────────────────────────────────
+
+/// Two running sessions, pids this process's own so the signal-0 probe reads
+/// them live: an api-key session committed from `or-main` to `or-alt` whose
+/// helper still serves `or-main`, and a plain OAuth session on `solo`. A third
+/// row names a pid that cannot run (a crashed session awaiting GC).
+fn seed_live_sessions() {
+    for name in ["or-main", "or-alt", "solo"] {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.into(), None, None))
+            .unwrap();
+    }
+    crate::testutil::register_names(&["or-main", "or-alt", "solo"]);
+    let launch = crate::testutil::api_key_profile("or-main", "https://openrouter.ai/api", "k");
+    let mut b = crate::testutil::live_row("4242-0", "or-main").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(&launch, true),
+    );
+    b.pid = std::process::id();
+    b.started_at = 1;
+    b.current_member = Some("or-alt".into());
+    b.key_generation = Some(2);
+    b.committed_at = Some(1_759_140_000_000);
+    crate::live_sessions::register(&b).unwrap();
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 1,
+            member: Some("or-main".into()),
+            served_at_ms: Some(1_759_139_990_000),
+            last_failure: None,
+        },
+    );
+    let mut a = crate::testutil::live_row("4242-1", "solo");
+    a.pid = std::process::id();
+    a.started_at = 2;
+    crate::live_sessions::register(&a).unwrap();
+    let mut dead = crate::testutil::live_row("4242-2", "solo");
+    dead.pid = u32::MAX - 1;
+    crate::live_sessions::register(&dead).unwrap();
+}
+
+// 61
+#[test]
+fn accounts_list_live_sessions_committed_and_served() {
+    let _home = HomeSandbox::new();
+    seed_live_sessions();
+    let resp = handle(&ctx(), &req("GET", "/v1/accounts", "", None), Door::Unix);
+    assert_eq!(resp.status, 200);
+    let sessions = body(&resp)["live_sessions"].clone();
+    assert_eq!(
+        sessions,
+        serde_json::json!([
+            {
+                "session_id": "4242-0",
+                "harness": "claude",
+                "start_profile": "or-main",
+                "executor": "api_key",
+                "relaunch_reason": null,
+                "requested_member": null,
+                "committed": {"member": "or-alt", "generation": 2, "at_ms": 1_759_140_000_000_u64},
+                "served": {"member": "or-main", "generation": 1, "at_ms": 1_759_139_990_000_u64},
+                "state": "swapping",
+                "idle": true,
+            },
+            {
+                "session_id": "4242-1",
+                "harness": "claude",
+                "start_profile": "solo",
+                "executor": "oauth",
+                "relaunch_reason": null,
+                "requested_member": null,
+                "committed": {"member": "solo", "generation": 0, "at_ms": null},
+                "served": {"member": "solo", "generation": 0, "at_ms": null},
+                "state": "served",
+            },
+        ]),
+        "the dead row is left out; the swapping session has run no helper since its commit, so \
+         it is idle, and only a swapping view carries the flag"
+    );
+    assert_eq!(body(&resp)["schema_version"], 1, "additive: no schema bump");
+}
+
+// 62
+#[test]
+fn account_by_id_filters_live_sessions() {
+    let _home = HomeSandbox::new();
+    seed_live_sessions();
+    let ids = |account: &str| -> Vec<String> {
+        let resp = handle(
+            &ctx(),
+            &req("GET", &format!("/v1/accounts/{account}"), "", None),
+            Door::Unix,
+        );
+        assert_eq!(resp.status, 200, "{account}");
+        body(&resp)["live_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["session_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Committed on one account, served on the other: both list it.
+    assert_eq!(ids("claude:or-alt"), ["4242-0"]);
+    assert_eq!(ids("claude:or-main"), ["4242-0"]);
+    assert_eq!(ids("claude:solo"), ["4242-1"]);
+}
+
+/// The document names the new field on both bodies, with its view schema.
+#[test]
+fn the_openapi_document_describes_live_sessions() {
+    let doc: serde_json::Value =
+        serde_json::from_slice(&openapi_document_bytes().unwrap()).unwrap();
+    let schemas = &doc["components"]["schemas"];
+    for body in ["AccountsBody", "AccountBody"] {
+        assert_eq!(
+            schemas[body]["properties"]["live_sessions"]["items"]["$ref"],
+            "#/components/schemas/LiveSessionView",
+            "{body}"
+        );
+    }
+    let view = &schemas["LiveSessionView"]["properties"];
+    for field in [
+        "session_id",
+        "harness",
+        "start_profile",
+        "executor",
+        "relaunch_reason",
+        "requested_member",
+        "committed",
+        "served",
+        "state",
+        "idle",
+    ] {
+        assert!(view.get(field).is_some(), "LiveSessionView.{field}");
+    }
+    assert_eq!(
+        schemas["SwapState"]["enum"],
+        serde_json::json!(["requested", "swapping", "stalled", "served"])
+    );
+}

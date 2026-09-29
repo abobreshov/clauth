@@ -1173,6 +1173,55 @@ pub(crate) fn switch_profile_prose(p: &Value) -> String {
     }
 }
 
+/// Prose for `switch_profile` with `session`: one sentence per `state`,
+/// naming the session, the members and the key generation the payload carries.
+pub(crate) fn switch_session_prose(p: &Value) -> String {
+    let text = |key: &str| p.get(key).and_then(Value::as_str);
+    let session = text("session").unwrap_or("unknown");
+    let target = text("target").unwrap_or("unknown");
+    let committed = text("committed_member").unwrap_or("unknown");
+    let served = text("served_member").unwrap_or("unknown");
+    let reason = text("reason").unwrap_or("unknown");
+    let generation = p
+        .get("key_generation")
+        .and_then(Value::as_u64)
+        .map(|n| format!(" (key generation {n})"))
+        .unwrap_or_default();
+    let command = text("command")
+        .map(|c| format!("; relaunch in a terminal with `{c}` (this tool never relaunches)"))
+        .unwrap_or_default();
+    match text("state") {
+        Some("served") => format!("session `{session}` is served by `{served}`{generation}"),
+        Some("swapping") => match text("reason") {
+            Some(failure) => {
+                format!("session `{session}` committed to `{committed}`{generation}, but {failure}")
+            }
+            None => format!(
+                "session `{session}` committed to `{committed}`{generation}; swapping: its \
+                 requests still authenticate as `{served}` until Claude Code's next request runs \
+                 the key helper"
+            ),
+        },
+        Some("requested") if text("executor") == Some("oauth") => format!(
+            "pointed session `{session}` at `{target}`; the switch lands at the session's next \
+             request, and a refused move is logged with the session staying put"
+        ),
+        Some("requested") => format!(
+            "requested `{target}` for session `{session}`; the session has not committed it yet"
+        ),
+        Some("relaunch_required") => {
+            format!("session `{session}` cannot hot-swap ({reason}){command}")
+        }
+        _ => match text("committed_member") {
+            Some(current) => format!(
+                "session `{session}` stays on `{current}`: `{target}` is not hot-swappable \
+                 ({reason}){command}"
+            ),
+            None => format!("session switch failed: {reason}"),
+        },
+    }
+}
+
 /// The whole usage clause renders within this many characters. The real
 /// envelope renders 117 and the composite-heavy one 254, while the pre-change
 /// line ran ~700 characters of mostly zeros; 320 sits far above every
