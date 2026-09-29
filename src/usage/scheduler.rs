@@ -1074,13 +1074,20 @@ fn fetch_with_rotation(
             true,
             false,
         ));
-    let proactive = proactive_rotation_due(
-        preemptive,
-        rolling_token,
-        access_expires_at,
-        now_ms() as i64,
-        interval_ms,
-    );
+    // Guest mode (plan §4.0): upstream clauth may carry this chain too, so
+    // this leg spends no refresh token and adopts nothing from the live
+    // `~/.claude` file. It still polls, but only on the access token it
+    // already holds: never proactive, and a rejected token bails to the
+    // disk cache below instead of rotating.
+    let guest = crate::identity::upstream_active();
+    let proactive = !guest
+        && proactive_rotation_due(
+            preemptive,
+            rolling_token,
+            access_expires_at,
+            now_ms() as i64,
+            interval_ms,
+        );
     let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
         let result = fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity));
@@ -1125,6 +1132,11 @@ fn fetch_with_rotation(
             FetchOutcome::cached(name, status, None, retry_after)
         }
     };
+
+    // Guest mode: everything below adopts or spends — see `guest` above.
+    if guest {
+        return bail_unrotated();
+    }
 
     // Per-profile rotation lock across the ENTIRE rotation leg — the adopt
     // below mutates the same stored credential fields as a refresh persist,
@@ -5225,6 +5237,12 @@ pub(super) fn claude_rolling_tick(
     now: u64,
     gate_fn: &dyn Fn(&ProfileName) -> crate::oauth::AuthGate,
 ) {
+    // Guest mode (plan §4.0): every re-stamp can reach a guarded refresh of
+    // a chain upstream clauth may also carry, and an active profile's
+    // re-stamp mirrors into the default macOS Keychain item upstream owns.
+    if crate::identity::upstream_active() {
+        return;
+    }
     {
         let Ok(mut p) = pacing.lock() else { return };
         // Clamped, not just compared: these are WALL-CLOCK epoch-ms, and a

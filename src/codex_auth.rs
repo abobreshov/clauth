@@ -794,6 +794,10 @@ pub(crate) enum StandbyOutcome {
     /// The no-replay memo could not be written, so nothing was sent; a kick
     /// this pass took is handed back.
     MemoFailed,
+    /// Guest mode ([`crate::identity::upstream_active`]): nothing read,
+    /// restored, memoed or sent. Upstream clauth may carry this chain too, and
+    /// a codex refresh token is single-use.
+    Guest,
 }
 
 /// One profile's standby pass. `refresher` is injected so every path is
@@ -804,6 +808,12 @@ pub(crate) fn standby_pass(
     now_rfc3339: String,
     refresher: &dyn Fn(&str) -> std::result::Result<CodexTokenResponse, CodexRefreshError>,
 ) -> StandbyOutcome {
+    // Ahead of everything, the memo included: a memo written for a send that
+    // never happens would block this token's first real refresh after the
+    // import lifts guest mode.
+    if crate::identity::upstream_active() {
+        return StandbyOutcome::Guest;
+    }
     let Ok(store) = profile_subpath(&ProfileName::from(name), "auth.json") else {
         return StandbyOutcome::Idle;
     };
@@ -1051,6 +1061,11 @@ fn run_pre_reread_hook(name: &str) {
 /// — reads the codex roster itself, so the claude scheduler's state stays
 /// untouched (per-harness independence, decision 4).
 pub(crate) fn standby_tick(now_ms: i64, now_rfc3339: &str) {
+    // Guest mode (plan §4.0): no codex chain is rotated — see `standby_pass`,
+    // which refuses on its own too.
+    if crate::identity::upstream_active() {
+        return;
+    }
     let Ok(state) = crate::codex_profiles::CodexState::load() else {
         return;
     };

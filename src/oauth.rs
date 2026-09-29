@@ -206,6 +206,11 @@ pub(crate) enum TokenFailure {
         column: usize,
         len: usize,
     },
+    /// Never sent: guest mode ([`crate::identity::upstream_active`]) withholds
+    /// every refresh-token spend, because upstream clauth may hold the same
+    /// single-use chain and a second spender kills it for both. Transient, so
+    /// no caller quarantines an account over it.
+    Guest,
 }
 
 impl TokenFailure {
@@ -224,6 +229,9 @@ impl TokenFailure {
             Self::Status(_) => "anthropic rejected the request",
             Self::Transport => "could not reach anthropic",
             Self::Body { .. } => "anthropic's reply was unreadable",
+            Self::Guest => {
+                "upstream clauth manages this machine's logins (guest mode), so tollgate refreshes nothing"
+            }
         }
     }
 
@@ -247,6 +255,8 @@ impl TokenFailure {
             // operator can act on.
             Self::Transport => Transient::new(cause, Retry::Connection),
             Self::Body { status, .. } => Transient::with_status(cause, *status, Retry::Wait),
+            // Nothing a retry changes: the cause names the state that blocks it.
+            Self::Guest => Transient::new(cause, Retry::Stated),
         }
     }
 
@@ -256,6 +266,7 @@ impl TokenFailure {
         match self {
             Self::Status(status) => format!("HTTP {status}"),
             Self::Transport => "no response".to_string(),
+            Self::Guest => "not sent: guest mode (upstream clauth is installed)".to_string(),
             Self::Body {
                 status,
                 kind,
@@ -418,6 +429,14 @@ pub(crate) fn refresh_result(
     refresh_token: &str,
     scopes: Option<&str>,
 ) -> std::result::Result<TokenResponse, RefreshError> {
+    // Guest mode: the one choke point every Claude refresh-token spend passes
+    // through. Upstream clauth may carry the same single-use chain (a store it
+    // links, or a pair it imported), and two spenders is the death plan §4.0
+    // forbids. The legs that would reach here skip themselves first; this is
+    // the belt for any caller that does not.
+    if crate::identity::upstream_active() {
+        return Err(RefreshError::Transient(TokenFailure::Guest));
+    }
     let body = refresh_body(refresh_token, scopes)
         .map_err(|_| RefreshError::Transient(TokenFailure::Transport))?;
 
@@ -742,6 +761,12 @@ pub(crate) fn auto_start_kick(
     let Some(rt) = refresh_token else {
         return KickResult::not_opened_with(first_rl);
     };
+    // Guest mode: the recovery spends the refresh token, which upstream
+    // clauth may also carry (plan §4.0). The first kick above spent only the
+    // access token.
+    if crate::identity::upstream_active() {
+        return KickResult::not_opened_with(first_rl);
+    }
     // Pace the recovery before any lock is taken.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
     // RotationGuard outermost across the HTTP window — acquired with no other
@@ -1770,6 +1795,13 @@ pub(crate) fn try_adopt_live_rotation(
         ACCOUNT_ID_CACHE_FILE, ADOPT_REFUSAL_FILE, load_profile_cache, remove_profile_cache,
         write_profile_cache,
     };
+
+    // Guest mode (plan §4.0): the live `~/.claude/.credentials.json` is
+    // upstream clauth's, and copying its refresh token into a tollgate store
+    // makes a second carrier of a single-use chain.
+    if crate::identity::upstream_active() {
+        return None;
+    }
 
     // CLA-SPLIT: this profile's live slot holds its STATIC session token, so
     // `classify_credentials_link` judges it against `session-token.json` while

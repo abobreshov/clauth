@@ -1040,7 +1040,11 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
+    // Guest mode: a codex login either adopts upstream's `~/.codex/auth.json`
+    // or mints a chain the standby leg would then have to rotate — both are
+    // OAuth legs plan §4.0 leaves to upstream clauth.
     if args.codex {
+        crate::identity::refuse_in_guest_mode()?;
         return if args.browser {
             actions::codex_login_browser(&args.profile)
         } else {
@@ -1058,6 +1062,11 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     });
     let reauth = matches!(route, LoginRoute::Reauth(_));
     let is_api = args.is_api_mode();
+    let is_alibaba = reauth
+        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
+    if login_needs_claude_oauth(&args, is_alibaba) {
+        crate::identity::refuse_in_guest_mode()?;
+    }
 
     // CLA-SPLIT capture flow: `--setup-token` writes the profile's
     // session-token sidecar and touches NOTHING else — the usage OAuth pair,
@@ -1083,8 +1092,6 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // and NOTHING else. Not the api key: the callback returns a workspace key
     // for a different product, and `actions::store_console_login` exists to
     // keep it off the profile.
-    let is_alibaba = reauth
-        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
     if !is_api && is_alibaba {
         return cmd_login_console(&mut config, &target, args.model.as_deref());
     }
@@ -1174,6 +1181,19 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether a Claude `tollgate login` would mint or capture an Anthropic
+/// subscription login — the browser OAuth flow, or a `--setup-token` mint —
+/// rather than store an endpoint + key (`--base-url` / `--api-key`) or an
+/// Alibaba console session. Guest mode (plan §4.0) refuses the former and
+/// keeps the latter: API-key and monitor-style profiles are what guest mode
+/// is for, and they spend no OAuth chain.
+fn login_needs_claude_oauth(args: &LoginArgs, alibaba_console: bool) -> bool {
+    if args.setup_token {
+        return true;
+    }
+    !args.is_api_mode() && !alibaba_console
 }
 
 /// `tollgate capture <name>`: save the login Claude Code is using now as a new

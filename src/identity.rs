@@ -187,6 +187,26 @@ pub(crate) fn refuse_in_guest_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether guest mode refuses a mutation (write or delete) of the macOS
+/// Keychain item at `service`. Only the DEFAULT `Claude Code-credentials`
+/// item: that is the one a global `claude` reads, so upstream clauth owns it
+/// exactly as it owns `~/.claude/.credentials.json`. A per-session namespaced
+/// item (`Claude Code-credentials-<hash>`) belongs to a runtime this tool
+/// created and stays writable. `keychain.rs` asks this at its two lowest
+/// writers, so every default-item mutation — a switch install, a rotation
+/// mirror, a rolling re-stamp, a sign-out — passes the gate. Pure so it is
+/// pinned on every platform; the module that calls it compiles on macOS only.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain layer; the gate is pinned on every platform"
+    )
+)]
+pub(crate) fn guest_refuses_keychain_service(service: &str) -> bool {
+    service == crate::claude::CLAUDE_KEYCHAIN_SERVICE && upstream_active()
+}
+
 /// The `owner` half of [`REPO_SLUG`].
 pub(crate) fn repo_owner() -> &'static str {
     REPO_SLUG

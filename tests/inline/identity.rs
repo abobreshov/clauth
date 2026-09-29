@@ -48,3 +48,31 @@ fn the_repo_slug_splits_into_owner_and_name() {
     assert_eq!(repo_name(), "clauth");
     assert_eq!(format!("{}/{}", repo_owner(), repo_name()), REPO_SLUG);
 }
+
+/// I4: guest mode refuses mutations of the DEFAULT `Claude Code-credentials`
+/// Keychain item (upstream clauth's, like `~/.claude/.credentials.json`) and
+/// leaves a per-session namespaced item writable. Pinned here because the
+/// Keychain module that asks it compiles on macOS only.
+#[test]
+fn guest_mode_refuses_only_the_default_keychain_item() {
+    let home = crate::testutil::HomeSandbox::new();
+    let default = crate::claude::CLAUDE_KEYCHAIN_SERVICE;
+    let namespaced =
+        crate::claude::namespaced_keychain_service(std::path::Path::new("/tmp/session-runtime"));
+
+    assert!(
+        !guest_refuses_keychain_service(default),
+        "no upstream install: the default item is ours to write"
+    );
+
+    std::fs::create_dir_all(home.home().join(UPSTREAM_DATA_DIR_NAME)).expect("stage ~/.clauth");
+    assert!(
+        guest_refuses_keychain_service(default),
+        "guest mode: the default item is upstream's"
+    );
+    assert!(
+        !guest_refuses_keychain_service(&namespaced),
+        "a per-session namespaced item stays writable in guest mode"
+    );
+    assert!(!guest_refuses_keychain_service("some-other-service"));
+}

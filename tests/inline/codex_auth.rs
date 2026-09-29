@@ -982,3 +982,65 @@ fn standby_tick_rotates_every_due_chain_through_the_wire() {
         "BOTH stores hold a rotated pair, one per wire call"
     );
 }
+
+/// B2: guest mode rotates no codex chain. The same due roster
+/// `standby_tick_rotates_every_due_chain_through_the_wire` rotates, with
+/// upstream clauth's `~/.clauth` staged: nothing reaches the wire, the stores
+/// are byte-identical, and no no-replay memo is left behind to block the
+/// token's first real refresh once an import lifts guest mode.
+#[test]
+fn standby_rotates_nothing_in_guest_mode() {
+    let home = HomeSandbox::new();
+    let now: i64 = 1_700_000_000_000;
+    let (addr, handle) = crate::testutil::serve_endpoints(3, |_path, i| {
+        (
+            200,
+            format!(
+                r#"{{"id_token":"id.n","access_token":"at.n{i}","refresh_token":"rt.new{i}"}}"#
+            ),
+        )
+    });
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+
+    crate::testutil::write_codex_roster(&["cx-guest-a", "cx-guest-b"]);
+    for name in ["cx-guest-a", "cx-guest-b"] {
+        write_codex_store(
+            name,
+            &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.old"),
+        );
+    }
+    let before: Vec<String> = ["cx-guest-a", "cx-guest-b"]
+        .into_iter()
+        .map(read_codex_store)
+        .collect();
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage ~/.clauth");
+
+    standby_tick(now, "2026-08-13T00:00:00Z");
+    assert_eq!(
+        standby_pass(
+            "cx-guest-a",
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|_| panic!("guest mode must not reach the refresher"),
+        ),
+        StandbyOutcome::Guest
+    );
+
+    let seen = handle.join().expect("join stub");
+    assert!(
+        seen.is_empty(),
+        "no codex refresh may reach the wire: {seen:?}"
+    );
+    let after: Vec<String> = ["cx-guest-a", "cx-guest-b"]
+        .into_iter()
+        .map(read_codex_store)
+        .collect();
+    assert_eq!(after, before, "every store is byte-identical");
+    for name in ["cx-guest-a", "cx-guest-b"] {
+        assert!(
+            !attempt_memo_path(name).expect("memo path").exists(),
+            "{name}: no memo for a send that never happened"
+        );
+    }
+}
