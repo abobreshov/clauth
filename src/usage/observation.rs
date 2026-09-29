@@ -577,6 +577,8 @@ impl SourceId {
             Some(Provider::Alibaba) => Self::Alibaba,
             Some(Provider::OpenRouter) => Self::OpenRouter,
             Some(Provider::MiniMax) => Self::MiniMax,
+            Some(Provider::OllamaCloud) => Self::OllamaCloud,
+            Some(Provider::OllamaDaemon) => Self::Ollama,
             None => Self::Generic,
         }
     }

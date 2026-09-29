@@ -5,10 +5,19 @@
 //! every fallback knob stay out — those are per-account, and a template that
 //! carried them would silently move an api key between accounts.
 //!
+//! One exception, built-ins only: a shipped preset may carry a fixed env
+//! ALLOWLIST of non-secret switches the endpoint needs (the Ollama Cloud
+//! preset's telemetry knobs). It never carries `ANTHROPIC_AUTH_TOKEN` /
+//! `ANTHROPIC_API_KEY` or any other credential: an api key reaches Claude Code
+//! only through the `apiKeyHelper` tollgate writes. Custom presets on disk
+//! carry no env at all.
+//!
 //! The built-ins ship in the binary; the rest live one JSON file per preset
 //! under `~/.tollgate/presets/`. The file NAME is the preset name, so it goes
 //! through [`crate::actions::validate_profile_name`] (the same charset that
 //! bounds a profile directory) before it ever reaches a path.
+
+use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -21,6 +30,10 @@ pub(crate) struct Preset {
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
     pub(crate) models: ModelSettings,
+    /// Env entries applied with the preset, each only where the account has no
+    /// value of its own. Built-ins only (see the module doc); always empty for
+    /// a custom preset.
+    pub(crate) env: BTreeMap<String, String>,
     /// Ships in the binary: never written, never deleted, never overwritten.
     pub(crate) builtin: bool,
 }
@@ -40,7 +53,11 @@ struct PresetFile {
 struct Builtin {
     name: &'static str,
     base_url: &'static str,
-    model: &'static str,
+    /// The base model, or `None` when the endpoint's catalogue is the
+    /// operator's to pick from (Ollama Cloud).
+    model: Option<&'static str>,
+    /// Non-secret env switches applied with the preset. Never a credential.
+    env: &'static [(&'static str, &'static str)],
     /// Whether `model` is written to every alias and the subagent row, or to
     /// `models.default` alone.
     ///
@@ -62,13 +79,15 @@ const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "DeepSeek",
         base_url: "https://api.deepseek.com/anthropic",
-        model: "deepseek-chat",
+        model: Some("deepseek-chat"),
+        env: &[],
         pin_every_tier: false,
     },
     Builtin {
         name: "Z.ai",
         base_url: "https://api.z.ai/api/anthropic",
-        model: "glm-5.2",
+        model: Some("glm-5.2"),
+        env: &[],
         pin_every_tier: false,
     },
     Builtin {
@@ -77,7 +96,8 @@ const BUILTINS: &[Builtin] = &[
         // `/v1/messages` lands on `/api/v1/messages` (openrouter.ai docs,
         // "Connect Claude to OpenRouter").
         base_url: "https://openrouter.ai/api",
-        model: "openrouter/auto",
+        model: Some("openrouter/auto"),
+        env: &[],
         pin_every_tier: false,
     },
     Builtin {
@@ -88,32 +108,63 @@ const BUILTINS: &[Builtin] = &[
         // account and endpoint; only the international one ships, matching what
         // `providers::minimax` claims.
         base_url: "https://api.minimax.io/anthropic",
-        model: "MiniMax-M3",
+        model: Some("MiniMax-M3"),
+        env: &[],
         pin_every_tier: false,
     },
     Builtin {
         name: "Qwen-TokenPlan-Intl",
         base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
-        model: "qwen3.8-max",
+        model: Some("qwen3.8-max"),
+        env: &[],
         pin_every_tier: true,
     },
     Builtin {
         name: "Qwen-TokenPlan-CN",
         base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        model: "qwen3.8-max",
+        model: Some("qwen3.8-max"),
+        env: &[],
         pin_every_tier: true,
     },
     Builtin {
         name: "Qwen-CodingPlan-Intl",
         base_url: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
-        model: "qwen3-coder-plus",
+        model: Some("qwen3-coder-plus"),
+        env: &[],
         pin_every_tier: true,
     },
     Builtin {
         name: "Qwen-CodingPlan-CN",
         base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic",
-        model: "qwen3-coder-plus",
+        model: Some("qwen3-coder-plus"),
+        env: &[],
         pin_every_tier: true,
+    },
+    Builtin {
+        name: "Ollama-Cloud",
+        // Ollama Cloud serves an Anthropic-compatible `/v1/messages` at the
+        // ROOT, so CC's `/v1/messages` lands on `https://ollama.com/v1/messages`
+        // (docs.ollama.com/integrations/claude-code). The inference key (minted
+        // at ollama.com/settings/keys) is Bearer-only and reaches CC solely via
+        // the `apiKeyHelper`; an `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`
+        // env entry would pin one key into the session and break a hot swap to
+        // another Ollama account.
+        base_url: "https://ollama.com",
+        // No model pinned: the catalogue moves too fast to ship ids. The live
+        // list is the unauthenticated `GET https://ollama.com/api/tags` (or
+        // `/v1/models`); the operator picks opus / sonnet / haiku / fable /
+        // subagent from it (Setup tab, or `tollgate login <p> --base-url
+        // https://ollama.com --api-key` then `--model <id>` / `[models]` in the
+        // profile's config.toml).
+        model: None,
+        // What `ollama launch claude` sets (ollama cmd/launch/claude.go),
+        // minus the context-window knob, which depends on the model picked.
+        env: &[
+            ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
+            ("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1"),
+            ("DISABLE_ERROR_REPORTING", "1"),
+        ],
+        pin_every_tier: false,
     },
 ];
 
@@ -121,7 +172,7 @@ fn builtins() -> Vec<Preset> {
     BUILTINS
         .iter()
         .map(|b| {
-            let model = || Some(b.model.to_string());
+            let model = || b.model.map(str::to_string);
             let tier = || b.pin_every_tier.then(model).flatten();
             Preset {
                 name: b.name.to_string(),
@@ -134,6 +185,11 @@ fn builtins() -> Vec<Preset> {
                     fable: tier(),
                     subagent: tier(),
                 },
+                env: b
+                    .env
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
                 builtin: true,
             }
         })
@@ -194,6 +250,7 @@ pub(crate) fn list_presets() -> Vec<Preset> {
             name: name.to_string(),
             base_url: file.base_url,
             models: file.models,
+            env: BTreeMap::new(),
             builtin: false,
         });
     }
@@ -217,6 +274,7 @@ pub(crate) fn load_preset(name: &str) -> Option<Preset> {
         name: trimmed.to_string(),
         base_url: file.base_url,
         models: file.models,
+        env: BTreeMap::new(),
         builtin: false,
     })
 }

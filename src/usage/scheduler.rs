@@ -345,6 +345,8 @@ impl ThirdPartyEntry {
                         crate::providers::Provider::Alibaba => b"alibaba".as_slice(),
                         crate::providers::Provider::OpenRouter => b"openrouter".as_slice(),
                         crate::providers::Provider::MiniMax => b"minimax".as_slice(),
+                        crate::providers::Provider::OllamaCloud => b"ollama_cloud".as_slice(),
+                        crate::providers::Provider::OllamaDaemon => b"ollama_daemon".as_slice(),
                     },
                 );
                 match console {
@@ -2816,6 +2818,10 @@ pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
         // scheduled — its fetch reports the missing session as `AuthExpired`,
         // which is an answer, where being dropped is a permanent "loading".
         Some(crate::providers::Provider::Alibaba) => true,
+        // The Ollama daemon needs no key (it signs with its own) and its fetch
+        // sends nothing; scheduling it is what puts its "usage needs an
+        // ollama.com API key" note on the surfaces instead of "loading".
+        Some(crate::providers::Provider::OllamaDaemon) => true,
         // An empty or whitespace-only key is no credential (matches the load
         // boundary's `has_usable_key`): it authenticates nothing, so treating it
         // as `Some` would schedule a run that cannot work.
@@ -3145,7 +3151,10 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // any other error falls back to cache, and a GENERIC no-data
                 // rescan additionally defers to the degraded floor below.
                 let (status, retry_after, dead_key) = match &err {
-                    crate::providers::ThirdPartyError::RateLimited { retry_after } => {
+                    // A quota 429 (Ollama's `session usage limit`) is paced like any
+                    // other 429: the server's `retry-after` defers the next slot.
+                    crate::providers::ThirdPartyError::RateLimited { retry_after }
+                    | crate::providers::ThirdPartyError::QuotaExhausted { retry_after } => {
                         (FetchStatus::RateLimited, *retry_after, false)
                     }
                     // Ahead of the cache arm on purpose: a cached copy still

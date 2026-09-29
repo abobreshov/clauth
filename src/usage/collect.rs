@@ -206,11 +206,13 @@ pub(crate) fn observe_profile(
 
     if third_party {
         let mtime = profile_cache_mtime_ms(name, THIRD_PARTY_CACHE_FILE);
-        if let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE) {
-            apply_third_party(&mut obs, &stats, now_secs);
+        let stats = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE);
+        if let Some(stats) = &stats {
+            apply_third_party(&mut obs, stats, now_secs);
             obs.observed_at = mtime.map(Timestamp::from_ms);
             obs.freshness = ctx.freshness_of(mtime);
         }
+        crate::providers::ollama_cloud::refine_observation(&mut obs, stats.as_ref());
         return obs;
     }
 

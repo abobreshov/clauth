@@ -898,17 +898,36 @@ pub(crate) fn edit_profile_preferred_days(
 /// acquisition, one disk write, one live-settings re-apply — means a failure
 /// leaves the account on its prior state rather than half-stamped (new endpoint,
 /// old models) the way chaining [`edit_profile_endpoint`] +
-/// [`edit_profile_model`] would.
+/// [`edit_profile_model`] would. Test-only now: the Setup tab applies presets
+/// through [`edit_profile_preset_with_env`], which this is with no env.
+#[cfg(test)]
 pub(crate) fn edit_profile_preset(
     config: &mut AppConfig,
     name: &ProfileName,
     base_url: Option<String>,
     models: ModelSettings,
 ) -> Result<()> {
+    edit_profile_preset_with_env(config, name, base_url, models, &BTreeMap::new())
+}
+
+/// [`edit_profile_preset`] plus a built-in preset's env allowlist (the Ollama
+/// Cloud preset's telemetry knobs), in the same transaction. Each entry is
+/// added only where the account has no value for that key: an operator's own
+/// setting always wins, and nothing is ever removed.
+pub(crate) fn edit_profile_preset_with_env(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    base_url: Option<String>,
+    models: ModelSettings,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
     with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.base_url = base_url;
         profile.models = models;
+        for (k, v) in env {
+            profile.env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         // Re-derive the provider exactly like `edit_profile_endpoint`: a stale
         // value here keeps (or blocks) third-party fetches against the wrong
         // endpoint. The api_key is unchanged, so only a moved endpoint can flip
