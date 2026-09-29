@@ -822,7 +822,7 @@ pub(crate) fn g2_entry(paths: &Paths, plan: &G2Plan) -> Result<(Entry, Option<Ve
                 "--yes".to_string(),
             ]),
             env_keys: Some(env_keys),
-            link: Some(plan.herdr.clone()),
+            herdr: Some(plan.herdr.clone()),
             step: Some("G2".to_string()),
             ..Facts::default()
         },
@@ -855,7 +855,7 @@ fn g2_env(plan: &G2Plan) -> Vec<(String, std::ffi::OsString)> {
 pub(crate) fn run_g2(e: &mut Entry) -> Result<(), Finding> {
     let bin = e.src.clone().unwrap_or_default();
     let config = e.dst.clone().unwrap_or_default();
-    let herdr = e.after.link.clone().unwrap_or_default();
+    let herdr = e.after.herdr.clone().unwrap_or_default();
     let plan = G2Plan {
         bin: bin.clone(),
         herdr,
@@ -895,6 +895,21 @@ pub(crate) fn run_g2(e: &mut Entry) -> Result<(), Finding> {
             ),
         )
     })
+}
+
+/// Whether a still-`planned` G2 already ran before a crash: herdr's config
+/// no longer holds its pre-run bytes, or herdr no longer lists the plugin
+/// the entry recorded. A resume then settles it instead of running
+/// upstream's uninstall a second time over its own result.
+pub(crate) fn g2_already_ran(e: &Entry) -> bool {
+    if probe_g2(e) != super::txn::Disk::Prior {
+        return true;
+    }
+    e.prior.plugin.is_some()
+        && e.after
+            .herdr
+            .as_deref()
+            .is_some_and(|herdr| upstream_record(herdr).is_none())
 }
 
 /// Where disk stands for G2: herdr's config as before the run, as the run

@@ -375,3 +375,65 @@ fn a_full_reference_import_then_rollback_leaves_every_file_tollgate_restores_byt
         );
     }
 }
+
+/// Self-review: retire's refusals. Before a committed import it is a usage
+/// error; while a Claude Code session runs it refuses (R1 rewrites files a
+/// live session rewrites); and an upstream entry that carries an `env`
+/// block is left in place and named, never journaled.
+#[test]
+fn retire_refuses_before_complete_while_claude_runs_and_keeps_a_secret_bearing_entry() {
+    let env = Env::new();
+    env.tree.reference();
+    globals(&env);
+    let e = retire::retire(&[], true).expect_err("no import yet");
+    assert_eq!(exit_of(Err(e)), 2);
+    run_ok();
+    env.procs(vec![proc_row(4242, &["claude"])]);
+    let e = retire::retire(&[Step::R1], true).expect_err("claude runs");
+    assert_eq!(blocked_codes(&e), ["process_alive"]);
+    env.procs(Vec::new());
+    env.tree.write_json(
+        &env.p(".claude.json"),
+        &serde_json::json!({"mcpServers": {"clauth": {"command": "clauth",
+            "env": {"OWNER_TOKEN": "FIXTURE-KEY-mcp"}}}}),
+    );
+    let done = retire::retire(&[Step::R1], true).expect("retires the rest");
+    assert!(
+        done.warnings
+            .iter()
+            .any(|w| w.code == "retire_secret_bearing"),
+        "{:?}",
+        done.warnings
+    );
+    assert!(
+        read_json(&env.p(".claude.json"))["mcpServers"]
+            .get("clauth")
+            .is_some(),
+        "left in place"
+    );
+    assert_no_fixture_secret(
+        "journal",
+        &std::fs::read_to_string(env.paths().journal()).expect("journal"),
+    );
+}
+
+/// Self-review: the rollback's prompt is unbounded too, so a session that
+/// starts while it is open refuses before the first write, exactly as the
+/// import's own post-confirmation recheck does.
+#[test]
+fn the_rollback_recheck_refuses_a_session_started_during_its_prompt() {
+    let env = Env::new();
+    env.tree.reference();
+    run_ok();
+    let before = env.snapshot();
+    env.seams.set(|s| {
+        s.after_confirm = Some(Box::new(|| {
+            seams::with(|st| st.procs = vec![FakeProc::new(602, &["claude"])]);
+        }));
+    });
+    let e = rollback(&Options::default()).expect_err("recheck refuses");
+    assert_eq!(blocked_codes(&e), ["process_alive"]);
+    assert_eq!(exit_of(Err(e)), 3);
+    assert_eq!(env.snapshot(), before, "nothing was written");
+    assert_eq!(env.journal().state, "complete");
+}

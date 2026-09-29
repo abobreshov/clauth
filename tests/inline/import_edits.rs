@@ -414,3 +414,201 @@ fn an_m_minus_1_refusal_touches_no_global_file() {
     assert!(!env.p("g2.log").exists(), "upstream's binary ran");
     assert!(herdr.installed());
 }
+
+/// Self-review: G2's own failure paths. A non-zero exit and a child that
+/// outlives its deadline both refuse with exit 3, put herdr's config back
+/// and record the journal `aborted`; nothing moved.
+#[test]
+fn a_failing_or_hung_g2_refuses_with_exit_3_and_restores_the_config() {
+    for hang in [false, true] {
+        let env = Env::new();
+        env.tree.reference();
+        let (_herdr, config, _pin) = g2_setup(&env);
+        let before = std::fs::read(&config).expect("config");
+        if hang {
+            // Strip the block, then hang past the deadline.
+            std::fs::write(env.p("g2-extra.sh"), "sleep 5\n").expect("extra");
+            env.seams
+                .set(|s| s.g2_deadline = Some(std::time::Duration::from_millis(300)));
+        } else {
+            std::fs::write(env.p("g2-fail"), "").expect("fail");
+        }
+        let store = env.p(".clauth/profiles/personal/credentials.json");
+        let e = run(&Options::default()).expect_err("G2 refuses");
+        assert_eq!(blocked_codes(&e), ["g2_failed"], "hang={hang}");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(if hang {
+                "did not finish within"
+            } else {
+                "exited Some(3)"
+            }),
+            "{text}"
+        );
+        assert_eq!(exit_of(Err(e)), 3);
+        assert_eq!(
+            std::fs::read(&config).expect("config"),
+            before,
+            "hang={hang}"
+        );
+        assert!(store.exists(), "no store moved");
+        let j = env.journal();
+        assert_eq!(j.state, "aborted");
+        assert_eq!(j.pre[0].status, Status::Undone);
+    }
+}
+
+/// Self-review: a crash inside M0. Before G2 ran, `--resume` runs it once
+/// and commits; after it ran but before `done` was written, `--resume`
+/// settles it without running upstream's uninstall again; after it was
+/// marked done, `import rollback` undoes `pre` alone (config bytes back,
+/// the plugin reinstalled at its commit) and the journal is `rolled_back`.
+#[test]
+fn a_crash_in_pre_resumes_to_the_commit_or_rolls_back_pre() {
+    let crash_run = |env: &Env| {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run(&Options::default());
+        }));
+        assert!(out.is_err(), "the simulated crash fired");
+        assert_eq!(env.journal().state, "pre");
+    };
+    let g2_runs = |env: &Env| {
+        std::fs::read_to_string(env.p("g2.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("argv="))
+            .count()
+    };
+
+    // Before G2 ran: resume runs it and commits.
+    let env = Env::new();
+    env.tree.reference();
+    let (_herdr, _config, _pin) = g2_setup(&env);
+    env.seams.set(|s| {
+        s.before_step = Some(Box::new(|seq| {
+            if seq == 0 {
+                panic!("simulated crash before G2");
+            }
+        }));
+    });
+    crash_run(&env);
+    assert_eq!(env.journal().pre[0].status, Status::Planned);
+    env.seams.set(|s| s.before_step = None);
+    txn::resume().expect("resume commits");
+    assert_eq!(g2_runs(&env), 1);
+    assert_eq!(env.journal().state, "complete");
+    drop((_herdr, _config, _pin));
+    drop(env);
+
+    // After G2 ran, before `done`: resume does not run it again.
+    let env = Env::new();
+    env.tree.reference();
+    let (herdr, _config, _pin) = g2_setup(&env);
+    env.seams.set(|s| {
+        s.before_step = Some(Box::new(|seq| {
+            if seq == 0 {
+                panic!("simulated crash before G2 was marked");
+            }
+        }));
+    });
+    crash_run(&env);
+    let status = std::process::Command::new(env.p("bin/clauth"))
+        .args(["herdr", "uninstall", "--yes"])
+        .env("HERDR_BIN_PATH", &herdr.bin)
+        .status()
+        .expect("the child a crash interrupted");
+    assert!(status.success());
+    env.seams.set(|s| s.before_step = None);
+    txn::resume().expect("resume commits");
+    assert_eq!(g2_runs(&env), 1, "G2 ran twice");
+    assert_eq!(env.journal().pre[0].status, Status::Done);
+    drop((herdr, _config, _pin));
+    drop(env);
+
+    // G2 done, crash before the fence: rollback undoes pre alone.
+    let env = Env::new();
+    env.tree.reference();
+    let (herdr, config, _pin) = g2_setup(&env);
+    let before = std::fs::read(&config).expect("config");
+    env.seams.set(|s| {
+        s.before_fence = Some(Box::new(|| panic!("simulated crash before the fence")));
+    });
+    crash_run(&env);
+    assert!(!herdr.installed());
+    assert!(
+        super::journal::interrupted_warning(&env.paths())
+            .is_some_and(|w| w.contains("interrupted at step")),
+    );
+    rollback(&Options::default()).expect("rolls back pre");
+    assert_eq!(std::fs::read(&config).expect("config"), before);
+    assert!(herdr.installed(), "reinstalled after the fence");
+    let j = env.journal();
+    assert_eq!(j.state, "rolled_back");
+    assert_eq!(j.pre[0].status, Status::Undone);
+    assert!(env.p(".clauth/profiles/personal/credentials.json").exists());
+}
+
+/// Self-review: with every global edit planned, the whole run still enters
+/// `ImportFence` once and no rank below `State` after the state flock (the
+/// edits are raw read-modify-writes, never a guest-gated or config-ranked
+/// helper).
+#[cfg(debug_assertions)]
+#[test]
+fn the_global_edits_enter_no_rank_below_state() {
+    use crate::lockorder::{rank, record_entries, value_of};
+    let env = Env::new();
+    env.tree
+        .reference()
+        .helper_in_settings("personal")
+        .registry_path(&[]);
+    let (_herdr, _config, _pin) = g2_setup(&env);
+    let exe = env.tree.tollgate_bin();
+    env.seams.set(|s| s.current_exe = Some(exe));
+    let (result, entered) = record_entries(|| run(&Options::default()));
+    result.expect("commits");
+    let j = env.journal();
+    for step in ["G1", "G3"] {
+        assert!(
+            j.main.iter().any(|e| e.after.step.as_deref() == Some(step)),
+            "{step} not run"
+        );
+    }
+    let state = value_of::<rank::State>();
+    let at = entered.iter().position(|r| *r == state).expect("state");
+    assert!(
+        entered[at..].iter().all(|r| *r >= state),
+        "a rank below State after item 9: {entered:?}"
+    );
+    assert_eq!(
+        entered
+            .iter()
+            .filter(|r| **r == value_of::<rank::ImportFence>())
+            .count(),
+        1
+    );
+}
+
+/// Self-review: the process scan names a process by its program and
+/// subcommand only; an argument value on its command line (a key passed on
+/// argv) never reaches a finding or the report.
+#[test]
+fn the_process_scan_never_echoes_an_argument_value() {
+    let env = Env::new();
+    env.tree.reference();
+    env.procs(vec![
+        proc_row(
+            701,
+            &["tollgate", "usage", "--account", "sk-ant-oat01-FIXTURE-p-1"],
+        ),
+        proc_row(
+            702,
+            &["tollgate", "login", "n", "--api-key", "FIXTURE-KEY-argv"],
+        ),
+        proc_row(703, &["claude", "--api-key", "FIXTURE-KEY-claude"]),
+    ]);
+    let s = survey(&Options::default());
+    let report = serde_json::to_string(&txn::report(&s, "dry_run")).expect("json");
+    assert_no_fixture_secret("report", &report);
+    assert!(codes(&s).contains(&"tollgate_process_alive".to_string()));
+    assert!(codes(&s).contains(&"process_alive".to_string()));
+}

@@ -360,6 +360,17 @@ pub(crate) mod seams {
         }
     }
 
+    /// Runs a test's hook between M0 and M3 (the fence not yet taken).
+    pub(crate) fn before_fence() {
+        #[cfg(test)]
+        {
+            let hook = with(|s| s.before_fence.take());
+            if let Some(mut hook) = hook {
+                hook();
+            }
+        }
+    }
+
     /// Whether a simulated crash fires at `seq`/`point`.
     pub(crate) fn crash(seq: u64, point: CrashPoint) -> bool {
         #[cfg(test)]
@@ -507,6 +518,7 @@ pub(crate) mod seams {
             pub(crate) procs: Vec<FakeProc>,
             pub(crate) before_step: Option<Hook>,
             pub(crate) after_confirm: Option<Plain>,
+            pub(crate) before_fence: Option<Plain>,
             pub(crate) crash: Option<(u64, CrashPoint)>,
             pub(crate) exdev: Vec<PathBuf>,
             pub(crate) foreign_dev: Vec<PathBuf>,

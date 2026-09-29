@@ -246,7 +246,9 @@ fn scan_once(paths: &Paths, scope: &Scope) -> Scan {
                     format!(
                         "a read-only tollgate run (pid {}, {}) is alive; it waits on the fence and exits",
                         p.pid,
-                        args.join(" ")
+                        // The subcommand words only: an argument's value
+                        // never reaches a report.
+                        exempt_words(args)
                     ),
                 )
                 .with_pid(p.pid),
@@ -271,6 +273,21 @@ fn scan_once(paths: &Paths, scope: &Scope) -> Scan {
         }
     }
     scan
+}
+
+/// An exempt run's subcommand words (`herdr tag`, `import status`, `usage`),
+/// never its other arguments.
+fn exempt_words(args: &[String]) -> String {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let n = match words.first() {
+        Some(&"herdr" | &"import") => 2,
+        _ => 1,
+    };
+    words.into_iter().take(n).collect::<Vec<_>>().join(" ")
 }
 
 /// A script file a runtime hosts (`cli.js`): the process is named for its

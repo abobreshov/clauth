@@ -158,7 +158,7 @@ Rollback refuses while any of these is true:
 - the claude slot links to a profile created after the import (`tollgate switch` back to an imported one first)
 - an upstream store path is occupied again
 
-Tollgate's own rosters are never copied back into `~/.clauth`.
+These checks run again after the confirmation, since the prompt has no time limit. Tollgate's own rosters are never copied back into `~/.clauth`.
 
 ## After the import: `import retire`
 
@@ -203,4 +203,6 @@ These stay yours to do by hand, when you are sure:
 
 - **Off-`PATH` upstream builds.** A `target/*/clauth` build of upstream, or a `cargo run` on the `mommy` branch, is not retired. Its TUI exit would turn the slot link back into a regular file. The dry-run lists them as warnings. Do not run them until tollgate's start-time reconcile ships.
 - **A regular-file slot comes back as a link.** Once the import captured or relinked a regular-file slot, a rollback restores a link to the store, never the original copy.
+- **Edited JSON files are pretty-printed.** G1, G3 and `r1` write `settings.json`, `~/.claude.json` and the plugin registries back with two-space indentation, as Claude Code writes them, so a file you formatted differently changes its whitespace (G4 edits the registry in place, byte for byte). Its keys keep their order, and a rollback puts back each value it changed.
+- **Retire holds no lock.** Claude Code takes none on its files, so retire refuses while a session runs, but one started during the retire itself could lose an update to `~/.claude.json`. Start no session until it finishes.
 - **herdr's plugin state is herdr's.** The reinstall rewrites herdr's `plugins.json` and its checkout. A rollback restores herdr's `config.toml` byte for byte, but not those.

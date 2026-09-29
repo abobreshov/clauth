@@ -148,6 +148,9 @@ pub(crate) struct Facts {
     /// `rewrite_line`: the one line replaced (a completion `source` line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<String>,
+    /// `exec` (G2): the herdr binary the child is told to drive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) herdr: Option<PathBuf>,
     /// Which global edit or retire step the entry is (`G1`…`G4`, `r1`…`r4`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) step: Option<String>,

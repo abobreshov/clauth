@@ -359,6 +359,20 @@ pub(crate) fn rollback_with(
     if !confirm(&pending)? {
         anyhow::bail!("tollgate import rollback: not confirmed; nothing was changed");
     }
+    super::seams::after_confirm();
+    // The prompt was unbounded: a session or lock holder that started while
+    // it was open refuses here, before the first write (as the import's own
+    // post-confirmation recheck does, I21).
+    let mut recheck = procs::check(&paths, &scope).blockers;
+    recheck.extend(procs::markers(&paths).0);
+    recheck.extend(super::fence::probe(&paths, &names).1);
+    if !recheck.is_empty() {
+        return Err(ImportBlocked {
+            blockers: recheck,
+            printed: false,
+        }
+        .into());
+    }
     let mut warnings = Vec::new();
     // Step 1, before the fence: the retire section. Its undo spawns
     // `claude` and herdr, which never run inside the hold (I15), and it

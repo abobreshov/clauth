@@ -1978,7 +1978,14 @@ fn run_pre(j: &mut Journal, paths: &Paths) -> Result<(), Finding> {
         if j.pre[i].status != Status::Planned || j.pre[i].op != Op::Exec {
             continue;
         }
-        let outcome = edits::run_g2(&mut j.pre[i]);
+        seams::before_step(j.pre[i].seq);
+        let outcome = if edits::g2_already_ran(&j.pre[i]) {
+            // A crash after the child ran and before `done` was written.
+            j.pre[i].after.sha256 = j.pre[i].dst.as_deref().and_then(fsops::sha256_file);
+            Ok(())
+        } else {
+            edits::run_g2(&mut j.pre[i])
+        };
         j.pre[i].status = Status::Done;
         j.write(paths)
             .map_err(|e| Finding::new("journal_write_failed", format!("{e:#}")))?;
@@ -2065,6 +2072,7 @@ fn fence_and_commit(
     mut warnings: Vec<Finding>,
 ) -> Result<Committed> {
     let result = (|| -> Result<Committed> {
+        seams::before_fence();
         // M3.
         let fence = match Fence::acquire(paths, names) {
             Ok(fence) => fence,
@@ -2073,32 +2081,55 @@ fn fence_and_commit(
                 return Err(blocked(vec![f]));
             }
         };
-        // M4: the same checks under the fence, the same tree.
-        let under = survey_at(paths, opts, Mode::InFence, false)?;
-        let mut blockers = under.blockers.clone();
-        if blockers.is_empty() && under.hash != expected_hash {
-            blockers.push(Finding::new(
-                "inventory_changed",
-                "~/.clauth or a live slot changed between the check and the fence; nothing was changed, retry",
-            ));
-        }
-        if !blockers.is_empty() {
-            abort_before_m5(j, paths, &mut warnings)?;
-            drop(fence);
-            return Err(blocked(blockers));
-        }
-        let planned = match under.plan.clone() {
-            Some(p) => p,
-            None => plan(&under)?,
+        // M4: the same checks under the fence, the same tree. Any refusal or
+        // error before `in_progress` is durable reverses `pre` first.
+        let m4 = (|| -> Result<Result<(Survey, Plan), Vec<Finding>>> {
+            let under = survey_at(paths, opts, Mode::InFence, false)?;
+            let mut blockers = under.blockers.clone();
+            if blockers.is_empty() && under.hash != expected_hash {
+                blockers.push(Finding::new(
+                    "inventory_changed",
+                    "~/.clauth or a live slot changed between the check and the fence; nothing was changed, retry",
+                ));
+            }
+            if !blockers.is_empty() {
+                return Ok(Err(blockers));
+            }
+            let planned = match under.plan.clone() {
+                Some(p) => p,
+                None => plan(&under)?,
+            };
+            for (path, bytes) in &planned.backups {
+                journal::write_backup(path, bytes)?;
+            }
+            Ok(Ok((under, planned)))
+        })();
+        let (under, planned) = match m4 {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(blockers)) => {
+                abort_before_m5(j, paths, &mut warnings)?;
+                drop(fence);
+                return Err(blocked(blockers));
+            }
+            Err(e) => {
+                abort_before_m5(j, paths, &mut warnings)?;
+                drop(fence);
+                return Err(e);
+            }
         };
-        for (path, bytes) in &planned.backups {
-            journal::write_backup(path, bytes)?;
-        }
         j.upstream_bins = under.bins.clone();
         j.profiles = planned.profiles.clone();
         j.main = planned.entries;
         j.set_state(ImportState::InProgress);
-        j.write(paths)?;
+        if let Err(e) = j.write(paths) {
+            // Nothing in `main` ran; the journal on disk is still `pre`.
+            j.main.clear();
+            j.profiles.clear();
+            j.set_state(ImportState::Pre);
+            abort_before_m5(j, paths, &mut warnings)?;
+            drop(fence);
+            return Err(e);
+        }
         warnings.extend(under.warnings.iter().cloned());
         let scope = under.scope();
         let outcome = forward(j, paths, &scope).and_then(|()| commit(j, paths, &scope));
