@@ -310,10 +310,25 @@ pub(crate) fn global_claude_json_path() -> Option<PathBuf> {
 /// JSON object (Claude Code caught mid-write, a hand edit), is an error: a
 /// fresh map there would replace the whole file, every other server and the
 /// account identity included.
+///
+/// Guest mode: `~/.claude.json` is upstream clauth's, but `mcpServers.tollgate`
+/// is tollgate's own key, so the write goes through
+/// `guest_write::guest_additive_write` — under upstream's lock, refused when
+/// anything but that entry would change (a non-object `mcpServers` included),
+/// atomic and mode-preserving.
 pub(crate) fn wire_mcp_server() -> Result<()> {
-    // Guest mode: `~/.claude.json` is upstream clauth's until an import.
-    crate::identity::refuse_in_guest_mode()?;
     let path = home_dir()?.join(".claude.json");
+    if crate::identity::upstream_active() {
+        crate::guest_write::guest_additive_write(
+            &path,
+            crate::guest_write::CLAUDE_JSON_KEYS,
+            |root| {
+                insert_tollgate_mcp(root);
+                Ok(())
+            },
+        )?;
+        return Ok(());
+    }
     let mut root: Map<String, Value> = match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(Value::Object(map)) => map,
@@ -332,6 +347,16 @@ pub(crate) fn wire_mcp_server() -> Result<()> {
             return Err(e).with_context(|| format!("failed to read {}", path.display()));
         }
     };
+    insert_tollgate_mcp(&mut root);
+    atomic_write(&path, serde_json::to_vec_pretty(&Value::Object(root))?)?;
+    Ok(())
+}
+
+/// Set `mcpServers.tollgate` to the canonical entry, creating `mcpServers`
+/// when absent. A non-object `mcpServers` is replaced by a fresh map — which
+/// guest mode's owned-keys check then refuses, since that value is not
+/// tollgate's.
+fn insert_tollgate_mcp(root: &mut Map<String, Value>) {
     let entry = tollgate_mcp_entry();
     match root
         .entry("mcpServers")
@@ -345,8 +370,6 @@ pub(crate) fn wire_mcp_server() -> Result<()> {
             *other = Value::Object(Map::from_iter([(crate::identity::NAME.to_string(), entry)]))
         }
     }
-    atomic_write(&path, serde_json::to_vec_pretty(&Value::Object(root))?)?;
-    Ok(())
 }
 
 /// The canonical stdio entry tollgate registers (matches `plugin.json`).

@@ -11,6 +11,7 @@ mod daemon;
 mod fallback;
 mod format;
 mod gateway;
+mod guest_write;
 mod harness;
 mod herdr;
 mod hook_context;
@@ -433,9 +434,10 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
             no_config,
             yes,
         } => {
-            // Guest mode: herdr's config is shared with upstream clauth's
-            // plugin, and plan §4.0 leaves it untouched until an import.
-            crate::identity::refuse_in_guest_mode()?;
+            // Guest mode: allowed. herdr registers the plugin under
+            // tollgate's own id, and the config write touches only
+            // tollgate's marked blocks (`herdr::write_validated` enforces it
+            // under upstream's lock).
             // The knob lives in profiles.toml (`AppState.herdr`), so the
             // row the plugin writes matches the TUI's setting. A missing
             // or unreadable file answers the default, never an error.

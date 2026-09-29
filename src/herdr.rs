@@ -11,6 +11,13 @@
 //! against a temporary copy first, which is what catches a `--key` herdr would
 //! otherwise disable on load. The real write lands in place rather than through
 //! a rename, so the file keeps the mode and inode herdr's config already has.
+//!
+//! Guest mode (upstream clauth installed, plan §4.0) shares this config with
+//! upstream's plugin. The install, heal and uninstall still run there, because
+//! everything they write is tollgate's own blocks under its own marker; the
+//! write then refuses any other change, holds upstream's `~/.clauth/.lock`,
+//! re-reads the file to be sure it did not move since the plan, and replaces
+//! it atomically with its mode kept (`crate::guest_write`).
 
 use std::ffi::OsStr;
 use std::io::{IsTerminal as _, Read as _};
@@ -1687,17 +1694,10 @@ fn key_from_block(block: &[String]) -> Option<String> {
 
 pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
     let bin = herdr_bin();
-    // Guest mode: herdr's config.toml belongs to upstream clauth's plugin
-    // until an import (plan §4.0), so only tollgate's own plugin registration
-    // is removed and the config is left as it is.
-    let guest = crate::identity::upstream_active();
-    if guest && !no_config {
-        errln!(
-            "tollgate: guest mode: leaving herdr's config.toml untouched (upstream clauth owns \
-             it); removing only tollgate's plugin"
-        );
-    }
-    let no_config = no_config || guest;
+    // Guest mode needs no branch here: the strip below removes only the
+    // blocks under tollgate's own marker and keeps everything else, upstream's
+    // marked blocks included, and `write_validated` re-checks exactly that
+    // under upstream's lock before it writes.
 
     // Read and strip before touching herdr, so one confirm covers both halves
     // and a decline leaves the plugin and the config both untouched.
@@ -1840,10 +1840,13 @@ fn mentions_token(value: &toml::Value) -> bool {
 /// `edit` names the change for the refusal message; both callers refuse with
 /// nothing written.
 fn write_validated(path: &Path, previous: &str, text: &str, bin: &str, edit: &str) -> Result<()> {
-    // The one writer of herdr's config: guest mode never reaches it
-    // (install, heal and uninstall all stop earlier), and this keeps any
-    // future caller from writing upstream's file.
-    crate::identity::refuse_in_guest_mode()?;
+    // Guest mode: the config is shared with upstream clauth's plugin. The
+    // edit may only add, change or drop tollgate's own marked blocks; checked
+    // before herdr is even asked, so an edit that strays writes nothing.
+    let guest = crate::identity::upstream_active();
+    if guest {
+        refuse_foreign_config_change(path, previous, text)?;
+    }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let probe = tempfile::Builder::new()
@@ -1863,12 +1866,47 @@ fn write_validated(path: &Path, previous: &str, text: &str, bin: &str, edit: &st
         errln!("tollgate: herdr already says this about your config: {stale}");
     }
 
+    if guest {
+        return write_guest_config(path, previous, text);
+    }
+
     // Shortcut, with its ceiling: a truncating in-place write is what keeps the
     // file's mode and inode, and its cost is that a crash or a full disk mid-
     // write leaves the config short. The upgrade is write-temp-then-rename with
     // the original's mode read and restored onto the temp first, which is worth
     // doing the day this writes anything a user cannot retype.
     std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Guest mode's owned-blocks rule for herdr's config: with tollgate's own
+/// marked blocks stripped from both, `previous` and `text` must read the same.
+/// Upstream's blocks (its own marker), the user's tables and every comment
+/// are foreign and must not move. Trailing newlines are not content: the
+/// append seam adds one to a file that lacked it.
+fn refuse_foreign_config_change(path: &Path, previous: &str, text: &str) -> Result<()> {
+    let foreign = |s: &str| strip_marked_blocks(s).0.trim_end_matches('\n').to_string();
+    if foreign(previous) != foreign(text) {
+        bail!(
+            "refusing to write {}: the edit would change lines outside tollgate's own blocks (guest mode: the rest of the file is upstream clauth's and yours)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Guest mode's write of herdr's config: under upstream's state flock, the
+/// file must still hold exactly what the edit was planned against (upstream's
+/// heal may have written it since), and then it is replaced atomically with
+/// its mode kept. A changed file writes nothing and asks for a rerun.
+fn write_guest_config(path: &Path, previous: &str, text: &str) -> Result<()> {
+    let _lock = crate::guest_write::upstream_lock()?;
+    if read_config(path)? != previous {
+        bail!(
+            "{} changed while tollgate was planning its edit, so nothing was written; rerun",
+            path.display()
+        );
+    }
+    crate::guest_write::atomic_replace(path, text.as_bytes())
 }
 
 /// Diagnostics `after` carries that `before` did not, which is the only set

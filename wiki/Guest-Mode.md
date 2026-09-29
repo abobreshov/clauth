@@ -1,6 +1,6 @@
 # Guest mode
 
-tollgate is a fork of [clauth](https://github.com/uwuclxdy/clauth) and is built to run next to an installed upstream clauth. Both tools would otherwise write the same global files: `~/.claude/.credentials.json`, `~/.claude/settings.json`, `~/.claude.json`, `~/.codex/auth.json`, Claude Code's plugin registry and herdr's `config.toml`. Only one tool may own those at a time, and until the owner's accounts are imported that tool is upstream. While that holds, tollgate runs in **guest mode**: it watches, and runs per-session accounts of its own, but writes none of upstream's files.
+tollgate is a fork of [clauth](https://github.com/uwuclxdy/clauth) and is built to run next to an installed upstream clauth. Both tools would otherwise write the same global files: `~/.claude/.credentials.json`, `~/.claude/settings.json`, `~/.claude.json`, `~/.codex/auth.json`, Claude Code's plugin registry and herdr's `config.toml`. Only one tool may own those at a time, and until the owner's accounts are imported that tool is upstream. While that holds, tollgate runs in **guest mode**: it watches, and runs per-session accounts of its own, but changes none of upstream's state in those files. The one exception is tollgate's own entries in them (its plugin, its MCP server, its herdr blocks), which it adds and removes without touching anything else (see [tollgate's own entries](#tollgates-own-entries)).
 
 ## When it is on
 
@@ -21,6 +21,32 @@ How to tell:
 - **Monitors, `tollgate usage`, the Usage tab, the local agent API and the MCP `usage` tool** all work unchanged.
 - **Upstream's accounts, read only.** tollgate reads upstream's non-secret status feed, `~/.clauth/status.json`, and shows each of its profiles as `upstream:<name>`, labelled `<name> (clauth)`, with its 5h / 7d figures. Nothing else under `~/.clauth` is read: no config, no credentials, no per-profile cache. The feed is as fresh as upstream's daemon keeps it; without one there may be no feed and no upstream rows.
 - **`tollgate herdr link` / `unlink`**, which write no herdr config.
+- **The Plugin tab's Claude Code plugin install and `mcpServers` wiring, `tollgate herdr install` / `uninstall`, and the Plugin tab's herdr config fix.** Each writes only tollgate's own entries (below).
+
+## tollgate's own entries
+
+Some of the shared files hold keys that only tollgate uses, under its own names. Upstream never reads or writes them, so guest mode lets tollgate add, change and remove them:
+
+| File | tollgate's entries |
+|------|--------------------|
+| `~/.claude/plugins/installed_plugins.json` | `plugins["tollgate@tollgate"]` |
+| `~/.claude/plugins/known_marketplaces.json` | `tollgate` |
+| `~/.claude/settings.json` | `enabledPlugins["tollgate@tollgate"]` |
+| `~/.claude.json` | `mcpServers.tollgate` |
+| herdr's plugin registry | the plugin id `tollgate` |
+| herdr's `config.toml` | the blocks under `# tollgate herdr plugin` |
+
+Every other key is left alone: `clauth@clauth`, `mcpServers.clauth`, upstream's `# clauth herdr plugin` blocks, `apiKeyHelper`, `env`, `oauthAccount` and the rest. The rules:
+
+- **Nothing else changes.** A direct edit (the `mcpServers` wiring, the herdr config) parses the file before and after, and refuses to write if anything besides tollgate's entries would differ. The plugin install runs `claude plugin`, whose writes tollgate does not control. So tollgate snapshots the three plugin files first, and after the run puts back any upstream key the CLI changed or dropped. It keeps tollgate's rows and anything the CLI only added, and logs the restore.
+- **Upstream's writers wait.** Each write holds upstream's state lock, `~/.clauth/.lock`, for the whole read-modify-write (for the plugin install, the whole `claude plugin` run). The lock file is opened read-only and never created. If upstream holds it for more than 5 seconds, the write stops with `upstream clauth is holding ~/.clauth/.lock … nothing was written; retry once it finishes`.
+- **Atomic, mode kept.** The file is replaced through a temp file and a rename, with its permission bits kept. A symlink is written through to its target.
+- **herdr still checks.** A herdr config edit is still validated with `herdr config check` on a temp copy first. Under the lock, tollgate re-reads the file and writes nothing if it changed since the edit was planned. The default key `prefix+t` is never bound over a key another block already binds, upstream's included. When upstream's block already sets the sidebar's claude row, tollgate tells you what to add rather than editing it.
+- **Uninstall removes only tollgate's.** `tollgate herdr uninstall` removes the `tollgate` plugin and tollgate's marked blocks. Nothing in tollgate deletes another tool's entry.
+
+Run the plugin install from a shell outside Claude Code. With `CLAUDE_CONFIG_DIR` set, `claude plugin` would write that session's config, not `~/.claude`, so the install refuses and says why.
+
+Because the plugin now sits in the shared `~/.claude`, upstream's Claude Code sessions load it too. Its hooks (`tollgate self-heal`, `tollgate hook-profile-changed-note`) do nothing in any session whose `CLAUDE_CONFIG_DIR` is not under `~/.tollgate`, so upstream's sessions get no tollgate notes. The plugin's MCP server, and a wired `mcpServers.tollgate`, do show tollgate's tools in those sessions.
 
 ## What is refused
 
@@ -37,8 +63,6 @@ tollgate: upstream clauth manages ~/.claude on this machine (guest mode). Use 't
 | `tollgate capture` | adopts the login in `~/.claude/.credentials.json`, which upstream owns |
 | `tollgate login <name> --codex`, with or without `--browser` | the capture replaces `~/.codex/auth.json` with a link into tollgate's store; either flow mints a second codex chain beside upstream's |
 | the Claude browser OAuth login, `tollgate login <name> --setup-token`, and the TUI's login | each mints a second Claude login for an account upstream already holds |
-| the Claude Code plugin install and the `mcpServers` wiring (Plugin tab fixes) | the plugin registry and `~/.claude.json` are upstream's |
-| `tollgate herdr install`, the Plugin tab's herdr config fix | herdr's `config.toml` carries upstream's plugin block |
 
 ## What is skipped silently
 
@@ -47,12 +71,11 @@ Background work that would write a global file stands down without an error:
 - the fallback chain and the scheduler never auto-switch; a chain decision stays put
 - the credential detach on TUI exit, the credential snapshot, the `settings.json` apply and the `~/.claude.json` identity strip
 - following or detaching `~/.codex/auth.json`
-- the Claude Code plugin self-heal, its preflight and the `installed_plugins.json` repoint
+- the Claude Code plugin self-heal, its preflight and the `installed_plugins.json` repoint, when the config dir they would write is an upstream session's. Otherwise they run under the rules above, and the repoint re-points only tollgate's own rows
 - renaming, deleting or logging out a profile recorded as active: the profile's own files change, the global legs do not
 - every Claude and codex OAuth leg: no refresh-token spend (usage polls use the access token already held and fall back to the cache on a 401), no rolling re-stamp, no codex standby rotation, no adopt from `~/.claude/.credentials.json`, no refresh after an auto-start 401, and no write to the default macOS Keychain item `Claude Code-credentials` (per-session items still work)
 - `settings.json` and `~/.claude.json` are not synced: each runtime's copy is seeded from your operator file at start and belongs to its session after that; nothing is written back, and runtime copies do not sync with each other
 - a session runtime gets a private copy of `~/.claude/plugins` at start (in both link modes), keeps its transcripts in `~/.tollgate/guest-claude/projects` instead of `~/.claude/projects` (`tollgate resume` seeds the named transcript there), and gets copies instead of links of the `~/.codex` entries it would otherwise share
-- `tollgate herdr uninstall` removes tollgate's plugin and leaves herdr's `config.toml` alone
 
 ## What holds whether or not guest mode is on
 

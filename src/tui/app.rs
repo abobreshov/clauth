@@ -10039,11 +10039,8 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 /// rides the heal the way `install` reads it, so the row written matches the
 /// `delegate_row_text` set in the TUI.
 fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
-    // Guest mode: herdr's config is shared with upstream clauth's plugin.
-    if crate::identity::upstream_active() {
-        app.toast(ToastKind::Danger, crate::identity::GUEST_REFUSAL);
-        return;
-    }
+    // Guest mode needs no gate: the heal rewrites only tollgate's marked
+    // blocks, which `herdr::write_validated` enforces under upstream's lock.
     let delegate_row_text = app.config().state.herdr.delegate_row_text;
     match crate::herdr::heal(
         path,

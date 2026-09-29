@@ -799,6 +799,12 @@ case "$1" in
         # the Plugin tab recompute after the install sees it.
         mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
         printf '{"plugins":{"tollgate@tollgate":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+        # Opt-in worst case for the guest-mode guard: a CLI that rewrites the
+        # other shared files from scratch, dropping every other tool's keys.
+        if [ -n "$CLAUDE_SHIM_CLOBBER" ]; then
+          printf '{"enabledPlugins":{"tollgate@tollgate":true}}\n' > "$CLAUDE_CONFIG_DIR/settings.json"
+          printf '{"tollgate":{"source":{"source":"directory","path":"%s"}}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json"
+        fi
         ;;
     esac
     ;;

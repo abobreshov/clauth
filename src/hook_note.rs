@@ -382,6 +382,13 @@ pub(crate) fn run() -> Result<()> {
     let _ = std::io::stdin()
         .take(MAX_PAYLOAD_BYTES)
         .read_to_string(&mut input);
+    // Guest mode: the plugin sits in the shared `~/.claude`, so upstream
+    // clauth's sessions fire this hook too. Their account is upstream's to
+    // report; tollgate says nothing there. Checked after the stdin drain, so
+    // the host's payload write never meets a closed pipe.
+    if crate::identity::hook_stands_down() {
+        return Ok(());
+    }
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };

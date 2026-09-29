@@ -2,7 +2,7 @@
 
 tollgate has two kinds of account. A **profile** is one tollgate can launch and switch: a Claude Code OAuth login, an API-key endpoint, or a codex login. A **monitor** is one it only watches: a Nous Portal account read through Hermes, an OpenRouter billing key, another provider's key. Both show up in `tollgate usage`, the TUI's Usage tab, the local agent API and the MCP `usage` tool.
 
-If upstream clauth is installed on this machine, tollgate starts in [guest mode](Guest-Mode): it shows clauth's accounts read-only and refuses anything that writes `~/.claude` or `~/.codex`. `tollgate start`, `usage`, `monitor` and the API all work as below.
+If upstream clauth is installed on this machine, tollgate starts in [guest mode](Guest-Mode): it shows clauth's accounts read-only and refuses anything that would change clauth's state in `~/.claude` or `~/.codex` (tollgate's own plugin and herdr entries still install). `tollgate start`, `usage`, `monitor` and the API all work as below.
 
 ## See what you have
 

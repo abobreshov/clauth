@@ -4,7 +4,7 @@
 
 **What is the difference between tollgate and clauth?** tollgate is a hard fork of [clauth](https://github.com/uwuclxdy/clauth). It keeps clauth's Claude Code and codex account management and adds usage and spend monitoring across providers (Ollama Cloud, OpenRouter, Nous through Hermes, DeepSeek, Z.ai, MiniMax, Alibaba, generic endpoints), monitoring-only accounts, a local agent API, a Waybar output and the Omarchy palette. It has its own binary, data dir (`~/.tollgate`), plugin ids and daemon port, so both can be installed at once.
 
-**I already use clauth. Will tollgate break it?** No. With `~/.clauth` present tollgate runs in [guest mode](Guest-Mode): it shows clauth's accounts read-only and refuses anything that writes `~/.claude`, `~/.codex`, the plugin registry or herdr's config. There is no import from clauth yet, so tollgate cannot take over those files; use `tollgate start <profile>` for its own accounts.
+**I already use clauth. Will tollgate break it?** No. With `~/.clauth` present tollgate runs in [guest mode](Guest-Mode): it shows clauth's accounts read-only and refuses anything that would change clauth's state in `~/.claude`, `~/.codex`, the plugin registry or herdr's config. Its own plugin, MCP entry and herdr blocks still install beside clauth's, touching nothing else. There is no import from clauth yet, so tollgate cannot take over those files; use `tollgate start <profile>` for its own accounts.
 
 **How do I watch an account I never launch from tollgate?** Add a monitor: `tollgate monitor add <id> --kind <nous|ollama_cloud|openrouter|provider> …` with the key named by environment variable. [Providers](Providers#monitors).
 

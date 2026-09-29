@@ -745,7 +745,7 @@ fn registry_remap_matches_both_separator_spellings() {
         "{}\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
         profiles.display()
     );
-    match super::registry_remap(&back_path, &prefix_fwd, &prefix_back, &claude) {
+    match super::registry_remap(&back_path, &prefix_fwd, &prefix_back, &claude, false) {
         agentgear::Remap::Rewrite(to) => assert_eq!(
             to,
             canonical.display().to_string(),
@@ -763,7 +763,7 @@ fn registry_remap_matches_both_separator_spellings() {
         "{}/D0/runtime-9-0/plugins/cache/mkt/plugin/1",
         profiles.display()
     );
-    match super::registry_remap(&fwd_path, &prefix_fwd, &prefix_back, &claude) {
+    match super::registry_remap(&fwd_path, &prefix_fwd, &prefix_back, &claude, false) {
         agentgear::Remap::Rewrite(to) => assert_eq!(
             to,
             canonical.display().to_string(),
@@ -780,7 +780,7 @@ fn registry_remap_matches_both_separator_spellings() {
     let outside = "/home/u/.claude/plugins/cache/mkt/plugin/1";
     assert!(
         matches!(
-            super::registry_remap(outside, &prefix_fwd, &prefix_back, &claude),
+            super::registry_remap(outside, &prefix_fwd, &prefix_back, &claude, false),
             agentgear::Remap::Keep
         ),
         "a path outside the profiles dir is not targeted"
