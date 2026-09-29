@@ -313,6 +313,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 provider,
             },
         ),
+        Command::Monitor { json, cmd } => usage::monitor::cli::dispatch(json, cmd),
         Command::Status {
             json: _,
             all,

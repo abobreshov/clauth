@@ -714,3 +714,50 @@ fn no_credential_reaches_the_cache_or_the_notes() {
         assert!(!json.contains("test-management"));
     }
 }
+
+/// The monitoring leg with only a management key: one `GET /api/v1/credits`
+/// with it, never `/api/v1/key`; the wallet is an unbound monitoring meter and
+/// nothing key-scoped is invented.
+#[test]
+fn a_wallet_only_fetch_sends_the_management_key_to_credits_alone() {
+    let http = Recorder::new(vec![body(CREDITS_FUNDED)]);
+    let usage = fetch_openrouter_wallet(MANAGEMENT, &http).expect("wallet");
+    assert_eq!(http.urls(), [CREDITS_URL]);
+    assert_eq!(http.calls.borrow()[0].1, MANAGEMENT);
+    let m = observed_meters(&usage, now());
+    assert_eq!(m.money.len(), 1, "the wallet alone: {:?}", m.money);
+    let wallet = meter(&m, METER_WALLET).unwrap();
+    assert_eq!(
+        wallet.scope_origin,
+        ScopeOrigin::MonitoringCredential { bound: false }
+    );
+    assert!(m.windows.is_empty());
+}
+
+/// On the wallet-only leg a `/credits` failure is the whole fetch, and a blank
+/// key sends nothing.
+#[test]
+fn a_wallet_only_fetch_maps_every_failure() {
+    for (reply, want) in [
+        (status(401), ThirdPartyError::AuthExpired),
+        (status(403), ThirdPartyError::Status),
+        (status(500), ThirdPartyError::Status),
+        (HttpReply::Network, ThirdPartyError::Network),
+        (body("{not json"), ThirdPartyError::Parse),
+    ] {
+        let http = Recorder::new(vec![reply]);
+        let err = fetch_openrouter_wallet(MANAGEMENT, &http).unwrap_err();
+        assert_eq!(std::mem::discriminant(&err), std::mem::discriminant(&want));
+    }
+    let http = Recorder::new(vec![status(429)]);
+    assert!(matches!(
+        fetch_openrouter_wallet(MANAGEMENT, &http),
+        Err(ThirdPartyError::RateLimited { .. })
+    ));
+    let http = Recorder::new(Vec::new());
+    assert!(matches!(
+        fetch_openrouter_wallet("  ", &http),
+        Err(ThirdPartyError::AuthExpired)
+    ));
+    assert!(http.urls().is_empty());
+}

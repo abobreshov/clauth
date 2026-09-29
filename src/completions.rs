@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -72,6 +72,14 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "limit-reset" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--list --yes -y" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "monitor" ]; then
+        COMPREPLY=( $(compgen -W "list add remove refresh --json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "add" ] && [ "$prev" = "--kind" ]; then
+        COMPREPLY=( $(compgen -W "nous ollama_cloud openrouter provider" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "add" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--kind --provider --label --api-key-env --billing-key-env --hermes-home --budget-usd-month --alert-pct --ttl-secs --disabled" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "refresh" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "usage" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --account --provider" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
@@ -110,6 +118,7 @@ _tollgate() {
             'daemon[run the headless scheduler with no TUI]' \
             'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'usage[print every account'"'"'s quota windows and money meters]' \
+            'monitor[list, add, remove and refresh monitoring-only usage sources]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
@@ -197,6 +206,25 @@ _tollgate() {
             '--cert[serve this certificate instead of the lego one; needs --key]' \
             '--key[private key for --cert]' \
             '--dump-openapi[print the OpenAPI document the REST API serves, and start nothing]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == monitor ]]; then
+        _values 'subcommand' 'list[list the monitors and their cached figures]' \
+            'add[add a monitor to monitors.toml]' \
+            'remove[remove a monitor and its cache]' \
+            'refresh[fetch monitors now]'
+        _values 'flag' '--json[emit the monitor list as JSON]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == add ]]; then
+        _values 'flag' '--kind[nous, ollama_cloud, openrouter or provider]' \
+            '--provider[with --kind provider: the typed provider]' \
+            '--label[human name]' \
+            '--api-key-env[NAME of the env var holding the api key]' \
+            '--billing-key-env[NAME of the env var holding a monitoring-only key]' \
+            '--hermes-home[with --kind nous: the Hermes home]' \
+            '--budget-usd-month[monthly budget in USD]' \
+            '--alert-pct[notify once past this percent]' \
+            '--ttl-secs[refresh interval in seconds]' \
+            '--disabled[add it disabled]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == refresh ]]; then
+        _values 'flag' '--json[emit JSON]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == usage ]]; then
         _values 'flag' '--json[emit the stable JSON envelope]' '--all[also include disabled profiles]' \
             '--account[only this account id or name]' '--provider[only this source or provider]'
@@ -237,6 +265,23 @@ complete -c tollgate -f -n __fish_is_first_token -a completions -d "Emit shell c
 complete -c tollgate -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
 complete -c tollgate -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
 complete -c tollgate -f -n __fish_is_first_token -a usage -d "Print every account's quota windows and money meters"
+complete -c tollgate -f -n __fish_is_first_token -a monitor -d "List, add, remove and refresh monitoring-only usage sources"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a list -d "List the monitors and their cached figures"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a add -d "Add a monitor to monitors.toml"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a remove -d "Remove a monitor and its cache"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a refresh -d "Fetch monitors now"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --kind -d "nous, ollama_cloud, openrouter or provider"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --provider -d "With --kind provider: the typed provider"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --label -d "Human name"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --api-key-env -d "NAME of the env var holding the api key"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --billing-key-env -d "NAME of the env var holding a monitoring-only key"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --hermes-home -d "With --kind nous: the Hermes home"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --budget-usd-month -d "Monthly budget in USD"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --alert-pct -d "Notify once past this percent"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --ttl-secs -d "Refresh interval in seconds"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --disabled -d "Add it disabled"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from refresh" -a --json -d "Emit the usage JSON envelope"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a --json -d "Emit the monitor list as JSON"
 complete -c tollgate -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c tollgate -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"

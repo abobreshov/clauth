@@ -63,6 +63,9 @@ impl super::Daemon {
             self.drain_pending_switch_off();
         }
         self.write_status();
+        // Monitoring-only sources (`monitors.toml`): fetch the due ones on a
+        // detached thread, so a slow provider never holds the tick.
+        crate::usage::monitor::poll_detached();
         // Converge a broken plugin registration in the background. The gate is two
         // registry reads inline and a needed heal runs detached (throttled inside
         // `heal_detached`), so this never blocks the run loop.

@@ -319,6 +319,57 @@ pub(crate) fn fetch_openrouter_usage(
     Ok(OpenRouterUsage { key, wallet, notes })
 }
 
+/// Read one OpenRouter wallet with a management key alone: `GET
+/// /api/v1/credits` and nothing else (the key never reaches `/api/v1/key`).
+/// The monitoring leg for a monitor configured with only `billing_key_env`.
+///
+/// Unlike the `/credits` leg of [`fetch_openrouter_usage`], a failure here is
+/// the whole fetch: 401 is [`ThirdPartyError::AuthExpired`], 429
+/// [`ThirdPartyError::RateLimited`], any other status
+/// [`ThirdPartyError::Status`], no status [`ThirdPartyError::Network`], and an
+/// unreadable body [`ThirdPartyError::Parse`]. The wallet is read with
+/// [`WalletCredential::Management`], so it projects as an unbound monitoring
+/// meter; the key snapshot is empty (no key spend, no cap, no free window).
+pub(crate) fn fetch_openrouter_wallet(
+    billing_key: &str,
+    http: &dyn OpenRouterHttp,
+) -> Result<OpenRouterUsage, ThirdPartyError> {
+    let billing_key = billing_key.trim();
+    if billing_key.is_empty() {
+        return Err(ThirdPartyError::AuthExpired);
+    }
+    let read_with = WalletCredential::Management;
+    match guarded_get(http, CREDITS_PATH, billing_key, read_with) {
+        HttpReply::Body(body) => {
+            let env = serde_json::from_str::<CreditsEnvelope>(&body)
+                .map_err(|_| ThirdPartyError::Parse)?;
+            Ok(OpenRouterUsage {
+                key: KeySnapshot::default(),
+                wallet: Some(WalletRead {
+                    total_credits: env.data.total_credits.0,
+                    total_usage: env.data.total_usage.0,
+                    read_with,
+                }),
+                notes: Vec::new(),
+            })
+        }
+        HttpReply::Status { code: 401, .. } => Err(ThirdPartyError::AuthExpired),
+        HttpReply::Status {
+            code: 429,
+            retry_after,
+        } => Err(ThirdPartyError::RateLimited { retry_after }),
+        HttpReply::Status { .. } => Err(ThirdPartyError::Status),
+        HttpReply::Network => Err(ThirdPartyError::Network),
+    }
+}
+
+/// [`fetch_openrouter_wallet`] over [`LiveHttp`], projected to
+/// [`ThirdPartyStats`] (the monitor source's live leg).
+pub(crate) fn fetch_wallet_stats(billing_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
+    let usage = fetch_openrouter_wallet(billing_key, &LiveHttp)?;
+    Ok(stats(&usage, crate::usage::now_epoch_secs()))
+}
+
 /// `GET ORIGIN+path`, refusing to send a management key to any path outside
 /// [`billing_key_may_reach`]. A refusal reads as a 403 so the one meter
 /// degrades and nothing is sent.
