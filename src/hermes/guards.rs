@@ -48,6 +48,9 @@ pub(crate) const SCRUB_EXACT: &[&str] = &[
     "HERMES_SHARED_AUTH_DIR",
     "HERMES_INFERENCE_PROVIDER",
     "HERMES_MODEL",
+    // Hermes sets it beside HERMES_MODEL for its own relaunches
+    // (`main.py:2227-2228`); an inherited one would outrank the roster's model.
+    "HERMES_INFERENCE_MODEL",
     "HERMES_S6_SUPERVISED_CHILD",
     "HERMES_PORTAL_BASE_URL",
     // Flips Hermes' managed-scope and auth-store behaviour (managed_scope.py:41-49).
@@ -367,7 +370,18 @@ pub(crate) fn g4_profiles(name: &str, paths: &HermesPaths) -> Result<()> {
 
 /// G5, the `start` pass-through: scan the WHOLE vector, `--` included,
 /// because Hermes scans for `-p` anywhere (`main.py:526-560`).
+///
+/// Hermes' parser is argparse with its default `allow_abbrev`, so it takes a
+/// unique prefix of a long option (`--prov anthropic` is `--provider`), and a
+/// short option's value glued on (`-manthropic:x` is `-m anthropic:x`). Both
+/// spellings are read here as the option they expand to.
 pub(crate) fn g5_argv(name: &str, provider: &str, args: &[String]) -> Result<()> {
+    // `--prov` / `--prov=x` against `--provider`: a prefix of the long option,
+    // `--` plus at least one letter.
+    let long_prefix_of = |arg: &str, full: &str| {
+        let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+        flag.len() > 2 && flag.starts_with("--") && full.starts_with(flag)
+    };
     let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
         let a = arg.as_str();
@@ -378,17 +392,23 @@ pub(crate) fn g5_argv(name: &str, provider: &str, args: &[String]) -> Result<()>
                 prefix(name)
             )));
         }
-        if a == "--provider" || a.starts_with("--provider=") {
+        if long_prefix_of(a, "--provider") {
             return Err(refuse(format!(
                 "{}'--provider' is fixed by the profile ({provider}); create another profile \
                  for another provider",
                 prefix(name)
             )));
         }
-        let model = if a == "-m" || a == "--model" {
+        let model = if a == "-m" || (long_prefix_of(a, "--model") && !a.contains('=')) {
             it.peek().map(|v| v.as_str())
+        } else if long_prefix_of(a, "--model") {
+            a.split_once('=').map(|(_, v)| v)
         } else {
-            a.strip_prefix("--model=")
+            // A glued short value, `-mX`. argparse reads `-m=x` as the value
+            // `=x`; Hermes' own alias split sees what follows it either way.
+            a.strip_prefix("-m")
+                .filter(|v| !v.is_empty())
+                .map(|glued| glued.trim_start_matches('='))
         };
         if let Some(model) = model
             && let Some((alias, _)) = model.split_once(':')

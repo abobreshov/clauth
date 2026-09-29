@@ -187,7 +187,14 @@ fn argv_scan_refuses_profile_flags_anywhere_including_after_dashdash() {
 /// alias, refuse; an OpenRouter slug `anthropic/…` passes.
 #[test]
 fn argv_scan_refuses_provider_and_anthropic_colon_model_but_allows_openrouter_slug() {
-    for v in [&["--provider", "nous"][..], &["--provider=nous"]] {
+    // argparse's abbreviations spell the same option.
+    for v in [
+        &["--provider", "nous"][..],
+        &["--provider=nous"],
+        &["--prov", "anthropic"],
+        &["--provi=anthropic"],
+        &["chat", "--pr", "x"],
+    ] {
         let text = refusal_text(g5_argv("or-main", "openrouter", &argv(v)));
         assert!(
             text.contains("'--provider' is fixed by the profile (openrouter)"),
@@ -199,16 +206,24 @@ fn argv_scan_refuses_provider_and_anthropic_colon_model_but_allows_openrouter_sl
         &["--model", "claude:opus"],
         &["--model=claude-code:sonnet"],
         &["--", "-m", "Anthropic:x"],
+        &["-manthropic:claude-opus-4"],
+        &["-m=claude:opus"],
+        &["--mod", "anthropic:x"],
+        &["--mo=claude_code:x"],
     ] {
         let text = refusal_text(g5_argv("or-main", "openrouter", &argv(v)));
         assert!(text.contains("-m routes to anthropic"), "{v:?}: {text}");
     }
-    g5_argv(
-        "or-main",
-        "openrouter",
-        &argv(&["-m", "anthropic/claude-sonnet-4.5"]),
-    )
-    .unwrap();
+    for ok in [
+        &["-m", "anthropic/claude-sonnet-4.5"][..],
+        &["-manthropic/claude-sonnet-4.5"],
+        &["--mod", "openai/gpt-5"],
+        // Not a prefix of `--provider` or `--model`: left to Hermes.
+        &["--prompt", "anthropic:x"],
+        &["--max-turns", "3"],
+    ] {
+        g5_argv("or-main", "openrouter", &argv(ok)).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+    }
 }
 
 /// Test 17 (G6).

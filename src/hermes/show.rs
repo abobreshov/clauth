@@ -12,7 +12,6 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -309,7 +308,9 @@ pub(crate) fn recent_sessions(home: &Path, path: Option<&OsStr>) -> Vec<SessionS
     let Some(sqlite) = resolve::which_on(path, "sqlite3") else {
         return Vec::new();
     };
-    let mut command = Command::new(sqlite);
+    // A helper, like herdr or notify-send: no monitoring or billing key rides
+    // into it.
+    let mut command = crate::providers::billing_key::helper_command(sqlite);
     command
         .arg("-readonly")
         .arg("-json")

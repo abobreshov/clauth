@@ -18,7 +18,6 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -328,7 +327,9 @@ pub(crate) fn read_state_db(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DbReading::default()),
         Err(_) => return Err(CacheError::DbUnreadable),
     }
-    let mut command = Command::new(sqlite);
+    // A helper, like herdr or notify-send: no monitoring or billing key rides
+    // into it.
+    let mut command = crate::providers::billing_key::helper_command(sqlite);
     command
         .arg("-readonly")
         .arg("-json")

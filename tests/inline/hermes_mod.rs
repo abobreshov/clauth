@@ -255,6 +255,8 @@ fn the_child_env_scrubs_xdg_claude_config_dir_and_gh_tokens() {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "PYTEST_CURRENT_TEST",
         "HERMES_INFERENCE_PROVIDER",
+        "HERMES_MODEL",
+        "HERMES_INFERENCE_MODEL",
         "MY_CUSTOM",
     ] {
         assert_eq!(env.get(key), Some(&None), "{key} must be scrubbed");

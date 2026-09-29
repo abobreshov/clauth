@@ -8,6 +8,7 @@
 use super::*;
 use crate::codex_profiles::CodexState;
 use crate::testutil::HomeSandbox;
+use std::process::Command;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hermes");
 /// 2026-09-01T00:00:00Z, the month the `state-v22.sql` rows sit in.

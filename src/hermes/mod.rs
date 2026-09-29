@@ -916,7 +916,9 @@ pub(crate) fn post_session_anthropic_rows(
     if !db.is_file() {
         return false;
     }
-    let mut command = Command::new(sqlite);
+    // A helper, like herdr or notify-send: no monitoring or billing key rides
+    // into it.
+    let mut command = crate::providers::billing_key::helper_command(sqlite);
     command
         .arg("-readonly")
         .arg("-json")

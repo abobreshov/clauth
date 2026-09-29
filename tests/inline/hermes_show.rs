@@ -8,6 +8,7 @@ use super::*;
 use crate::hermes::profiles::Provider;
 use crate::hermes::testkit::{Fixture, NoManagedScope, TEST_KEY_FINGERPRINT, new_openrouter};
 use crate::testutil::HomeSandbox;
+use std::process::Command;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hermes");
 
