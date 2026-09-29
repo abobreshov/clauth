@@ -1655,14 +1655,6 @@ fn clear_backup_postscript(target: &str) -> String {
     )
 }
 
-/// `tollgate delete <name> [--yes] [--force]` — remove a profile and all its
-/// credentials (the whole on-disk profile dir + state + caches), OAuth or
-/// API-key. Prompts `[y/N]` on a TTY unless `--yes`. Delete is an irreversible
-/// `remove_dir_all`, so unlike a reauth a non-TTY stdin does NOT get an implicit
-/// yes: it must pass `--yes`, else the delete is refused. A profile held by a
-/// live `tollgate start` session is refused unless `--force` (independent of
-/// `--yes`). If the deleted profile was active, its live
-/// `~/.claude/.credentials.json` link and settings.json endpoint are cleared.
 /// The Hermes leg of `start` (spec §4.4 step 1): the claude-only flags refuse
 /// by name, `--explain` runs G1–G6 and prints the pick line, and a real start
 /// is `start::run_hermes`. `--auto` never reaches here: it walks the claude
@@ -1796,6 +1788,14 @@ fn cmd_delete_hermes(canonical: &str, yes: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `tollgate delete <name> [--yes] [--force]` — remove a profile and all its
+/// credentials (the whole on-disk profile dir + state + caches), OAuth or
+/// API-key. Prompts `[y/N]` on a TTY unless `--yes`. Delete is an irreversible
+/// `remove_dir_all`, so unlike a reauth a non-TTY stdin does NOT get an implicit
+/// yes: it must pass `--yes`, else the delete is refused. A profile held by a
+/// live `tollgate start` session is refused unless `--force` (independent of
+/// `--yes`). If the deleted profile was active, its live
+/// `~/.claude/.credentials.json` link and settings.json endpoint are cleared.
 fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
@@ -1810,6 +1810,11 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
         outln!(
             "tollgate: note — '{canonical}' also names a codex profile; deleting the CLAUDE one"
+        );
+    }
+    if hermes::profiles::HermesState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!(
+            "tollgate: note — '{canonical}' also names a Hermes profile; deleting the CLAUDE one"
         );
     }
     if !confirm_profile_delete(&canonical, yes)? {
@@ -1979,6 +1984,11 @@ fn cmd_switch(name: &str) -> Result<()> {
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
         outln!(
             "tollgate: note — '{canonical}' also names a codex profile; switching the CLAUDE one"
+        );
+    }
+    if hermes::profiles::HermesState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!(
+            "tollgate: note — '{canonical}' also names a Hermes profile; switching the CLAUDE one"
         );
     }
     refuse_if_disabled(&config, &canonical)?;

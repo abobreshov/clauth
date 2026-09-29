@@ -2125,6 +2125,7 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
         return Vec::new();
     };
     let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let hermes = crate::hermes::profiles::HermesState::load().unwrap_or_default();
     let claude_roster: Vec<String> = crate::profile::claude_roster_names()
         .unwrap_or_default()
         .into_iter()
@@ -2136,8 +2137,11 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
         let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
-        // Claude-first for a dual-claimed name, like every other site.
-        if codex.holds(profile_name) && !claude_roster.iter().any(|p| p == profile_name) {
+        // Claude-first for a dual-claimed name, like every other site. A
+        // Hermes home holds Hermes' own tree, never a Claude Code store.
+        if (codex.holds(profile_name) || hermes.holds(profile_name))
+            && !claude_roster.iter().any(|p| p == profile_name)
+        {
             continue;
         }
         let profile_path = profile.path();

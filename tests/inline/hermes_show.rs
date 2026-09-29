@@ -398,3 +398,63 @@ fn list_renders_the_estimate_or_the_usage_error() {
     );
     assert!(render_list(&[]).starts_with("no Hermes profiles"));
 }
+
+/// A torn `auth.json` (Hermes mid-write) is a pool line saying so, never an
+/// error or a partial view; and a label carrying control characters reaches
+/// the terminal without them.
+#[test]
+fn show_survives_a_torn_auth_json_and_strips_control_characters() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let _fx = fixture(&sb);
+    new_openrouter("or-main");
+    let paths = HermesPaths::for_name("or-main").unwrap();
+    std::fs::write(
+        paths.home.join("auth.json"),
+        "{\"version\": 1, \"credential_pool\": {",
+    )
+    .unwrap();
+    let s = show_out("or-main", false, Some(&no_path(&sb))).unwrap();
+    assert!(s.pool.is_none());
+    assert!(
+        s.pool_error
+            .as_deref()
+            .is_some_and(|e| e.contains("retry when Hermes is not writing it")),
+        "{s:?}"
+    );
+    assert!(render_show(&s).contains("pool        auth.json cannot be read now"));
+
+    std::fs::write(
+        paths.home.join("auth.json"),
+        r#"{"version":1,"credential_pool":{"openrouter":[{"label":"evil\u001b[2Jlabel","source":"manual","auth_type":"api_key","last_status":"ok\u0007"}]}}"#,
+    )
+    .unwrap();
+    let s = show_out("or-main", false, Some(&no_path(&sb))).unwrap();
+    let lines = pool_lines(s.pool.as_ref().unwrap());
+    assert_eq!(
+        lines[0],
+        "#1 evil[2Jlabel  api_key/manual  ok  req -  prio -"
+    );
+    assert!(
+        !render_show(&s)
+            .chars()
+            .any(|c| c == '\u{1b}' || c == '\u{7}')
+    );
+}
+
+/// A `config set` that fails returns Hermes' exit code and still drops the
+/// marker, so the home is not left busy.
+#[test]
+fn strategy_writer_returns_the_childs_code_and_releases_the_home() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let fx = fixture(&sb);
+    new_pool("pool-a");
+    fx.set_ctl("hermes.exit", "3");
+    assert_eq!(pool_strategy("pool-a", "least_used").unwrap(), 3);
+    assert!(!crate::runtime::has_live_session(&ProfileName::from(
+        "pool-a"
+    )));
+    fx.set_ctl("hermes.exit", "0");
+    assert_eq!(pool_strategy("pool-a", "least_used").unwrap(), 0);
+}

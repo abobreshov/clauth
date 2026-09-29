@@ -99,8 +99,7 @@ pub(crate) fn list_rows(path: Option<&OsStr>) -> Result<Vec<ListRow>> {
                 usage_error: cache
                     .as_ref()
                     .and_then(|c| c.error)
-                    .map(|e| serde_json::to_value(e).ok())
-                    .and_then(|v| v.and_then(|v| v.as_str().map(str::to_string))),
+                    .map(|e| e.as_str().to_string()),
             }
         })
         .collect())
@@ -247,7 +246,13 @@ pub(crate) fn pool_out(view: &PoolAuthView, profile: &HermesProfile) -> PoolOut 
 /// `#<n> <label>  <auth_type>/<source>  <status>[ until <reset>]  req <count>
 /// prio <p>  fp …<last 4 hex>`, one line per entry.
 pub(crate) fn pool_lines(pool: &PoolOut) -> Vec<String> {
-    let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+    // Labels and statuses are Hermes-written, and a label is whatever the
+    // user typed at `auth add`: no control character reaches the terminal.
+    let dash = |v: &Option<String>| {
+        v.as_deref()
+            .map(|s| s.chars().filter(|c| !c.is_control()).collect())
+            .unwrap_or_else(|| "-".to_string())
+    };
     pool.entries
         .iter()
         .map(|e| {

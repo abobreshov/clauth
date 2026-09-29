@@ -33,6 +33,8 @@ use super::observation::{
 use crate::hermes::home::HermesPaths;
 use crate::hermes::profiles::{HermesProfile, HermesState};
 use crate::logline::logline;
+use crate::profile::ProfileName;
+use crate::runtime::RotationGuard;
 
 /// The cache file beside the profile's Hermes home.
 pub(crate) const CACHE_FILE: &str = "hermes_usage_cache.json";
@@ -82,6 +84,16 @@ pub(crate) enum CacheError {
 }
 
 impl CacheError {
+    /// The snake_case spelling this serialises as (`sqlite3_missing`, …).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CacheError::Sqlite3Missing => "sqlite3_missing",
+            CacheError::SchemaUnknown => "schema_unknown",
+            CacheError::DbUnreadable => "db_unreadable",
+            CacheError::Timeout => "timeout",
+        }
+    }
+
     /// The one sentence the observation's `Unavailable` failure carries.
     pub(crate) fn message(self) -> &'static str {
         match self {
@@ -380,8 +392,13 @@ pub(crate) fn load(name: &str) -> Option<HermesUsageCache> {
 /// Read `name`'s home and write its cache (spec §4.6). A failed read keeps
 /// the last good rows for [`KEEP_LAST_GOOD_MS`] and records why.
 /// `hermes_version` is the version a `start` teardown launched; `None`
-/// carries the cached one over. Never writes for a profile whose home is gone
-/// (a delete in flight): that would recreate its directory.
+/// carries the cached one over.
+///
+/// The `sqlite3` child runs with no lock held. The write then takes the
+/// profile's RotationGuard without waiting and re-checks the home under it,
+/// so it can never land inside a `hermes delete` (which holds that guard) and
+/// recreate the directory the delete removed. A busy guard skips the write
+/// and still returns the fresh reading: the next refresh writes it.
 pub(crate) fn refresh_with(
     name: &str,
     now_ms: u64,
@@ -434,6 +451,12 @@ pub(crate) fn refresh_with(
         },
     };
     let bytes = serde_json::to_vec_pretty(&cache)?;
+    let Some(_guard) = RotationGuard::try_acquire(&ProfileName::from(name))? else {
+        return Ok(cache);
+    };
+    if !paths.home.is_dir() {
+        bail!("Hermes profile '{name}' has no home");
+    }
     crate::profile::atomic_write_600(&paths.profile.join(CACHE_FILE), bytes)
         .with_context(|| format!("failed to write {CACHE_FILE} for '{name}'"))?;
     Ok(cache)

@@ -4203,6 +4203,23 @@ fn herdr_tag_uses_hermes_origin_and_hermes_home_join_through_the_script() {
     chain_stop(&setup);
     drop(setup);
 
+    // A `hermes` run inside a claude session climbs to that session's row:
+    // not the pane's account, so the pane falls through to the native match.
+    let setup = tag_answering_setup("hermes", Some("herm 5%\n"));
+    std::fs::write(
+        setup.home.home().join(".tollgate/live_sessions/s2.json"),
+        r#"{"session_id":"s2","start_profile":"work","harness":"claude","pid":1001,"started_at":0,"isolated":false,"follows_chain":false,"intended_member":null,"chain_cursor":null,"current_member":null,"last_swap_at":null}"#,
+    )
+    .unwrap();
+    let out = chain_report_out(&setup, r#"{"agent":"hermes"}"#);
+    assert_eq!(out, "herm 5%\n", "the claude row is not the hermes pane's");
+    assert_eq!(
+        tag_log(&setup).first().map(String::as_str),
+        Some("herdr tag --agent hermes")
+    );
+    chain_stop(&setup);
+    drop(setup);
+
     // The HERMES_HOME join, with a sentinel riding in the same environ.
     let setup = tag_answering_setup("hermes", Some("herm 2%\n"));
     let proc_dir = setup.home.home().join("proc/1001");

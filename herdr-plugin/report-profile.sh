@@ -144,6 +144,15 @@ pane_hermes_home() {
     tr '\0' '\n' <"$proc_root/$1/environ" 2>/dev/null | sed -n 's/^HERMES_HOME=//p' | head -1
 }
 
+# Whether row $1 belongs to the pane's harness. A hermes pane takes only a
+# Hermes row: a `hermes` run inside a `tollgate start <claude-profile>` session
+# climbs to that session's row, whose account the pane does not burn. The other
+# agents keep their rows as before.
+row_fits_agent() {
+    [ "$agent" != hermes ] && return 0
+    grep -q '"harness":"hermes"' "$1" 2>/dev/null
+}
+
 # The account a row names: the member a --with-fallback session swapped onto,
 # else its launch member.
 row_profile() {
@@ -227,7 +236,9 @@ if [ -z "$agentless" ] && [ -z "$native" ] && [ -n "$pane" ]; then
     fg_pid=$(printf '%s' "$info" | sed -n 's/.*"foreground_process_group_id":\([0-9]*\).*/\1/p')
     if [ -n "$fg_pid" ]; then
         row=$(session_row "$fg_pid")
-        [ -n "$row" ] && profile=$(row_profile "$row")
+        if [ -n "$row" ] && row_fits_agent "$row"; then
+            profile=$(row_profile "$row")
+        fi
     fi
     # The pid sweep is the compat path for a process-info without the
     # foreground field. When the field is there and found no row, the pane
@@ -243,6 +254,7 @@ if [ -z "$agentless" ] && [ -z "$native" ] && [ -n "$pane" ]; then
             _pargs=$(proc_args "$_pp")
             case "$_pargs" in 'tollgate mcp '* | 'tollgate mcp') continue ;; esac
             row=$(session_row "$pid") || continue
+            row_fits_agent "$row" || continue
             profile=$(row_profile "$row")
             [ -n "$profile" ] && break
         done

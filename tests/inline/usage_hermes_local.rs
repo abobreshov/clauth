@@ -433,3 +433,38 @@ fn refresh_never_recreates_a_deleted_profile_dir() {
     assert!(refresh_with("gone", SEP_20_MS, Some(&path), None).is_err());
     assert!(!paths.profile.exists());
 }
+
+/// A refresh racing a writer that holds the profile's RotationGuard (a
+/// `hermes delete`, a `key`) returns its fresh reading but writes nothing:
+/// the write never waits on, and never lands inside, that guard.
+#[test]
+fn refresh_skips_the_write_while_the_profile_is_busy() {
+    let sb = HomeSandbox::new();
+    roster(&["or-main"]);
+    touch_db("or-main");
+    let path = sqlite_stub(&sb, &fixture("sqlite-out/v22-september.json"), 0);
+    // The holder is another thread: this one must hold no tollgate lock
+    // across the sqlite3 child (the unlocked-spawn assert would fire).
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // The sandbox's home override is process-wide, so the holder sees it.
+    let holder = std::thread::spawn(move || {
+        let guard = RotationGuard::try_acquire(&ProfileName::from("or-main"))
+            .unwrap()
+            .expect("uncontended");
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(guard);
+    });
+    held_rx.recv().unwrap();
+    let reading = refresh_with("or-main", SEP_20_MS, Some(&path), None).unwrap();
+    assert_eq!(reading.total_cost().as_str(), "0.012346");
+    assert!(
+        load("or-main").is_none(),
+        "nothing written under a held guard"
+    );
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    refresh_with("or-main", SEP_20_MS, Some(&path), None).unwrap();
+    assert!(load("or-main").is_some(), "the next refresh writes it");
+}
