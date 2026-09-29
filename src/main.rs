@@ -232,7 +232,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     let Some(command) = cli.command else {
         use std::io::IsTerminal as _;
         if std::io::stdout().is_terminal() {
-            return cmd_tui(theme_override);
+            return cmd_tui(theme_override, cli.tab);
         }
         return cmd_bare_help();
     };
@@ -445,6 +445,13 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
             herdr::install(key.as_deref(), no_config, yes, delegate_row_text)
         }
         cli::HerdrCommand::Uninstall { no_config, yes } => herdr::uninstall(no_config, yes),
+        // Neither touches herdr's config.toml, only the registry entry for
+        // tollgate's own plugin id, so guest mode does not gate them.
+        cli::HerdrCommand::Link { path } => herdr::link::link(path.as_deref()),
+        cli::HerdrCommand::Unlink => herdr::link::unlink(),
+        cli::HerdrCommand::Tag { agent, profile } => {
+            herdr::tag::run(profile.as_deref(), agent.as_deref())
+        }
         cli::HerdrCommand::Config { cmd } => match cmd {
             cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },
@@ -2264,7 +2271,10 @@ fn cmd_bare_help() -> Result<()> {
     Err(HelpRendered.into())
 }
 
-fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
+fn cmd_tui(
+    theme_override: Option<tui::theme::Tier>,
+    open_tab: Option<crate::profile::HomeTab>,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     completions::auto_install_once();
@@ -2281,7 +2291,7 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
     // detection channel: no flag, no config key, so a normal terminal can
     // never trip it by accident.
     let herdr_mode = std::env::var("HERDR_ENV").as_deref() == Ok("1");
-    tui::run(config, herdr_mode)
+    tui::run(config, herdr_mode, open_tab)
 }
 
 /// Feature→test traceability map.

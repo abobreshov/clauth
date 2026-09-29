@@ -1,6 +1,6 @@
 #!/bin/sh
-# Detached per-pane watcher, spawned by `report-profile.sh` for Claude Code
-# and codex panes. Re-publishes the pane's account on a timer, so the sidebar
+# Detached per-pane watcher, spawned by `report-profile.sh` for Claude Code,
+# codex and native (hermes, grok, agy) panes. Re-publishes the pane's account on a timer, so the sidebar
 # tag follows an account swap that fires no herdr event: a `--with-fallback`
 # session moving onto the next chain member, or a bare `claude` following a
 # `tollgate switch`. Each tick it re-reads herdr's own per-pane agent record and
@@ -61,13 +61,14 @@ while :; do
     }
     fails=0
     live=$(printf '%s\n' "$raw" | pane_agent)
-    # The pane no longer runs claude or codex (a shell, or another agent):
+    # The pane no longer runs claude, codex or a native harness (a shell, or
+    # another agent):
     # clear the tag and release the pidfile, so an idle pane stops showing an
     # account instead of keeping a stale one forever.
     case "$live" in
-        claude | codex) ;;
+        claude | codex | hermes | grok | agy) ;;
         *)
-            "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" --clear-token tollgate --clear-display-agent >/dev/null 2>&1
+            "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" --clear-token tollgate --clear-token tollgate_severity --clear-display-agent >/dev/null 2>&1
             exit 0
             ;;
     esac

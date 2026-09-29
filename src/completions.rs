@@ -53,7 +53,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--control --sessions" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
-        COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "install uninstall link unlink config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
         COMPREPLY=( $(compgen -W "get" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ] && [ "${COMP_WORDS[3]}" = "get" ]; then
@@ -62,6 +62,8 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "link" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--path" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -156,6 +158,8 @@ _tollgate() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
         _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]' \
             'uninstall[remove the plugin and the config lines it added]' \
+            'link[link a local checkout'"'"'s plugin into herdr]' \
+            'unlink[unlink the locally linked plugin]' \
             'config[print one herdr knob]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config ]]; then
         _values 'subcommand' 'get[print the knob value on one line]'
@@ -165,6 +169,8 @@ _tollgate() {
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == link ]]; then
+        _values 'flag' '--path[repo root or plugin dir to link]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
@@ -310,6 +316,8 @@ complete -c tollgate -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP se
 complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a link -d "Link a local checkout's plugin into herdr"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a unlink -d "Unlink the locally linked plugin"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a config -d "Print one herdr knob"
 complete -c tollgate -f -n "__fish_seen_subcommand_from config" -a get -d "Print the knob value on one line"
 complete -c tollgate -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -d "Knob name"
@@ -318,6 +326,7 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_s
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from link" -a --path -d "Repo root or plugin dir to link"
 complete -c tollgate -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c tollgate -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c tollgate -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__tollgate_profiles)" -d Profile

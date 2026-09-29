@@ -2612,6 +2612,17 @@ impl App {
         self
     }
 
+    /// An explicit `--tab` (the herdr `tollgate.usage` action's `--tab usage`)
+    /// outranks both the configured home tab and the first herdr landing:
+    /// the caller asked for that view. Applied at construction like
+    /// [`Self::with_herdr_mode`]'s landing, so the first paint is on it.
+    pub(crate) fn with_open_tab(mut self, tab: Option<HomeTab>) -> Self {
+        if let Some(tab) = tab {
+            self.tab = tab.into();
+        }
+        self
+    }
+
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
     /// opened, wrapped by each effect's own period.
     pub(crate) fn anim_ms(&self) -> u64 {

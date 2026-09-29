@@ -2,7 +2,7 @@ id = "tollgate"
 name = "tollgate"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Claude Code account switcher and usage dashboard, in a herdr popup"
+description = "AI subscription and spend monitor: accounts, usage windows, and the auto-switch chain, in a herdr popup"
 platforms = ["linux", "macos"]
 
 [[panes]]
@@ -14,6 +14,15 @@ description = "Accounts, usage windows, and the auto-switch chain"
 placement = "popup"
 command = ["tollgate"]
 
+# The same dashboard, opened straight on the usage view (`--tab` outranks the
+# configured home tab and the first-launch landing).
+[[panes]]
+id = "usage"
+title = "tollgate usage"
+description = "Every account's usage windows and money meters"
+placement = "popup"
+command = ["tollgate", "--tab", "usage"]
+
 [[actions]]
 id = "open"
 title = "Open tollgate"
@@ -22,9 +31,16 @@ contexts = ["global", "workspace"]
 command = ["sh", "open-pane.sh", "tui"]
 
 [[actions]]
+id = "usage"
+title = "Open tollgate usage"
+description = "Open the tollgate dashboard on the usage view in a popup"
+contexts = ["global", "workspace", "pane"]
+command = ["sh", "open-pane.sh", "usage"]
+
+[[actions]]
 id = "which"
 title = "Show this pane's tollgate account"
-description = "Publish the account the focused pane burns as pane metadata"
+description = "Publish the account the focused pane burns, with its lead metric, as pane metadata"
 contexts = ["global", "workspace", "pane"]
 command = ["sh", "report-profile.sh"]
 

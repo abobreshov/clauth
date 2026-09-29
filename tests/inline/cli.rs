@@ -1167,6 +1167,7 @@ fn revoking_an_unknown_device_exits_one_naming_it() {
     let _home = crate::testutil::HomeSandbox::new();
     let err = dispatch(Cli {
         theme: None,
+        tab: None,
         command: Some(Command::Devices {
             json: false,
             cmd: Some(crate::cli::DevicesCommand::Revoke {
@@ -1509,6 +1510,7 @@ fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
 
     let err = dispatch(Cli {
         theme: None,
+        tab: None,
         command: Some(Command::External(vec!["strat".into(), "acme".into()])),
     })
     .expect_err("more than one bare word is nothing tollgate knows");
@@ -1522,6 +1524,7 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
     let _home = crate::testutil::HomeSandbox::new();
     let err = dispatch(Cli {
         theme: None,
+        tab: None,
         command: Some(Command::Daemon {
             standby: false,
             no_standby: false,
