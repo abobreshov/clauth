@@ -872,6 +872,7 @@ The tool shipped as **tollgate** 0.1.0 on `feat/tollgate` (D8). The user-facing 
 | Monitors / P4-NOUS (part) | `monitors.toml`, `tollgate monitor`, per-monitor cache (TTL, 429 hold, 7-day stale, single flight, fingerprint), budgets and `notify-send` alerts, daemon polling; Nous via Hermes' unexpired access token (D10 reader); `provider` monitors; upstream read-only view from `~/.clauth/status.json` | No own Nous device login (S5(a)); the monitor layer is new relative to §5's rows |
 | Agent API | Read-only loopback HTTP (`127.0.0.1:8454`, bearer `~/.tollgate/api-token`) + unix socket, seven routes, OpenAPI, redaction, `tollgate api serve\|token\|url`, MCP `usage` | New relative to §5; documented in `docs/agent-api.md` |
 | herdr H1 / H2 / H4-lite | Usage-aware `$tollgate` tag + `$tollgate_severity`; native `hermes` / `grok` / `agy` panes matched to a single owning account; `tollgate.usage` action (`--tab usage`); `tollgate herdr link` / `unlink` | H4-lite is the usage action only: no `tollgate.swap`. No H2h, H3 narrow popup layout or H5 compat suite |
+| Shipped: H-1a/H-1b (Hermes part 1, `docs/specs/hermes-harness.md` §8) | `Harness::Hermes` + `HermesEngine`; `hermes-profiles.toml`; the home layout with a sibling child `HOME` (`profiles/<n>/{hermes-home,child-home}`); guards G1–G15 and the `ProjectionV1` projector (Hermes' own interpreter and parsers); the `.env` one-line writer; the env scrub; `tollgate hermes new\|key\|auth\|list\|delete`; `tollgate start <hermes>` with the marker + live row, PDEATHSIG and the teardown evidence checks; the three-roster name validate; the S7(f) spike (`docs/spikes/s7f-hermes-home.md`), compiled in as the start gate | Home under `~/.tollgate/profiles/<n>/hermes-home`, not `~/.local/share/<tool>/hermes/<n>` (D-H1). The entrypoint is re-resolved at every launch, never cached (D-H4). The H-1d daemon live-slot watcher is dropped: the child `HOME` removes the route it guarded (D-H17). The `hermes` verb is hidden from help until part 2 adds completions, `show` and `pool` |
 
 **Not yet**
 
@@ -879,7 +880,7 @@ The tool shipped as **tollgate** 0.1.0 on `feat/tollgate` (D8). The user-facing 
 |---|---|
 | `tollgate import clauth [--dry-run]`, `import rollback`, the retire checklist (§4.0 migration) | R3a–R3d |
 | Executor B (API-key hot swap within a class), relaunch in place, class-aware chain rotation | S1, P6a–P6c |
-| Hermes as a harness: `Harness::Hermes`, homes and guards, `tollgate hermes new\|auth`, `hermes_local` estimate, pool view, relaunch-to-switch | H-1a–H-4 |
+| Hermes part 2: `hermes_local` estimate and `Origin::HermesProfile`, pool view and strategy writer, `hermes show\|pool`, `which`, TUI filter, status/list/completions, herdr join and H2h, MCP `switch_profile` refusal, the `hermes_projector_real` CI tier | H-1c, H-1d-lite, H-2, H-3, H-4 |
 | TUI restyle of all tabs and consolidation 8 → 6 with the `HomeTab` alias map | P5 (only the Usage tab's monitor cards landed), P5b |
 | Fork-signed self-update: new minisign key, release workflow, mandatory verification in `install.sh` | R1 |
 | Grok / Antigravity legs, `tollgate providers`, Anthropic Admin and other management sources, a local estimate for Claude Code | P4b, P4c, P4d |
