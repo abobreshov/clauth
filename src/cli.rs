@@ -426,6 +426,17 @@ pub(crate) enum Command {
         cmd: Option<crate::usage::monitor::cli::MonitorCommand>,
     },
 
+    /// Serve or locate the local agent API
+    ///
+    /// A read-only JSON API on loopback (default 127.0.0.1:8454, bearer from
+    /// ~/.tollgate/api-token) and on the unix socket ~/.tollgate/api.sock (no
+    /// token) that agents call to read accounts, usage and the status feed.
+    /// `tollgate daemon` hosts it unless `local_api.enabled = false`.
+    Api {
+        #[command(subcommand)]
+        cmd: ApiCommand,
+    },
+
     /// Print the usage / auto-switch snapshot as JSON
     ///
     /// The same shape the daemon writes to ~/.tollgate/status.json.
@@ -684,6 +695,29 @@ impl LoginArgs {
     pub(crate) fn is_api_mode(&self) -> bool {
         self.base_url.is_some() || self.api_key.is_some()
     }
+}
+
+/// `tollgate api <cmd>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ApiCommand {
+    /// Serve the local agent API in the foreground until killed
+    ///
+    /// For machines that run no daemon. Binds the loopback address from
+    /// `local_api.listen` (or --listen) and ~/.tollgate/api.sock.
+    Serve {
+        /// Loopback address to bind instead of `local_api.listen`; any
+        /// non-loopback address is refused.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+    },
+    /// Print the API token's path, creating the token on first use
+    Token {
+        /// Print the token itself instead, alone on one line.
+        #[arg(long)]
+        show: bool,
+    },
+    /// Print the API's base URL and a curl example for each door
+    Url,
 }
 
 /// `tollgate herdr <cmd>`: install and uninstall the plugin and its config wiring.

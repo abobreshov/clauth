@@ -315,7 +315,7 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     // guaranteed to hold: some harnesses defer tool schemas, so a description is
     // unloaded until something searches for it. Every tool by name, so a fifth
     // tool that forgets the router reds here.
-    for tool in ["profiles", "switch_profile", "delegate", "monitor"] {
+    for tool in ["profiles", "switch_profile", "delegate", "monitor", "usage"] {
         assert!(
             out.contains(&format!("`{tool}`")),
             "the tool router must name every tool, `{tool}` included: {out}",

@@ -24,6 +24,7 @@ mod jsonsync;
 mod keychain;
 mod list;
 mod live_sessions;
+mod local_api;
 mod lock;
 mod lockorder;
 mod logline;
@@ -314,6 +315,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             },
         ),
         Command::Monitor { json, cmd } => usage::monitor::cli::dispatch(json, cmd),
+        Command::Api { cmd } => match cmd {
+            cli::ApiCommand::Serve { listen } => local_api::cmd_serve(listen),
+            cli::ApiCommand::Token { show } => local_api::cmd_token(show),
+            cli::ApiCommand::Url => local_api::cmd_url(),
+        },
         Command::Status {
             json: _,
             all,

@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor api status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -82,6 +82,12 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "usage" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --account --provider" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "api" ]; then
+        COMPREPLY=( $(compgen -W "serve token url" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "api" ] && [ "${COMP_WORDS[2]}" = "serve" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--listen" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "api" ] && [ "${COMP_WORDS[2]}" = "token" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--show" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --disabled" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
@@ -119,6 +125,7 @@ _tollgate() {
             'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'usage[print every account'"'"'s quota windows and money meters]' \
             'monitor[list, add, remove and refresh monitoring-only usage sources]' \
+            'api[serve or locate the local agent API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
@@ -228,6 +235,14 @@ _tollgate() {
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == usage ]]; then
         _values 'flag' '--json[emit the stable JSON envelope]' '--all[also include disabled profiles]' \
             '--account[only this account id or name]' '--provider[only this source or provider]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == api ]]; then
+        _values 'subcommand' 'serve[serve the local agent API in the foreground]' \
+            'token[print the API token path, creating it on first use]' \
+            'url[print the base URL and curl examples]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == api && "${words[3]}" == serve ]]; then
+        _values 'flag' '--listen[loopback address to bind instead of local_api.listen]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == api && "${words[3]}" == token ]]; then
+        _values 'flag' '--show[print the token itself]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
@@ -282,6 +297,12 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --disabled -d "Add it disabled"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from refresh" -a --json -d "Emit the usage JSON envelope"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a --json -d "Emit the monitor list as JSON"
+complete -c tollgate -f -n __fish_is_first_token -a api -d "Serve or locate the local agent API"
+complete -c tollgate -f -n "__fish_seen_subcommand_from api" -a serve -d "Serve the local agent API in the foreground"
+complete -c tollgate -f -n "__fish_seen_subcommand_from api" -a token -d "Print the API token path, creating it on first use"
+complete -c tollgate -f -n "__fish_seen_subcommand_from api" -a url -d "Print the base URL and curl examples"
+complete -c tollgate -f -n "__fish_seen_subcommand_from api; and __fish_seen_subcommand_from serve" -a --listen -d "Loopback address to bind"
+complete -c tollgate -f -n "__fish_seen_subcommand_from api; and __fish_seen_subcommand_from token" -a --show -d "Print the token itself"
 complete -c tollgate -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c tollgate -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"

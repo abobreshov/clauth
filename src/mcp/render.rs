@@ -581,7 +581,7 @@ here and switch through its CLI.\n\n",
         "Tools: `profiles` (accounts + cached usage, zero quota; `scope:\"session\"` for this \
 session's own), `switch_profile` ({}), `delegate` (run a task on another account; the only tool \
 that spends), `monitor` (check, collect or stop a backgrounded delegate, or wait on tollgate's \
-state).\n\n",
+state), `usage` (every account across providers as JSON, read-only).\n\n",
         switch_router_clause(auth),
     ));
     out.push_str(
