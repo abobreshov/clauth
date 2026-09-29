@@ -16,6 +16,7 @@ tollgate is a hard fork of [clauth](https://github.com/uwuclxdy/clauth) (MIT). T
 | [Configuration](Configuration) | `profiles.toml`, per-profile `config.toml`, `monitors.toml`, palette, local API, presets, storage layout |
 | [Auto-switch](Auto-Switch) | the fallback chain: thresholds, gates, burn-aware mode, spend ceilings |
 | [Codex](Codex) | OpenAI codex accounts: adopt or mint a ChatGPT login, run `codex` under a profile, the codex chain |
+| [Hermes](Hermes) | Hermes Agent homes as profiles: the child `HOME`, the launch guards, spend from `state.db`, the credential pool |
 | [Daemon](Daemon) | `tollgate daemon`, the local agent API, the TLS REST API, and the `status.json` read contract |
 | [Claude Code plugin](Claude-Code-Plugin) | the MCP server, its five tools, `delegate` in full |
 | [herdr plugin](Herdr-Plugin) | the tollgate popup in herdr, the keys, the usage-aware pane tag |

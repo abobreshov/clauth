@@ -17,6 +17,7 @@ How to tell:
 ## What works
 
 - **`tollgate start <profile>`**: every session runs in its own `CLAUDE_CONFIG_DIR` (or `CODEX_HOME`) under `~/.tollgate/profiles/<name>/`, so it needs none of upstream's files. This is how you use a tollgate profile in guest mode.
+- **Every [Hermes](Hermes) verb**: a Hermes home, its child `HOME`, the roster and the caches all live under `~/.tollgate`, and the Hermes it launches runs with a `HOME` holding no `.claude`, so it cannot read or rewrite upstream's `~/.claude/.credentials.json` either. The one difference: `hermes new` prints the `herdr integration install hermes` command instead of running it, since herdr's config is shared with upstream's plugin.
 - **`tollgate login <name> --base-url … --api-key …`** creates API-key profiles (Ollama Cloud, OpenRouter, DeepSeek, …), and Alibaba console re-logins still run. The first profile is created but never made the active account, since that would link it into `~/.claude`. Subscription logins are refused (below).
 - **Monitors, `tollgate usage`, the Usage tab, the local agent API and the MCP `usage` tool** all work unchanged.
 - **Upstream's accounts, read only.** tollgate reads upstream's non-secret status feed, `~/.clauth/status.json`, and shows each of its profiles as `upstream:<name>`, labelled `<name> (clauth)`, with its 5h / 7d figures. Nothing else under `~/.clauth` is read: no config, no credentials, no per-profile cache. The feed is as fresh as upstream's daemon keeps it; without one there may be no feed and no upstream rows.

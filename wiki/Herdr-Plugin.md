@@ -113,7 +113,13 @@ The severity class rides beside it as a second token, `$tollgate_severity` (`ok`
 
 ### Native panes
 
-`hermes`, `grok` and `agy` panes run harnesses tollgate does not launch, so they have no session row. The binary tags one with the single enabled account its harness owns (for `hermes`, a Nous monitor that reads Hermes' own login) and tags nothing when there is none or more than one: an ambiguous pane is cleared rather than tagged with a guess. No Grok or Antigravity reader ships in 0.1.0, so `grok` and `agy` panes stay untagged for now. The pane still gets a watcher, so an account that appears later tags it on the next tick.
+`grok` and `agy` panes run harnesses tollgate does not launch, so they have no session row. The binary tags one with the single enabled account its harness owns and tags nothing when there is none or more than one: an ambiguous pane is cleared rather than tagged with a guess. No Grok or Antigravity reader ships in 0.1.0, so `grok` and `agy` panes stay untagged for now. The pane still gets a watcher, so an account that appears later tags it on the next tick.
+
+A `hermes` pane resolves in three steps:
+
+1. a pane started with `tollgate start <hermes-profile>` ([Hermes](Hermes)) through its live session row, like a Claude Code pane, and tagged with that profile's month-to-date spend (`or-main $4.12/mo`);
+2. a bare `hermes` pane through its `HERMES_HOME`: the reporter reads that one variable out of the pane's `/proc/<pid>/environ` and nothing else (`tr '\0' '\n' | sed -n 's/^HERMES_HOME=//p'`), so no other variable of the pane's environment enters a shell variable, the tag or a log. A tollgate Hermes home (`~/.tollgate/profiles/<name>/hermes-home`) of a roster profile names that profile. Linux only; macOS has no `/proc`;
+3. anything else (your own `~/.hermes`) the native match: the single enabled account Hermes' own login backs, a Nous monitor reading `~/.hermes/auth.json`. A tollgate Hermes profile is never that match, since a lone one would tag your own Hermes pane with the wrong account.
 
 ### How it follows the pane
 

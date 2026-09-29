@@ -105,7 +105,7 @@ tollgate list           # account table with cached usage, no network
 |---------|-------|------|
 | `tollgate` | | open the TUI (with stdout not a terminal: command help on stderr, exit 2) |
 | `tollgate <profile>` | | switch to that profile and exit — deprecated, use `tollgate switch <name>`; a codex name moves the codex active marker instead ([Codex](Codex#switch)) |
-| `tollgate start <profile> [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | run `claude` under that profile's own config dir; a codex profile runs `codex` under its own `CODEX_HOME` instead, and `--with-fallback` is refused there ([Codex](Codex#run)) |
+| `tollgate start <profile> [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | run `claude` under that profile's own config dir; a codex profile runs `codex` under its own `CODEX_HOME` instead, and `--with-fallback` is refused there ([Codex](Codex#run)); a Hermes profile runs Hermes on its own home, with `-- <hermes args>` passed through ([Hermes](Hermes#launch)) |
 | `tollgate start --auto [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | start on the first fallback-chain member with headroom for the models the session will run |
 | `tollgate login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
 | `tollgate login <profile> --codex` | `--browser` | adopt the `codex login` in your `~/.codex` as a codex profile; `--browser` mints a fresh ChatGPT login in the browser instead and leaves `~/.codex` alone ([Codex](Codex#add-an-account)) |
@@ -116,8 +116,8 @@ tollgate list           # account table with cached usage, no network
 | `tollgate disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `tollgate enable <profile>` | | put a disabled profile back |
 | `tollgate limit-reset <profile>` | `--list`, `--yes` | spend one of a codex account's banked usage-limit resets; `--list` shows them and spends nothing ([Codex](Codex#use-a-usage-limit-reset)) |
-| `tollgate which` | `--json` | print the profile owning the loaded credentials; inside a `tollgate start` codex session, that codex profile |
-| `tollgate list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
+| `tollgate which` | `--json` | print the profile owning the loaded credentials; inside a `tollgate start` codex or Hermes session, that profile |
+| `tollgate list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section and Hermes profiles in a `HERMES` one, which `--all` leaves alone |
 | `tollgate jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
 | `tollgate switch <name>` / `tollgate switch <sid> <profile>` | | one name switches the global account (the bare `tollgate <name>` form, deprecated); two names move a live session, picked up at its next request |
 | `tollgate sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
@@ -133,6 +133,13 @@ tollgate list           # account table with cached usage, no network
 | `tollgate status --json` | `--all`, `--disabled` | print the daemon's status shape once, from disk, codex accounts included |
 | `tollgate mcp` | | stdio MCP server; Claude Code launches this, not you |
 | `tollgate completions <bash\|zsh\|fish\|install> [shell]` | | print or install a completion script |
+| `tollgate hermes new <name>` | `--provider nous\|openrouter\|ollama-cloud`, `--model <id>`, `--pool`, `--env-key`, `--stdin`, `--no-key` | create a Hermes profile, a whole Hermes home of its own ([Hermes](Hermes)) |
+| `tollgate hermes key <name>` | `--stdin` | set or replace an env-mode Hermes key (prompted hidden, never argv) |
+| `tollgate hermes auth <name> add\|remove\|reset …` | `--type api-key\|oauth`, `--label`, `--no-browser`, `--timeout` | hand off to Hermes' own `hermes auth` on that home |
+| `tollgate hermes list` | `--json` | the Hermes profiles with this month's spend |
+| `tollgate hermes show <name>` | `--json`, `--check` | home, pool, spend and latest sessions; `--check` runs every launch guard and exits 1 on a refusal |
+| `tollgate hermes pool <name> strategy <s>` | | `fill_first`, `round_robin`, `random` or `least_used`, on an idle pool home |
+| `tollgate hermes delete <name>` | `--yes`, `--force` | remove a Hermes profile and its home |
 | `tollgate herdr install` | `--key <spec>`, `--no-config`, `--yes` | install the [herdr](https://herdr.dev) plugin and bind a key to it |
 | `tollgate herdr uninstall` | `--no-config`, `--yes` | remove that plugin and the config lines it added |
 | `tollgate herdr link` | `--path <dir>` | link a local checkout's `herdr-plugin/` into herdr (the dev install); writes no herdr config |

@@ -27,6 +27,7 @@ tollgate monitors and manages your AI subscriptions and spending from one termin
 - **From inside Claude**: the MCP plugin lets a live session list accounts, switch, or delegate a prompt to another account, and tells it when the account behind it changed
 - **Headless**: `tollgate daemon` runs the refresh and auto-switch loop with no TUI, publishes `status.json`, and can serve that feed, the account switch and herdr panes to another machine over HTTPS with `--listen`
 - **Codex too**: adopt or mint a ChatGPT login as a codex profile, run `codex` under it in its own `CODEX_HOME`, and rotate accounts between sessions on a separate codex chain
+- **Hermes profiles**: run Hermes Agent under a named account in a home of its own, with a child `HOME` that keeps it away from `~/.claude`, a launch audit that refuses every route to Anthropic, and each home's month-to-date spend from its own `state.db`
 - **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, multi-instance safe
 
 ## Coming from clauth: guest mode
@@ -102,6 +103,7 @@ tollgate monitor refresh                       # fetch now; `tollgate daemon` po
 | `tollgate list` / `tollgate which` | account table with cached usage / who owns this session |
 | `tollgate daemon` | headless refresh, monitor polling, auto-switch, the local agent API; `--listen` adds the TLS REST API on `0.0.0.0:8453` |
 | `tollgate api serve` / `token` / `url` | run the local agent API without a daemon, print its token path, print its URL and `curl` lines |
+| `tollgate hermes new` / `show` / `list` | Hermes Agent homes as profiles ([below](#hermes-profiles)) |
 | `tollgate herdr install` / `link` | set up the herdr plugin |
 
 Every command and flag: [Quickstart](wiki/Quickstart.md).
@@ -121,9 +123,23 @@ Every command and flag: [Quickstart](wiki/Quickstart.md).
 | MiniMax | `minimax` | api key | Token Plan 5h and 7d | 5h, 7d |
 | Alibaba Model Studio | `alibaba` | api key + console session | 7d (5h when reported), tier | 5h, 7d |
 | any other endpoint | `generic` | api key | best-effort scan | none |
+| Hermes profile (a home tollgate launches) | `hermes` | Hermes' own (tollgate holds none) | month-to-date spend from the home's `state.db`, Nous cooldowns | none |
 | upstream clauth (guest mode) | `upstream_clauth` | read only | what clauth's feed carries | none (5h / 7d are flagged, but an upstream account never joins a chain) |
 
 Only chain-eligible windows can move the fallback chain; monitors and upstream accounts never join one, whatever their windows' `chain_eligible` flag says. Setup, what is read, and each provider's limitations: [Providers](wiki/Providers.md).
+
+## Hermes profiles
+
+tollgate launches [Hermes Agent](wiki/Hermes.md) under a named profile, as it does `claude` and `codex`. Each profile is a whole Hermes home, `~/.tollgate/profiles/<name>/hermes-home`, started with a child `HOME` that holds only links to `~/.gitconfig`, `~/.config/git` and `~/.ssh`, so the Hermes it launches cannot reach `~/.claude`, `~/.clauth`, `~/.codex` or `~/.hermes`. Hermes owns its credentials; tollgate writes one line of the home's `.env`.
+
+```sh
+tollgate hermes new or-main --provider openrouter   # prompts for the key, input hidden
+tollgate start or-main -- chat -q "hello"
+tollgate hermes show or-main --check                # every launch guard's verdict
+tollgate hermes list                                # this month's spend per home
+```
+
+Every launch audits the home with Hermes' own parsers and refuses any route to Anthropic, an unpinned auxiliary provider and a bulk secrets source. Each home's spend comes from its own `state.db` (read with `sqlite3 -readonly`) as a `hermes:<name>` account. Switching is a relaunch. [Hermes](wiki/Hermes.md) has the details.
 
 ## Local agent API
 
@@ -196,6 +212,7 @@ Swap in your theme's colours. The figures come from the caches, so keep `tollgat
 | [herdr plugin](wiki/Herdr-Plugin.md) | the popup, the keys, the usage-aware pane tag |
 | [Tokens and cost](wiki/Tokens-And-Cost.md) | the token dashboard and its cost figure |
 | [Codex](wiki/Codex.md) | ChatGPT logins as codex profiles |
+| [Hermes](wiki/Hermes.md) | Hermes Agent homes as profiles: isolation, guards, spend, pool |
 | [Security](wiki/Security.md) | where credentials live, secrets rules, the API token |
 | [FAQ](wiki/FAQ.md) | common questions and troubleshooting |
 

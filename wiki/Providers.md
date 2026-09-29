@@ -30,7 +30,7 @@ An account reaches tollgate one of three ways:
 
 "Chain-eligible" is the `chain_eligible` flag on each window in the JSON: only those windows can make a fallback chain move ([Auto-switch](Auto-Switch)). A monitor or an upstream account is never a chain member, whatever its windows' flags say: an `ollama_cloud` monitor on a legacy plan and every `upstream:` account publish `chain_eligible: true` on their 5h / 7d windows.
 
-`GET /v1/providers` on the [local agent API](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/agent-api.md) also lists `hermes`, `grok` and `antigravity`. Those sources are named in the catalog so agents can plan for them; no reader for them ships in 0.1.0.
+`GET /v1/providers` on the [local agent API](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/agent-api.md) also lists `hermes`, `grok` and `antigravity`. `hermes` is the source of the Hermes profiles tollgate launches ([Hermes](Hermes#spend)); `grok` and `antigravity` are named in the catalog so agents can plan for them, and no reader for them ships in 0.1.0.
 
 ## Anthropic
 
@@ -116,7 +116,7 @@ tollgate monitor add nous-work --kind nous --hermes-home ~/work/.hermes
 
 **With a Nous API key** (`--api-key-env NOUS_API_KEY`) there is no balance endpoint to read, so the monitor reports money unavailable without fetching.
 
-**Limitations.** Hermes must have run recently enough to hold an unexpired token; the reading goes stale in between. An unreadable `auth.json` (mid-write) keeps the last reading, marked stale. There is no Hermes harness yet: tollgate does not launch Hermes, and a herdr `hermes` pane is tagged from the Nous monitor that reads Hermes' own login.
+**Limitations.** Hermes must have run recently enough to hold an unexpired token; the reading goes stale in between. An unreadable `auth.json` (mid-write) keeps the last reading, marked stale. This monitor reads your own `~/.hermes` (or `--hermes-home`); the Hermes homes tollgate launches ([Hermes](Hermes)) report their own spend from `state.db` as `hermes:<name>` accounts instead.
 
 ## DeepSeek, Z.ai, MiniMax
 
