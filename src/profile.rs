@@ -1039,6 +1039,15 @@ pub(crate) struct AppState {
     /// block on the next save; an explicit `auto_update = false` serializes.
     #[serde(default, skip_serializing_if = "update_is_default")]
     pub(crate) update: UpdateSettings,
+    /// The `[local_api]` table: the local agent API the daemon hosts
+    /// (`local_api = { enabled = true, listen = "127.0.0.1:8454" }`). Omitted
+    /// from the file while at its default.
+    #[serde(default, skip_serializing_if = "local_api_is_default")]
+    pub(crate) local_api: crate::local_api::LocalApiSettings,
+}
+
+fn local_api_is_default(local_api: &crate::local_api::LocalApiSettings) -> bool {
+    *local_api == crate::local_api::LocalApiSettings::default()
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1257,6 +1266,7 @@ impl Default for AppState {
             herdr: HerdrSettings::default(),
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
+            local_api: crate::local_api::LocalApiSettings::default(),
         }
     }
 }

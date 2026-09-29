@@ -736,6 +736,17 @@ pub(crate) struct ProfilesArgs {
     scope: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct UsageArgs {
+    /// Only the account with this id (`claude:work`, `codex:main`) or name.
+    account: Option<String>,
+    /// Only accounts from this source (`anthropic_oauth`, `codex`,
+    /// `openrouter`, `deepseek`, ...) or provider name (`OpenRouter`).
+    provider: Option<String>,
+    /// `all: true`: include disabled profiles too. Default false.
+    all: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateArgs {
     /// Which account(s) to use. One or multiple; one delegate per account, all
@@ -997,6 +1008,21 @@ key, which delegates on that key."
             prose.push_str(&note);
         }
         Ok(CallToolResult::success(single_block(prose)))
+    }
+
+    #[tool(
+        description = "Every account tollgate observes, across providers (Claude, codex, API-key \
+providers, monitors), as the JSON envelope `tollgate usage --json` prints: \
+`{schema_version, generated_at, guest_mode, accounts[]}`. Each account carries its quota windows \
+(`used_pct`, `resets_at`), money meters (exact decimal strings) and freshness. Read-only, from \
+caches: it spends no quota. Credentials are never included.",
+        annotations(read_only_hint = true)
+    )]
+    async fn usage(
+        &self,
+        Parameters(args): Parameters<UsageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(usage_tool_result(&args))
     }
 
     #[tool(
@@ -5399,6 +5425,22 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The `usage` tool's reply: the local API's redacted `usage --json` envelope
+/// as one compact JSON text block. Blocking cache reads only, like `profiles`.
+fn usage_tool_result(args: &UsageArgs) -> CallToolResult {
+    let report = crate::local_api::routes::usage_report(&crate::usage::collect::CollectOpts {
+        include_disabled: args.all.unwrap_or(false),
+        account: args.account.clone().filter(|a| !a.is_empty()),
+        provider: args.provider.clone().filter(|p| !p.is_empty()),
+    });
+    match serde_json::to_string(&report) {
+        Ok(json) => CallToolResult::success(single_block(json)),
+        Err(e) => CallToolResult::error(single_block(format!(
+            "failed to serialize the usage report: {e}"
+        ))),
+    }
+}
+
 /// How long a client may treat `server/discover` and `tools/list` as fresh. Both
 /// are fixed for the process — the tool set is compile-time and the instructions
 /// block is built once at startup — so a cached copy is never staler than the
@@ -5810,3 +5852,7 @@ mod background_sandbox_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_startup.rs"]
 mod startup_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_usage_tool.rs"]
+mod usage_tool_tests;

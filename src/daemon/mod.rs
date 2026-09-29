@@ -63,6 +63,8 @@ use status_json::LiveSignals;
 pub(crate) use status_json::{
     ProfileEntry, build_codex_entries, build_profile_entries, build_status,
 };
+// The local agent API documents `/v1/status` with the feed's own schema.
+pub(crate) use status_json::StatusBody;
 // The feed's schema number, published by `GET /api/v1/health` so a remote reader
 // can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
 pub(crate) use status_json::SCHEMA_VERSION;
@@ -74,7 +76,7 @@ const TICK: Duration = Duration::from_secs(1);
 /// ~5 min at the 1s tick — rare enough to be free, frequent enough to
 /// bound a busy log.
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
-const STATUS_FILE: &str = "status.json";
+pub(crate) const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "tollgated.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
 /// lock file itself because Windows locks are mandatory (`LockFileEx`): a
@@ -433,6 +435,7 @@ pub(crate) fn serve(
 
     let config = load_config()?;
     warn_if_spend_is_uncapped(&config);
+    let local_api = config.state.local_api.clone();
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
     daemon.boot();
 
@@ -457,6 +460,12 @@ pub(crate) fn serve(
             daemon.live_stores(),
         )?;
     }
+
+    // The local agent API (loopback + unix socket, read-only). Below the
+    // singleton claim like the TLS listener, so only the running daemon holds
+    // its port and socket; never fatal, so a taken port costs only this API.
+    // Held for the process's life: `run` below never returns.
+    let _local_api = crate::local_api::start_in_daemon(&local_api, daemon.status_path.clone());
 
     // After the listener, the last start step that can fail, so a start that
     // dies leaves no gateway behind; before `run`, which never returns, so
