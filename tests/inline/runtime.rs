@@ -11909,3 +11909,48 @@ fn a_guest_plugin_copy_that_fails_part_way_starts_the_session_with_no_plugins() 
         assert_eq!(guest_tree_snapshot(&op_plugins), before);
     });
 }
+
+/// G1 residual, fail closed on `projects`: a `projects` link a pre-guest
+/// build left at `~/.claude/projects` that cannot be removed (here a
+/// write-denied runtime dir) refuses the start, the way a surviving `plugins`
+/// or state link does. Before, the unlink failure was only logged, the reuse
+/// check kept the link, and the session wrote its transcripts into the
+/// operator's store.
+#[cfg(unix)]
+#[test]
+fn a_guest_projects_link_that_cannot_be_removed_refuses_the_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        // No operator `plugins/`, so the plugin leg has nothing to copy and
+        // cannot refuse the start on its own.
+        fs::remove_dir_all(claude_home.join("plugins")).expect("drop plugins");
+        let runtime = tmp.path().join(".tollgate/profiles/guest/runtime-9998-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        std::os::unix::fs::symlink(claude_home.join("projects"), runtime.join("projects"))
+            .expect("pre-guest link");
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o500)).expect("chmod");
+        if fs::remove_file(runtime.join("projects")).is_ok() {
+            // Rights that ignore the mode (root): the failure cannot be posed.
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("restore");
+            return;
+        }
+
+        let placed = place_guest_private_entries(&runtime, &claude_home);
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("restore");
+
+        let err = placed.expect_err("a surviving operator projects link refuses the start");
+        assert!(
+            format!("{err:#}").contains("still links outside the guest store"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read_link(runtime.join("projects")).expect("link"),
+            claude_home.join("projects")
+        );
+    });
+}

@@ -4946,8 +4946,9 @@ pub(crate) fn guest_projects_store() -> Result<PathBuf> {
 ///
 /// A link either name already holds is dropped first unless it is the one this
 /// mode places: a tree built before guest mode began links both at `~/.claude`,
-/// and the additive walk would otherwise keep that link. A `plugins` link that
-/// cannot be dropped refuses the start: everything below would write through it.
+/// and the additive walk would otherwise keep that link. A `plugins` or
+/// `projects` link that cannot be dropped refuses the start: the session would
+/// write through it into `~/.claude`.
 fn place_guest_private_entries(
     runtime: &Path,
     claude_home: &Path,
@@ -4961,6 +4962,21 @@ fn place_guest_private_entries(
         let ours = *name == "projects" && std::fs::read_link(&dst).is_ok_and(|t| t == store);
         if is_link && !ours {
             unlink_link(&dst, "guest-mode operator link");
+            // Fail closed like `plugins` ([`place_guest_plugins`]) and the
+            // store entries ([`place_guest_store_entries`]): a surviving
+            // `projects` link would pass the reuse check below and send every
+            // transcript into `~/.claude/projects`.
+            if *name == "projects"
+                && dst
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                anyhow::bail!(
+                    "guest mode: {} still links outside the guest store and could not be \
+                     removed; refusing to start a session that would write through it",
+                    dst.display()
+                );
+            }
         }
     }
 
