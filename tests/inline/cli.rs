@@ -4062,3 +4062,108 @@ fn a_bare_listen_binds_the_forks_own_port() {
         "bare --listen means identity::DEFAULT_LISTEN"
     );
 }
+
+// ── login in guest mode (plan §4.0) ─────────────────────────────────────────
+//
+// Guest mode runs no Claude or Codex OAuth leg, so `tollgate login` refuses
+// the flows that mint or capture one and keeps the endpoint + key flow that
+// guest mode exists for. The browser arms are pinned through the predicate
+// (driving them would open a browser); every other arm runs `cmd_login`.
+
+fn guest_home() -> crate::testutil::HomeSandbox {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage ~/.clauth");
+    assert!(crate::identity::upstream_active(), "fixture reads as guest");
+    home
+}
+
+fn is_guest_refusal(result: &Result<()>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.downcast_ref::<crate::identity::GuestRefusal>().is_some())
+}
+
+#[test]
+fn guest_login_refuses_exactly_the_subscription_login_flows() {
+    // Browser OAuth (new or reauth) and a setup-token mint are Anthropic
+    // subscription logins.
+    assert!(login_needs_claude_oauth(&login(&["login", "acme"]), false));
+    assert!(login_needs_claude_oauth(
+        &login(&["login", "acme", "--setup-token"]),
+        false
+    ));
+    // An endpoint + key capture is what guest mode is for.
+    assert!(!login_needs_claude_oauth(
+        &login(&[
+            "login",
+            "acme",
+            "--base-url",
+            "https://api.deepseek.com/anthropic"
+        ]),
+        false
+    ));
+    assert!(!login_needs_claude_oauth(
+        &login(&["login", "acme", "--api-key", "sk-test"]),
+        false
+    ));
+    // An Alibaba console re-login captures a console session, no OAuth chain.
+    assert!(!login_needs_claude_oauth(&login(&["login", "acme"]), true));
+}
+
+#[test]
+fn guest_login_refuses_a_setup_token_capture() {
+    let _home = guest_home();
+    let result = cmd_login(login(&["login", "acme", "--setup-token"]));
+    assert!(is_guest_refusal(&result), "{result:?}");
+    assert!(
+        crate::claude::session_token_status(&ProfileName::from("acme")).is_none(),
+        "no sidecar was written"
+    );
+}
+
+#[test]
+fn guest_login_refuses_a_codex_capture() {
+    let home = guest_home();
+    std::fs::create_dir_all(home.home().join(".codex")).expect("mkdir ~/.codex");
+    std::fs::write(
+        home.home().join(".codex").join("auth.json"),
+        br#"{"tokens":{"refresh_token":"upstream-codex"}}"#,
+    )
+    .expect("stage upstream codex login");
+    let result = cmd_login(login(&["login", "cx", "--codex"]));
+    assert!(is_guest_refusal(&result), "{result:?}");
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("codex state")
+            .canonical_name("cx")
+            .is_none(),
+        "no codex profile was captured"
+    );
+}
+
+#[test]
+fn guest_login_still_captures_an_api_key_profile() {
+    let _home = guest_home();
+    let result = cmd_login(login(&[
+        "login",
+        "deep",
+        "--base-url",
+        "https://api.deepseek.com/anthropic",
+        "--api-key",
+        "sk-test",
+    ]));
+    assert!(
+        result.is_ok(),
+        "an API-key login is allowed in guest mode: {result:?}"
+    );
+    let config = crate::profile::load_config().expect("config");
+    let profile = config
+        .find(&ProfileName::from("deep"))
+        .expect("the api profile exists");
+    assert_eq!(
+        profile.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+}

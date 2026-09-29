@@ -6665,3 +6665,19 @@ fn the_codex_store_owner_is_anchored_to_tollgates_root() {
         None
     );
 }
+
+/// B2: guest mode refuses a codex browser login in the pre-flight, ahead of
+/// the browser — a fresh chain is still an OAuth leg upstream clauth owns
+/// (plan §4.0), and the standby leg would have to rotate it.
+#[test]
+fn codex_browser_preflight_refuses_in_guest_mode() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage ~/.clauth");
+    let err = codex_browser_preflight("fresh").expect_err("guest mode refuses");
+    assert!(
+        err.downcast_ref::<crate::identity::GuestRefusal>()
+            .is_some(),
+        "{err:#}"
+    );
+}

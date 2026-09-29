@@ -8290,6 +8290,12 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
     if login_in_flight(app, &name, is_new) {
         return;
     }
+    // Guest mode (plan §4.0): an Anthropic OAuth login is a leg upstream
+    // clauth owns. Ahead of `begin_login`, so a refusal opens no browser.
+    if crate::identity::upstream_active() {
+        app.toast(ToastKind::Danger, crate::identity::GUEST_REFUSAL);
+        return;
+    }
     let pending = match crate::oauth_login::begin_login() {
         Ok(pending) => pending,
         Err(e) => {

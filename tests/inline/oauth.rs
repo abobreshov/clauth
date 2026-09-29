@@ -1102,6 +1102,40 @@ mod adopt_live_rotation {
         );
     }
 
+    /// B2: guest mode adopts nothing. The live `~/.claude/.credentials.json`
+    /// is upstream clauth's, so copying its fresher pair into the tollgate
+    /// store would make a second carrier of one single-use chain — the same
+    /// fixture `adopts_a_fresher_same_account_pair` adopts from.
+    #[test]
+    fn guest_mode_adopts_nothing_from_the_live_file() {
+        let home = HomeSandbox::new();
+        let name = "adopt-guest";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+            .expect("stage ~/.clauth");
+        let store = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "credentials.json",
+        )
+        .expect("store path");
+        let before = std::fs::read(&store).expect("store bytes");
+
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
+
+        assert_eq!(adopted, None, "guest mode must not adopt the live pair");
+        assert_eq!(stored_access(&handle, name), "at-old");
+        assert_eq!(
+            std::fs::read(&store).expect("store bytes"),
+            before,
+            "the tollgate store is byte-identical"
+        );
+    }
+
     #[test]
     fn refuses_a_live_login_from_a_different_account() {
         let _home = HomeSandbox::new();
@@ -5659,5 +5693,32 @@ fn dead_chain_copy_alibaba_without_a_console_keeps_the_dead_chain_sentence() {
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
         Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// B2: the Claude refresh choke point spends nothing in guest mode. Every leg
+/// that could reach it skips itself first; this pins the belt under them —
+/// a listener that would have answered 200 sees no request at all, and the
+/// refusal is transient so no caller quarantines an account over it.
+#[test]
+fn refresh_result_sends_nothing_in_guest_mode() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage ~/.clauth");
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let result = refresh_result("rt-old", None);
+    let seen = server.join().expect("listener");
+
+    assert!(seen.is_empty(), "no refresh may reach the wire: {seen:?}");
+    assert!(
+        matches!(result, Err(RefreshError::Transient(TokenFailure::Guest))),
+        "a transient guest refusal, never a quarantine verdict"
     );
 }

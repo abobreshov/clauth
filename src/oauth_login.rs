@@ -617,6 +617,9 @@ impl LoginError {
             TokenFailure::Body { status, .. } => {
                 Transient::with_status(cause, *status, Retry::Restart)
             }
+            // A login exchange never builds this variant (only the refresh
+            // choke point does); the arm exists for exhaustiveness.
+            TokenFailure::Guest => Transient::new(cause, Retry::Stated),
         }
     }
 

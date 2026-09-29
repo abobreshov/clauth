@@ -1643,6 +1643,10 @@ fn write_codex_profile_store(
 /// so the "own-roster passes, cross-harness refuses" rule is testable without
 /// opening a real browser.
 fn codex_browser_preflight(name: &str) -> Result<String> {
+    // Guest mode: the minted chain is an OAuth leg plan §4.0 leaves to
+    // upstream clauth, and the standby leg would have to rotate it. Ahead of
+    // the browser, so a refusal opens nothing.
+    crate::identity::refuse_in_guest_mode()?;
     let trimmed = validate_name_chars(name)?.to_string();
     validate_foreign_harness_free(&trimmed, Harness::Codex)?;
     Ok(trimmed)

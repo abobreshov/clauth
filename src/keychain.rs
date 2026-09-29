@@ -757,6 +757,11 @@ fn security_quote(s: &str) -> Result<String> {
 /// Whether a write happens at all is [`merge_write`]'s call, which is where the
 /// skip and its reasons live.
 fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
+    // Guest mode, ahead of the read: no `security` subprocess (or access
+    // prompt) for a write `put_blob_at` would refuse anyway.
+    if crate::identity::guest_refuses_keychain_service(service) {
+        return Err(crate::identity::GuestRefusal.into());
+    }
     let existing = blob_to_merge_with(service, account);
     match merge_write(incoming, existing.as_ref(), keep) {
         Some(blob) => put_blob_at(service, account, &blob),
@@ -1023,6 +1028,10 @@ fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
 /// the whole hold shares is one reason it cannot run, which is exactly why
 /// that arm must not fail the write).
 fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
+    // Guest mode: the default item is upstream clauth's (plan §4.0).
+    if crate::identity::guest_refuses_keychain_service(service) {
+        return Err(crate::identity::GuestRefusal.into());
+    }
     let json = serde_json::to_string(blob).context("failed to serialize the Keychain item")?;
     let line = add_generic_password_line(service, account, &json)?;
     // Past `-i`'s line ceiling the tokenizer truncates the value instead of
@@ -1077,6 +1086,10 @@ fn delete_at_witnessing(
     account: &str,
     on_spawn: impl FnOnce(u32) -> Result<()>,
 ) -> Result<()> {
+    // Guest mode: the default item is upstream clauth's (plan §4.0).
+    if crate::identity::guest_refuses_keychain_service(service) {
+        return Err(crate::identity::GuestRefusal.into());
+    }
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.args(["delete-generic-password", "-s", service, "-a", account]);
     let output = run_with_deadline_witnessing(cmd, security_deadline(), None, on_spawn)
@@ -1580,6 +1593,10 @@ pub(crate) enum SignOutOutcome {
 /// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
 /// the evidence survives it, and the event line says where.
 fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
+    // Guest mode, ahead of the read: see `merge_and_put_at`.
+    if crate::identity::guest_refuses_keychain_service(service) {
+        return Err(crate::identity::GuestRefusal.into());
+    }
     // The two `None` cases part here rather than sharing an early return: an
     // absent item is already signed out and says nothing, while a read that
     // FAILED takes the most destructive branch there is, deleting the item

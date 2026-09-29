@@ -13047,3 +13047,210 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
         "a key-rejected member must never be chosen as a walk target"
     );
 }
+
+// ── guest mode (plan §4.0): no OAuth leg spends or adopts ────────────────────
+//
+// With upstream clauth's `~/.clauth` present and no completed import, the
+// fetch lease is ours whenever upstream's locks sit free — the common "installed
+// but idle" case — so each leg must refuse on guest mode itself rather than
+// lean on the lease stand-down.
+
+fn stage_upstream_data_dir(home: &crate::testutil::HomeSandbox) {
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage ~/.clauth");
+}
+
+/// B2: a 401 in guest mode serves the disk cache instead of rotating. The
+/// listener would answer the refresh with a fresh pair, so a leg that still
+/// spends is caught by the token endpoint appearing in `seen`.
+#[test]
+fn a_401_in_guest_mode_bails_to_cache_without_spending_the_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    stage_upstream_data_dir(&home);
+    let name = "guest-401";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, r#"{"account":{"uuid":"uuid-1"}}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the poll on the held access token still runs: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "guest mode must not spend the refresh token: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None);
+    // The disk-cache bail (no cache staged here, so it reads as `Failed`).
+    assert!(!outcome.from_fetch, "a cache bail, not a live reading");
+    // The leg itself stands down; the refresh choke point under it never has
+    // to refuse (which would count a refresh failure).
+    assert!(!outcome.refresh_failed, "no refresh was attempted");
+    #[allow(clippy::expect_used, reason = "test")]
+    let stored = config
+        .lock()
+        .expect("config lock")
+        .find(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(stored.as_deref(), Some("at-old"), "the store did not move");
+}
+
+/// B2: a token inside the proactive lead window does not rotate in guest
+/// mode. The poll still runs on the (unexpired) access token it holds and
+/// serves a live reading — polling needs no refresh.
+#[test]
+fn guest_mode_polls_on_the_held_token_instead_of_rotating_ahead_of_expiry() {
+    let home = crate::testutil::HomeSandbox::new();
+    stage_upstream_data_dir(&home);
+    let name = "guest-proactive";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"limits":[{"kind":"session","percent":12,
+               "resets_at":"2099-01-01T00:00:00+00:00"}]}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, r#"{"account":{"uuid":"uuid-1"}}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    // Inside the lead window: without guest mode this leg rotates first.
+    let soon = crate::usage::now_ms() as i64 + 60_000;
+    {
+        #[allow(clippy::expect_used, reason = "test")]
+        let mut cfg = config.lock().expect("config lock");
+        assert!(cfg.state.preemptive_rotation, "the default arms the leg");
+        let oauth = cfg
+            .profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == name)
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("fixture oauth");
+        oauth.expires_at = Some(soon);
+    }
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(soon),
+        auth_broken: false,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "guest mode must not rotate ahead of expiry: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None);
+    assert_eq!(outcome.status, super::FetchStatus::Fresh);
+    assert!(outcome.from_fetch, "a live reading on the held token");
+    assert!(!outcome.refresh_failed, "no refresh was attempted");
+}
+
+/// B2: the 5h-window kick may spend its access token, but its 401 recovery
+/// must not spend the refresh token in guest mode.
+#[test]
+fn auto_start_kick_does_not_rotate_in_guest_mode() {
+    let home = crate::testutil::HomeSandbox::new();
+    stage_upstream_data_dir(&home);
+    let name = "guest-kick";
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some(&activity),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick's rotation leg must not run in guest mode: {seen:?}"
+    );
+    // The leg stands down before its refresh spinner: the choke point under
+    // it never has to refuse.
+    #[allow(clippy::expect_used, reason = "test")]
+    let marked = activity.lock().expect("activity").contains_key(name);
+    assert!(!marked, "no rotation was started");
+    assert!(!result.opened);
+    assert_eq!(result.rotated, None);
+}
+
+/// B2: the CLA-ROLL scan re-stamps nothing in guest mode — the dying rolling
+/// sidecar `claude_rolling_tick_restamps_a_dying_rolling_sidecar` gates is
+/// left alone.
+#[test]
+fn claude_rolling_tick_restamps_nothing_in_guest_mode() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-guest"], &[]);
+    write_rolling_sidecar("cl-guest", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    stage_upstream_data_dir(&home);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' must not be re-stamped in guest mode")
+    });
+}
