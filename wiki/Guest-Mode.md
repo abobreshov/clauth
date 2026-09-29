@@ -17,7 +17,7 @@ How to tell:
 ## What works
 
 - **`tollgate start <profile>`**: every session runs in its own `CLAUDE_CONFIG_DIR` (or `CODEX_HOME`) under `~/.tollgate/profiles/<name>/`, so it needs none of upstream's files. This is how you use a tollgate profile in guest mode.
-- **`tollgate login <name>`** creates profiles: API-key endpoints (Ollama Cloud, OpenRouter, DeepSeek, …) and browser OAuth logins alike. The first profile is created but never made the active account, since that would link it into `~/.claude`.
+- **`tollgate login <name> --base-url … --api-key …`** creates API-key profiles (Ollama Cloud, OpenRouter, DeepSeek, …), and Alibaba console re-logins still run. The first profile is created but never made the active account, since that would link it into `~/.claude`. Subscription logins are refused (below).
 - **Monitors, `tollgate usage`, the Usage tab, the local agent API and the MCP `usage` tool** all work unchanged.
 - **Upstream's accounts, read only.** tollgate reads upstream's non-secret status feed, `~/.clauth/status.json`, and shows each of its profiles as `upstream:<name>`, labelled `<name> (clauth)`, with its 5h / 7d figures. Nothing else under `~/.clauth` is read: no config, no credentials, no per-profile cache. The feed is as fresh as upstream's daemon keeps it; without one there may be no feed and no upstream rows.
 - **`tollgate herdr link` / `unlink`**, which write no herdr config.
@@ -35,7 +35,8 @@ tollgate: upstream clauth manages ~/.claude on this machine (guest mode). Use 't
 | every Claude Code switch: `tollgate switch <name>`, the bare `tollgate <name>`, the TUI's switch, the MCP `switch_profile` tool, the daemon's REST `POST /api/v1/switch` (answered `409`) | a switch relinks `~/.claude/.credentials.json` and rewrites `settings.json`. A codex switch still runs, but moves only tollgate's own marker and leaves `~/.codex/auth.json` alone |
 | `wrap_off` / switch-off-all | clears the same slot |
 | `tollgate capture` | adopts the login in `~/.claude/.credentials.json`, which upstream owns |
-| `tollgate login <name> --codex` without `--browser` | replaces `~/.codex/auth.json` with a link into tollgate's store |
+| `tollgate login <name> --codex`, with or without `--browser` | the capture replaces `~/.codex/auth.json` with a link into tollgate's store; either flow mints a second codex chain beside upstream's |
+| the Claude browser OAuth login, `tollgate login <name> --setup-token`, and the TUI's login | each mints a second Claude login for an account upstream already holds |
 | the Claude Code plugin install and the `mcpServers` wiring (Plugin tab fixes) | the plugin registry and `~/.claude.json` are upstream's |
 | `tollgate herdr install`, the Plugin tab's herdr config fix | herdr's `config.toml` carries upstream's plugin block |
 
@@ -48,7 +49,9 @@ Background work that would write a global file stands down without an error:
 - following or detaching `~/.codex/auth.json`
 - the Claude Code plugin self-heal, its preflight and the `installed_plugins.json` repoint
 - renaming, deleting or logging out a profile recorded as active: the profile's own files change, the global legs do not
-- `settings.json` and `~/.claude.json` sync one way: your operator files still seed each tollgate runtime, but nothing is written back to them
+- every Claude and codex OAuth leg: no refresh-token spend (usage polls use the access token already held and fall back to the cache on a 401), no rolling re-stamp, no codex standby rotation, no adopt from `~/.claude/.credentials.json`, no refresh after an auto-start 401, and no write to the default macOS Keychain item `Claude Code-credentials` (per-session items still work)
+- `settings.json` and `~/.claude.json` are not synced: each runtime's copy is seeded from your operator file at start and belongs to its session after that; nothing is written back, and runtime copies do not sync with each other
+- a session runtime gets a private copy of `~/.claude/plugins` at start (in both link modes), keeps its transcripts in `~/.tollgate/guest-claude/projects` instead of `~/.claude/projects` (`tollgate resume` seeds the named transcript there), and gets copies instead of links of the `~/.codex` entries it would otherwise share
 - `tollgate herdr uninstall` removes tollgate's plugin and leaves herdr's `config.toml` alone
 
 ## What holds whether or not guest mode is on
@@ -64,7 +67,9 @@ These keep the two tools apart on any machine where both are installed:
 
 ## Known gaps
 
-- `tollgate login <name>` still runs the Claude browser OAuth flow in guest mode. It writes only the new profile, but it mints a second login for that account alongside upstream's.
+- With real links, a guest session still links the other top-level `~/.claude` entries (`CLAUDE.md`, `todos/`, `history.jsonl`, …), so a session can write them; only `plugins/`, `projects/`, the settings and credentials files are kept off.
+- An isolated guest session's transcripts are still rescued into `~/.claude/projects` at teardown, and `tollgate sessions` / `resume` list only `~/.claude/projects`, not the guest store.
+- A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before guest mode is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - `tollgate list` and `tollgate status --json` print each profile's `base_url` unredacted. `usage --json` and the local agent API redact endpoints.
 - There is no import, and so no supported way to hand the global files from upstream to tollgate.
 

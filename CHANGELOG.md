@@ -15,8 +15,10 @@ First release of tollgate, a hard fork of [clauth](https://github.com/uwuclxdy/c
 ### Guest mode
 
 - While `~/.clauth` exists and no import has completed, tollgate writes none of `~/.claude/.credentials.json`, `~/.claude/settings.json`, `~/.claude.json`, `~/.codex/auth.json`, the Claude Code plugin registry or herdr's `config.toml`.
-- Claude Code switches (CLI, TUI, MCP `switch_profile`, REST `POST /api/v1/switch` with a 409), switch-off, `capture`, codex adoption, the plugin install, `mcpServers` wiring and `herdr install` refuse with one line; auto-switch, the credential detach and snapshot, settings apply, the identity strip and the plugin self-heal skip silently. Settings sync is one way (operator files seed runtimes, nothing is written back).
-- `tollgate start`, API-key and OAuth logins (never auto-activated), monitors, `usage` and the agent API keep working.
+- Claude Code switches (CLI, TUI, MCP `switch_profile`, REST `POST /api/v1/switch` with a 409), switch-off, `capture`, codex adoption, the plugin install, `mcpServers` wiring and `herdr install` refuse with one line; auto-switch, the credential detach and snapshot, settings apply, the identity strip and the plugin self-heal skip silently. Settings sync is off: each runtime's copy is seeded from the operator file at start, and nothing is written back.
+- `tollgate start`, API-key logins (never auto-activated), monitors, `usage` and the agent API keep working. Claude OAuth and `--setup-token` logins, both codex logins and the TUI login refuse.
+- No Claude or codex OAuth leg runs: no refresh-token spend (polls use the held access token), no rolling re-stamp, no codex standby rotation, no live-rotation adopt, and no write to the default macOS Keychain item.
+- Session runtimes get a private copy of `~/.claude/plugins`, keep transcripts in `~/.tollgate/guest-claude/projects`, and copy rather than link the shared `~/.codex` entries.
 - Upstream's accounts appear read-only as `upstream:<name>`, projected from `~/.clauth/status.json` alone.
 - The TUI shows a `[ guest ]` pill; `usage --json`, the agent API and `status --json` carry `guest_mode`.
 - Independently of guest mode, tollgate's usage fetcher stands down while upstream's daemon, standby or fetch lock is held, and nothing claims a credentials symlink into a store tollgate does not own.
@@ -63,10 +65,25 @@ First release of tollgate, a hard fork of [clauth](https://github.com/uwuclxdy/c
 - `tollgate.usage` action opens the dashboard on the Usage tab.
 - `tollgate herdr link [--path]` / `unlink` for a local checkout. `install` and the heal pick only `tollgate-v*` release tags and check the manifest id before herdr runs; a key another binding owns is never bound twice.
 
+### Fixes from the 0.1.0 review
+
+The pre-release review and how each finding was settled: [docs/tollgate-code-review-0.1.0.md](docs/tollgate-code-review-0.1.0.md). Beyond the guest-mode changes above:
+
+- Helper processes (`notify-send`, the browser opener, herdr, git, the terminal spawn, plugin probes) start with monitoring and billing keys scrubbed from their environment.
+- Key-bearing provider GETs follow no redirect, cap bodies at 2 MiB and have a 20 s end-to-end deadline; the shared usage agent has the same deadline.
+- An OpenRouter wallet read with a management key no longer decides the inference account's availability, and a `/credits` 429 holds that wallet for its `Retry-After` (at least 5 minutes).
+- Credential redaction also catches keys embedded in punctuation, such as JSON strings.
+- The local agent API's GETs no longer repair anything on disk, `/v1/status` is always parsed and fully redacted, TCP requests must carry a loopback `Host` (421 otherwise), and the socket's directory is checked and tightened before bind.
+- The herdr plugin scripts no longer pass a pane id into `sed` or session paths through `xargs`.
+
 ### Known gaps
 
 - **No import yet.** `tollgate import clauth` is designed but not implemented, so guest mode cannot end while clauth is installed.
-- **Login still runs OAuth in guest mode.** `tollgate login <name>` runs the Claude browser flow and mints a second login for that account beside upstream's.
+- **Old credential links survive guest mode.** A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before `~/.clauth` appeared is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
+- **Guest sessions still share some of `~/.claude`.** With real links, the top-level entries other than `plugins/`, `projects/`, `settings.json` and `.credentials.json` (`CLAUDE.md`, `todos/`, `history.jsonl`, …) stay linked and writable. An isolated guest session's transcripts are still rescued into `~/.claude/projects`, and `sessions` / `resume` do not list the guest store.
+- **macOS guest Keychain guard not built on macOS yet.** The default-item refusal is tested on Linux through its predicate; `keychain.rs` itself has not been compiled for macOS since the change.
+- **Some platform-only helpers keep the full environment.** `ps`, `tasklist`, `powershell` and `/usr/bin/security` (Windows and macOS only) are not scrubbed of monitoring keys.
+- **The OpenRouter wallet hold is per process.** A `/credits` 429 hold lives in memory, so a separate CLI process (a manual `monitor refresh`) does not see the daemon's.
 - **`list` and `status --json` show `base_url` unredacted.** `usage --json` and the agent API redact it.
 - **`tollgate api serve` leaves `api.sock` behind on SIGTERM.** The next start replaces the stale socket.
 - **herdr `--display-agent` scope unverified.** Whether the `border label` knob's label is scoped to one pane is not verified against herdr 0.9.

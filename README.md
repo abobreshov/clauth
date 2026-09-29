@@ -18,6 +18,17 @@ tollgate monitors and manages your AI subscriptions and spending from one termin
 
 > The recording predates the fork and shows upstream clauth's TUI; tollgate keeps its layout and adds the Usage tab's monitor cards and the Omarchy palette.
 
+## Features
+
+- **Switch** Claude Code accounts in one keypress or `tollgate <name>`: OAuth (Pro / Max / Team / Enterprise) or a custom API endpoint, plan tier detected for you
+- **Monitor** live 5h / 7d rate-limit bars, provider balances and quotas, a token dashboard with API-equivalent cost, and the Claude status-incident feed
+- **Auto-switch** down a fallback chain when an account hits its limit, with weekly-window and spend-ceiling gates; opted-in accounts queue their auto-start so their 5h windows open apart
+- **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins or hooks
+- **From inside Claude**: the MCP plugin lets a live session list accounts, switch, or delegate a prompt to another account, and tells it when the account behind it changed
+- **Headless**: `tollgate daemon` runs the refresh and auto-switch loop with no TUI, publishes `status.json`, and can serve that feed, the account switch and herdr panes to another machine over HTTPS with `--listen`
+- **Codex too**: adopt or mint a ChatGPT login as a codex profile, run `codex` under it in its own `CODEX_HOME`, and rotate accounts between sessions on a separate codex chain
+- **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, multi-instance safe
+
 ## Coming from clauth: guest mode
 
 > [!IMPORTANT]
