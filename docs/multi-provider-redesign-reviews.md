@@ -132,3 +132,115 @@ D7: Provisionally direct read-only API; require S2 and explicit platform fallbac
 Worked for 3m 5s · 9:39 AM
 
 
+
+
+# Plan v3 review — Grok (grok-4.7, high, plan mode) — 2026-09-29
+
+VERDICT: APPROVE WITH CHANGES
+
+Blocking issues
+1. Import treats the live Claude login as a symlink, and upstream can mint a second carrier after the store is moved. The inventory says ~/.claude/.credentials.json → ~/.clauth/profiles/scifoo/credentials.json (plan line 69) and step 4 says "Repoint" it (lines 180–181). The codex sentence on that same line handles a regular file; the Claude sentence does not. Metadata: ~/.claude/.credentials.json is a regular file, mode 0600, 6498 bytes, not a symlink. ~/.codex/auth.json is also a regular file (0600, 4049 bytes), which the plan states. No inode or byte comparison was done. classify_link_at treats a non-symlink as content equality of the access token (src/claude.rs:949-968). After credentials.json is renamed away, is_first_login_at is true when the expected store is gone and the live path is a regular file with a login (src/claude.rs:1003-1016), and snapshot_active_credentials then adopts: it copies the live file back into ~/.clauth/profiles/<active>/ and symlinks (src/claude.rs:2494-2530). Upstream 0.16.0 does not read MIGRATED and is still installed until a later, owner-confirmed cargo uninstall (plan lines 187–196). The tool only stands down when it sees clauthd.lock or usage-fetch.lock held (plan lines 144–145); it does not hold those leases, and upstream never checks the fork. Rollback makes this worse: it cargo installs 0.16.0 before the moved stores are renamed back (plan lines 198–203). Fix: under one critical section, symlink_metadata plus nlink. Symlink: retarget it in the same step as the rename. Regular file: abort on Diverged; if it is the same carrier, the live file is the survivor and the profile copy is not refreshed again. Hold ~/.clauth/clauthd.lock and usage-fetch.lock from the first rename until retire. Put the upstream binary back only after the stores are back. Journal move and copy separately; wipe only copy-action paths. "Originals were never touched" (plan line 204) is false for a rename(2).
+2. The move set is not the credential set, so a sidecar refresh token stays behind. credential_fingerprint is exactly credentials.json, session-token.json, and session-token.static.json (src/claude.rs:152-170). The install source is the sidecar when it is long-lived (src/claude.rs:886-898). A sidecar that still contains a refresh token is a mis-fill and "by construction a copy of credentials.json" (src/claude.rs:48-52, 200-202). The import table moves only credentials.json and codex auth.json (plan lines 165–166). Today's three profile dirs (leadtone, personal, scifoo) list no sidecar, so this is not armed on disk now. The rolling-token writer creates that file (src/claude.rs:315-355). Leaving a mis-fill in ~/.clauth while the tool refreshes the moved copy is the permanent-death case in docs/codex-plan.md:17-20 (decisions 7 and 8: one physical file, copy means a second carrier). Same rule for codex: there is no codex-profiles.toml and no profiles/*/auth.json today, and the regular ~/.codex/auth.json must stay untouched. If a profile auth.json ever exists beside that regular file, do not refresh the imported copy. Fix: rename(2) all three Claude files, never copy them. Refuse a codex profile whose auth.json is not the single linked inode of ~/.codex/auth.json.
+
+Important issues
+1. profiles.toml does not drop unknown keys. save_app_state reattaches them (src/profile.rs:2477-2500). The comment at line 2492 describes the
+bug that function closes. codex-profiles.toml does drop them: plain toml::to_string_pretty (src/codex_profiles.rs:205-208; the comment at lines
+10–11 is only half right). The rollback warning (plan lines 148, 206) is wrong for the Claude roster.
+2. The Hermes home rule is inverted relative to main.py. HERMES_HOME is trusted and left alone only when its parent directory is named profiles
+(hermes_cli/main.py:580-592). Otherwise startup reads <root>/active_profile and can replace HERMES_HOME (main.py:606-640).
+get_default_hermes_root returns the grandparent when the parent is profiles, and returns the home itself otherwise (hermes_constants.py:184-
+191). A layout whose parent is not profiles avoids sharing ~/.hermes/shared/nous_auth.json, and that shared store copies tokens with no account
+check (hermes_cli/auth.py:4808-4840). It also skips the trust return, so "never create active_profile" is load-bearing and the plan's causal
+sentence (line 554) is not. HERMES_SHARED_AUTH_DIR is honored first (auth.py:4748-4750) and is the real private-store guard. Pin that, and make
+a present active_profile abort launch.
+3. A binary built before the updater is compiled out still self-replaces from upstream. API_URL is uwuclxdy/clauth (src/update.rs:12), the
+minisign key is pinned (line 31), an empty key skips verification (update.rs:175-176, 195-197), and auto_update defaults on (update.rs:57-63).
+A non-cargo binary downloads and self_replaces (update.rs:84-115, 282); ~/.cargo/bin only notifies (update.rs:288-298). R0 says "Updates
+disabled" and R2 adds the config key (plan lines 575, 577). Fix: R0 must refuse spawn() at compile time, before any fork binary is executed.
+The plan's R1 key, fork URL, and default off are the right end state.
+4. Guest mode forbids writing ~/.claude/settings.json (plan line 146) while the helper exe check rewrites that file on mismatch (line 132).
+Gate the rewrite on a completed import.
+5. Executor A/B is not weakened. The restated protocol matches the approved one: state flock rank 500 before SwapCell 550 (src/
+lockorder.rs:191-205), commit through SessionFields, ack only after a flushed exit-0 write under <sid>.helper.lock, helper takes no state
+flock. HarnessEngine (src/harness.rs:65-82) and the Codex install bail (harness.rs:153-161) match a third harness that installs nothing.
+os.replace of Path.home()/.claude/.credentials.json is real and ignores CLAUDE_CONFIG_DIR (agent/anthropic_adapter.py:958, 1167, 1210);
+refusing provider anthropic in tool-managed homes is the right v1 cut. Pool source claude_code refreshes that same file (agent/
+credential_pool.py:681-688, 1218-1246).
+Top 3 changes
+1. Rewrite §4.0 step 4 for a regular-file live slot, hold the upstream leases across import, and install 0.16.0 on rollback only after the
+stores are restored.
+2. Move session-token.json and session-token.static.json with credentials.json. Never copy a file that can hold a refresh token.
+3. Correct the Hermes parent-name rule to main.py:580-592, and compile out self-update in R0 before any fork binary runs.
+
+
+
+# Plan v3 review — Codex (GPT-6-Astra, read-only sandbox) — 2026-09-29
+
+VERDICT: REVISE
+## Blocking issues
+1. Import omits credential files that determine Claude’s login behavior. The migration inventory moves only credentials.json and Codex auth.json (plan:166
+   (docs/multi-provider-redesign-plan.md:166)). However, session-token.json can be the installed credential, while session-token.static.json preserves its
+   recovery token. Without the sidecar, installation falls back to the rotating OAuth store (src/claude.rs:23, src/claude.rs:118, src/claude.rs:890). Fix:
+   migrate the complete credential set, preserve its installation semantics, and test static, rolling and ordinary OAuth profiles. Also inventory durable
+   profiles/<p>/codex-home data; it contains session history and databases omitted from the table (src/runtime.rs:6338).
+2. Migration does not specify a transaction that excludes credential writers. Import checks processes before moving files, but does not require holding both
+   tools’ state locks and upstream leases throughout the transaction. Rollback excludes tool processes and helper-based CC sessions, but misses bare OAuth CC
+   sessions and native Codex sessions using adopted links (plan:145 (docs/multi-provider-redesign-plan.md:145), plan:154 (docs/multi-provider-redesign-
+   plan.md:154), plan:198 (docs/multi-provider-redesign-plan.md:198)). Upstream writes synchronize on its own .lock; fork locks cannot exclude them (src/
+   lock.rs:347). Fix: define lock acquisition, retained leases, process revalidation, and exclusion of every session sharing a moved store. Specify durable
+   journal ordering, destination-conflict handling and refusal of cross-filesystem moves. A MIGRATED file alone does not disable the unchanged upstream
+   dispatcher (src/main.rs:215).
+3. Hermes isolation remains porous, including a route to the owner’s Claude credentials. Creating a home .env does not prevent installation .env loading: it
+   still fills missing variables; managed .env subsequently overrides them. This contradicts the mitigation at plan:553 (docs/multi-provider-redesign-
+   plan.md:553). Evidence: $HSP/hermes_cli/env_loader.py:331–336,366–370, where $HSP is defined at plan:13–15. Moreover, blocking the primary provider anthropic
+   is insufficient: auxiliary Anthropic requests call the same credential resolver ($HSP/agent/auxiliary_client.py:2797–2818), which reads and refreshes the
+   real Claude credential file ($HSP/agent/anthropic_adapter.py:1311–1332). Fix: enforce account binding against all effective environment/configuration layers
+   and reject Anthropic auxiliary/fallback/pool routes as well as the primary provider. A warning cannot establish isolation.
+## Important issues
+4. The identity inventory misses executable behavior. These are not cosmetic literals eligible for lazy renaming:
+    • Session creation invokes upstream clauth start (src/daemon/api/create.rs:375).
+    • Pane matching recognizes only a process named clauth (src/daemon/api/panes.rs:324).
+    • Daemon replacement recognizes only clauth daemon (src/daemon/probe.rs:588).
+    • Pane metadata reads tokens.clauth (src/daemon/api/panes.rs:347).
+   Fix: add these to R0/R2 and test using the renamed binary while upstream remains installed. Otherwise fork actions can launch upstream or fail to recognize
+   their own processes.
+5. OpenRouter wallet attribution is unproven. The plan accepts a separate management key, then labels its /credits result using the inference key’s identity
+   (plan:529–532 (docs/multi-provider-redesign-plan.md:529)). But /credits reports the authenticated credential’s wallet and returns no account identifier. A
+   management key belonging to account B can therefore display B’s balance against inference account A. Fix: verify the binding or represent the monitoring
+   account separately; keep organization scope unresolved until S6(c). Add a mismatched-key fixture. OpenRouter credits contract.
+6. Two observation rules produce incorrect output. Deduplicating solely by (source, scope_id) can collapse subscription/top-up balances, different periods, or
+   unrelated accounts with missing IDs (plan:281 (docs/multi-provider-redesign-plan.md:281)). Require known scope identity plus meter identity, currency and
+   period. Separately, Nous used_pct omits ×100 and a positive-denominator guard (plan:518 (docs/multi-provider-redesign-plan.md:518)); Hermes explicitly
+   implements both ($HSP/agent/account_usage.py:174–181). Test $22/$7.90 → 64.09%, zero cap, unknown identities and multiple balance categories.
+7. Ollama exhaustion does not guarantee continued billing. The plan promises continuing overage at plan:400 (docs/multi-provider-redesign-plan.md:400) and
+   plan:451 (docs/multi-provider-redesign-plan.md:451). Published pricing instead describes consuming purchased credits after included credits; Team
+   additionally supports automatic usage billing. Fix: display “included credits consumed” until purchased balance/automatic billing is known, and gate this
+   mapping on S4(d), not merely S4(a). Ollama pricing.
+8. Hermes automatic rotation is not a specified manual hot swap. The proposed strategies select credentials automatically, while H4 relaunches and account homes
+   cannot resume across homes (plan:388 (docs/multi-provider-redesign-plan.md:388), plan:559 (docs/multi-provider-redesign-plan.md:559), plan:598 (docs/multi-
+   provider-redesign-plan.md:598)). The cited strategy descriptions confirm automatic selection ($HSP/hermes_cli/auth_commands.py:736–747). Fix: explicitly
+   distinguish automatic failover from user-selected credential switching; specify a proven live-selection mechanism and acknowledgement, or disclose relaunch-
+   only manual switching.
+## Minor / nits
+9. Hermes credential storage contradicts itself. “Only <home>/.env” (plan:317 (docs/multi-provider-redesign-plan.md:317)) conflicts with prescribed auth add
+   --type api-key, which stores the key as a pooled credential ($HSP/hermes_cli/auth_commands.py:210–220). Document both storage modes and their fingerprint/
+   attribution rules.
+10. Signing custody needs an executable CI design. The plan requires a passphrase-protected key, but the cited workflow provides only MINISIGN_SECRET_KEY and
+   invokes signing without supplying a passphrase (plan:214 (docs/multi-provider-redesign-plan.md:214), .github/workflows/release.yml:103). Specify
+   noninteractive signing and make installer verification mandatory, resolving “or document the gap” at plan:219.
+## Missing from the plan
+Acceptance fixtures for the findings above: concurrent import/rollback writers, session-token migration, foreign environment layers, auxiliary Anthropic
+  resolution, and mismatched monitoring identities. Existing additions do not cover these cases (plan:638–655 (docs/multi-provider-redesign-plan.md:638)).
+Bounded delivery slices: H-1 combines engine, roster, environment handling, launcher, UI, status and herdr integration; R3 combines migration, rollback and
+  retirement (plan:578 (docs/multi-provider-redesign-plan.md:578), plan:595 (docs/multi-provider-redesign-plan.md:595)). Separate the isolation and transaction
+  foundations from their UI/integration consumers.
+Self-contained preservation of approved invariants: v3 retains A, dispatch, State→SwapCell ordering and stable acknowledgement locking, but delegates details
+  to v2.3. Restate the two-writer row/sidecar rule and exact in-lock revalidation conditions rather than relying on the inaccurate historical line range
+  (plan:336–357 (docs/multi-provider-redesign-plan.md:336); 87ceb3da:docs/multi-provider-redesign-plan.md:199–246).
+## Decisions
+D1: Describe Hermes manual switching as relaunch-only until live selection is proven; automatic pool rotation does not establish the requested interaction.
+D12(b): Refuse Anthropic across primary, auxiliary, fallback and pool routes; a primary-provider check leaves the credential hazard reachable.
+## Top 3 changes
+1. Make import/rollback a complete, writer-exclusive credential migration.
+2. Enforce Hermes isolation across every environment and inference route.
+3. Complete operational renaming and correct wallet attribution, deduplication and exhaustion semantics.
