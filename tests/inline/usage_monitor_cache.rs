@@ -298,6 +298,89 @@ fn a_refresh_notifies_once_per_crossing_and_window() {
     );
 }
 
+/// An OpenRouter transport scripted per call; panics on an unscripted request,
+/// so a `/credits` sent inside the hold fails the test.
+struct ScriptedOpenRouter {
+    replies: std::sync::Mutex<std::collections::VecDeque<crate::providers::openrouter::HttpReply>>,
+    urls: std::sync::Mutex<Vec<String>>,
+}
+
+impl crate::providers::openrouter::OpenRouterHttp for ScriptedOpenRouter {
+    fn get(&self, url: &str, _bearer: &str) -> crate::providers::openrouter::HttpReply {
+        self.urls.lock().unwrap().push(url.to_string());
+        self.replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| panic!("unscripted request to {url}"))
+    }
+}
+
+/// A `/credits` 429 inside a partial success clears the monitor's own cache
+/// hold (the `/key` meters landed), yet a forced `monitor refresh` from another
+/// process still re-reads `/key` alone until the wallet's `Retry-After`
+/// passes: the wallet hold is persisted, not the process's.
+#[test]
+fn a_forced_refresh_in_another_process_keeps_off_a_held_wallet() {
+    use crate::providers::openrouter::{HttpReply, WalletHolds, fetch_stats_with};
+    let _home = HomeSandbox::new();
+    let m = or_monitor();
+    let key = include_str!("../fixtures/openrouter/key_limited.json").to_string();
+    let credits = include_str!("../fixtures/openrouter/credits_funded.json").to_string();
+    let urls: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = std::sync::Arc::default();
+    let n = AtomicUsize::new(0);
+    let seen = urls.clone();
+    // Each call stands in for a separate process: a fresh transport and a
+    // fresh hold store, with nothing but the disk shared.
+    let http = FakeHttp::stats(move || {
+        let (now, replies) = match n.fetch_add(1, Ordering::SeqCst) {
+            0 => (
+                T0,
+                vec![
+                    HttpReply::Body(key.clone()),
+                    HttpReply::Status {
+                        code: 429,
+                        retry_after: Some(std::time::Duration::from_secs(600)),
+                    },
+                ],
+            ),
+            1 => (T0 + 60_000, vec![HttpReply::Body(key.clone())]),
+            _ => (
+                T0 + 601_000,
+                vec![
+                    HttpReply::Body(key.clone()),
+                    HttpReply::Body(credits.clone()),
+                ],
+            ),
+        };
+        let transport = ScriptedOpenRouter {
+            replies: std::sync::Mutex::new(replies.into()),
+            urls: std::sync::Mutex::default(),
+        };
+        let out = fetch_stats_with(SECRET, None, &transport, &WalletHolds::persistent(), now);
+        seen.lock()
+            .unwrap()
+            .push(transport.urls.lock().unwrap().clone());
+        out
+    });
+
+    let first = refreshed(refresh_one(&m, &deps(&http, T0), true).unwrap());
+    assert_eq!(
+        first.hold_until_ms, None,
+        "a partial success holds no monitor"
+    );
+    let held = refreshed(refresh_one(&m, &deps(&http, T0 + 60_000), true).unwrap());
+    assert!(held.failure.is_none(), "the key meters still refresh");
+    refreshed(refresh_one(&m, &deps(&http, T0 + 601_000), true).unwrap());
+
+    const KEY: &str = "https://openrouter.ai/api/v1/key";
+    const CREDITS: &str = "https://openrouter.ai/api/v1/credits";
+    assert_eq!(
+        *urls.lock().unwrap(),
+        [vec![KEY, CREDITS], vec![KEY], vec![KEY, CREDITS]]
+    );
+}
+
 #[test]
 fn remove_deletes_the_cache_and_lock() {
     let _home = HomeSandbox::new();

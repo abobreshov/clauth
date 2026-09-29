@@ -1283,17 +1283,43 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
     fields.nth(18).map(str::to_string)
 }
 
-/// macOS and the BSDs: `ps -o lstart`, the start time to the second.
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn process_start_time(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
+/// The `ps -o lstart` the macOS/BSD [`process_start_time`] runs. Built on
+/// every platform so the Linux suite pins its scrub: a helper inherits no
+/// monitoring or billing key ([`crate::providers::billing_key::helper_command`]);
+/// the pinned `LC_ALL` / `TZ` are layered after it.
+#[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))] // spawned off Linux unix alone
+pub(crate) fn ps_start_time_command(pid: u32) -> Command {
+    let mut command = crate::providers::billing_key::helper_command("ps");
+    command
         .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .env("TZ", "UTC0")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    command
+}
+
+/// The PowerShell the Windows [`process_start_time`] runs, scrubbed and
+/// portable like [`ps_start_time_command`].
+#[cfg_attr(not(windows), allow(dead_code))] // spawned on Windows alone
+pub(crate) fn powershell_start_time_command(pid: u32) -> Command {
+    let mut command = crate::providers::billing_key::helper_command("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks"),
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// macOS and the BSDs: `ps -o lstart`, the start time to the second.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn process_start_time(pid: u32) -> Option<String> {
+    let output = ps_start_time_command(pid).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1309,17 +1335,7 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
 /// the TLS listener's FQDN lookup already runs.
 #[cfg(windows)]
 pub(crate) fn process_start_time(pid: u32) -> Option<String> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks"),
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = powershell_start_time_command(pid).output().ok()?;
     let ticks = String::from_utf8(output.stdout).ok()?;
     let ticks = ticks.trim();
     (output.status.success() && !ticks.is_empty() && ticks.bytes().all(|b| b.is_ascii_digit()))

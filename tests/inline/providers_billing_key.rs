@@ -337,3 +337,48 @@ fn the_browser_opener_is_scrubbed() {
     let cmd = crate::platform::open_url_command("https://example.invalid/authorize");
     assert_scrubbed(&cmd, &names);
 }
+
+/// The shared helper constructor scrubs before the caller layers its own env,
+/// so a variable the call site pins deliberately still wins.
+#[test]
+fn the_shared_helper_constructor_scrubs_before_the_callers_env() {
+    let _home = HomeSandbox::new();
+    let names = seed_helper_keys();
+    let mut cmd = helper_command("helper");
+    cmd.env("LC_ALL", "C");
+    assert_eq!(cmd.get_program(), "helper");
+    assert_scrubbed(&cmd, &names);
+    assert_eq!(
+        env_overrides(&cmd).get("LC_ALL"),
+        Some(&Some("C".to_string()))
+    );
+}
+
+/// The macOS Keychain CLI every `keychain.rs` leg spawns is built scrubbed,
+/// by absolute path, although that module compiles on macOS alone.
+#[test]
+fn the_keychain_cli_is_scrubbed() {
+    let _home = HomeSandbox::new();
+    let names = seed_helper_keys();
+    let cmd = crate::platform::security_command();
+    assert_eq!(cmd.get_program(), "/usr/bin/security");
+    assert_scrubbed(&cmd, &names);
+}
+
+/// The gateway's process-start probes (`ps -o lstart` off Linux, PowerShell
+/// on Windows) are built scrubbed; `ps` keeps its pinned locale and zone.
+#[test]
+fn the_gateway_start_time_probes_are_scrubbed() {
+    let _home = HomeSandbox::new();
+    let names = seed_helper_keys();
+    let ps = crate::daemon::gateway::ps_start_time_command(42);
+    assert_eq!(ps.get_program(), "ps");
+    assert_scrubbed(&ps, &names);
+    let env = env_overrides(&ps);
+    assert_eq!(env.get("LC_ALL"), Some(&Some("C".to_string())));
+    assert_eq!(env.get("TZ"), Some(&Some("UTC0".to_string())));
+
+    let pwsh = crate::daemon::gateway::powershell_start_time_command(42);
+    assert_eq!(pwsh.get_program(), "powershell.exe");
+    assert_scrubbed(&pwsh, &names);
+}
