@@ -467,13 +467,51 @@ fn status(ctx: &Ctx) -> Response {
     // The daemon's published feed, passed through untouched (a torn file does
     // not parse and falls through to the rebuild).
     if let Some((body, etag)) = crate::daemon::api::routes::read_feed_tagged(&ctx.status_path) {
+        // Untouched unless a profile's endpoint needs redacting; then the
+        // redacted copy goes out untagged, since the tag names the file's bytes.
+        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body)
+            && redact_status(&mut value)
+        {
+            return Response::serialize(200, &value);
+        }
         return Response::raw_json_tagged(200, body, etag);
     }
     let Ok(config) = crate::profile::load_config() else {
         return Response::error(503, "status_unavailable");
     };
     let body = crate::daemon::build_status(&config, config.state.refresh_interval_ms, None, false);
-    Response::serialize(200, &body)
+    match serde_json::to_value(&body) {
+        Ok(mut value) => {
+            redact_status(&mut value);
+            Response::serialize(200, &value)
+        }
+        Err(_) => Response::error(500, "internal"),
+    }
+}
+
+/// Every `profiles[].base_url` of a status body through [`redact_endpoint`],
+/// the rule the observation routes apply to `endpoint`. `true` when anything
+/// changed.
+pub(crate) fn redact_status(body: &mut serde_json::Value) -> bool {
+    let Some(profiles) = body
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for p in profiles {
+        if let Some(slot) = p.get_mut("base_url")
+            && let Some(raw) = slot.as_str()
+        {
+            let clean = redact_endpoint(raw);
+            if clean != raw {
+                *slot = serde_json::Value::String(clean);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// The local API's OpenAPI document.

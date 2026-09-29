@@ -168,13 +168,14 @@ pub(crate) fn list_rows(
     now_ms: u64,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ListRow> {
-    let interval = crate::profile::AppState::default().refresh_interval_ms;
     monitors
         .into_iter()
         .map(|m| {
             let c = cache::load(&m.id).filter(|c| c.matches(&m));
+            // The monitor's own TTL, as the collector judges it: `list` and
+            // `tollgate usage` must agree on what is stale.
             let observation = observe_monitor(&m, c.as_ref(), now_ms, |at| {
-                freshness_at(at, now_ms, interval)
+                freshness_at(at, now_ms, m.ttl_ms())
             });
             ListRow {
                 api_key_env_set: m.api_key_env.as_deref().map(|n| env(n).is_some()),
@@ -186,7 +187,9 @@ pub(crate) fn list_rows(
         .collect()
 }
 
-fn freshness_at(at: Option<u64>, now_ms: u64, interval_ms: u64) -> Freshness {
+/// Freshness against a cadence, the rule [`crate::usage::collect::CollectCtx::freshness_at_cadence`]
+/// applies.
+pub(crate) fn freshness_at(at: Option<u64>, now_ms: u64, interval_ms: u64) -> Freshness {
     match at {
         None => Freshness::NotFetched,
         Some(at) => match now_ms.checked_sub(at) {
@@ -276,7 +279,6 @@ fn refresh(id: Option<&str>, json: bool) -> Result<()> {
         env: &process_env,
         now_ms: crate::usage::now_ms(),
     };
-    let interval = crate::profile::AppState::default().refresh_interval_ms;
     let mut observations = Vec::new();
     for m in &selected {
         let outcome = cache::refresh_one(m, &deps, true)?;
@@ -291,7 +293,7 @@ fn refresh(id: Option<&str>, json: bool) -> Result<()> {
             RefreshOutcome::NotDue(_) | RefreshOutcome::Refreshed(_) => None,
         };
         let obs = observe_monitor(m, outcome.cache(), deps.now_ms, |at| {
-            freshness_at(at, deps.now_ms, interval)
+            freshness_at(at, deps.now_ms, m.ttl_ms())
         });
         if !json {
             let now_secs = i64::try_from(deps.now_ms / 1000).unwrap_or(i64::MAX);

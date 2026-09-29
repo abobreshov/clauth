@@ -35,10 +35,10 @@ pub(crate) const DEFAULT_LISTEN: &str = crate::identity::DEFAULT_LISTEN;
 )]
 pub(crate) struct Cli {
     /// Force a color depth instead of auto-detecting one (TUI only).
-    ///
-    /// `display_order` keeps the propagated copy at the bottom of every
-    /// subcommand's option list instead of clap's default slot near the top,
-    /// where a TUI-only flag reads as one of that command's own.
+    // `display_order` keeps the propagated copy at the bottom of every
+    // subcommand's option list instead of clap's default slot near the top,
+    // where a TUI-only flag reads as one of that command's own. (A plain
+    // comment: a doc line here would print in every command's `--help`.)
     #[arg(long, global = true, value_name = "TIER", display_order = 900)]
     pub(crate) theme: Option<ThemeArg>,
 

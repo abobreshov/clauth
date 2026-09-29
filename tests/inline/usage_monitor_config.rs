@@ -254,3 +254,79 @@ fn an_invalid_monitor_is_never_written() {
     assert!(add(&m).is_err());
     assert!(!monitors_path().unwrap().exists());
 }
+
+/// A key typed where the file cannot hold it — unquoted, under a misspelt
+/// name, or in a field of another type — is refused by the TOML parser, whose
+/// own message quotes the source line. The refusal (which the daemon logs on
+/// every scan) names the position and the reason, never the value.
+#[test]
+fn a_parse_error_never_echoes_the_line_it_failed_on() {
+    let key = "sk-or-v1-deadbeefcafe0123456789";
+    let cases = [
+        (
+            format!("[[monitor]]\nid = \"or\"\nkind = \"openrouter\"\napi_key_env = {key}\n"),
+            "line 4",
+        ),
+        (
+            format!("[[monitor]]\nid = \"or\"\nkind = \"openrouter\"\napikey = \"{key}\"\n"),
+            "apikey",
+        ),
+        (
+            format!("[[monitor]]\nid = \"or\"\nkind = \"nous\"\nttl_secs = \"{key}\"\n"),
+            "line 4, column 12",
+        ),
+        (
+            format!("[[monitor]]\nid = \"or\"\nkind = \"nous\"\nlabel = \"x\"\n\"{key}\" = 1\n"),
+            "line 5",
+        ),
+    ];
+    for (text, names) in &cases {
+        let err = format!("{:#}", parse(text).unwrap_err());
+        assert!(err.contains(names), "the error locates the fault: {err}");
+        assert!(!err.contains("deadbeef"), "the value is not echoed: {err}");
+    }
+}
+
+/// The add path parses the file it edits with `toml_edit`: a broken file is
+/// refused the same way, without quoting the line.
+#[test]
+fn a_broken_file_is_refused_on_add_without_echoing_it() {
+    let _home = HomeSandbox::new();
+    let path = monitors_path().unwrap();
+    crate::profile::mkdir_700(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "[[monitor]]\nid = \"or\"\nkind = \"openrouter\"\napi_key_env = sk-or-v1-deadbeefcafe0123456789\n",
+    )
+    .unwrap();
+    let err = format!(
+        "{:#}",
+        add(&MonitorConfig::new("n", MonitorKind::Nous)).unwrap_err()
+    );
+    assert!(err.contains("line 4"), "{err}");
+    assert!(!err.contains("deadbeef"), "{err}");
+    let err = format!("{:#}", load().unwrap_err());
+    assert!(!err.contains("deadbeef"), "{err}");
+}
+
+/// A referenced name is scrubbed from every session spawn, so a process
+/// variable in a key slot would strip `PATH` or `HOME` from every `claude`.
+#[test]
+fn a_process_variable_is_refused_as_a_key_name() {
+    for name in [
+        "PATH",
+        "HOME",
+        "path",
+        "XDG_RUNTIME_DIR",
+        "CLAUDE_CONFIG_DIR",
+        "HERDR_ENV",
+    ] {
+        let err = format!("{:#}", validate_env_name(name).unwrap_err());
+        assert!(err.contains("process environment"), "{name}: {err}");
+        let text =
+            format!("[[monitor]]\nid = \"or\"\nkind = \"openrouter\"\napi_key_env = \"{name}\"\n");
+        assert!(parse(&text).is_err(), "{name} loads from the file");
+    }
+    validate_env_name("OPENROUTER_API_KEY").unwrap();
+    validate_env_name("MY_PATH_KEY").unwrap();
+}

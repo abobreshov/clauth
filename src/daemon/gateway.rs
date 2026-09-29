@@ -1194,6 +1194,7 @@ fn spawn(record: &GatewayRecord, env: &GatewayEnv, log: File) -> std::io::Result
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    crate::providers::billing_key::scrub_monitoring_env(&mut command);
     env.apply(&mut command);
     #[cfg(unix)]
     {

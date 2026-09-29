@@ -691,6 +691,20 @@ const MAX_MESSAGE_CHARS: usize = 160;
 /// `[redacted]` (a word after `Bearer`, an `sk-`/`sess-`-style key, any
 /// 32+-char run of token alphabet), and the result cut to 160 chars.
 pub(crate) fn sanitize_message(raw: &str) -> String {
+    let joined = redact_credentials(raw);
+    if joined.chars().count() <= MAX_MESSAGE_CHARS {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(MAX_MESSAGE_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// [`sanitize_message`] without the length cap: control characters dropped,
+/// whitespace collapsed, credential-shaped words replaced with `[redacted]`.
+/// For text a person reads whole (a config error) that must still never
+/// carry a key.
+pub(crate) fn redact_credentials(raw: &str) -> String {
     fn tokenish(w: &str) -> bool {
         let core = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
         let alphabet = |c: char| c.is_ascii_alphanumeric() || "-_.=+/".contains(c);
@@ -715,13 +729,7 @@ pub(crate) fn sanitize_message(raw: &str) -> String {
         redact_next = word.eq_ignore_ascii_case("bearer");
         out.push(word);
     }
-    let joined = out.join(" ");
-    if joined.chars().count() <= MAX_MESSAGE_CHARS {
-        return joined;
-    }
-    let mut cut: String = joined.chars().take(MAX_MESSAGE_CHARS - 1).collect();
-    cut.push('…');
-    cut
+    out.join(" ")
 }
 
 // ── Quota windows ──────────────────────────────────────────────────────────────

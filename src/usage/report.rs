@@ -42,13 +42,16 @@ impl UsageReport {
 
 /// `tollgate usage [--json] [--all] [--account A] [--provider P]`.
 pub(crate) fn run(json: bool, opts: &CollectOpts) -> Result<()> {
-    let accounts = collect(opts);
-    let now_secs = crate::usage::now_epoch_secs();
     if json {
-        let report = UsageReport::new(accounts, now_secs, crate::identity::upstream_active());
+        // The agent API's own read path, redaction included, so this and
+        // `GET /v1/usage` are the same envelope: an endpoint's userinfo or a
+        // key in its query never reaches an agent through either door.
+        let report = crate::local_api::routes::usage_report(opts);
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    let accounts = collect(opts);
+    let now_secs = crate::usage::now_epoch_secs();
     if accounts.is_empty() {
         outln!("no accounts yet. add one with `tollgate login <name>`.");
         return Ok(());

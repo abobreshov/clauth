@@ -137,3 +137,43 @@ fn add_then_remove_through_the_dispatch() {
     assert!(config::load().unwrap().is_empty());
     assert!(run(MonitorCommand::Remove { id: "nous".into() }).is_err());
 }
+
+/// `monitor list` judges a reading against the monitor's own TTL, the rule
+/// the collector (`tollgate usage`, the agent API) applies, so the two never
+/// disagree on what is stale.
+#[test]
+fn list_rows_judge_freshness_by_the_monitors_own_ttl() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let observed = now - 30 * 60_000;
+    let mut slow = MonitorConfig::new("slow", MonitorKind::Nous);
+    slow.ttl_secs = Some(3600);
+    let fast = MonitorConfig::new("fast", MonitorKind::Nous);
+    let dir = config::monitors_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    for m in [&slow, &fast] {
+        let c = cache::MonitorCache {
+            version: cache::CACHE_VERSION,
+            id: m.id.clone(),
+            fingerprint: m.fingerprint(),
+            checked_at_ms: Some(observed),
+            observed_at_ms: Some(observed),
+            reading: Some(crate::usage::monitor::source::Reading::default()),
+            failure: None,
+            hold_until_ms: None,
+            alerts: Default::default(),
+        };
+        std::fs::write(
+            cache::cache_path(&m.id).unwrap(),
+            serde_json::to_vec(&c).unwrap(),
+        )
+        .unwrap();
+    }
+    let rows = list_rows(vec![slow, fast], now, &|_| None);
+    assert_eq!(rows[0].observation.freshness, Freshness::Fresh, "slow");
+    assert!(
+        matches!(rows[1].observation.freshness, Freshness::Stale { .. }),
+        "fast: {:?}",
+        rows[1].observation.freshness
+    );
+}

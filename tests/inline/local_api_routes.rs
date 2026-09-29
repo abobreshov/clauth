@@ -327,3 +327,78 @@ fn the_openapi_document_matches_the_route_table() {
         "bearer"
     );
 }
+
+/// A profile whose endpoint carries a credential (userinfo, a `?key=`) as the
+/// collector reads it, saved the way `tollgate login --base-url` saves it.
+fn seed_leaky_profile() {
+    let p = crate::profile::Profile::new(
+        "ep".to_string(),
+        Some(
+            "https://user:pw-deadbeef@api.deepseek.com/anthropic?key=sk-deadbeefcafe0123456789"
+                .to_string(),
+        ),
+        Some("sk-placeholder-not-a-key".to_string()),
+    );
+    crate::profile::save_profile(&p).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![crate::profile::ProfileName::from("ep")],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+}
+
+/// `tollgate usage --json` and `GET /v1/usage` share this envelope, so an
+/// endpoint's userinfo and query reach neither.
+#[test]
+fn the_usage_envelope_redacts_a_profiles_endpoint() {
+    let _home = HomeSandbox::new();
+    seed_leaky_profile();
+    let report = usage_report(&CollectOpts::default());
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(json.contains("api.deepseek.com/anthropic"), "{json}");
+    assert!(!json.contains("deadbeef"), "{json}");
+}
+
+/// `/v1/status` redacts `profiles[].base_url` too, whether it rebuilds the
+/// feed or passes the daemon's through; a feed with nothing to redact still
+/// goes out byte for byte with its tag.
+#[test]
+fn the_status_route_redacts_profile_endpoints() {
+    let _home = HomeSandbox::new();
+    seed_leaky_profile();
+    let ctx = ctx();
+    let rebuilt = handle(&ctx, &req("GET", "/v1/status", "", None), Door::Unix);
+    assert_eq!(rebuilt.status, 200);
+    let text = String::from_utf8(rebuilt.body.clone()).unwrap();
+    assert!(text.contains("api.deepseek.com/anthropic"), "{text}");
+    assert!(!text.contains("deadbeef"), "rebuilt: {text}");
+
+    std::fs::create_dir_all(ctx.status_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &ctx.status_path,
+        text.replace(
+            "api.deepseek.com/anthropic",
+            "u:pw-deadbeef@api.deepseek.com/anthropic",
+        ),
+    )
+    .unwrap();
+    let served = handle(&ctx, &req("GET", "/v1/status", "", None), Door::Unix);
+    let served_text = String::from_utf8(served.body.clone()).unwrap();
+    assert!(
+        !served_text.contains("deadbeef"),
+        "passed through: {served_text}"
+    );
+    assert!(
+        served.etag.is_none(),
+        "a rewritten feed is not tagged as the file"
+    );
+
+    std::fs::write(&ctx.status_path, text.as_bytes()).unwrap();
+    let clean = handle(&ctx, &req("GET", "/v1/status", "", None), Door::Unix);
+    assert_eq!(
+        clean.body,
+        text.as_bytes(),
+        "a clean feed passes through untouched"
+    );
+    assert!(clean.etag.is_some());
+}

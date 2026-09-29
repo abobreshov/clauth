@@ -1679,6 +1679,17 @@ fn key_from_block(block: &[String]) -> Option<String> {
 
 pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
     let bin = herdr_bin();
+    // Guest mode: herdr's config.toml belongs to upstream clauth's plugin
+    // until an import (plan §4.0), so only tollgate's own plugin registration
+    // is removed and the config is left as it is.
+    let guest = crate::identity::upstream_active();
+    if guest && !no_config {
+        errln!(
+            "tollgate: guest mode: leaving herdr's config.toml untouched (upstream clauth owns \
+             it); removing only tollgate's plugin"
+        );
+    }
+    let no_config = no_config || guest;
 
     // Read and strip before touching herdr, so one confirm covers both halves
     // and a decline leaves the plugin and the config both untouched.
@@ -1821,6 +1832,10 @@ fn mentions_token(value: &toml::Value) -> bool {
 /// `edit` names the change for the refusal message; both callers refuse with
 /// nothing written.
 fn write_validated(path: &Path, previous: &str, text: &str, bin: &str, edit: &str) -> Result<()> {
+    // The one writer of herdr's config: guest mode never reaches it
+    // (install, heal and uninstall all stop earlier), and this keeps any
+    // future caller from writing upstream's file.
+    crate::identity::refuse_in_guest_mode()?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let probe = tempfile::Builder::new()

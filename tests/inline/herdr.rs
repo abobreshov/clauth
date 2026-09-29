@@ -4206,3 +4206,55 @@ fn an_ambiguous_native_pane_publishes_the_clear_and_keeps_a_watcher() {
         chain_stop(&setup);
     }
 }
+
+/// Guest mode (plan §4.0): herdr's config.toml belongs to upstream clauth's
+/// plugin, so `uninstall` removes only tollgate's plugin registration and
+/// leaves the file byte for byte — even a block tollgate would recognise.
+#[cfg(unix)]
+#[test]
+fn uninstall_in_guest_mode_leaves_herdrs_config_alone() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME)).unwrap();
+    assert!(crate::identity::upstream_active());
+    let path = home.home().join("config.toml");
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    std::fs::write(&path, &wired).expect("fixture written");
+
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "echo \"$@\" >> \"$(dirname \"$0\")/calls.log\"; exit 0",
+    );
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HERDR_CONFIG_PATH", Some(path.as_os_str())),
+        ],
+    );
+
+    uninstall(false, true).expect("the plugin half runs");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("config reads"),
+        wired,
+        "the config is untouched in guest mode"
+    );
+    let log = std::fs::read_to_string(home.home().join("calls.log")).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l == "plugin uninstall tollgate"),
+        "tollgate's own plugin is still removed: {log}"
+    );
+    assert!(
+        !log.contains("config check"),
+        "no config candidate is validated: {log}"
+    );
+    assert!(
+        write_validated(&path, &wired, "", &shim.to_string_lossy(), "x").is_err(),
+        "the config writer itself refuses in guest mode"
+    );
+}

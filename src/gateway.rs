@@ -1787,6 +1787,7 @@ fn run_check(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    crate::providers::billing_key::scrub_monitoring_env(&mut command);
     env.apply(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,

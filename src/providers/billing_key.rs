@@ -37,6 +37,56 @@ pub(crate) fn valid_env_name(name: &str) -> bool {
         && (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !crate::runtime::MANAGED_ENV_KEYS.contains(&name)
+        && !is_process_env_name(name)
+}
+
+/// Variables every process runs on, never a key: the shell's own (`PATH`,
+/// `HOME`, the locale), the session's (`XDG_*`, `DISPLAY`, the D-Bus and ssh
+/// agent sockets), and the ones tollgate, Claude Code, codex and herdr steer
+/// their children with. A referenced name is scrubbed from every session
+/// spawn, so one of these named as a key slot would strip it from every
+/// `claude` / `codex`; they are refused where a name is accepted and never
+/// scrubbed. Compared case-insensitively (Windows env names fold case).
+pub(crate) fn is_process_env_name(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "PWD",
+        "OLDPWD",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSH_AUTH_SOCK",
+        "COLORTERM",
+        "NO_COLOR",
+        "COLUMNS",
+        "LINES",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "HERMES_HOME",
+    ];
+    const PREFIXES: &[&str] = &["LC_", "XDG_", "HERDR_", "TOLLGATE_", "CLAUTH_"];
+    let upper = name.to_ascii_uppercase();
+    EXACT.contains(&upper.as_str()) || PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 
 /// The env-var name `profile` references, when its `config.toml` sets a valid
@@ -85,6 +135,35 @@ pub(crate) fn referenced_env_vars() -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The monitoring-ONLY credentials among [`referenced_env_vars`]: each
+/// profile's `billing_key_env` and each monitor's `billing_key_env`, never a
+/// monitor's `api_key_env` (an inference key some other child, such as the
+/// gateway, may legitimately be configured to read).
+pub(crate) fn monitoring_only_env_vars() -> Vec<String> {
+    let mut names: Vec<String> = crate::profile::load_app_state()
+        .map(|state| state.profiles.iter().filter_map(billing_key_env).collect())
+        .unwrap_or_default();
+    if let Ok(monitors) = crate::usage::monitor::config::load() {
+        names.extend(monitors.into_iter().filter_map(|m| m.billing_key_env));
+    }
+    names.retain(|n| valid_env_name(n));
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Strip the monitoring-only credentials ([`monitoring_only_env_vars`]) from
+/// a non-session child the daemon spawns (the gateway). The daemon holds them
+/// to read balances; a management key can mint and delete keys, so it never
+/// rides into a third-party binary's environment (plan §4.3: "never" in child
+/// env). Call before layering the child's own env, so a value the operator
+/// set there deliberately still wins.
+pub(crate) fn scrub_monitoring_env(command: &mut std::process::Command) {
+    for name in monitoring_only_env_vars() {
+        command.env_remove(name);
+    }
 }
 
 /// Strip every referenced monitoring-credential variable from `command`'s

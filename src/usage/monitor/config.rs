@@ -312,6 +312,14 @@ pub(crate) fn validate_env_name(name: &str) -> Result<()> {
             "expected the NAME of an environment variable (like OPENROUTER_API_KEY), not its value"
         );
     }
+    if crate::providers::billing_key::is_process_env_name(name) {
+        // Every referenced name is scrubbed from session spawns, so naming
+        // `PATH` or `HOME` here would strip it from every `claude` / `codex`.
+        bail!(
+            "${name} is part of the process environment, not a key; name the variable that \
+             holds the key"
+        );
+    }
     let digits = name.bytes().filter(u8::is_ascii_digit).count();
     let lower = name.bytes().filter(u8::is_ascii_lowercase).count();
     if name.len() >= 24 && digits >= 4 && lower >= 4 {
@@ -326,7 +334,6 @@ pub(crate) fn validate_env_name(name: &str) -> Result<()> {
 /// Every provider a `kind = "provider"` monitor can name. Kept as a list
 /// rather than an exhaustive match so a new [`Provider`] variant does not
 /// break this file; add it here to make it nameable.
-// TODO(merge): add Provider::OllamaCloud once the Ollama branch lands.
 const NAMEABLE_PROVIDERS: &[Provider] = &[
     Provider::DeepSeek,
     Provider::Zai,
@@ -387,7 +394,14 @@ const SECRET_KEYS: &[&str] = &[
 
 /// Parse and validate `monitors.toml` text.
 pub(crate) fn parse(text: &str) -> Result<Vec<MonitorConfig>> {
-    let raw: toml::Table = toml::from_str(text).context("monitors.toml is not valid TOML")?;
+    let raw: toml::Table = toml::from_str(text).map_err(|e| {
+        toml_error(
+            text,
+            "monitors.toml is not valid TOML",
+            e.message(),
+            e.span(),
+        )
+    })?;
     if let Some(toml::Value::Array(tables)) = raw.get("monitor") {
         for t in tables {
             let Some(t) = t.as_table() else { continue };
@@ -400,9 +414,55 @@ pub(crate) fn parse(text: &str) -> Result<Vec<MonitorConfig>> {
             }
         }
     }
-    let file: MonitorsFile = toml::from_str(text).context("monitors.toml")?;
+    let file: MonitorsFile = toml::from_str(text)
+        .map_err(|e| toml_error(text, "monitors.toml", e.message(), e.span()))?;
     validate_all(&file.monitor)?;
     Ok(file.monitor)
+}
+
+/// A TOML error as `<what> at line L, column C: <message>`, with the
+/// message's quoted values and credential-shaped words redacted.
+///
+/// The parsers' own `Display` quotes the offending source line, so an
+/// unquoted key (`api_key_env = sk-or-…`) or a key under a misspelt name
+/// (`apikey = "sk-or-…"`) would be echoed whole — to the terminal, and every
+/// scan into the daemon log. This keeps the position and the reason only.
+fn toml_error(
+    text: &str,
+    what: &str,
+    message: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> anyhow::Error {
+    let at = span
+        .and_then(|s| text.get(..s.start))
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!(" at line {line}, column {col}")
+        })
+        .unwrap_or_default();
+    anyhow::anyhow!("{what}{at}: {}", redact_toml_message(message))
+}
+
+/// A parser message with every double-quoted value blanked (serde's
+/// `invalid type: string "…"` carries the value) and credential-shaped
+/// words masked. Backticked names (`unknown field \`lable\``) are kept.
+fn redact_toml_message(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut quoted = false;
+    for c in message.chars() {
+        if c == '"' {
+            if quoted {
+                out.push_str("…\"");
+            } else {
+                out.push('"');
+            }
+            quoted = !quoted;
+        } else if !quoted {
+            out.push(c);
+        }
+    }
+    crate::usage::observation::redact_credentials(&out)
 }
 
 /// Every monitor valid, ids unique.
@@ -464,8 +524,14 @@ fn edit_file(edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Re
     crate::lock::lock_file_with_timeout(&lock, std::time::Duration::from_secs(5))?;
     let path = monitors_path()?;
     let text = read_capped(&path)?.unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut =
-        text.parse().context("monitors.toml is not valid TOML")?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        toml_error(
+            &text,
+            "monitors.toml is not valid TOML",
+            e.message(),
+            e.span(),
+        )
+    })?;
     edit(&mut doc)?;
     let out = doc.to_string();
     parse(&out).context("the edited monitors.toml would not load")?;

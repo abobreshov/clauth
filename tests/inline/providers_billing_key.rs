@@ -221,3 +221,56 @@ fn the_openrouter_target_carries_the_env_name_and_others_do_not() {
         crate::usage::profile_credential_fingerprint(&bare)
     );
 }
+
+/// A process variable is never a key name, so it is never looked up or
+/// scrubbed: a hand-edited `billing_key_env = "PATH"` would otherwise strip
+/// `PATH` from every session spawn.
+#[test]
+fn a_process_variable_is_never_a_billing_key_name() {
+    for name in [
+        "PATH",
+        "HOME",
+        "Home",
+        "XDG_DATA_HOME",
+        "TOLLGATE_NO_API",
+        "CODEX_HOME",
+    ] {
+        assert!(!valid_env_name(name), "{name}");
+        assert!(env_name_from_config(&format!("billing_key_env = \"{name}\"\n")).is_none());
+    }
+    assert!(valid_env_name("OPENROUTER_MGMT_KEY"));
+}
+
+/// The gateway's scrub carries only monitoring-ONLY names: a profile's or a
+/// monitor's `billing_key_env`, never a monitor's `api_key_env` (an inference
+/// key the gateway may be configured to read).
+#[test]
+fn the_gateway_scrub_drops_monitoring_keys_and_keeps_inference_keys() {
+    let _home = HomeSandbox::new();
+    seed(&[("or", Some(OR_URL), Some("PROFILE_MGMT"))]);
+    let mut m = crate::usage::monitor::config::MonitorConfig::new(
+        "orm",
+        crate::usage::monitor::config::MonitorKind::OpenRouter,
+    );
+    m.api_key_env = Some("MONITOR_INFERENCE".into());
+    m.billing_key_env = Some("MONITOR_MGMT".into());
+    crate::usage::monitor::config::add(&m).unwrap();
+
+    assert_eq!(
+        monitoring_only_env_vars(),
+        ["MONITOR_MGMT".to_string(), "PROFILE_MGMT".to_string()]
+    );
+    let mut command = std::process::Command::new("true");
+    scrub_monitoring_env(&mut command);
+    let removed: Vec<String> = command
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    assert!(removed.contains(&"MONITOR_MGMT".to_string()), "{removed:?}");
+    assert!(removed.contains(&"PROFILE_MGMT".to_string()), "{removed:?}");
+    assert!(
+        !removed.contains(&"MONITOR_INFERENCE".to_string()),
+        "{removed:?}"
+    );
+}
