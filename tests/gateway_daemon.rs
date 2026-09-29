@@ -1,4 +1,4 @@
-//! The managed gateway under a real `clauth daemon`: a boot with an adopted
+//! The managed gateway under a real `tollgate daemon`: a boot with an adopted
 //! config runs exactly one gateway and publishes it healthy, SIGTERM stops it
 //! before the daemon dies of that signal, and a `--standby` daemon runs none
 //! until it takes over. Every run drives the stub `shunt` of
@@ -36,8 +36,8 @@ struct Sandbox {
 impl Sandbox {
     fn new() -> Self {
         let home = tempfile::tempdir().expect("home");
-        let clauth = home.path().join(".clauth");
-        fs::create_dir_all(&clauth).expect(".clauth");
+        let tollgate = home.path().join(".tollgate");
+        fs::create_dir_all(&tollgate).expect(".tollgate");
         let etc = fs::canonicalize(home.path())
             .expect("canonical home")
             .join("etc");
@@ -52,7 +52,7 @@ impl Sandbox {
         let dir = home.path().join("stub");
         let binary = stub::write_stub(&dir);
         fs::write(
-            clauth.join("gateway.toml"),
+            tollgate.join("gateway.toml"),
             format!(
                 "config = \"{}\"\nbinary = \"{}\"\ndisabled = false\n",
                 config.display(),
@@ -71,15 +71,15 @@ impl Sandbox {
         }
     }
 
-    fn clauth(&self) -> PathBuf {
-        self.home.path().join(".clauth")
+    fn tollgate(&self) -> PathBuf {
+        self.home.path().join(".tollgate")
     }
 
     fn log(&self) -> PathBuf {
         self.home.path().join("daemon-stderr.log")
     }
 
-    /// `clauth daemon <args>` over this home, its stderr in [`Self::log`]
+    /// `tollgate daemon <args>` over this home, its stderr in [`Self::log`]
     /// (appended, as a supervisor points it), nothing inherited that names
     /// another home or reaches the network.
     fn daemon(&self, args: &[&str]) -> Daemon {
@@ -88,23 +88,23 @@ impl Sandbox {
             .append(true)
             .open(self.log())
             .expect("daemon log");
-        let child = Command::new(env!("CARGO_BIN_EXE_clauth"))
+        let child = Command::new(env!("CARGO_BIN_EXE_tollgate"))
             .arg("daemon")
             .args(args)
             .env_clear()
             .env("HOME", self.home.path())
             .env("PATH", "/usr/bin:/bin")
-            .env("CLAUTH_NO_UPDATE", "1")
+            .env("TOLLGATE_NO_UPDATE", "1")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
             .spawn()
-            .expect("spawn clauth daemon");
+            .expect("spawn tollgate daemon");
         Daemon(Some(child))
     }
 
-    /// `clauth daemon` whose SIGHUP is inherited as ignored (`nohup`, a
+    /// `tollgate daemon` whose SIGHUP is inherited as ignored (`nohup`, a
     /// non-interactive shell's `&`): a shell sets `trap "" HUP` and execs it,
     /// which is exactly the disposition the daemon must not turn into a death.
     fn daemon_ignoring_hup(&self) -> Daemon {
@@ -117,18 +117,18 @@ impl Sandbox {
             .arg("-c")
             .arg(format!(
                 "trap '' HUP; exec '{}' daemon",
-                env!("CARGO_BIN_EXE_clauth")
+                env!("CARGO_BIN_EXE_tollgate")
             ))
             .env_clear()
             .env("HOME", self.home.path())
             .env("PATH", "/usr/bin:/bin")
-            .env("CLAUTH_NO_UPDATE", "1")
+            .env("TOLLGATE_NO_UPDATE", "1")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
             .spawn()
-            .expect("spawn clauth daemon ignoring SIGHUP");
+            .expect("spawn tollgate daemon ignoring SIGHUP");
         Daemon(Some(child))
     }
 
@@ -138,14 +138,14 @@ impl Sandbox {
 
     /// The feed's `gateway` object, once one is published.
     fn gateway(&self) -> Option<Value> {
-        let body = fs::read(self.clauth().join("status.json")).ok()?;
+        let body = fs::read(self.tollgate().join("status.json")).ok()?;
         let feed: Value = serde_json::from_slice(&body).ok()?;
         feed.get("gateway").cloned()
     }
 
     /// The feed's `generated_at`, which the daemon restamps on each publish.
     fn generated_at(&self) -> Option<String> {
-        let body = fs::read(self.clauth().join("status.json")).ok()?;
+        let body = fs::read(self.tollgate().join("status.json")).ok()?;
         let feed: Value = serde_json::from_slice(&body).ok()?;
         feed.get("generated_at")?.as_str().map(str::to_owned)
     }
@@ -275,20 +275,20 @@ fn a_daemon_boot_runs_one_healthy_gateway_and_stops_it_on_sigterm() {
     sandbox.server.wait_serving(false);
     assert!(
         sandbox.log_text().contains(&format!(
-            "clauth daemon: the shunt gateway (pid {}) stopped (signal 15)",
+            "tollgate daemon: the shunt gateway (pid {}) stopped (signal 15)",
             calls[0].pid
         )),
         "the gateway got SIGTERM from its daemon: {}",
         sandbox.log_text()
     );
     assert!(
-        !sandbox.clauth().join("gateway-child.json").exists(),
+        !sandbox.tollgate().join("gateway-child.json").exists(),
         "a clean stop leaves no child marker"
     );
     assert_eq!(sandbox.calls().len(), 1, "no restart on the way out");
 }
 
-/// The gateway's stdout and stderr land in `~/.clauth/gateway.log`, created
+/// The gateway's stdout and stderr land in `~/.tollgate/gateway.log`, created
 /// owner-only, and never in the daemon's own stderr: shunt logs every request
 /// at `info`, which would flood the daemon's capped log.
 #[test]
@@ -301,7 +301,7 @@ fn the_gateways_output_lands_in_its_own_owner_only_log() {
     let pid = sandbox.calls()[0].pid;
     daemon.terminate();
 
-    let log = sandbox.clauth().join("gateway.log");
+    let log = sandbox.tollgate().join("gateway.log");
     let written = fs::read_to_string(&log).unwrap_or_default();
     let mode = fs::metadata(&log)
         .ok()
@@ -331,7 +331,7 @@ fn a_standby_daemon_spawns_nothing_until_it_takes_over() {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(sandbox.clauth().join("clauthd.lock"))
+        .open(sandbox.tollgate().join("tollgated.lock"))
         .expect("open the daemon lock");
     holder.try_lock().expect("hold the daemon lock");
 
@@ -378,7 +378,7 @@ fn a_daemon_stops_its_gateway_on_sigint_and_sighup_too() {
         sandbox.server.wait_serving(false);
         assert!(
             sandbox.log_text().contains(&format!(
-                "clauth daemon: the shunt gateway (pid {pid}) stopped (signal 15)"
+                "tollgate daemon: the shunt gateway (pid {pid}) stopped (signal 15)"
             )),
             "the gateway got SIGTERM from its daemon: {}",
             sandbox.log_text()
@@ -455,7 +455,7 @@ fn a_daemon_that_inherited_sighup_ignored_keeps_running_on_hangup() {
     sandbox.server.wait_serving(false);
     assert!(
         sandbox.log_text().contains(&format!(
-            "clauth daemon: the shunt gateway (pid {pid}) stopped (signal 15)"
+            "tollgate daemon: the shunt gateway (pid {pid}) stopped (signal 15)"
         )),
         "the gateway got SIGTERM from its daemon: {}",
         sandbox.log_text()

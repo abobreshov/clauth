@@ -721,7 +721,7 @@ fn mirror_tree_seeds_runtime_only_nested_to_canonical() {
 /// A dir `mirror_tree` seeds back onto the canonical `~/.claude/` side (the
 /// runtime side created it first, e.g. CC writing a fresh session-state tree
 /// under the runtime's `CLAUDE_CONFIG_DIR`) must land owner-only like every
-/// other dir clauth creates under `~/.claude/`, not at the process umask
+/// other dir tollgate creates under `~/.claude/`, not at the process umask
 /// (typically 0755) — same invariant as the rescue path, different trigger
 /// (the Fake-symlink-mode watchdog tick instead of isolated-runtime teardown).
 #[cfg(unix)]
@@ -960,7 +960,7 @@ fn mirror_tree_writes_through_a_canonical_symlink() {
 }
 
 /// The asymmetry, pinned: a link on the RUNTIME side is not followed, because
-/// that side is clauth's own copy rather than anything the operator declared.
+/// that side is tollgate's own copy rather than anything the operator declared.
 /// Following one would aim a mirror write at an absolute path outside BOTH
 /// trees, past everything the 0600/0700 tree invariant reaches.
 ///
@@ -1912,7 +1912,7 @@ fn make_profile(name: &str) -> crate::profile::Profile {
 /// IS the deleted-account state `refuse_if_unconfigured` refuses, so a fixture
 /// without it would pin that gate instead of whatever the test is about.
 /// Read-modify-write, so one fixture can register several. Call INSIDE
-/// [`with_fake_home`] — it writes into `~/.clauth`.
+/// [`with_fake_home`] — it writes into `~/.tollgate`.
 fn configured_profile(name: &str) -> crate::profile::Profile {
     let profile = make_profile(name);
     register_profile(&profile);
@@ -2454,10 +2454,10 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
-/// `runtime/settings.json` carries clauth-owned credential routing for an
+/// `runtime/settings.json` carries tollgate-owned credential routing for an
 /// api-key profile (top-level `apiKeyHelper` naming the profile, plus the
 /// base_url and model env keys), so it is a credential file and must land
-/// 0o600 like every other clauth-owned write. The raw key is NOT in this file
+/// 0o600 like every other tollgate-owned write. The raw key is NOT in this file
 /// (it lives in `config.toml`, minted per request by the helper) — but the
 /// helper string and the surrounding env are still operator-sensitive, so the
 /// perm invariant is unchanged from the pre-helper era. The seeded
@@ -2641,7 +2641,7 @@ fn has_live_session_false_when_sessions_dir_empty() {
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("empty")
             .join("sessions");
@@ -2658,7 +2658,7 @@ fn has_live_session_false_when_all_sessions_dead() {
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("dead")
             .join("sessions");
@@ -2676,7 +2676,7 @@ fn has_live_session_true_when_any_session_alive() {
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("alive")
             .join("sessions");
@@ -2714,7 +2714,7 @@ fn has_live_session_true_with_mixed_alive_and_dead() {
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("mixed")
             .join("sessions");
@@ -2736,7 +2736,7 @@ fn live_session_count_counts_only_alive() {
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("counted")
             .join("sessions");
@@ -2806,7 +2806,7 @@ fn acquire_creates_runtime_and_pid_file() {
 
         let profile_dir = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("lifecycle");
         let expected_runtime = profile_dir.join(format!("runtime-{sid}"));
@@ -2850,7 +2850,7 @@ fn acquire_wipes_a_stale_tree_at_its_own_path_when_no_marker_holds_it() {
 
             let runtime = tmp
                 .path()
-                .join(".clauth")
+                .join(".tollgate")
                 .join("profiles")
                 .join("stale")
                 .join("runtime");
@@ -2934,7 +2934,7 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
             .expect_err("a start for a deleted account must fail loudly");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("vanishes") && msg.contains("clauth list"),
+            msg.contains("vanishes") && msg.contains("tollgate list"),
             "the refusal must name the account and the way out, got: {msg}"
         );
 
@@ -2977,7 +2977,7 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
 /// flock.
 ///
 /// What the flock placement buys is the mutation holding NO rotation lock: a
-/// clauth predating the guard witness on `actions::delete_profile`, where the
+/// tollgate predating the guard witness on `actions::delete_profile`, where the
 /// state flock is the only serialization point the two versions share. That is a
 /// live mixed-version state, not a hypothetical, and the seam is what makes it
 /// deterministic — no threads, no sleeps, nothing to schedule.
@@ -2994,7 +2994,7 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
             &[],
             false,
             || {
-                // A record removal taking no rotation lock — the shape a clauth
+                // A record removal taking no rotation lock — the shape a tollgate
                 // predating the witness ships. Its own body still runs under
                 // `with_state_lock`, which is the serialization this gate's
                 // placement rests on.
@@ -3135,7 +3135,7 @@ fn acquire_refuses_a_deleted_account_whose_directory_came_back() {
     });
 }
 
-/// Black-box `clauth start` isolation: a full `acquire` must build the runtime
+/// Black-box `tollgate start` isolation: a full `acquire` must build the runtime
 /// tree from the profile's OWN canonical credentials and never leak the live
 /// `~/.claude/.credentials.json` (a different account's tokens) into it. Also
 /// pins that `acquire` leaves the real home's credential file untouched.
@@ -3149,12 +3149,12 @@ fn acquire_isolates_credentials_from_real_home() {
         let live_creds = claude_home.join(".credentials.json");
         fs::write(&live_creds, CREDS_V1).expect("write live creds");
 
-        // Pre-stage the profile's own canonical credentials (what `clauth start`
+        // Pre-stage the profile's own canonical credentials (what `tollgate start`
         // restores for this profile) with a DISTINCT token chain.
         let profile = configured_profile("isolated");
         let canonical = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("isolated")
             .join("credentials.json");
@@ -3233,7 +3233,7 @@ fn acquire_builds_the_runtime_partition_the_mcp_note_describes() {
         let profile = configured_profile("partition");
         let canonical = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("partition")
             .join("credentials.json");
@@ -3355,7 +3355,7 @@ fn acquire_twice_same_process_counts_two_sessions() {
     });
 }
 
-/// Every `clauth start` session gets its OWN tree — the shared flavor included,
+/// Every `tollgate start` session gets its OWN tree — the shared flavor included,
 /// which two same-profile sessions used to share. Pins the exact per-session
 /// names and the `runtime<rest>` ↔ `sessions<rest>` pairing they rest on.
 #[test]
@@ -3384,7 +3384,7 @@ fn two_shared_sessions_get_independent_trees() {
             "two shared sessions of one profile must not share a marker dir"
         );
 
-        let profile_dir = tmp.path().join(".clauth").join("profiles").join("twin");
+        let profile_dir = tmp.path().join(".tollgate").join("profiles").join("twin");
         for rt in [&a, &b] {
             let sid = sid_of(rt.config_dir());
             assert_eq!(rt.config_dir(), profile_dir.join(format!("runtime-{sid}")));
@@ -3450,7 +3450,7 @@ fn a_per_session_acquire_stamps_no_marker_at_the_bare_stem_path() {
                 let profile = configured_profile(name);
                 let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
                 let sid = live_sid(&rt);
-                let profile_dir = tmp.path().join(".clauth").join("profiles").join(name);
+                let profile_dir = tmp.path().join(".tollgate").join("profiles").join(name);
                 assert_eq!(
                     rt.sessions_dir(),
                     profile_dir.join(format!("{bare_stem}-{sid}")),
@@ -3492,7 +3492,7 @@ fn a_per_session_acquire_stamps_no_marker_at_the_bare_stem_path() {
 /// Under [`LinkMode::Fake`] a SHARED session's marker sits in the bare-stem
 /// `sessions/` every session of the profile shares, so a colliding sid lands on
 /// a file another live process holds. The claim runs inside the state flock, so
-/// a blocking wait there wedges every other clauth process on the home, not just
+/// a blocking wait there wedges every other tollgate process on the home, not just
 /// this one.
 ///
 /// Runs `acquire` on a worker thread and fails on a timeout rather than hanging:
@@ -3513,7 +3513,7 @@ fn a_foreign_holder_of_our_own_marker_never_blocks_acquire() {
 
             let sessions = tmp
                 .path()
-                .join(".clauth")
+                .join(".tollgate")
                 .join("profiles")
                 .join("collide")
                 .join("sessions");
@@ -3580,8 +3580,8 @@ fn teardown_racing_a_wedged_peer_removes_its_own_files_within_one_retry() {
 
         // A wedged peer: a second open file description holding the flock, which
         // conflicts with the state flock exactly as a second process would.
-        let lock_path = crate::profile::clauth_dir()
-            .expect("clauth dir")
+        let lock_path = crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join(crate::lock::LOCK_FILENAME);
         let holder = std::sync::Arc::new(std::sync::Mutex::new(Some(
             crate::profile::open_state_file(&lock_path).expect("open holder"),
@@ -3646,8 +3646,8 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
         let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
 
-        let lock_path = crate::profile::clauth_dir()
-            .expect("clauth dir")
+        let lock_path = crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join(crate::lock::LOCK_FILENAME);
         let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
         holder.lock().expect("hold the flock");
@@ -3694,7 +3694,7 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
 ///
 /// The typed error is the assertion, not the sentence: `run_delegate` renders it
 /// through `{e}` and the TUI through the chain, so a caller that must tell
-/// contention from an `~/.clauth` fault does it by `downcast_ref` and would keep
+/// contention from an `~/.tollgate` fault does it by `downcast_ref` and would keep
 /// passing on a reworded string.
 #[test]
 fn a_start_behind_a_wedged_rotation_fails_with_the_bounded_wait() {
@@ -3981,7 +3981,7 @@ fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
 /// The CEILING, as a relation between the wait and the host's own silence
 /// tolerance rather than a second literal: the pre-spawn wait is silent on the
 /// wire, so it has to end before Claude Code's 30-minute stdio idle abort
-/// gives up on the call. A deadline past that turns clauth's named refusal
+/// gives up on the call. A deadline past that turns tollgate's named refusal
 /// into the client's opaque abort, which is the outcome the bound exists to
 /// remove.
 #[test]
@@ -4125,7 +4125,11 @@ fn fake_mode_shares_one_tree_across_two_sessions() {
             let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
                 .expect("second acquire");
 
-            let profile_dir = tmp.path().join(".clauth").join("profiles").join("faketwin");
+            let profile_dir = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join("faketwin");
             assert_eq!(a.config_dir(), profile_dir.join("runtime"));
             assert_eq!(b.config_dir(), profile_dir.join("runtime"));
             assert_eq!(a.sessions_dir(), profile_dir.join("sessions"));
@@ -4411,7 +4415,7 @@ fn a_shared_fake_session_keys_its_marker_on_the_bare_sessions_stem() {
                 ProfileRuntime::acquire(&shared, Isolation::Shared, &[], false).expect("acquire");
             let bare = tmp
                 .path()
-                .join(".clauth")
+                .join(".tollgate")
                 .join("profiles")
                 .join("fakebare-shared")
                 .join("sessions");
@@ -4811,7 +4815,7 @@ fn prune_removes_a_dangling_directory_link() {
 fn has_live_session_sees_a_per_session_dir_of_either_flavor() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
         for (profile, sessions_name, sid) in [
             ("gate-shared", "sessions-31337-0", "31337-0"),
             ("gate-iso", "sessions-isolated-31337-1", "31337-1"),
@@ -4865,7 +4869,7 @@ fn an_unreadable_profile_dir_reads_as_live_not_idle() {
     with_fake_home(tmp.path(), || {
         let profile = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("unreadable");
         let sessions = profile.join("sessions-9001-0");
@@ -5031,7 +5035,7 @@ fn gc_leaves_profile_children_that_only_look_like_runtime_dirs() {
     with_fake_home(tmp.path(), || {
         let profile = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("bystander");
         fs::create_dir_all(&profile).expect("mkdir profile");
@@ -5077,7 +5081,7 @@ fn has_live_session_sees_isolated_session() {
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("iso")
             .join("sessions-isolated");
@@ -5118,7 +5122,7 @@ fn has_live_session_sees_isolated_session() {
 fn gc_removes_stale_runtime_but_spares_live() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
 
         // Stale: a runtime tree with a dead (unlocked) pid file.
         let stale_runtime = profiles.join("stale").join("runtime");
@@ -5173,7 +5177,7 @@ fn gc_removes_stale_runtime_but_spares_live() {
 fn gc_collects_a_dead_per_session_pair_and_spares_a_held_one() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
 
         // Dead: both flavors, marker present but unlocked.
         let mut dead = Vec::new();
@@ -5231,7 +5235,7 @@ fn gc_collects_a_dead_per_session_pair_and_spares_a_held_one() {
 fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
 
         let orphan = profiles.join("orphan").join("sessions-5150-0");
         fs::create_dir_all(&orphan).expect("mkdir orphan");
@@ -5278,7 +5282,7 @@ fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
 fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
 
         // Crashed: a per-session pair whose marker is dead. The sweep collects
         // the tree, so the item's dir goes with it.
@@ -5386,7 +5390,7 @@ fn orphaned_keychain_item_follows_the_dir() {
 fn gc_spares_the_keychain_item_a_reminted_acquire_claims_mid_sweep() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
 
         // A crashed pair: dead marker, tree present — what the sweep collects.
         let runtime = profiles.join("crashed").join("runtime-4242-0");
@@ -5447,7 +5451,7 @@ fn gc_spares_the_keychain_item_a_reminted_acquire_claims_mid_sweep() {
 fn gc_skips_the_tree_sweep_under_the_plugin_tab_probe() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
         let runtime = profiles.join("crashed").join("runtime-4242-0");
         let sessions = profiles.join("crashed").join("sessions-4242-0");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
@@ -5494,7 +5498,7 @@ fn gc_skips_the_tree_sweep_under_the_plugin_tab_probe() {
 fn live_namespaced_keychain_services_derives_every_runtime_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
         let shared = profiles.join("p1").join("runtime-4242-0");
         let isolated = profiles.join("p2").join("runtime-isolated-777-3");
         let sessions = profiles.join("p1").join("sessions-4242-0");
@@ -5531,9 +5535,9 @@ fn live_namespaced_keychain_services_derives_every_runtime_dir() {
 fn live_namespaced_keychain_services_fails_closed_when_the_profiles_root_is_unreadable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let clauth = tmp.path().join(".clauth");
-        fs::create_dir_all(&clauth).expect("mkdir .clauth");
-        fs::write(clauth.join("profiles"), b"not a dir").expect("profiles as a file");
+        let tollgate = tmp.path().join(".tollgate");
+        fs::create_dir_all(&tollgate).expect("mkdir .tollgate");
+        fs::write(tollgate.join("profiles"), b"not a dir").expect("profiles as a file");
         assert!(
             live_namespaced_keychain_services().is_err(),
             "an unreadable profiles root must fail the derivation, not read as empty"
@@ -5548,7 +5552,7 @@ fn live_namespaced_keychain_services_fails_closed_when_the_profiles_root_is_unre
 fn live_namespaced_keychain_services_fails_closed_when_a_profile_dir_is_unreadable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
         fs::create_dir_all(&profiles).expect("mkdir profiles");
         fs::write(profiles.join("p1"), b"not a dir").expect("profile as a file");
         assert!(
@@ -5565,7 +5569,7 @@ fn live_namespaced_keychain_services_fails_closed_when_a_profile_dir_is_unreadab
 fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let profiles = tmp.path().join(".clauth").join("profiles");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
 
         // Dead: marker file present but unlocked.
         let dead_markers = profiles.join("rowdead").join("sessions-6001-0");
@@ -5699,7 +5703,7 @@ fn session_teardown_holds_the_state_flock_once() {
 
 #[test]
 fn scrub_profile_env_drops_managed_and_active_custom_keys() {
-    // `clauth start <B>` from a session running profile A must not inherit A's
+    // `tollgate start <B>` from a session running profile A must not inherit A's
     // endpoint/auth/model overrides nor A's custom `[env]`. The target's
     // runtime settings.json re-supplies whichever it defines.
     let mut cmd = std::process::Command::new("claude");
@@ -6185,16 +6189,16 @@ fn swap_support_refuses_a_shared_tree() {
 }
 
 /// The rotation refusal is macOS-ONLY and pure, so both arms run from a Linux
-/// box. It exists because clauth cannot write the Keychain item a `clauth start`
+/// box. It exists because tollgate cannot write the Keychain item a `tollgate start`
 /// session's Claude Code reads (that item is namespaced per `CLAUDE_CONFIG_DIR`;
 /// `keychain::SERVICE` is the unsuffixed one), so a rotation there signs the
 /// session out rather than propagating to it.
 #[test]
 fn rotation_is_blocked_by_a_live_session_only_on_macos() {
-    // macOS: a live `clauth start` session is the whole refusal.
+    // macOS: a live `tollgate start` session is the whole refusal.
     assert!(rotation_blocked_by_live_session(true, true));
     assert!(!rotation_blocked_by_live_session(false, true));
-    // Everywhere else the session shares the credential FILE clauth rotates,
+    // Everywhere else the session shares the credential FILE tollgate rotates,
     // so it follows the new pair on its next request.
     assert!(!rotation_blocked_by_live_session(true, false));
     assert!(!rotation_blocked_by_live_session(false, false));
@@ -6420,7 +6424,7 @@ fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
 /// observe when it stops. The marker is liveness bookkeeping the destructive
 /// guards read, and on macOS what `rotation_blocked_for` reads; it never
 /// removes a member from `rotation_candidates`, so both stay candidates
-/// throughout. A swapped session follows whichever pair clauth writes.
+/// throughout. A swapped session follows whichever pair tollgate writes.
 #[test]
 fn a_swap_keeps_both_members_marked_live_and_both_rotation_candidates() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -6621,7 +6625,7 @@ fn gc_spares_a_swapped_members_marker_dir_while_the_session_lives() {
 
 /// GC's half of the force-delete divergence, mirroring the tally's
 /// `a_swapped_session_counts_on_current_member_after_its_launch_marker_is_removed`:
-/// `clauth delete <launch> --force` removes the launch profile's whole dir, marker
+/// `tollgate delete <launch> --force` removes the launch profile's whole dir, marker
 /// dirs included, while the session keeps running on the member it swapped onto.
 /// Probing `start_profile` there finds nothing, reads the row as dead, and reaps a
 /// session the tally is still counting — the exact split the shared
@@ -7756,7 +7760,7 @@ fn a_convergence_keychain_failure_memo_silences_a_standing_fault() {
 
 /// The whole safety argument for counting bare sessions: their markers live
 /// OUTSIDE `profiles/`, so `has_live_session` — which gates delete, disable, and
-/// every macOS rotation leg — reads exactly the `clauth start` sessions it read
+/// every macOS rotation leg — reads exactly the `tollgate start` sessions it read
 /// before. Both directions, because a marker namespace that suppressed a real
 /// session's marker would be the same defect pointing the other way.
 #[test]
@@ -7780,18 +7784,18 @@ fn a_bare_session_marker_is_invisible_to_has_live_session() {
                 .expect("hold a session");
         assert!(
             has_live_session(&crate::profile::ProfileName::from("work")),
-            "a real `clauth start` session still reads live with a bare marker present"
+            "a real `tollgate start` session still reads live with a bare marker present"
         );
     });
 }
 
-/// A bare session dies without teardown as the normal case (it never ran clauth
+/// A bare session dies without teardown as the normal case (it never ran tollgate
 /// code), so its marker file outlives it and only GC removes it.
 #[test]
 fn gc_prunes_a_dead_bare_session_marker() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let dir = tmp.path().join(".clauth").join("live_bare");
+        let dir = tmp.path().join(".tollgate").join("live_bare");
         drop(register_bare_session().expect("register a bare session"));
         assert_eq!(
             fs::read_dir(&dir).expect("read live_bare").count(),
@@ -7825,7 +7829,7 @@ fn gc_spares_a_held_bare_session_marker() {
     });
 }
 
-/// The bare-marker sweep runs at every `clauth mcp` boot, the Plugin tab's
+/// The bare-marker sweep runs at every `tollgate mcp` boot, the Plugin tab's
 /// 3s-budget probe child included, and the state flock waits up to
 /// `STATE_LOCK_TIMEOUT` behind a macOS switch's keychain shell-out. Every other
 /// acquisition inside this sweep is conditional on there being work; this one
@@ -7911,7 +7915,7 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         let profile = configured_profile("evented");
         let canonical = tmp
             .path()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("evented")
             .join("credentials.json");
@@ -8316,9 +8320,9 @@ fn the_mirror_walks_past_a_publish_in_flight() {
 
 // ── the rotation refusal's content narrowing ─────────────────────────────────
 //
-// `rotation_blocked_for` refuses on macOS whenever a `clauth start` session is
+// `rotation_blocked_for` refuses on macOS whenever a `tollgate start` session is
 // live, because that session's Claude Code holds the pair in a Keychain item
-// clauth cannot write. `live_session_holds_rotatable` narrows it to the
+// tollgate cannot write. `live_session_holds_rotatable` narrows it to the
 // sessions the mechanism can actually reach: signing a session out takes an
 // `invalid_grant`, which takes a refresh token to spend. These pin the
 // narrowing AND every fail-closed direction, since each unknown here is a
@@ -8440,7 +8444,7 @@ fn every_unknown_launch_store_reads_as_rotatable() {
         );
         drop(held);
 
-        // (b) a row from a clauth that predates the field.
+        // (b) a row from a tollgate that predates the field.
         let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("legacy"))
             .expect("profile_dir")
             .join("session-token.json");
@@ -8550,7 +8554,7 @@ fn a_fanout_warning_fires_at_two_and_three_live_sessions() {
         assert_eq!(
             fanout_warning(true, &name, &store, &session),
             Some(
-                "clauth: warning: 'fanout-a' has 2 live sessions sharing one rotating login; run `clauth rolling-token fanout-a` before one refresh signs the others out"
+                "tollgate: warning: 'fanout-a' has 2 live sessions sharing one rotating login; run `tollgate rolling-token fanout-a` before one refresh signs the others out"
                     .to_string()
             ),
             "the second live session holding the rotating login is exactly the warning"
@@ -8560,7 +8564,7 @@ fn a_fanout_warning_fires_at_two_and_three_live_sessions() {
         assert_eq!(
             fanout_warning(true, &name, &store, &session),
             Some(
-                "clauth: warning: 'fanout-a' has 3 live sessions sharing one rotating login; run `clauth rolling-token fanout-a` before one refresh signs the others out"
+                "tollgate: warning: 'fanout-a' has 3 live sessions sharing one rotating login; run `tollgate rolling-token fanout-a` before one refresh signs the others out"
                     .to_string()
             ),
             "the observed count includes every live holder"
@@ -8691,7 +8695,7 @@ fn a_fanout_warning_counts_the_session_whose_write_landed_even_while_its_row_nam
         assert_eq!(
             fanout_warning(true, &name, &store, &session),
             Some(
-                "clauth: warning: 'fanout-swap' has 2 live sessions sharing one rotating login; run `clauth rolling-token fanout-swap` before one refresh signs the others out"
+                "tollgate: warning: 'fanout-swap' has 2 live sessions sharing one rotating login; run `tollgate rolling-token fanout-swap` before one refresh signs the others out"
                     .to_string()
             ),
             "the observed count includes the session whose write just landed"
@@ -8708,13 +8712,13 @@ fn live_isolated_stores_skip_codex_profiles_by_roster() {
     let home = crate::testutil::HomeSandbox::new();
     let mut locks = Vec::new();
     for name in ["cl", "cx"] {
-        let projects = home
-            .home()
-            .join(format!(".clauth/profiles/{name}/runtime-isolated/projects"));
+        let projects = home.home().join(format!(
+            ".tollgate/profiles/{name}/runtime-isolated/projects"
+        ));
         fs::create_dir_all(&projects).expect("mkdir projects");
         let sessions = home
             .home()
-            .join(format!(".clauth/profiles/{name}/sessions-isolated"));
+            .join(format!(".tollgate/profiles/{name}/sessions-isolated"));
         fs::create_dir_all(&sessions).expect("mkdir sessions");
         let lock = open_pid_file(&sessions.join("12345")).expect("open pid");
         lock.lock().expect("lock pid");
@@ -8734,7 +8738,7 @@ fn live_isolated_stores_skip_codex_profiles_by_roster() {
 // ── codex session homes ──────────────────────────────────────────────────────
 
 /// The copied config.toml loses exactly the keys that would let the session read
-/// or write outside the home clauth just built — and nothing else. `sqlite_home`
+/// or write outside the home tollgate just built — and nothing else. `sqlite_home`
 /// and `cli_auth_credentials_store` are also pinned by a forced `-c` at spawn;
 /// `debug.config_lockfile` is why that pin alone is not enough, since a lockfile
 /// replay rebuilds the config from ONE layer and erases the `-c` layer entirely.
@@ -8756,7 +8760,7 @@ fn a_session_config_loses_the_keys_that_escape_the_home() {
     )
     .expect("write config");
 
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
@@ -8797,7 +8801,7 @@ fn a_session_config_loses_the_keys_that_escape_the_home() {
     );
 }
 
-/// A config clauth cannot parse copies through untouched. codex will reject it
+/// A config tollgate cannot parse copies through untouched. codex will reject it
 /// the same way, and a session that refuses to start beats one silently reshaped
 /// by a parse that got it wrong.
 #[cfg(unix)]
@@ -8809,7 +8813,7 @@ fn an_unparseable_operator_config_copies_through_verbatim() {
     let broken = "model = \"o3\n[unclosed\n";
     fs::write(operator.join("config.toml"), broken).expect("write config");
 
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
@@ -8844,7 +8848,7 @@ fn a_copied_config_is_owner_only_whatever_the_operators_mode() {
         }
     }
 
-    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let session_home = home.home().join(".tollgate/profiles/cx/codex-home-4242-0");
     let plain_dst = session_home.join("config.toml");
     let stripped_dst = session_home.join("work.config.toml");
     copy_codex_config(&operator.join("config.toml"), &plain_dst).expect("copy plain");
@@ -8894,7 +8898,7 @@ fn a_shared_codex_home_links_the_table() {
     fs::write(operator.join("hooks.json"), b"{}").expect("write hooks");
     fs::write(operator.join("config.toml"), b"model = \"o3\"\n").expect("write config");
 
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
@@ -8985,7 +8989,7 @@ fn an_isolated_codex_home_links_only_the_auth() {
     fs::create_dir_all(operator.join("skills")).expect("mkdir operator skills");
     fs::write(operator.join("AGENTS.md"), b"# agents").expect("write agents");
 
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-isolated-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
@@ -9027,7 +9031,7 @@ fn an_isolated_codex_home_links_only_the_auth() {
 #[test]
 fn a_rollout_written_through_the_linked_root_is_in_the_store_before_teardown() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
@@ -9060,7 +9064,7 @@ fn a_rollout_written_through_the_linked_root_is_in_the_store_before_teardown() {
 #[test]
 fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
 
     let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
@@ -9127,7 +9131,7 @@ fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
 #[test]
 fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
 
     with_link_mode(LinkMode::Fake, || {
@@ -9167,7 +9171,7 @@ fn a_session_home_carries_the_profile_layers_and_the_plugin_store() {
     )
     .expect("write profile layer");
 
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
@@ -9199,7 +9203,7 @@ fn a_session_home_carries_the_profile_layers_and_the_plugin_store() {
 #[test]
 fn a_db_codex_healed_in_place_reaches_the_durable_store() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let store = profile.join("codex-home");
     fs::create_dir_all(&store).expect("mkdir store");
@@ -9248,7 +9252,7 @@ fn teardown_leaves_an_untouched_durable_entry_on_its_own_inode() {
     use std::os::unix::fs::MetadataExt;
 
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let store = profile.join("codex-home");
     fs::create_dir_all(&store).expect("mkdir store");
@@ -9283,7 +9287,7 @@ fn teardown_leaves_an_untouched_durable_entry_on_its_own_inode() {
 #[test]
 fn fake_mode_refuses_the_second_flavor_of_one_profile() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     fs::write(profile.join("auth.json"), b"{\"v\":1}").expect("seed store");
 
@@ -9316,7 +9320,7 @@ fn fake_mode_refuses_the_second_flavor_of_one_profile() {
 #[test]
 fn a_crashed_fake_isolated_home_keeps_the_only_rotated_chain() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     fs::write(profile.join("auth.json"), b"{\"spent\":true}").expect("seed store");
 
@@ -9359,7 +9363,7 @@ fn a_crashed_fake_isolated_home_keeps_the_only_rotated_chain() {
 #[test]
 fn a_fake_mode_codex_home_reconverges_the_auth_projection() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     fs::write(profile.join("auth.json"), b"{\"v\":1}").expect("seed store");
 
@@ -9397,7 +9401,7 @@ fn a_fake_mode_codex_home_reconverges_the_auth_projection() {
 #[test]
 fn the_fake_mode_boundaries_break_a_full_tie_by_their_own_prior() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let store = profile.join("auth.json");
     fs::write(&store, b"{\"v\":1}").expect("seed store");
@@ -9541,7 +9545,7 @@ fn fake_convergence_breaks_a_full_tie_by_the_boundarys_prior() {
 #[test]
 fn gc_collects_a_dead_codex_home_and_spares_the_live_and_the_bare() {
     let home = crate::testutil::HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/cx");
+    let profile = home.home().join(".tollgate/profiles/cx");
 
     // A crash's leftover: home with a dead (empty) marker dir.
     let dead_home = profile.join("codex-home-4242-0");
@@ -9627,8 +9631,8 @@ fn the_rescue_tombstone_name_is_rejected_by_the_pairing_predicate() {
 fn gc_rescues_an_isolated_tree_with_no_live_marker() {
     let sb = HomeSandbox::new();
     let claude_home = sb.home().join(".claude");
-    let runtime = sb.home().join(".clauth/profiles/iso/runtime-isolated");
-    let sessions = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let runtime = sb.home().join(".tollgate/profiles/iso/runtime-isolated");
+    let sessions = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
     fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
     fs::create_dir_all(runtime.join("shell-snapshots")).unwrap();
@@ -9655,7 +9659,7 @@ fn gc_rescues_an_isolated_tree_with_no_live_marker() {
     assert!(!sessions.exists(), "the marker dir must be gone");
     assert!(
         !sb.home()
-            .join(".clauth/profiles/iso/runtime-isolated.rescuing")
+            .join(".tollgate/profiles/iso/runtime-isolated.rescuing")
             .exists(),
         "no tombstone may be left behind"
     );
@@ -9670,10 +9674,10 @@ fn gc_rescues_a_per_session_isolated_tree_with_no_live_marker() {
     let claude_home = sb.home().join(".claude");
     let runtime = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated-4242-7");
+        .join(".tollgate/profiles/iso/runtime-isolated-4242-7");
     let sessions = sb
         .home()
-        .join(".clauth/profiles/iso/sessions-isolated-4242-7");
+        .join(".tollgate/profiles/iso/sessions-isolated-4242-7");
     fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
     fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
     fs::create_dir_all(runtime.join("shell-snapshots")).unwrap();
@@ -9702,7 +9706,7 @@ fn gc_rescues_a_per_session_isolated_tree_with_no_live_marker() {
     );
     assert!(
         !sb.home()
-            .join(".clauth/profiles/iso/runtime-isolated-4242-7.rescuing")
+            .join(".tollgate/profiles/iso/runtime-isolated-4242-7.rescuing")
             .exists(),
         "no per-session tombstone may be left behind"
     );
@@ -9714,8 +9718,8 @@ fn gc_rescues_a_per_session_isolated_tree_with_no_live_marker() {
 fn gc_spares_an_isolated_tree_with_a_live_marker() {
     let sb = HomeSandbox::new();
     let claude_home = sb.home().join(".claude");
-    let runtime = sb.home().join(".clauth/profiles/iso/runtime-isolated");
-    let sessions = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let runtime = sb.home().join(".tollgate/profiles/iso/runtime-isolated");
+    let sessions = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
     fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
     fs::create_dir_all(runtime.join("shell-snapshots")).unwrap();
@@ -9740,7 +9744,7 @@ fn gc_spares_an_isolated_tree_with_a_live_marker() {
     assert!(!claude_home.join("shell-snapshots").exists());
     assert!(
         !sb.home()
-            .join(".clauth/profiles/iso/runtime-isolated.rescuing")
+            .join(".tollgate/profiles/iso/runtime-isolated.rescuing")
             .exists(),
         "nothing may be renamed to a tombstone"
     );
@@ -9752,8 +9756,8 @@ fn gc_spares_an_isolated_tree_with_a_live_marker() {
 fn gc_removes_a_shared_pair_without_rescuing() {
     let sb = HomeSandbox::new();
     let claude_home = sb.home().join(".claude");
-    let runtime = sb.home().join(".clauth/profiles/sh/runtime");
-    let sessions = sb.home().join(".clauth/profiles/sh/sessions");
+    let runtime = sb.home().join(".tollgate/profiles/sh/runtime");
+    let sessions = sb.home().join(".tollgate/profiles/sh/sessions");
     fs::create_dir_all(runtime.join("projects/-w-sh")).unwrap();
     fs::write(runtime.join("projects/-w-sh/s1.jsonl"), "transcript").unwrap();
     fs::create_dir_all(&sessions).unwrap();
@@ -9778,7 +9782,7 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
     let claude_home = sb.home().join(".claude");
     let tombstone = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated.rescuing");
+        .join(".tollgate/profiles/iso/runtime-isolated.rescuing");
     fs::create_dir_all(tombstone.join("projects/-w-iso")).unwrap();
     fs::write(tombstone.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
     fs::create_dir_all(tombstone.join("shell-snapshots")).unwrap();
@@ -9802,7 +9806,9 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
 #[test]
 fn namespaced_keychain_owner_records_service_profile_session_owner_only() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/ledgered/runtime-700-1");
+    let runtime = home
+        .home()
+        .join(".tollgate/profiles/ledgered/runtime-700-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let profile = crate::profile::ProfileName::from("ledgered");
     let session = SessionId::for_test("700-1");
@@ -9998,7 +10004,7 @@ fn retiring_a_namespaced_keychain_owner_removes_later_delete_authority() {
 fn the_namespaced_keychain_ledger_rejects_malformed_owner_rows() {
     let _home = HomeSandbox::new();
     let path = namespaced_keychain_ledger::path().expect("ledger path");
-    fs::create_dir_all(path.parent().expect("ledger parent")).expect("clauth dir");
+    fs::create_dir_all(path.parent().expect("ledger parent")).expect("tollgate dir");
     let write = |body: &str| fs::write(&path, body).expect("fixture ledger");
 
     write(r#"{"owners":[{"service":"not-a-namespaced-service","profile":"p","session":"1-1"}]}"#);
@@ -10060,7 +10066,9 @@ fn a_ledger_row_outlives_its_profile_and_stays_authoritative() {
 #[test]
 fn a_namespaced_write_is_refused_while_a_sweeps_delete_is_in_flight() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/inflight/runtime-800-1");
+    let runtime = home
+        .home()
+        .join(".tollgate/profiles/inflight/runtime-800-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let profile = crate::profile::ProfileName::from("inflight");
     let session = SessionId::for_test("800-1");
@@ -10072,10 +10080,10 @@ fn a_namespaced_write_is_refused_while_a_sweeps_delete_is_in_flight() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("epoch")
         .as_secs();
-    let record_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let record_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(
         &record_path,
         serde_json::json!({"deletes": [{"service": service.clone(), "stamp_secs": stamp}]})
@@ -10116,7 +10124,7 @@ fn a_namespaced_write_is_refused_while_a_sweeps_delete_is_in_flight() {
 #[test]
 fn a_stale_in_flight_record_is_swept_and_admits_the_write() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/stale/runtime-801-1");
+    let runtime = home.home().join(".tollgate/profiles/stale/runtime-801-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let profile = crate::profile::ProfileName::from("stale");
     let session = SessionId::for_test("801-1");
@@ -10130,10 +10138,10 @@ fn a_stale_in_flight_record_is_swept_and_admits_the_write() {
         .as_secs();
     let stale_stamp = now - namespaced_keychain_ledger::IN_FLIGHT_STALE_AFTER.as_secs();
     let other = "Claude Code-credentials-c56fc9bd";
-    let record_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let record_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(
         &record_path,
         serde_json::json!({"deletes": [
@@ -10177,7 +10185,9 @@ fn a_stale_in_flight_record_is_swept_and_admits_the_write() {
 #[test]
 fn an_alive_delete_child_keeps_refusing_past_the_age_bound() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/pidalive/runtime-815-1");
+    let runtime = home
+        .home()
+        .join(".tollgate/profiles/pidalive/runtime-815-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let profile = crate::profile::ProfileName::from("pidalive");
     let session = SessionId::for_test("815-1");
@@ -10189,10 +10199,10 @@ fn an_alive_delete_child_keeps_refusing_past_the_age_bound() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("epoch")
         .as_secs();
-    let record_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let record_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(
         &record_path,
         serde_json::json!({"deletes": [{
@@ -10233,7 +10243,7 @@ fn an_alive_delete_child_keeps_refusing_past_the_age_bound() {
 #[test]
 fn a_pid_dead_row_falls_back_to_the_age_bound() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/pidded/runtime-816-1");
+    let runtime = home.home().join(".tollgate/profiles/pidded/runtime-816-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let profile = crate::profile::ProfileName::from("pidded");
     let session = SessionId::for_test("816-1");
@@ -10249,10 +10259,10 @@ fn a_pid_dead_row_falls_back_to_the_age_bound() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("epoch")
         .as_secs();
-    let record_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let record_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(
         &record_path,
         serde_json::json!({"deletes": [{
@@ -10358,10 +10368,10 @@ fn one_collectors_clear_cannot_erase_anothers_live_tracking() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("epoch")
         .as_secs();
-    let record_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let record_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(
         &record_path,
         serde_json::json!({"deletes": [{
@@ -10533,11 +10543,13 @@ fn the_keychain_delete_sink_requires_the_in_flight_witness() {
 #[test]
 fn the_gc_recheck_blocks_while_a_peer_holds_the_state_flock() {
     let home = HomeSandbox::new();
-    let sessions = home.home().join(".clauth/profiles/blocked/sessions-810-1");
-    let runtime = home.home().join(".clauth/profiles/blocked/runtime-810-1");
+    let sessions = home
+        .home()
+        .join(".tollgate/profiles/blocked/sessions-810-1");
+    let runtime = home.home().join(".tollgate/profiles/blocked/runtime-810-1");
     let service = "Claude Code-credentials-c56fc9bd";
-    let record_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let record_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = crate::lock::with_state_lock(|_held| {
@@ -10580,12 +10592,12 @@ fn the_gc_recheck_blocks_while_a_peer_holds_the_state_flock() {
 #[test]
 fn the_gc_recheck_skips_the_delete_when_the_stamp_cannot_persist() {
     let home = HomeSandbox::new();
-    let sessions = home.home().join(".clauth/profiles/skip/sessions-814-1");
-    let runtime = home.home().join(".clauth/profiles/skip/runtime-814-1");
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let sessions = home.home().join(".tollgate/profiles/skip/sessions-814-1");
+    let runtime = home.home().join(".tollgate/profiles/skip/runtime-814-1");
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(&path, r#"{"deletes": [}"#).expect("corrupt record");
     let decision = gc_keychain_recheck(
         Some("Claude Code-credentials-c56fc9bd"),
@@ -10605,7 +10617,7 @@ fn the_gc_recheck_skips_the_delete_when_the_stamp_cannot_persist() {
 #[test]
 fn the_census_gate_spares_a_live_service_without_stamping() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/gated/runtime-811-1");
+    let runtime = home.home().join(".tollgate/profiles/gated/runtime-811-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let service = crate::claude::namespaced_keychain_service(
         &runtime.canonicalize().expect("canonical runtime"),
@@ -10614,8 +10626,8 @@ fn the_census_gate_spares_a_live_service_without_stamping() {
         census_delete_gate(&service).expect("gate").is_none(),
         "a dir-derived service is live: the gate spares it"
     );
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
     assert!(!path.exists(), "the spare never stamps a record");
 }
@@ -10626,7 +10638,7 @@ fn the_census_gate_spares_a_live_service_without_stamping() {
 #[test]
 fn the_census_gate_stamps_an_orphaned_service_before_its_delete() {
     let home = HomeSandbox::new();
-    fs::create_dir_all(home.home().join(".clauth/profiles/gated")).expect("profiles dir");
+    fs::create_dir_all(home.home().join(".tollgate/profiles/gated")).expect("profiles dir");
     let service = "Claude Code-credentials-c56fc9bd";
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -10689,12 +10701,12 @@ fn the_census_gate_stamps_an_orphaned_service_before_its_delete() {
 #[test]
 fn a_corrupt_in_flight_record_refuses_the_write_fail_closed() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/corrupt/runtime-813-1");
+    let runtime = home.home().join(".tollgate/profiles/corrupt/runtime-813-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("keychain-deletes-in-flight.json");
-    fs::create_dir_all(path.parent().expect("record parent")).expect("clauth dir");
+    fs::create_dir_all(path.parent().expect("record parent")).expect("tollgate dir");
     fs::write(
         &path,
         r#"{"deletes":[{"service":"not-a-namespaced-service","stamp_secs":1}]}"#,

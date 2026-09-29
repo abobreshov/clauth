@@ -45,7 +45,7 @@ fn a_minimal_file_defaults_the_rest() {
 }
 
 /// A key this binary does not know must not fail the load: the file is owned
-/// by whichever clauth wrote it last, and a newer one may know more fields.
+/// by whichever tollgate wrote it last, and a newer one may know more fields.
 #[test]
 fn an_unknown_key_does_not_fail_the_load() {
     let _home = HomeSandbox::new();
@@ -106,8 +106,8 @@ fn the_weekly_line_is_the_codex_files_own_with_the_claude_default() {
 #[test]
 fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
     let _home = HomeSandbox::new();
-    let path = clauth_dir()
-        .expect("clauth dir")
+    let path = tollgate_dir()
+        .expect("tollgate dir")
         .join("codex-profiles.toml");
 
     write_codex_state("profiles = [\"a\", \"b\"]\n");
@@ -140,8 +140,8 @@ fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
 #[test]
 fn an_out_of_band_weekly_line_heals_on_the_next_save() {
     let _home = HomeSandbox::new();
-    let path = clauth_dir()
-        .expect("clauth dir")
+    let path = tollgate_dir()
+        .expect("tollgate dir")
         .join("codex-profiles.toml");
     let raw = "profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 120.0\n";
     write_codex_state(raw);

@@ -1,4 +1,4 @@
-//! Shared engine for clauth's "newest parseable copy wins" JSON reconcilers.
+//! Shared engine for tollgate's "newest parseable copy wins" JSON reconcilers.
 //!
 //! Two Claude Code files need the same treatment: `.claude.json`
 //! ([`crate::claude_json`]) and `settings.json` ([`crate::settings_sync`]). Both
@@ -55,7 +55,7 @@ pub(crate) fn newest_mtime(paths: &[PathBuf]) -> Option<SystemTime> {
         .max()
 }
 
-/// Every file clauth reconciles for one synced document: the operator's own
+/// Every file tollgate reconciles for one synced document: the operator's own
 /// copy under `base` plus each SHARED per-session runtime copy of `file`.
 /// Enumerated through [`crate::runtime::shared_runtime_dirs`] rather than a
 /// fixed `<profile>/runtime` path — every session owns its own `runtime-<sid>`,
@@ -111,7 +111,7 @@ struct Member {
 /// — atomically, only on change. Idempotent after convergence.
 ///
 /// `operator_file` is the one member Claude Code owns (the copy under the
-/// operator's home rather than under `~/.clauth`); see [`write_member`] for why
+/// operator's home rather than under `~/.tollgate`); see [`write_member`] for why
 /// it is written differently.
 pub(crate) fn sync_paths(
     paths: &[PathBuf],
@@ -230,15 +230,15 @@ fn merge_member(
 }
 
 /// Write one synced member. The rename swaps the inode, so the mode is the
-/// writer's, not the file's: a clauth-owned copy (under `~/.clauth`) gets 0o600
+/// writer's, not the file's: a tollgate-owned copy (under `~/.tollgate`) gets 0o600
 /// so the syncer can't silently revert the seed's owner-only mode, while
 /// `operator_file` — Claude Code's own copy under the operator's home — lands at
 /// CC's own 0o644 posture, matching what `claude::apply_profile_to_claude_settings`
 /// already does to that file. Note this is not preservation: `atomic_write`
 /// renames a fresh umask-moded temp over the path, so a hand-tightened operator
-/// file is widened. Deliberate — clauth does not own that file and does not
+/// file is widened. Deliberate — tollgate does not own that file and does not
 /// restyle it either way. Any path that is not `operator_file` is treated as
-/// clauth-owned, the stricter default.
+/// tollgate-owned, the stricter default.
 fn write_member(path: &Path, bytes: &[u8], operator_file: Option<&Path>) -> std::io::Result<()> {
     if operator_file == Some(path) {
         atomic_write(path, bytes)

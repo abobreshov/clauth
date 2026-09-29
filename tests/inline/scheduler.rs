@@ -730,7 +730,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
 /// cover: a refresh the endpoint rejected without confirming the token is dead
 /// (`RefreshError::Transient`) leaves the profile unflagged on purpose, so
 /// `auth_broken`'s backoff never applies. Without a ladder of its own, the one
-/// failure mode that hits every profile at once — clauth's own request shape
+/// failure mode that hits every profile at once — tollgate's own request shape
 /// drifting — re-hits the token endpoint at the full cadence forever, on every
 /// account, with the row saying only `cached`. Same curve and ceiling as the 429
 /// ladder, and computed live at partition time so a recovery snaps straight back.
@@ -4361,8 +4361,8 @@ fn a_decision_is_rewritten_only_when_the_row_disagrees_with_it() {
 
     // The registry keeps one file per session, so the dir holds exactly this row.
     let row_file = std::fs::read_dir(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("live_sessions"),
     )
     .expect("read the registry dir")
@@ -4428,8 +4428,8 @@ fn a_healthy_session_gets_no_decision_and_its_row_is_not_touched() {
     let _marker = register_live_row(&row);
 
     let row_file = std::fs::read_dir(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("live_sessions"),
     )
     .expect("read the registry dir")
@@ -4573,7 +4573,7 @@ fn fresh_body_lagging_a_kick_keeps_the_live_window() {
     assert_eq!(
         merged.five_hour.unwrap().utilization,
         80.0,
-        "a window clauth never kicked must not override the wire"
+        "a window tollgate never kicked must not override the wire"
     );
     assert_eq!(merged.open_at, None);
 
@@ -6439,7 +6439,7 @@ fn pre_rotation_other_errors_bail_to_cache() {
 // toggle (default ON), the CLA-ROLL flag (which ORs over the toggle, never
 // over the clock), and whether the stored expiry sits inside the lead
 // window. Liveness, active-ness and the Keychain are NOT inputs — every
-// non-isolated session reads the same credential file clauth rotates.
+// non-isolated session reads the same credential file tollgate rotates.
 
 #[test]
 fn preemptive_rotation_is_on_by_default_and_the_toggle_still_disables_it() {
@@ -6506,7 +6506,7 @@ fn the_rotation_lead_clears_claude_codes_own_five_minute_refresh_threshold() {
     assert_eq!(shipped, 90_000, "the cadence this margin is sized against");
     assert!(
         super::rotate_lead_ms(shipped) > CC_REFRESH_THRESHOLD_MS,
-        "clauth must rotate before CC's own threshold, got {} ms vs {CC_REFRESH_THRESHOLD_MS} ms",
+        "tollgate must rotate before CC's own threshold, got {} ms vs {CC_REFRESH_THRESHOLD_MS} ms",
         super::rotate_lead_ms(shipped)
     );
     // The floor, not the cadence term, is what clears it at the shipped rate.
@@ -6524,7 +6524,7 @@ fn proactive_rotation_never_fires_on_unknown_expiry() {
     ));
 }
 
-/// Liveness is not an input. Under the old gate a running `clauth start`
+/// Liveness is not an input. Under the old gate a running `tollgate start`
 /// session froze rotation on that account; it shares the credential file, so
 /// the predicate must not care either way — there is no session parameter left
 /// to pass, and this pins that the same inputs still decide.
@@ -7541,7 +7541,7 @@ fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
 // row the user watches (2026-07-12: the endpoint recovered while the active
 // account sat out a 14-minute slot as `RateLimited`), so shallow streaks cap
 // at 2× cadence. The cap RELEASES past `ACTIVE_CAP_MAX_STREAK`: the `/usage`
-// window counts rejected polls and only clauth's own polls fill it (#30), so
+// window counts rejected polls and only tollgate's own polls fill it (#30), so
 // a sustained storm must climb the same drain ladder as idle profiles or the
 // capped re-polls keep the window pinned. Idle profiles always keep the full
 // ladder.
@@ -8594,7 +8594,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
 // The sample series behind BOTH burn readers: the TUI's in-memory
 // `history_cache` and `fallback::burn_rate_for_profile`, the disk read that
 // gates burn-aware auto-switching. It is appended on the FETCH path, so the
-// holder of the single-fetcher lease owns it — a headless `clauth daemon` keeps
+// holder of the single-fetcher lease owns it — a headless `tollgate daemon` keeps
 // it advancing with no TUI open, and no second process can interleave a line.
 // Written from `App::apply_usage` instead, the log tracked TUI uptime: headless
 // it froze, the 2-day prune then emptied it, and burn-aware auto-switch
@@ -8799,7 +8799,7 @@ fn a_fresh_wire_reset_drops_the_prev_wire_sourced_window() {
     };
 
     // Both prev shapes a reset must be visible through: a wire-sourced window
-    // clauth never kicked, and a kick whose lag horizon has long passed.
+    // tollgate never kicked, and a kick whose lag horizon has long passed.
     for (name, prev) in [
         ("wire", pre_reset(97.0, None)),
         ("stale-kick", pre_reset(97.0, Some(now - 1200))),
@@ -9194,7 +9194,7 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
 // whole suite). These point all three Anthropic endpoints at one loopback
 // listener and assert which of them a leg actually reaches.
 
-/// THE ROW'S HEADLINE BEHAVIOUR. Under the old gate a live `clauth start`
+/// THE ROW'S HEADLINE BEHAVIOUR. Under the old gate a live `tollgate start`
 /// session made this leg bail to disk cache on every 401, so such an account
 /// served stale usage forever and never recovered its login. Off macOS it must
 /// now rotate through the 401 and re-poll with the new token.
@@ -9344,7 +9344,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
 
 /// The macOS counterpart: the same 401, the same live session, and the leg must
 /// NOT reach the token endpoint. This is the sign-out the refusal exists to
-/// prevent — clauth cannot hand the rotated pair to that session's Claude Code,
+/// prevent — tollgate cannot hand the rotated pair to that session's Claude Code,
 /// so spending the chain would strand it. Serving cache here is the correct
 /// outcome, not a degradation.
 #[cfg(target_os = "macos")]
@@ -9743,8 +9743,8 @@ fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_ref
 // set_rotation_blocked_override`): the predicate's first term is compile-time
 // false off macOS, so no Linux run reaches a `true` arm any other way.
 
-/// The refusal must not gate the carry. A live `clauth start` session blocks
-/// the ROTATION — clauth cannot write the Keychain item that session's CC
+/// The refusal must not gate the carry. A live `tollgate start` session blocks
+/// the ROTATION — tollgate cannot write the Keychain item that session's CC
 /// reads — but the carry spends no refresh token; it only reads the store. So
 /// a flagged profile whose on-disk pair an external re-login through the
 /// session's own chain already moved still self-heals: quarantine lifted,
@@ -10515,7 +10515,7 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
 // the post-adopt relink, which no assertion here reads.
 
 /// The pre-spend adopt. CC's routine refresh renames a fresh regular file over
-/// clauth's symlink, so the live slot holds a fresher same-account pair while
+/// tollgate's symlink, so the live slot holds a fresher same-account pair while
 /// the store lags — and the store's refresh token is already spent. Adopting
 /// costs zero requests to the token endpoint; spending is what lands the
 /// profile in `auth_broken` on the next tick.
@@ -10867,7 +10867,7 @@ fn claude_rolling_tick_transient_failure_widens_the_retry() {
 fn claude_rolling_tick_skips_a_disabled_profile() {
     let _home = crate::testutil::HomeSandbox::new();
     let config = rolling_profile_config(&["cl-off"], &[]);
-    // Disable it the way `clauth disable` does.
+    // Disable it the way `tollgate disable` does.
     {
         let mut cfg = config.lock().expect("lock");
         cfg.find_mut(&crate::profile::ProfileName::from("cl-off"))

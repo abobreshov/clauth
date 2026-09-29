@@ -23,7 +23,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
     }
 }
 
-/// A row written by a clauth that predates the opt-in field must not read as
+/// A row written by a tollgate that predates the opt-in field must not read as
 /// opted IN on upgrade — the decision leg would then move EVERY live session off
 /// the account it launched on.
 #[test]
@@ -57,8 +57,8 @@ fn a_codex_row_round_trips_its_harness_tag() {
     let listed = list().pop().expect("one row");
     assert_eq!(listed, written, "the tag must survive the round-trip");
     let raw = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("live_sessions")
             .join("4242-0.json"),
     )
@@ -116,7 +116,7 @@ fn each_writers_update_preserves_the_others_fields() {
     assert_eq!(after.chain_cursor, Some(2));
 }
 
-/// A delegate's row is registered by the `clauth mcp` that spawns it (that
+/// A delegate's row is registered by the `tollgate mcp` that spawns it (that
 /// process's `std::process::id()` is what register reads) and re-keyed onto the
 /// delegate child right after spawn. `set_pid` is the mutator behind the
 /// re-key, and it must move nothing else — the daemon's decision fields least
@@ -383,7 +383,7 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
     );
 }
 
-/// After `clauth delete <launch_profile> --force`, the launch profile's marker
+/// After `tollgate delete <launch_profile> --force`, the launch profile's marker
 /// dir is gone — but the session keeps running on `current_member` and holds
 /// that member's marker. The probe must look at `current_member`, not
 /// `start_profile`, to find it.
@@ -398,7 +398,7 @@ fn a_swapped_session_counts_on_current_member_after_its_launch_marker_is_removed
     };
     register(&swapped).expect("register the swapped row");
     // Hold the marker for `current_member` ("spare"), not `start_profile`
-    // ("work"). The procedure `clauth delete work --force` removed the
+    // ("work"). The procedure `tollgate delete work --force` removed the
     // work markers, so only the spare marker exists.
     let _marker = crate::runtime::hold_session_row_marker(
         &crate::profile::ProfileName::from("spare"),
@@ -492,7 +492,7 @@ fn write_linked_credentials(refresh: &str) {
     .expect("write linked credentials");
 }
 
-/// A bare `claude` — started without `clauth start` — burns the same account
+/// A bare `claude` — started without `tollgate start` — burns the same account
 /// window a supervised session does, and the daemon's global auto-switch really
 /// does move it (it repoints the very link the session re-reads), so it counts as
 /// following the chain too.
@@ -546,7 +546,7 @@ fn bare_attribution_follows_the_credential_link_not_the_active_profile() {
 }
 
 /// The fd closing IS the release, which is what makes this survive SIGKILL: a
-/// bare session runs no clauth code and has no teardown path to unregister from.
+/// bare session runs no tollgate code and has no teardown path to unregister from.
 #[test]
 fn releasing_a_bare_marker_stops_it_counting() {
     let _home = HomeSandbox::new();
@@ -585,7 +585,7 @@ fn releasing_a_bare_marker_stops_it_counting() {
     assert!(settled, "a released bare marker must stop counting");
 }
 
-/// The tally is read by a TUI that may itself be running inside a `clauth start`
+/// The tally is read by a TUI that may itself be running inside a `tollgate start`
 /// session, where `CLAUDE_CONFIG_DIR` names its own runtime tree. That env
 /// describes the READER, so letting it reach the attribution claims every bare
 /// `claude` on the box for the reader's profile. Pinning the resolver in
@@ -603,7 +603,7 @@ fn bare_attribution_ignores_the_readers_own_config_dir() {
     write_linked_credentials("rt-work");
     let reader_runtime = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("spare")
         .join("runtime-4242-0");

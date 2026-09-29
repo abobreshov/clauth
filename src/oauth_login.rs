@@ -1,5 +1,5 @@
 //! Interactive OAuth login for a fresh Claude Code account, shared by the
-//! `clauth login` CLI and the TUI Setup tab (login / re-login rows). Both
+//! `tollgate login` CLI and the TUI Setup tab (login / re-login rows). Both
 //! observe the flow through [`LoginProgress`] callbacks.
 //!
 //! One login, two doors. [`begin_login`] mints ONE PKCE pair and ONE `state`,
@@ -285,7 +285,7 @@ fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
     let html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>clauth</title><style>\
+         <title>tollgate</title><style>\
          :root{{--bg:#1E1E2E;--raised:#181825;--line:#313244;--text:#CDD6F4;--dim:#A6ADC8;--faint:#7F849C;--tone:{tone}}}\
          @media(prefers-color-scheme:light){{:root{{--bg:#EFF1F5;--raised:#FFFFFF;--line:#CCD0DA;--text:#1E1E2E;--dim:#6C6F85;--faint:#9CA0B0;--tone:{tone_light}}}}}\
          *{{box-sizing:border-box;margin:0;padding:0}}\
@@ -295,7 +295,7 @@ fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
          h1{{font-size:22px;font-weight:550;letter-spacing:-.01em;margin-bottom:8px}}\
          p{{font-size:14px;line-height:1.55;color:var(--dim)}}\
          </style></head><body><main>\
-         <div class=\"eyebrow\">clauth</div><h1>{title}</h1><p>{detail}</p>\
+         <div class=\"eyebrow\">tollgate</div><h1>{title}</h1><p>{detail}</p>\
          </main>{script}</body></html>",
         title = page.title,
         detail = page.detail,
@@ -315,7 +315,7 @@ fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
 /// The callback's `error` / `error_description` query params are upstream text
 /// with NO cap (worse than the token-endpoint bodies, which at least passed a
 /// first-line + 200-char trim), and they used to be interpolated straight into
-/// `clauth login`'s stderr and the TUI Setup toast. So `error` is PARSED into
+/// `tollgate login`'s stderr and the TUI Setup toast. So `error` is PARSED into
 /// RFC 6749 §4.1.2.1's closed code set at the boundary and its bytes dropped;
 /// `error_description` is free-form and never leaves the wire at all. No
 /// `Display`, no conversion into `anyhow::Error`.
@@ -396,7 +396,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             Page {
                 tone: Tone::Danger,
                 title: "That request didn't parse",
-                detail: "clauth expected an OAuth callback here. clauth is still waiting \
+                detail: "tollgate expected an OAuth callback here. tollgate is still waiting \
                          for the real callback; you can close this tab.",
                 auto_close: false,
             },
@@ -421,7 +421,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
     if let Some(err) = query_param(query, "error") {
         // Parse before anything else touches it: `err` and the `error_description`
         // beside it are uncapped browser-supplied text, and interpolating them
-        // into the `bail!` below put them on `clauth login`'s stderr and the TUI
+        // into the `bail!` below put them on `tollgate login`'s stderr and the TUI
         // Setup toast verbatim. `error_description` is not read at all.
         let rejection = AuthorizeRejection::parse(&err);
         // A user-declined consent screen reads differently from a broken flow.
@@ -430,7 +430,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
                 tone: Tone::Warning,
                 title: "Login canceled",
                 detail: "You declined the authorization request, so no login was \
-                         captured. Close this tab; you can retry from clauth any time.",
+                         captured. Close this tab; you can retry from tollgate any time.",
                 auto_close: false,
             }
         } else {
@@ -438,13 +438,13 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
                 tone: Tone::Danger,
                 title: "Login failed",
                 detail: "Claude reported an error during authorization. Close this \
-                         tab and retry the login from clauth.",
+                         tab and retry the login from tollgate.",
                 auto_close: false,
             }
         };
         write_response(&stream, "400 Bad Request", page);
         logline!(
-            "clauth: the authorize callback refused the login: {}",
+            "tollgate: the authorize callback refused the login: {}",
             rejection.log_detail()
         );
         anyhow::bail!("{}", rejection.user_message());
@@ -457,7 +457,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
                 tone: Tone::Danger,
                 title: "No code in the callback",
                 detail: "The redirect arrived without an authorization code. Close \
-                         this tab; clauth is still waiting for the real callback.",
+                         this tab; tollgate is still waiting for the real callback.",
                 auto_close: false,
             },
         );
@@ -470,8 +470,8 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             Page {
                 tone: Tone::Danger,
                 title: "Login blocked",
-                detail: "This callback didn't match the login clauth started, so it \
-                         was rejected for safety. Retry the login from clauth.",
+                detail: "This callback didn't match the login tollgate started, so it \
+                         was rejected for safety. Retry the login from tollgate.",
                 auto_close: false,
             },
         );
@@ -483,7 +483,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         Page {
             tone: Tone::Success,
             title: "You're logged in",
-            detail: "clauth captured the login. This tab will try to close itself; \
+            detail: "tollgate captured the login. This tab will try to close itself; \
                      if it sticks around, close it and head back to the terminal.",
             auto_close: true,
         },
@@ -546,7 +546,7 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
             expires_at: Some((now_ms() + token.expires_in * 1000) as i64),
             scopes,
             subscription_type: None,
-            // A login clauth mints itself has no outside-written keys to keep.
+            // A login tollgate mints itself has no outside-written keys to keep.
             // Claude Code adds its own on its first token save (measured:
             // `refreshTokenExpiresAt`, `rateLimitTier`), and the catch-all
             // holds them from then on. The tier is stamped HERE too instead of
@@ -567,10 +567,10 @@ pub(crate) struct LoginOutcome {
     pub(crate) account_uuid: Option<AccountId>,
 }
 
-/// Why a `clauth login` produced no credential.
+/// Why a `tollgate login` produced no credential.
 ///
 /// Typed so its two callers can diverge exactly as the switch path's already do:
-/// `clauth login`'s stderr names the HTTP status (a terminal has no companion
+/// `tollgate login`'s stderr names the HTTP status (a terminal has no companion
 /// log open beside it) and the TUI's login toast does not. No `Display` and no
 /// `Into<anyhow::Error>`, so neither caller can bypass that split with a bare
 /// `{e}` or a `?`.
@@ -582,7 +582,7 @@ pub(crate) enum LoginError {
     /// Everything else: the authorize callback's rejection (already canned by
     /// [`AuthorizeRejection`], and a browser redirect carries no HTTP status of
     /// ours to name), CSPRNG, the loopback bind/accept, the state mismatch, the
-    /// login timeout. All clauth-authored, so both renderings coincide.
+    /// login timeout. All tollgate-authored, so both renderings coincide.
     Local(anyhow::Error),
 }
 
@@ -593,7 +593,7 @@ impl LoginError {
     /// The operative fact is that this function has NO retry path around
     /// `exchange_code`: whatever the status, the failure unwinds out of
     /// [`PendingLogin::run`] and the only action left to anyone is running
-    /// `clauth login` again. So the refresh path's `Wait` — right for a 429 it
+    /// `tollgate login` again. So the refresh path's `Wait` — right for a 429 it
     /// will re-attempt on its next tick — names an action that does not exist
     /// here.
     ///
@@ -628,7 +628,7 @@ impl LoginError {
         }
     }
 
-    /// Canned plus the HTTP status where one exists: `clauth login`'s stderr.
+    /// Canned plus the HTTP status where one exists: `tollgate login`'s stderr.
     pub(crate) fn cli_message(&self) -> String {
         match self {
             Self::Exchange(f) => Self::transient(f).text_with_status(),
@@ -654,7 +654,7 @@ fn finish_login(
     let token = crate::oauth::exchange_code(code, verifier, redirect_uri, state).map_err(|e| {
         // The BODY stops here; the status rides the typed value so stderr can
         // name it and the toast cannot.
-        logline!("clauth: login code exchange failed: {}", e.log_detail());
+        logline!("tollgate: login code exchange failed: {}", e.log_detail());
         LoginError::Exchange(e)
     })?;
     let mut creds = credentials_from_token(token);
@@ -668,7 +668,7 @@ fn finish_login(
     // credits-only, and a login block without it reads as untiered), and carry
     // out the account uuid so the caller can anchor the profile without a
     // second identical request. Best-effort: a probe failure never fails the login
-    // — clauth's usage poll re-derives the tier within a cycle and the anchor
+    // — tollgate's usage poll re-derives the tier within a cycle and the anchor
     // backfills on the hourly ride-along.
     let mut account_uuid = None;
     if let Some(oauth) = creds.claude_ai_oauth.as_mut()
@@ -857,7 +857,7 @@ pub(crate) fn parse_manual_code(
     Ok(code.to_string())
 }
 
-/// A one-glance summary of a captured login for the `clauth login` CLI. Never
+/// A one-glance summary of a captured login for the `tollgate login` CLI. Never
 /// prints the tokens — just a sha256 prefix of the refresh token (proves it is
 /// real and lets you confirm it differs from other profiles), the granted
 /// scopes, and the access-token expiry.

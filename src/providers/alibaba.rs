@@ -40,7 +40,7 @@ pub(crate) const DEFAULT_REGION: &str = "cn-beijing";
 /// sit in, used when deriving a console site/region from a `base_url`.
 const INTL_REGION: &str = "ap-southeast-1";
 
-/// The inference hosts clauth recognises as Alibaba Model Studio, each with the
+/// The inference hosts tollgate recognises as Alibaba Model Studio, each with the
 /// console site + region its plan is administered from, and the console page
 /// where that plan's api key and quota live. These are the four the shipped
 /// presets point at; matching is host-boundary (`url_matches_host`), so
@@ -127,7 +127,7 @@ pub(crate) struct Gateway {
 /// Gateway for a (region, site) pair. An unknown region falls back to the
 /// `cn-beijing` row **for that site**: the site is the one axis that can't be
 /// guessed (a token minted on one front is meaningless on the other), while a
-/// region clauth doesn't know is most likely a new mainland one.
+/// region tollgate doesn't know is most likely a new mainland one.
 pub(crate) fn gateway(region: &str, site: ConsoleSite) -> Gateway {
     match (region, site) {
         (INTL_REGION, ConsoleSite::Domestic) => Gateway {
@@ -279,7 +279,7 @@ fn unwrap_payload<T: DeserializeOwned>(text: &str) -> Result<T, ThirdPartyError>
 /// The 5h pair is emitted only when the response actually carries it: it is
 /// documented and every tier publishes a `five_hour` allowance, yet a real Solo
 /// account returned the weekly pair alone even after spending, so a synthesised
-/// 5h bar would be a claim clauth cannot make.
+/// 5h bar would be a claim tollgate cannot make.
 fn stats(
     usage: &UsagePayload,
     subscription: Option<&SubscriptionPayload>,

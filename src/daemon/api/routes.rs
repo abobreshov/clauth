@@ -299,7 +299,7 @@ pub(crate) struct Handled {
 /// Everything a request handler is allowed to touch.
 pub(crate) struct ApiContext {
     pub(crate) config: ConfigHandle,
-    /// `~/.clauth/status.json` — the feed the main loop rewrites each tick.
+    /// `~/.tollgate/status.json` — the feed the main loop rewrites each tick.
     pub(crate) status_path: PathBuf,
     /// One in-flight `POST /api/v1/switch` at a time. See [`rank::ApiSwitch`].
     pub(crate) switch_gate: RankedMutex<(), rank::ApiSwitch>,
@@ -391,14 +391,14 @@ pub(crate) fn republish(ctx: &ApiContext) {
 }
 
 /// The reason every failed pairing redemption carries, whatever failed.
-const PAIRING_REFUSED: &str = "that code did not pair a device: check it, or run `clauth devices \
+const PAIRING_REFUSED: &str = "that code did not pair a device: check it, or run `tollgate devices \
                                pair <name>` on the host for a new one";
 /// The reason a view-only device gets from a route that needs control.
 const CONTROL_REQUIRED: &str = "this device is paired view-only; this needs a device paired with \
-                                `clauth devices pair <name> --control` on the host";
+                                `tollgate devices pair <name> --control` on the host";
 /// The reason a device with a tier this build does not know gets everywhere.
-const TIER_UNKNOWN: &str = "this device was paired by a newer clauth with a tier this one does \
-                            not know; run that clauth, or revoke the device and pair it again";
+const TIER_UNKNOWN: &str = "this device was paired by a newer tollgate with a tier this one does \
+                            not know; run that tollgate, or revoke the device and pair it again";
 
 /// Resolve the route, authenticate, check the route's access, dispatch.
 ///
@@ -451,7 +451,7 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
             // The per-request line names the route and status only, so the
             // cause has to be carried by this one line or nowhere.
             if !READ_FAILED_NOTED.swap(true, Ordering::AcqRel) {
-                logline!("clauth api: refusing every request until the device list reads: {e:#}");
+                logline!("tollgate api: refusing every request until the device list reads: {e:#}");
             }
             return Handled {
                 response: Response::error(500, "internal"),
@@ -511,8 +511,8 @@ static UNKNOWN_TIER_NOTED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn refuse_unknown_tier(device: &devices::Device) -> Response {
     if !UNKNOWN_TIER_NOTED.swap(true, Ordering::AcqRel) {
         logline!(
-            "clauth api: device '{}' carries tier {:?}, which this build does not \
-             know, so every route refuses it; run the clauth that paired it",
+            "tollgate api: device '{}' carries tier {:?}, which this build does not \
+             know, so every route refuses it; run the tollgate that paired it",
             sanitize_for_log(&device.name),
             sanitize_for_log(device.tier.as_str())
         );
@@ -555,7 +555,7 @@ pub(crate) struct HealthBody {
     responses(
         (status = 200, description = "the build's version and the feed schema", body = HealthBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -571,7 +571,7 @@ fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     )
 }
 
-/// `GET /api/v1/status` — the same body `~/.clauth/status.json` carries.
+/// `GET /api/v1/status` — the same body `~/.tollgate/status.json` carries.
 ///
 /// Served straight off disk in the common case. The main loop already rewrites
 /// that file atomically every tick, so passing the bytes through takes no lock,
@@ -601,7 +601,7 @@ fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
         (status = 200, description = "the status feed", body = crate::daemon::status_json::StatusBody, headers(("ETag" = String, description = "the feed's entity tag"))),
         (status = 304, description = "the feed has not changed", headers(("ETag" = String, description = "the feed's entity tag"))),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read, or the status body failed to serialize (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -667,7 +667,7 @@ fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
             Response::raw_json_tagged(200, bytes, etag)
         }
         Err(e) => {
-            logline!("clauth api: failed to serialize a status body: {e}");
+            logline!("tollgate api: failed to serialize a status body: {e}");
             Response::error(500, "internal")
         }
     }
@@ -775,7 +775,7 @@ pub(crate) struct SwitchOk {
 /// MCP `switch` tool calls. That is deliberate and load-bearing: the AUTH-1
 /// gate (never install credentials a refresh has rejected), the disabled-target
 /// refusal, and the divergence policy all live inside it, so this endpoint
-/// cannot drift into a weaker switch than the rest of clauth performs.
+/// cannot drift into a weaker switch than the rest of tollgate performs.
 #[utoipa::path(
     post,
     path = "/api/v1/switch",
@@ -784,7 +784,7 @@ pub(crate) struct SwitchOk {
         (status = 200, description = "the switch landed; the profile left behind and the one now active", body = SwitchOk),
         (status = 400, description = "the body held no parseable profile (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
@@ -831,7 +831,7 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     ) {
         Ok((previous, active)) => {
             logline!(
-                "clauth api: device '{}' switched to '{active}'",
+                "tollgate api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
             republish(ctx);
@@ -852,12 +852,12 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             // (`failed to publish /home/…/credentials.json`), and a body is
             // the one surface handed to a remote reader.
             logline!(
-                "clauth api: device '{}' switch to '{canonical}' refused: {}",
+                "tollgate api: device '{}' switch to '{canonical}' refused: {}",
                 caller.device_for_log(),
                 sanitize_for_log(&format!("{e:#}"))
             );
             // A held state flock is the one retryable failure here: another
-            // clauth process is mid-write, and the same request will work in a
+            // tollgate process is mid-write, and the same request will work in a
             // moment. Everything else needs the operator to change something.
             if let Some(timeout) = e.state_lock_timeout() {
                 Response::refused(
@@ -931,7 +931,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     match pairing::redeem(&code) {
         Ok(Redeemed::Paired { name, tier, token }) => {
             logline!(
-                "clauth api: {} paired device '{}' ({})",
+                "tollgate api: {} paired device '{}' ({})",
                 caller.peer,
                 sanitize_for_log(&name),
                 sanitize_for_log(tier.as_str())
@@ -949,7 +949,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
         Ok(Redeemed::Refused) => Response::refused(403, "pairing_refused", PAIRING_REFUSED),
         Err(e) => {
             logline!(
-                "clauth api: {} pairing failed: {}",
+                "tollgate api: {} pairing failed: {}",
                 caller.peer,
                 sanitize_for_log(&format!("{e:#}"))
             );
@@ -1016,7 +1016,7 @@ pub(crate) fn openapi_document_bytes() -> Result<Vec<u8>, String> {
     responses(
         (status = 200, description = "the OpenAPI document for this API", body = serde_json::Value, content_type = "application/json"),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read, or the document failed to serialize (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -1025,7 +1025,7 @@ fn openapi_document(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     match openapi_document_bytes() {
         Ok(document) => Response::raw_json(200, document),
         Err(e) => {
-            logline!("clauth api: {e}");
+            logline!("tollgate api: {e}");
             Response::error(500, "internal")
         }
     }

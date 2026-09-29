@@ -1,8 +1,8 @@
-//! `clauth herdr install`'s decision half. `plan_config` is pure text in, text
+//! `tollgate herdr install`'s decision half. `plan_config` is pure text in, text
 //! out, which is where the append-only rule either holds or corrupts a config
-//! clauth does not own; the subprocess half (herdr's installer, `config check`)
+//! tollgate does not own; the subprocess half (herdr's installer, `config check`)
 //! is covered by running the command against a real herdr. The `[herdr]` knob
-//! table in profiles.toml and its `clauth herdr config get` read path are
+//! table in profiles.toml and its `tollgate herdr config get` read path are
 //! pinned here too, through the same load the TUI uses.
 
 use super::*;
@@ -27,10 +27,10 @@ fn appended(existing: &str, key: &str, delegate_row_text: bool) -> String {
 #[test]
 fn empty_config_gets_both_blocks() {
     let text = appended("", "prefix+a", false);
-    assert!(text.contains(r#"command = "clauth.open""#));
+    assert!(text.contains(r#"command = "tollgate.open""#));
     assert!(text.contains(r#"key = "prefix+a""#));
     assert!(text.contains("[ui.sidebar.agents.rows_by_agent]"));
-    assert!(text.contains("$clauth"));
+    assert!(text.contains("$tollgate"));
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn an_existing_binding_is_left_alone() {
         "[[keys.command]]\n",
         "key = \"prefix+z\"\n",
         "type = \"plugin_action\"\n",
-        "command = \"clauth.open\"\n"
+        "command = \"tollgate.open\"\n"
     );
     let plan = plan_config(existing, "prefix+a", false).expect("plan");
     assert!(
@@ -60,7 +60,7 @@ fn another_plugins_binding_does_not_count_as_ours() {
         "command = \"someone.else\"\n"
     );
     let text = appended(existing, "prefix+a", false);
-    assert!(text.contains(r#"command = "clauth.open""#));
+    assert!(text.contains(r#"command = "tollgate.open""#));
     // Arrays of tables append cleanly, so both bindings survive.
     let doc: toml::Value = toml::from_str(&text).expect("parses");
     let commands = doc["keys"]["command"].as_array().expect("array");
@@ -71,7 +71,7 @@ fn another_plugins_binding_does_not_count_as_ours() {
 fn a_claude_row_already_rendering_the_token_is_left_alone() {
     let existing = concat!(
         "[ui.sidebar.agents.rows_by_agent]\n",
-        r#"claude = [["state_icon"], ["agent", "$clauth"]]"#,
+        r#"claude = [["state_icon"], ["agent", "$tollgate"]]"#,
         "\n"
     );
     let plan = plan_config(existing, "prefix+a", false).expect("plan");
@@ -176,11 +176,11 @@ fn a_key_that_would_break_the_file_is_refused() {
 /// crate cannot silently turn "already wired" into "wire it again".
 #[test]
 fn token_detection_walks_nested_groups() {
-    let row: toml::Value = toml::from_str(r#"v = [["a"], ["b", "$clauth"]]"#).expect("parse");
+    let row: toml::Value = toml::from_str(r#"v = [["a"], ["b", "$tollgate"]]"#).expect("parse");
     assert!(mentions_token(&row["v"]));
     let plain: toml::Value = toml::from_str(r#"v = [["a"], ["b"]]"#).expect("parse");
     assert!(!mentions_token(&plain["v"]));
-    let substring: toml::Value = toml::from_str(r#"v = ["$clauthx"]"#).expect("parse");
+    let substring: toml::Value = toml::from_str(r#"v = ["$tollgatex"]"#).expect("parse");
     assert!(
         !mentions_token(&substring["v"]),
         "a longer name is a different token"
@@ -257,14 +257,14 @@ fn only_diagnostics_the_edit_added_are_refused() {
 #[test]
 fn the_config_root_is_derived_from_herdrs_own_path_or_refused() {
     assert_eq!(
-        config_path_from_plugin_dir("/home/u/.config/herdr/plugins/config/clauth"),
+        config_path_from_plugin_dir("/home/u/.config/herdr/plugins/config/tollgate"),
         Some(std::path::PathBuf::from(
             "/home/u/.config/herdr/config.toml"
         ))
     );
     assert_eq!(
         config_path_from_plugin_dir(
-            "/Users/u/Library/Application Support/herdr/plugins/config/clauth"
+            "/Users/u/Library/Application Support/herdr/plugins/config/tollgate"
         ),
         Some(std::path::PathBuf::from(
             "/Users/u/Library/Application Support/herdr/config.toml"
@@ -272,11 +272,11 @@ fn the_config_root_is_derived_from_herdrs_own_path_or_refused() {
     );
     assert_eq!(config_path_from_plugin_dir(""), None);
     assert_eq!(
-        config_path_from_plugin_dir("/plugins/config/clauth"),
+        config_path_from_plugin_dir("/plugins/config/tollgate"),
         None,
         "root has no config.toml of herdr's"
     );
-    assert_eq!(config_path_from_plugin_dir("clauth"), None);
+    assert_eq!(config_path_from_plugin_dir("tollgate"), None);
 }
 
 /// The seam `install` writes through: a plan appended onto its file must strip back to that file, byte for byte. `uninstall`'s strip is knob-agnostic, so the delegate row (knob on) has to round-trip the same as today's.
@@ -326,7 +326,7 @@ fn registry_entry_from_reads_every_real_shape() {
     assert_eq!(linked.min_herdr_version.as_deref(), Some("0.8.0"));
     assert_eq!(
         linked.plugin_root.as_deref(),
-        Some("/home/uwuclxdy/repos/rs/clauth/herdr-plugin")
+        Some("/home/uwuclxdy/repos/rs/tollgate/herdr-plugin")
     );
     assert_eq!(linked.source_kind.as_deref(), Some("local"));
     assert!(linked.warnings.is_empty());
@@ -346,7 +346,7 @@ fn registry_entry_from_reads_every_real_shape() {
     assert!(stale.enabled);
     assert_eq!(
         stale.plugin_root.as_deref(),
-        Some("/gone/clauth/herdr-plugin")
+        Some("/gone/tollgate/herdr-plugin")
     );
     assert_eq!(
         stale.warnings,
@@ -362,12 +362,12 @@ fn registry_entry_from_reads_every_real_shape() {
 }
 
 /// The one install refusal: a registered local link is the developer's live
-/// tree, herdr refuses a github install over it, and clauth must say so before
+/// tree, herdr refuses a github install over it, and tollgate must say so before
 /// the fetch, naming the tree and both ways out.
 #[test]
 fn install_refuses_over_a_registered_local_link() {
     let local = registry_entry_from(&plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","plugin_root":"/tree/herdr-plugin","source":{"kind":"local"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","plugin_root":"/tree/herdr-plugin","source":{"kind":"local"}}"#,
     ))
     .expect("entry");
     let err = refuse_over_local_link(Some(&local)).expect_err("a local link refuses");
@@ -377,7 +377,7 @@ fn install_refuses_over_a_registered_local_link() {
         "the error names the tree: {text}"
     );
     assert!(
-        text.contains("clauth herdr uninstall"),
+        text.contains("tollgate herdr uninstall"),
         "the error names the way out: {text}"
     );
     assert!(
@@ -386,7 +386,7 @@ fn install_refuses_over_a_registered_local_link() {
     );
 
     let github = registry_entry_from(&plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github"}}"#,
     ))
     .expect("entry");
     refuse_over_local_link(Some(&github)).expect("a github entry proceeds");
@@ -402,7 +402,7 @@ fn install_refuses_over_a_registered_local_link() {
 fn install_refuses_a_local_link_before_running_herdrs_installer() {
     let home = crate::testutil::HomeSandbox::new();
     let answer = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","plugin_root":"/tree/herdr-plugin","source":{"kind":"local"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","plugin_root":"/tree/herdr-plugin","source":{"kind":"local"}}"#,
     );
     let shim = write_shim(
         home.home(),
@@ -454,11 +454,11 @@ fn install_refuses_a_local_link_before_running_herdrs_installer() {
 fn the_installing_line_names_the_pinned_tag() {
     assert_eq!(
         installing_line(Some("v0.15.1")),
-        "clauth: installing uwuclxdy/clauth/herdr-plugin at v0.15.1 into herdr"
+        "tollgate: installing abobreshov/clauth/herdr-plugin at v0.15.1 into herdr"
     );
     assert_eq!(
         installing_line(None),
-        "clauth: installing uwuclxdy/clauth/herdr-plugin into herdr"
+        "tollgate: installing abobreshov/clauth/herdr-plugin into herdr"
     );
 }
 
@@ -472,7 +472,7 @@ fn the_unpinned_release_note_names_the_error_and_the_fallback() {
         "the note names the probe failure: {note}"
     );
     assert!(
-        note.contains("installing uwuclxdy/clauth/herdr-plugin unpinned"),
+        note.contains("installing abobreshov/clauth/herdr-plugin unpinned"),
         "the note names the fallback: {note}"
     );
 }
@@ -552,10 +552,10 @@ fn annotated_tag(tag: &str, tag_object: &str, commit: &str) -> String {
 fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
     let home = crate::testutil::HomeSandbox::new();
     let before = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let after = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"dddddddddddddddd"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"dddddddddddddddd"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -574,7 +574,9 @@ fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
         .expect("heal runs")
         .expect("update lands");
     assert!(
-        line.contains("reinstalled the herdr plugin from uwuclxdy/clauth/herdr-plugin at v0.15.10"),
+        line.contains(
+            "reinstalled the herdr plugin from abobreshov/clauth/herdr-plugin at v0.15.10"
+        ),
         "the line names the release the update landed at: {line}"
     );
     assert!(
@@ -585,13 +587,13 @@ fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.10 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.10 --yes",
         "the update is a reinstall pinned to the release tag, preview skipped"
     );
     let git_log = std::fs::read_to_string(home.home().join("git.log")).unwrap_or_default();
     assert_eq!(
         git_log.trim(),
-        "ls-remote --tags https://github.com/uwuclxdy/clauth.git",
+        "ls-remote --tags https://github.com/abobreshov/clauth.git",
         "the probe reads the release tags"
     );
 }
@@ -605,7 +607,7 @@ fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
 fn plugin_heal_skips_an_install_at_the_latest_release() {
     let home = crate::testutil::HomeSandbox::new();
     let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"bbbbbbbbbbbbbbbb"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"bbbbbbbbbbbbbbbb"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -635,10 +637,10 @@ fn plugin_heal_skips_an_install_at_the_latest_release() {
 fn plugin_heal_reports_the_tag_commit_when_the_fresh_probe_has_no_commit() {
     let home = crate::testutil::HomeSandbox::new();
     let before = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let after = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -659,14 +661,14 @@ fn plugin_heal_reports_the_tag_commit_when_the_fresh_probe_has_no_commit() {
 }
 
 /// Every shape that carries no github commit is skipped before any network
-/// call: no clauth entry, a linked checkout, a disabled entry, and a github
+/// call: no tollgate entry, a linked checkout, a disabled entry, and a github
 /// entry whose commit field is missing.
 #[cfg(unix)]
 #[test]
 fn plugin_heal_skips_every_non_stale_shape() {
     let home = crate::testutil::HomeSandbox::new();
     let stale = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -674,33 +676,37 @@ fn plugin_heal_skips_every_non_stale_shape() {
 
     let cases = [
         (
-            "no clauth entry",
+            "no tollgate entry",
             plugin_list_json(r#"{"plugin_id":"other"}"#),
         ),
         (
             "a linked checkout",
-            plugin_list_json(r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"local"}}"#),
+            plugin_list_json(
+                r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"local"}}"#,
+            ),
         ),
         (
             "a disabled entry",
             plugin_list_json(
-                r#"{"enabled":false,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+                r#"{"enabled":false,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
             ),
         ),
         (
             "a github entry without a commit",
-            plugin_list_json(r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github"}}"#),
+            plugin_list_json(
+                r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github"}}"#,
+            ),
         ),
         (
             "a fork's install",
             plugin_list_json(
-                r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"someone","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+                r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"someone","repo":"tollgate","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
             ),
         ),
         (
             "a fork under a different repo name",
             plugin_list_json(
-                r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth-plugins","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+                r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"uwuclxdy","repo":"tollgate-plugins","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
             ),
         ),
     ];
@@ -731,7 +737,7 @@ fn plugin_heal_skips_every_non_stale_shape() {
 fn plugin_heal_fails_loud_when_the_remote_probe_fails() {
     let home = crate::testutil::HomeSandbox::new();
     let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     write_shim(home.home(), "git", "exit 1");
@@ -752,7 +758,7 @@ fn plugin_heal_fails_loud_when_the_remote_probe_fails() {
 fn plugin_heal_skips_when_no_release_tag_exists() {
     let home = crate::testutil::HomeSandbox::new();
     let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -782,7 +788,7 @@ fn plugin_heal_skips_when_no_release_tag_exists() {
 fn plugin_heal_fails_loud_when_the_install_fails() {
     let home = crate::testutil::HomeSandbox::new();
     let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = write_shim(
         home.home(),
@@ -810,7 +816,7 @@ fn plugin_heal_fails_loud_when_the_install_fails() {
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.1 --yes",
         "the failed install was pinned to the tag"
     );
 }
@@ -823,7 +829,7 @@ fn plugin_heal_fails_loud_when_the_install_fails() {
 fn plugin_heal_bounds_a_stalled_install() {
     let home = crate::testutil::HomeSandbox::new();
     let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = write_shim(
         home.home(),
@@ -849,7 +855,7 @@ fn plugin_heal_bounds_a_stalled_install() {
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.1 --yes",
         "the stalled install was pinned to the tag"
     );
     assert!(
@@ -858,113 +864,18 @@ fn plugin_heal_bounds_a_stalled_install() {
     );
 }
 
-/// `heal_detached` reinstalls once per throttle window: the first attempt
-/// installs, a second spawns nothing.
+/// Self-update is compiled out of this build (plan §4.0), and the detached
+/// herdr heal is a network reinstall, so it is a no-op whatever the saved
+/// toggle says: over a stale github registration with a newer release tag on
+/// the remote, neither a saved-on nor a saved-off call installs anything.
 #[cfg(unix)]
 #[test]
-fn heal_detached_reinstalls_once_and_throttles() {
-    use crate::testutil::join_background_tasks;
-
-    let home = crate::testutil::HomeSandbox::new();
-    let before = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
-    );
-    let after = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"bbbbbbbbbbbbbbbb"}}"#,
-    );
-    let shim = stateful_heal_shim(home.home());
-    git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
-    let _env = heal_env(
-        &home,
-        &shim,
-        &before,
-        &after,
-        &tags,
-        &[("HERDR_SHIM_STATE", std::ffi::OsStr::new("1"))],
-    );
-    reset_heal_throttle_for_test();
-
-    heal_detached(true);
-    join_background_tasks();
-    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
-    assert_eq!(
-        log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
-        "the first attempt installs"
-    );
-
-    // The floor is armed by the first attempt: a second spawns nothing.
-    heal_detached(true);
-    join_background_tasks();
-    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
-    assert_eq!(
-        log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
-        "the floor refuses a second attempt"
-    );
-}
-
-/// The opt-out gates the network update before the throttle claim.
-#[cfg(unix)]
-#[test]
-fn heal_detached_respects_the_update_optout() {
+fn heal_detached_is_a_noop_in_this_build() {
     use crate::testutil::join_background_tasks;
 
     let home = crate::testutil::HomeSandbox::new();
     let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
-    );
-    let shim = stateful_heal_shim(home.home());
-    git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
-    let _env = heal_env(
-        &home,
-        &shim,
-        &entry,
-        &entry,
-        &tags,
-        &[
-            ("HERDR_SHIM_STATE", std::ffi::OsStr::new("1")),
-            ("CLAUTH_NO_UPDATE", std::ffi::OsStr::new("1")),
-        ],
-    );
-    reset_heal_throttle_for_test();
-
-    heal_detached(true);
-    join_background_tasks();
-    assert!(
-        !home.home().join("heal.log").exists(),
-        "the opt-out gates the network update"
-    );
-
-    // The gate must run BEFORE the throttle claim: if the opted-out call had
-    // claimed, the floor would refuse this second, un-gated call. It landing
-    // proves the opted-out call never armed the floor.
-    let _unset = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
-    heal_detached(true);
-    join_background_tasks();
-    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
-    assert_eq!(
-        log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
-        "an un-gated call right after an opted-out one still installs"
-    );
-}
-
-/// The saved `[update].auto_update` toggle gates the network update exactly
-/// like the env opt-out: with the env unset, a saved off must suppress the
-/// install AND leave the throttle unclaimed (the un-gated follow-up call
-/// proves the floor was never armed). Red pre-change — the old gate read the
-/// env alone, so this first call installs.
-#[cfg(unix)]
-#[test]
-fn heal_detached_respects_the_saved_update_toggle() {
-    use crate::testutil::join_background_tasks;
-
-    let home = crate::testutil::HomeSandbox::new();
-    let entry = plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -979,52 +890,18 @@ fn heal_detached_respects_the_saved_update_toggle() {
     );
     reset_heal_throttle_for_test();
 
-    heal_detached(false);
-    join_background_tasks();
-    assert!(
-        !home.home().join("heal.log").exists(),
-        "the saved off gates the network update"
-    );
-
-    // The gate must run BEFORE the throttle claim: if the saved-off call had
-    // claimed, the floor would refuse this second, un-gated call. It landing
-    // proves the saved-off call never armed the floor.
-    heal_detached(true);
-    join_background_tasks();
-    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
-    assert_eq!(
-        log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
-        "an un-gated call right after a saved-off one still installs"
-    );
-}
-
-/// The fail-closed sentinel: `heal_detached` refuses to run when only
-/// `HERDR_BIN_PATH` is pinned, because a herdr pane injects that with the
-/// operator's real binary. The shim-state var is the sentinel a test fake sets.
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "stage a herdr shim beside a `HERDR_SHIM_STATE` pin")]
-fn heal_detached_fails_closed_without_the_shim_sentinel() {
-    let home = crate::testutil::HomeSandbox::new();
-    reset_heal_throttle_for_test();
-    let _env = crate::testutil::EnvPin::new(
-        &home,
-        &[
-            (
-                "HERDR_BIN_PATH",
-                Some(home.home().join("no-such-herdr").as_os_str()),
-            ),
-            ("HERDR_SHIM_STATE", None),
-            ("CLAUTH_NO_UPDATE", None),
-        ],
-    );
-
-    heal_detached(true);
+    for saved in [true, false] {
+        heal_detached(saved);
+        join_background_tasks();
+        assert!(
+            !home.home().join("heal.log").exists(),
+            "saved {saved}: the heal installs nothing in this build"
+        );
+    }
 }
 
 /// `install`'s herdr shim: answers the plugin list with `$ANSWER` (a registry
-/// with no clauth entry, so no local-link refusal fires) and records the
+/// with no tollgate entry, so no local-link refusal fires) and records the
 /// install argv.
 #[cfg(unix)]
 fn install_shim(dir: &Path) -> PathBuf {
@@ -1082,19 +959,19 @@ fn install_pins_the_latest_release_tag() {
     let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.1 --yes",
         "the install is pinned to the release tag"
     );
     let git_log = std::fs::read_to_string(home.home().join("git.log")).unwrap_or_default();
     assert_eq!(
         git_log.trim(),
-        "ls-remote --tags https://github.com/uwuclxdy/clauth.git",
+        "ls-remote --tags https://github.com/abobreshov/clauth.git",
         "the probe reads the release tags"
     );
     let printed = capture.snapshot();
     assert_eq!(
         printed,
-        ["clauth: installing uwuclxdy/clauth/herdr-plugin at v0.15.1 into herdr"],
+        ["tollgate: installing abobreshov/clauth/herdr-plugin at v0.15.1 into herdr"],
         "the printed line names the tag the argv pins"
     );
 }
@@ -1116,7 +993,7 @@ fn install_proceeds_unpinned_when_the_release_probe_fails() {
     let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --yes",
         "the fallback install is unpinned"
     );
     let printed = capture.snapshot();
@@ -1130,11 +1007,11 @@ fn install_proceeds_unpinned_when_the_release_probe_fails() {
         "the note names the probe failure: {printed:?}"
     );
     assert!(
-        printed[0].contains("installing uwuclxdy/clauth/herdr-plugin unpinned"),
+        printed[0].contains("installing abobreshov/clauth/herdr-plugin unpinned"),
         "the note names the fallback: {printed:?}"
     );
     assert_eq!(
-        printed[1], "clauth: installing uwuclxdy/clauth/herdr-plugin into herdr",
+        printed[1], "tollgate: installing abobreshov/clauth/herdr-plugin into herdr",
         "the unpinned line follows the note: {printed:?}"
     );
 }
@@ -1155,12 +1032,12 @@ fn install_proceeds_unpinned_when_no_release_tag_exists() {
     let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --yes",
         "an install with no release tag is unpinned"
     );
     assert_eq!(
         capture.snapshot(),
-        ["clauth: installing uwuclxdy/clauth/herdr-plugin into herdr"],
+        ["tollgate: installing abobreshov/clauth/herdr-plugin into herdr"],
         "no tag prints the unpinned line, and no note"
     );
 }
@@ -1206,18 +1083,18 @@ fn uninstall_writes_the_clean_config_before_the_unlink() {
         "the error names the residual: {shown}"
     );
     assert!(
-        shown.contains("plugin uninstall clauth"),
+        shown.contains("plugin uninstall tollgate"),
         "the error names the manual finish: {shown}"
     );
     let text = std::fs::read_to_string(&path).expect("config reads");
     assert!(
-        !text.contains("# clauth herdr plugin"),
+        !text.contains("# tollgate herdr plugin"),
         "the config was already cleaned when the unlink failed: {text}"
     );
     let log = std::fs::read_to_string(home.home().join("uninstall.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin uninstall clauth",
+        "plugin uninstall tollgate",
         "the unlink ran after the config write: {log}"
     );
 }
@@ -1242,14 +1119,14 @@ fn config_status_reads_binding_and_sidebar() {
         "[[keys.command]]\n",
         "key = \"ctrl+alt+c\"\n",
         "type = \"plugin_action\"\n",
-        "command = \"clauth.open\"\n",
+        "command = \"tollgate.open\"\n",
     ));
     assert_eq!(bound_other_key.bound_key.as_deref(), Some("ctrl+alt+c"));
     assert_eq!(bound_other_key.sidebar, SidebarState::Absent);
 
     let templated = config_status(concat!(
         "[ui.sidebar.agents.rows_by_agent]\n",
-        r#"claude = [["agent", "$clauth"]]"#,
+        r#"claude = [["agent", "$tollgate"]]"#,
         "\n",
     ));
     assert_eq!(templated.sidebar, SidebarState::Templated);
@@ -1279,8 +1156,8 @@ fn plan_config_and_config_status_agree() {
     let configs: &[&str] = &[
         "",
         "[[keys.command]]\nkey = \"prefix+z\"\ntype = \"shell\"\ncommand = \"ls\"\n",
-        "[[keys.command]]\nkey = \"ctrl+alt+c\"\ntype = \"plugin_action\"\ncommand = \"clauth.open\"\n",
-        "[ui.sidebar.agents.rows_by_agent]\nclaude = [[\"agent\", \"$clauth\"]]\n",
+        "[[keys.command]]\nkey = \"ctrl+alt+c\"\ntype = \"plugin_action\"\ncommand = \"tollgate.open\"\n",
+        "[ui.sidebar.agents.rows_by_agent]\nclaude = [[\"agent\", \"$tollgate\"]]\n",
         "[ui.sidebar.agents.rows_by_agent]\nclaude = [[\"agent\"]]\n",
         "[ui.sidebar.agents.rows_by_agent]\ncodex = [[\"agent\"]]\n",
         "[ui.sidebar.agents]\nrow_gap = 1\n",
@@ -1315,7 +1192,7 @@ fn plan_config_and_config_status_agree() {
 
 #[test]
 fn a_marker_as_the_last_line_drops_alone() {
-    let existing = "# my config\n[ui]\naccent = \"cyan\"\n# clauth herdr plugin";
+    let existing = "# my config\n[ui]\naccent = \"cyan\"\n# tollgate herdr plugin";
     assert_eq!(
         without_marked_blocks(existing),
         "# my config\n[ui]\naccent = \"cyan\"\n"
@@ -1324,7 +1201,7 @@ fn a_marker_as_the_last_line_drops_alone() {
 
 #[test]
 fn a_marker_before_user_content_keeps_the_content() {
-    let existing = "[misc]\n# clauth herdr plugin\n\nsomething = \"user value\"\n";
+    let existing = "[misc]\n# tollgate herdr plugin\n\nsomething = \"user value\"\n";
     assert_eq!(
         without_marked_blocks(existing),
         "[misc]\n\nsomething = \"user value\"\n"
@@ -1342,7 +1219,7 @@ fn bound_key_reads_the_open_binding_not_the_first_entry() {
         "[[keys.command]]\n",
         "key = \"prefix+a\"\n",
         "type = \"plugin_action\"\n",
-        "command = \"clauth.open\"\n",
+        "command = \"tollgate.open\"\n",
     ))
     .expect("parses");
     assert_eq!(bound_key(&doc).as_deref(), Some("prefix+a"));
@@ -1351,7 +1228,7 @@ fn bound_key_reads_the_open_binding_not_the_first_entry() {
 #[test]
 fn a_registry_entry_without_enabled_reads_as_enabled() {
     let entry = registry_entry_from(&plugin_list_json(
-        r#"{"plugin_id":"clauth","version":"0.1.0"}"#,
+        r#"{"plugin_id":"tollgate","version":"0.1.0"}"#,
     ))
     .expect("entry");
     assert!(entry.enabled);
@@ -1360,7 +1237,7 @@ fn a_registry_entry_without_enabled_reads_as_enabled() {
 #[test]
 fn registry_warnings_skip_non_strings_without_panicking() {
     let entry = registry_entry_from(&plugin_list_json(
-        r#"{"plugin_id":"clauth","warnings":["a",1,"b"]}"#,
+        r#"{"plugin_id":"tollgate","warnings":["a",1,"b"]}"#,
     ))
     .expect("entry");
     assert_eq!(entry.warnings, vec!["a".to_string(), "b".to_string()]);
@@ -1398,17 +1275,17 @@ fn read_config_treats_absent_as_empty_and_fails_on_non_utf8() {
 fn the_delegate_token_rides_the_row_only_when_the_knob_is_on() {
     let off = appended("", "prefix+a", false);
     assert!(
-        off.contains(r#"["agent", "$clauth"]"#),
+        off.contains(r#"["agent", "$tollgate"]"#),
         "the knob off writes today's row exactly: {off}"
     );
     assert!(
-        !off.contains("$clauth_delegate"),
+        !off.contains("$tollgate_delegate"),
         "the delegate token must stay out of the off row: {off}"
     );
 
     let on = appended("", "prefix+a", true);
     assert!(
-        on.contains(r#"["agent", "$clauth", "$clauth_delegate"]"#),
+        on.contains(r#"["agent", "$tollgate", "$tollgate_delegate"]"#),
         "the knob on appends the delegate token to the agent group: {on}"
     );
     // The row is otherwise identical.
@@ -1416,8 +1293,8 @@ fn the_delegate_token_rides_the_row_only_when_the_knob_is_on() {
     let on_row = on.split("rows_by_agent]\n").nth(1).expect("row");
     assert_eq!(
         on_row.replace(
-            r#"["agent", "$clauth", "$clauth_delegate"]"#,
-            r#"["agent", "$clauth"]"#
+            r#"["agent", "$tollgate", "$tollgate_delegate"]"#,
+            r#"["agent", "$tollgate"]"#
         ),
         off_row,
         "the on row differs only in the agent group"
@@ -1425,8 +1302,8 @@ fn the_delegate_token_rides_the_row_only_when_the_knob_is_on() {
 }
 
 /// The resync `install`/`heal` run, through the seam they both write through:
-/// strip clauth's blocks, plan on the base, append. A knob toggle must
-/// rewrite exactly the blocks clauth wrote — the old row goes, the new one
+/// strip tollgate's blocks, plan on the base, append. A knob toggle must
+/// rewrite exactly the blocks tollgate wrote — the old row goes, the new one
 /// lands, nothing user-owned moves — and the toggle back restores the
 /// original byte for byte.
 #[test]
@@ -1448,7 +1325,7 @@ fn a_knob_toggle_rewrites_exactly_the_marked_blocks() {
         "the user's own content is untouched"
     );
     assert_eq!(
-        text.matches("$clauth_delegate").count(),
+        text.matches("$tollgate_delegate").count(),
         1,
         "exactly one delegate token, the new row's: {text}"
     );
@@ -1469,7 +1346,7 @@ fn a_knob_toggle_rewrites_exactly_the_marked_blocks() {
 }
 
 /// A user key glued directly onto the last line install wrote (no blank
-/// separator, valid TOML in the same table) is not part of any block clauth
+/// separator, valid TOML in the same table) is not part of any block tollgate
 /// wrote: the strip must end the block before it, so the resync write cannot
 /// eat the line.
 #[test]
@@ -1492,7 +1369,7 @@ fn a_user_key_glued_to_a_marked_block_survives_the_resync() {
     );
 }
 
-/// A user line INTERRUPTING clauth's block (a comment or key between the
+/// A user line INTERRUPTING tollgate's block (a comment or key between the
 /// block's own lines) makes the whole block user-owned: the strip must keep
 /// the header and every line, or the resync write strands the tail lines
 /// under a table whose header was consumed.
@@ -1525,11 +1402,11 @@ fn a_user_line_inside_a_marked_block_keeps_the_whole_block() {
     );
 }
 
-// ── edited marked blocks: the strip keeps what clauth did not write ────────
+// ── edited marked blocks: the strip keeps what tollgate did not write ────────
 
 /// The todo's repro: a user who trims the claude row (drops the `tab` group)
 /// owns that row now. The strip must compare the block against every block
-/// clauth writes — both knob variants — and keep a mismatch whole, so the
+/// tollgate writes — both knob variants — and keep a mismatch whole, so the
 /// resync reconstructs the file byte for byte and the plan reports the row
 /// through the hand-owned note instead of silently rewriting it. The toggle
 /// direction holds too: an edited row matches neither variant, so a knob
@@ -1540,8 +1417,8 @@ fn an_edited_sidebar_row_survives_the_resync_byte_for_byte() {
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let edited = wired.replace(
-        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]"#,
-        r#"claude = [["state_icon", "workspace"], ["agent", "$clauth"]]"#,
+        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$tollgate"]]"#,
+        r#"claude = [["state_icon", "workspace"], ["agent", "$tollgate"]]"#,
     );
     assert_ne!(edited, wired, "the fixture edit landed");
     for delegate_row_text in [false, true] {
@@ -1569,7 +1446,7 @@ fn an_edited_sidebar_row_survives_the_resync_byte_for_byte() {
 
 /// A binding block edited without touching the command it binds (a
 /// description, say) is the user's now: the strip keeps the block, the plan
-/// sees `clauth.open` still bound and reports it, and the resync
+/// sees `tollgate.open` still bound and reports it, and the resync
 /// reconstructs the file byte for byte.
 #[test]
 fn an_edited_binding_block_survives_the_resync_byte_for_byte() {
@@ -1577,7 +1454,7 @@ fn an_edited_binding_block_survives_the_resync_byte_for_byte() {
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let edited = wired.replace(
-        r#"description = "clauth accounts""#,
+        r#"description = "tollgate accounts""#,
         r#"description = "opener""#,
     );
     assert_ne!(edited, wired, "the fixture edit landed");
@@ -1593,23 +1470,23 @@ fn an_edited_binding_block_survives_the_resync_byte_for_byte() {
     );
     assert!(
         plan.notes.iter().any(|n| n.contains("already bound")),
-        "`clauth.open` is still bound, so the hand-owned note fires: {:?}",
+        "`tollgate.open` is still bound, so the hand-owned note fires: {:?}",
         plan.notes
     );
 }
 
-/// An edit that moves the command off `clauth.open` (say `clauth.open
+/// An edit that moves the command off `tollgate.open` (say `tollgate.open
 /// --now`) keeps the whole block too, and `bound_key` matches the exact
-/// command, so `clauth.open` now reads as unbound: no already-bound note
-/// fires, and clauth appends its own binding beside the user's.
+/// command, so `tollgate.open` now reads as unbound: no already-bound note
+/// fires, and tollgate appends its own binding beside the user's.
 #[test]
-fn a_binding_edited_off_clauth_open_keeps_the_edit_and_rewires_clauths_own() {
+fn a_binding_edited_off_tollgate_open_keeps_the_edit_and_rewires_tollgates_own() {
     let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let edited = wired.replace(
-        r#"command = "clauth.open""#,
-        r#"command = "clauth.open --now""#,
+        r#"command = "tollgate.open""#,
+        r#"command = "tollgate.open --now""#,
     );
     assert_ne!(edited, wired, "the fixture edit landed");
     let (text, plan, removed, noop) = install_resync(&edited, "prefix+a", false).expect("resync");
@@ -1618,24 +1495,24 @@ fn a_binding_edited_off_clauth_open_keeps_the_edit_and_rewires_clauths_own() {
         "the edited binding is not in the removal diff: {removed:?}"
     );
     assert!(
-        text.contains(r#"command = "clauth.open --now""#),
+        text.contains(r#"command = "tollgate.open --now""#),
         "the user's command edit survives: {text}"
     );
     assert!(
-        text.contains(r#"command = "clauth.open""#),
-        "`clauth.open` reads as unbound, so clauth wires its own binding"
+        text.contains(r#"command = "tollgate.open""#),
+        "`tollgate.open` reads as unbound, so tollgate wires its own binding"
     );
     assert_eq!(
         text.matches("[[keys.command]]").count(),
         2,
-        "the edited binding and clauth's own both stand: {text}"
+        "the edited binding and tollgate's own both stand: {text}"
     );
     assert!(
         plan.notes.iter().all(|n| !n.contains("already bound")),
-        "no already-bound note: the edited command no longer binds `clauth.open`: {:?}",
+        "no already-bound note: the edited command no longer binds `tollgate.open`: {:?}",
         plan.notes
     );
-    assert!(!noop, "clauth's own binding is added, so the write fires");
+    assert!(!noop, "tollgate's own binding is added, so the write fires");
 }
 
 /// `uninstall` strips with no key in hand, and it must keep the user's edits
@@ -1647,8 +1524,8 @@ fn an_edited_block_is_absent_from_uninstalls_removal_diff() {
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let edited = wired.replace(
-        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]"#,
-        r#"claude = [["state_icon", "workspace"], ["agent", "$clauth"]]"#,
+        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$tollgate"]]"#,
+        r#"claude = [["state_icon", "workspace"], ["agent", "$tollgate"]]"#,
     );
     assert_ne!(edited, wired, "the fixture edit landed");
     let (text, removed, kept_after_stripped) = strip_marked_blocks(&edited);
@@ -1667,7 +1544,7 @@ fn an_edited_block_is_absent_from_uninstalls_removal_diff() {
         "the edited sidebar block is not in the removal diff: {removed:?}"
     );
     assert!(
-        text.contains(r#"claude = [["state_icon", "workspace"], ["agent", "$clauth"]]"#),
+        text.contains(r#"claude = [["state_icon", "workspace"], ["agent", "$tollgate"]]"#),
         "the edited row survives the uninstall strip: {text}"
     );
 }
@@ -1701,7 +1578,7 @@ fn a_heal_keeps_a_custom_key_binding_and_still_toggles_the_row() {
         "the heal does not re-key the binding: {text}"
     );
     assert!(
-        text.contains("$clauth_delegate"),
+        text.contains("$tollgate_delegate"),
         "the knob toggle still lands: {text}"
     );
 }
@@ -1745,7 +1622,7 @@ fn an_edited_binding_does_not_freeze_the_sidebar_toggle() {
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let edited = wired.replace(
-        r#"description = "clauth accounts""#,
+        r#"description = "tollgate accounts""#,
         r#"description = "opener""#,
     );
     assert_ne!(edited, wired, "the fixture edit landed");
@@ -1755,7 +1632,7 @@ fn an_edited_binding_does_not_freeze_the_sidebar_toggle() {
         "the edited binding survives: {text}"
     );
     assert!(
-        text.contains("$clauth_delegate"),
+        text.contains("$tollgate_delegate"),
         "the sidebar toggle still lands beside the kept binding: {text}"
     );
     assert_eq!(
@@ -1841,13 +1718,13 @@ fn a_failing_snapshot_still_attempts_the_open() {
         "herdr",
         "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"; exit 1",
     );
-    write_shim(home.home(), "clauth", "echo fit");
+    write_shim(home.home(), "tollgate", "echo fit");
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/herdr-plugin/open-pane.sh");
     let out = std::process::Command::new("sh")
         .arg(path)
         .arg("tui")
         .env("HERDR_BIN_PATH", &herdr_shim)
-        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PLUGIN_ID", "tollgate")
         .env(
             "PATH",
             format!(
@@ -1935,13 +1812,13 @@ fn the_fit_sed_reads_the_real_snapshot_shape() {
 }
 
 /// Runs the real `herdr-plugin/open-pane.sh` with `herdr_body` as the herdr
-/// shim (every call logs its argv as one line of `open.log`), the `clauth`
+/// shim (every call logs its argv as one line of `open.log`), the `tollgate`
 /// shim answering `knob` for `herdr config get popup_width`, and returns
 /// (exit code, log).
 #[cfg(unix)]
 fn run_open_pane(home: &Path, herdr_body: &str, knob: &str) -> (Option<i32>, String) {
     let herdr_shim = write_shim(home, "herdr", herdr_body);
-    write_shim(home, "clauth", &format!("echo {knob}"));
+    write_shim(home, "tollgate", &format!("echo {knob}"));
     let out = std::process::Command::new("sh")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1949,7 +1826,7 @@ fn run_open_pane(home: &Path, herdr_body: &str, knob: &str) -> (Option<i32>, Str
         ))
         .arg("tui")
         .env("HERDR_BIN_PATH", &herdr_shim)
-        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PLUGIN_ID", "tollgate")
         .env(
             "PATH",
             format!(
@@ -2088,7 +1965,7 @@ fn a_popup_arm_retries_the_plain_pair_when_the_sizing_flags_are_refused() {
     );
     assert_eq!(
         log.lines().last(),
-        Some("plugin pane open --plugin clauth --entrypoint tui"),
+        Some("plugin pane open --plugin tollgate --entrypoint tui"),
         "the retry is the plain pair alone: {log}"
     );
 }
@@ -2228,7 +2105,7 @@ fn a_hand_owned_claude_row_survives_the_resync() {
     assert!(
         plan.notes
             .iter()
-            .any(|n| n.contains(r#"["agent", "$clauth", "$clauth_delegate"]"#)),
+            .any(|n| n.contains(r#"["agent", "$tollgate", "$tollgate_delegate"]"#)),
         "the hand-merge line the note suggests carries the knob's token"
     );
     assert_eq!(
@@ -2242,13 +2119,13 @@ fn a_hand_owned_claude_row_survives_the_resync() {
     );
 }
 
-// ── `[herdr]` knob store + `clauth herdr config get` read path ─────────────
+// ── `[herdr]` knob store + `tollgate herdr config get` read path ─────────────
 
 /// Seed a real-shaped profiles.toml through the resolver the app reads
-/// (`clauth_dir()`), never a hand-built path, so the fixture pins the parse
+/// (`tollgate_dir()`), never a hand-built path, so the fixture pins the parse
 /// path `load_config` walks.
 fn write_profiles_toml(body: &str) {
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join("profiles.toml"), body).expect("write profiles.toml");
 }
@@ -2318,8 +2195,8 @@ fn saving_default_knobs_omits_the_herdr_block_until_one_moves() {
 
     crate::profile::save_app_state(&config.state).expect("save");
     let text = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .expect("read");
@@ -2333,8 +2210,8 @@ fn saving_default_knobs_omits_the_herdr_block_until_one_moves() {
     moved.herdr.pane_tag = false;
     crate::profile::save_app_state(&moved).expect("save");
     let text = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .expect("read");
@@ -2529,7 +2406,7 @@ fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
                     },
             }),
         ..
-    } = Cli::try_parse_from(["clauth", "herdr", "config", "get", "popup_width"])
+    } = Cli::try_parse_from(["tollgate", "herdr", "config", "get", "popup_width"])
         .expect("`herdr config get` must parse")
     else {
         panic!("`herdr config get` must select the get arm");
@@ -2537,8 +2414,8 @@ fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
     assert_eq!(key, "popup_width");
 
     // A bare `config` names no operation, and `get` takes exactly one key.
-    assert!(Cli::try_parse_from(["clauth", "herdr", "config"]).is_err());
-    assert!(Cli::try_parse_from(["clauth", "herdr", "config", "get"]).is_err());
+    assert!(Cli::try_parse_from(["tollgate", "herdr", "config"]).is_err());
+    assert!(Cli::try_parse_from(["tollgate", "herdr", "config", "get"]).is_err());
 
     // Hidden-ish: parseable, completable, but absent from herdr's help.
     let help = Cli::command()
@@ -2555,9 +2432,9 @@ fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
 // ── report-profile.sh knob-off overrides, driven through the real script ────
 
 /// Runs the real `herdr-plugin/report-profile.sh` against a shimmed `herdr`
-/// and `clauth`: the herdr shim logs every `pane report-metadata` argv as one
+/// and `tollgate`: the herdr shim logs every `pane report-metadata` argv as one
 /// line and fails both `process-info` and `pane get` (the latter makes a
-/// spawned watcher end on its retry budget without re-reporting), the clauth
+/// spawned watcher end on its retry budget without re-reporting), the tollgate
 /// shim answers `which` with `fit` and dispatches `herdr config get <key>` to
 /// the knob values baked in at write time. HOME, the state dir and the pane id
 /// all point into the sandbox, so no live pane or real tree is touched.
@@ -2579,7 +2456,7 @@ fn report_profile_run(
     );
     write_shim(
         home.home(),
-        "clauth",
+        "tollgate",
         &format!(
             "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo {pane_tag} ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
         ),
@@ -2590,11 +2467,11 @@ fn report_profile_run(
         "/herdr-plugin/report-profile.sh"
     ))
     .env("HERDR_BIN_PATH", home.home().join("herdr"))
-    .env("HERDR_PLUGIN_ID", "clauth")
+    .env("HERDR_PLUGIN_ID", "tollgate")
     .env("HERDR_PANE_ID", "p1")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
     // Never the host's /proc: see `report_profile_resolve_run_in`.
-    .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
+    .env("TOLLGATE_PROC_ROOT", home.home().join("proc"))
     .env("HOME", home.home())
     .env(
         "PATH",
@@ -2640,7 +2517,7 @@ fn report_profile_run(
 
 /// `pane_tag` off publishes the token clear instead of silently skipping the
 /// report, and still skips the watcher: one report-metadata call carrying
-/// `--clear-token clauth` and no `--token`, and no pidfile under the state
+/// `--clear-token tollgate` and no `--token`, and no pidfile under the state
 /// dir. The agent reads as claude, so a watcher WOULD spawn if the off path
 /// leaked past the gate.
 #[cfg(unix)]
@@ -2654,7 +2531,7 @@ fn pane_tag_off_publishes_the_token_clear_and_spawns_no_watcher() {
     );
     let line = &lines[0];
     assert!(
-        line.contains("--clear-token clauth"),
+        line.contains("--clear-token tollgate"),
         "the token clear is published: {line}"
     );
     assert!(
@@ -2689,13 +2566,13 @@ fn border_label_off_publishes_the_display_agent_clear() {
         "no display-agent publish beside the clear: {line}"
     );
     assert!(
-        line.contains("--token clauth=fit"),
+        line.contains("--token tollgate=fit"),
         "the on pane_tag still publishes the token: {line}"
     );
 }
 
 /// Regression control: both knobs on publishes today's artifacts unchanged —
-/// `--token clauth=<profile>` and `--display-agent <profile>`, no clear flags.
+/// `--token tollgate=<profile>` and `--display-agent <profile>`, no clear flags.
 #[cfg(unix)]
 #[test]
 fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
@@ -2707,7 +2584,7 @@ fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
     );
     let line = &lines[0];
     assert!(
-        line.contains("--token clauth=fit"),
+        line.contains("--token tollgate=fit"),
         "the token publish stays: {line}"
     );
     assert!(
@@ -2726,7 +2603,7 @@ fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
 
 /// Both knobs off: herdr's one report-metadata call can carry both clears
 /// (0.8.2 pane.rs refuses only set+clear of the SAME field), so the script
-/// makes exactly one call and it publishes `--clear-token clauth` AND
+/// makes exactly one call and it publishes `--clear-token tollgate` AND
 /// `--clear-display-agent`.
 #[cfg(unix)]
 #[test]
@@ -2735,7 +2612,7 @@ fn both_knobs_off_publish_both_clears_in_one_call() {
     assert_eq!(lines.len(), 1, "both clears ride the one call: {lines:?}");
     let line = &lines[0];
     assert!(
-        line.contains("--clear-token clauth"),
+        line.contains("--clear-token tollgate"),
         "the token clear is published: {line}"
     );
     assert!(
@@ -2755,12 +2632,12 @@ fn both_knobs_off_publish_both_clears_in_one_call() {
 // ── report-profile.sh pane resolution, driven through the real script ────────
 
 /// Runs the real `herdr-plugin/report-profile.sh` against shimmed `herdr`,
-/// `ps` and `clauth`. The herdr shim answers `pane process-info` ONCE (its
+/// `ps` and `tollgate`. The herdr shim answers `pane process-info` ONCE (its
 /// second caller is the detached watcher, which must fail it three times so it
 /// ends itself) and logs every `pane report-metadata` argv; the ps shim
-/// answers ppid/args from the caller's scripted map; the clauth shim answers
+/// answers ppid/args from the caller's scripted map; the tollgate shim answers
 /// `which` with `fit` and the config knobs. Rows land in the sandbox's
-/// `~/.clauth/live_sessions`; `stale_row` names one whose mtime is pushed an
+/// `~/.tollgate/live_sessions`; `stale_row` names one whose mtime is pushed an
 /// hour back, posing the dead-session leftover a recycled pid would leave.
 /// Returns the logged report lines.
 #[cfg(unix)]
@@ -2785,8 +2662,8 @@ fn report_profile_resolve_run(
 /// [`report_profile_resolve_run`] with the event hook's `agent` field spelled
 /// by the caller, an optional ADOPTED codex login, and the `border_label`
 /// knob: `adopted_codex = Some(name)` lays `~/.codex/auth.json` as a symlink
-/// onto `~/.clauth/profiles/<name>/auth.json` in the sandbox, the shape
-/// `clauth login <name> --codex` leaves behind. `CODEX_HOME` is scrubbed from
+/// onto `~/.tollgate/profiles/<name>/auth.json` in the sandbox, the shape
+/// `tollgate login <name> --codex` leaves behind. `CODEX_HOME` is scrubbed from
 /// the script's env so the sandbox's `~/.codex` is the operator home it reads.
 /// The shim's `pane get` fails, so a spawned watcher ends on its retry budget
 /// without re-reporting; the helper joins that watcher (the pidfile disappears)
@@ -2846,7 +2723,7 @@ fn report_profile_resolve_run_proc(
 }
 
 /// The shared body of the resolve runs above. `proc_tree = None` points
-/// `CLAUTH_PROC_ROOT` at a directory that does not exist, so the script takes
+/// `TOLLGATE_PROC_ROOT` at a directory that does not exist, so the script takes
 /// its `ps` path (the one macOS runs) and the scripted `ps` shim answers.
 /// Either way the variable is set: left unset, the script would read the
 /// HOST's `/proc`, where the fake pids these tests use may be real processes.
@@ -2878,10 +2755,10 @@ fn report_profile_resolve_run_in(
         cmdline.push('\0');
         std::fs::write(dir.join("cmdline"), cmdline).expect("cmdline written");
     }
-    let sessions = home.home().join(".clauth/live_sessions");
+    let sessions = home.home().join(".tollgate/live_sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     if let Some(name) = adopted_codex {
-        let store = home.home().join(".clauth/profiles").join(name);
+        let store = home.home().join(".tollgate/profiles").join(name);
         std::fs::create_dir_all(&store).expect("profile store");
         std::fs::write(store.join("auth.json"), "{}").expect("chain written");
         let codex = home.home().join(".codex");
@@ -2912,7 +2789,7 @@ fn report_profile_resolve_run_in(
     write_shim(home.home(), "ps", ps_body);
     write_shim(
         home.home(),
-        "clauth",
+        "tollgate",
         &format!(
             "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
         ),
@@ -2923,12 +2800,12 @@ fn report_profile_resolve_run_in(
         "/herdr-plugin/report-profile.sh"
     ))
     .env("HERDR_BIN_PATH", home.home().join("herdr"))
-    .env("HERDR_PLUGIN_ID", "clauth")
+    .env("HERDR_PLUGIN_ID", "tollgate")
     .env("HERDR_PANE_ID", "p1")
     .env("HERDR_PLUGIN_EVENT_JSON", agent_json)
     .env_remove("CODEX_HOME")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
-    .env("CLAUTH_PROC_ROOT", &proc_root)
+    .env("TOLLGATE_PROC_ROOT", &proc_root)
     .env("HOME", home.home())
     .env(
         "PATH",
@@ -2959,7 +2836,7 @@ fn report_profile_resolve_run_in(
 
 /// Waits for a spawned watcher's pidfile to disappear, so the detached watcher
 /// never outlives its sandbox (whose shims vanish at drop, sending the
-/// watcher's probes to the installed `clauth`). Bounded as a hang detector,
+/// watcher's probes to the installed `tollgate`). Bounded as a hang detector,
 /// never a fixed sleep; the watcher removes the pidfile in its EXIT trap.
 #[cfg(unix)]
 fn join_watcher(state_dir: &std::path::Path, pane: &str) {
@@ -2988,13 +2865,13 @@ fn token_line(lines: &[String]) -> String {
 
 /// The pane's own session resolves FIRST, off `foreground_process_group_id`.
 /// The sweep order puts the delegate's claude before the supervisor, and the
-/// delegate's row is keyed on the pane's `clauth mcp`, so a sweep-first
+/// delegate's row is keyed on the pane's `tollgate mcp`, so a sweep-first
 /// resolution names the delegate's account (D3) for a pane running uwuclxdy.
 #[cfg(unix)]
 #[test]
 fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
-    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; *' 1001') echo 1002;; *' 1002') echo 1000;; esac;;\n  *'-o args='*) case \"$*\" in *' 1002') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"tollgate"},{"pid":1000,"ppid":1,"command":"tollgate"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; *' 1001') echo 1002;; *' 1002') echo 1000;; esac;;\n  *'-o args='*) case \"$*\" in *' 1002') echo 'tollgate mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
     let lines = report_profile_resolve_run(
         info,
         ps,
@@ -3002,7 +2879,7 @@ fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
         None,
     );
     assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        token_line(&lines).contains("--token tollgate=uwuclxdy"),
         "the pane's own session wins over the delegate row: {}",
         lines[0]
     );
@@ -3014,11 +2891,11 @@ fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
 #[cfg(unix)]
 #[test]
 fn a_bare_pane_hosting_a_delegate_still_answers_the_global_account() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
-    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"tollgate"},{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'tollgate mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
     let lines = report_profile_resolve_run(info, ps, &[("1003-0", "D3", 1003)], None);
     assert!(
-        token_line(&lines).contains("--token clauth=fit"),
+        token_line(&lines).contains("--token tollgate=fit"),
         "the bare pane answers the global account: {}",
         lines[0]
     );
@@ -3031,8 +2908,8 @@ fn a_bare_pane_hosting_a_delegate_still_answers_the_global_account() {
 #[cfg(unix)]
 #[test]
 fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
-    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
-    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1000;; *' 1000') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"tollgate"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"tollgate"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1000;; *' 1000') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'tollgate mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
     let lines = report_profile_resolve_run(
         info,
         ps,
@@ -3040,7 +2917,7 @@ fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
         None,
     );
     assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        token_line(&lines).contains("--token tollgate=uwuclxdy"),
         "the sweep climbs past the mcp to the pane's supervisor: {}",
         lines[0]
     );
@@ -3053,13 +2930,13 @@ fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
 #[cfg(unix)]
 #[test]
 fn the_proc_walk_resolves_the_foreground_chain_without_ps() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"tollgate"},{"pid":1000,"ppid":1,"command":"tollgate"}]}}"#;
     let (lines, ps_calls) = report_profile_resolve_run_proc(
         info,
         &[
-            (1000, 1, "clauth start uwuclxdy"),
+            (1000, 1, "tollgate start uwuclxdy"),
             (1001, 1002, "claude"),
-            (1002, 1000, "clauth mcp"),
+            (1002, 1000, "tollgate mcp"),
         ],
         &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
     );
@@ -3068,7 +2945,7 @@ fn the_proc_walk_resolves_the_foreground_chain_without_ps() {
         "no ps call on the /proc path: {ps_calls:?}"
     );
     assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        token_line(&lines).contains("--token tollgate=uwuclxdy"),
         "the pane's own session wins over the delegate row: {}",
         lines[0]
     );
@@ -3077,14 +2954,14 @@ fn the_proc_walk_resolves_the_foreground_chain_without_ps() {
 /// The `/proc` ppid read decides the answer here: the foreground pid has no
 /// row of its own, so only the climb to its parent reaches one. A ppid parse
 /// that cuts `stat` at the FIRST ") " (the faked comm holds one) reads the
-/// state letter as the parent, stops the climb, and falls to `clauth which`.
+/// state letter as the parent, stops the climb, and falls to `tollgate which`.
 #[cfg(unix)]
 #[test]
 fn the_proc_walk_climbs_to_the_parent_row() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1000,"command":"claude"}]}}"#;
     let (lines, ps_calls) = report_profile_resolve_run_proc(
         info,
-        &[(1000, 1, "clauth start uwuclxdy"), (1001, 1000, "claude")],
+        &[(1000, 1, "tollgate start uwuclxdy"), (1001, 1000, "claude")],
         &[("1000-0", "uwuclxdy", 1000)],
     );
     assert!(
@@ -3092,28 +2969,28 @@ fn the_proc_walk_climbs_to_the_parent_row() {
         "no ps call on the /proc path: {ps_calls:?}"
     );
     assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        token_line(&lines).contains("--token tollgate=uwuclxdy"),
         "the climb reaches the parent's row, not the global account: {}",
         lines[0]
     );
 }
 
 /// The compat sweep on the `/proc` path: the parent check and the climb both
-/// read `/proc`, and an mcp carrying arguments (`clauth mcp --stdio`, the
-/// `'clauth mcp '*` arm) is still recognised and climbed through. The delegate
+/// read `/proc`, and an mcp carrying arguments (`tollgate mcp --stdio`, the
+/// `'tollgate mcp '*` arm) is still recognised and climbed through. The delegate
 /// child 1002 carries a row of its own, so the sweep's parent check is what
 /// keeps its account off the pane.
 #[cfg(unix)]
 #[test]
 fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
-    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"tollgate"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"tollgate"}]}}"#;
     let (lines, ps_calls) = report_profile_resolve_run_proc(
         info,
         &[
-            (1000, 1, "clauth start uwuclxdy"),
+            (1000, 1, "tollgate start uwuclxdy"),
             (1001, 1000, "claude"),
             (1002, 1003, "claude"),
-            (1003, 1001, "clauth mcp --stdio"),
+            (1003, 1001, "tollgate mcp --stdio"),
         ],
         &[
             ("1000-0", "uwuclxdy", 1000),
@@ -3126,7 +3003,7 @@ fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
         "no ps call on the /proc path: {ps_calls:?}"
     );
     assert!(
-        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        token_line(&lines).contains("--token tollgate=uwuclxdy"),
         "the sweep climbs past the mcp to the pane's supervisor: {}",
         lines[0]
     );
@@ -3140,7 +3017,7 @@ fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
 #[cfg(unix)]
 #[test]
 fn two_rows_on_one_pid_resolve_to_the_newest() {
-    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"tollgate"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let lines = report_profile_resolve_run(
         info,
@@ -3149,20 +3026,20 @@ fn two_rows_on_one_pid_resolve_to_the_newest() {
         Some("1823355-1"),
     );
     assert!(
-        token_line(&lines).contains("--token clauth=DS4"),
+        token_line(&lines).contains("--token tollgate=DS4"),
         "the newest row wins over the stale one: {}",
         lines[0]
     );
 }
 
-/// A codex pane running `clauth start <name>` names that profile. The registry
-/// walk is harness-blind (a codex row is keyed on its `clauth start` supervisor
+/// A codex pane running `tollgate start <name>` names that profile. The registry
+/// walk is harness-blind (a codex row is keyed on its `tollgate start` supervisor
 /// like a claude one), so the only thing that kept codex panes untagged was the
 /// agent gate; and a codex pane gets a watcher like a claude pane, because a
 /// codex chain rotates between sessions with no herdr event either.
 #[cfg(unix)]
 #[test]
-fn a_codex_pane_running_a_clauth_session_names_its_profile() {
+fn a_codex_pane_running_a_tollgate_session_names_its_profile() {
     let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"codex"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
     let (lines, watcher_spawned) = report_profile_resolve_run_as(
@@ -3175,7 +3052,7 @@ fn a_codex_pane_running_a_clauth_session_names_its_profile() {
         None,
     );
     assert!(
-        token_line(&lines).contains("--token clauth=work"),
+        token_line(&lines).contains("--token tollgate=work"),
         "the codex session's profile is published: {}",
         lines[0]
     );
@@ -3184,7 +3061,7 @@ fn a_codex_pane_running_a_clauth_session_names_its_profile() {
 
 /// A bare codex pane (foreground present, no registered session) answers the
 /// ADOPTED login — the profile `~/.codex/auth.json` links into — and never
-/// `clauth which`, which answers the Claude Code side (`fit` here) for a caller
+/// `tollgate which`, which answers the Claude Code side (`fit` here) for a caller
 /// holding no `CODEX_HOME`: that is a different harness's account painted on
 /// a codex pane.
 #[cfg(unix)]
@@ -3202,7 +3079,7 @@ fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
         None,
     );
     assert!(
-        token_line(&lines).contains("--token clauth=work"),
+        token_line(&lines).contains("--token tollgate=work"),
         "the adopted profile is published, not the claude account: {}",
         lines[0]
     );
@@ -3210,7 +3087,7 @@ fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
 
 /// A bare codex pane whose login is NOT adopted publishes the token clear
 /// instead of leaving a stale tag standing: the empty resolution flows through
-/// the off-side clear branch, and the Claude Code fallback (`clauth which` →
+/// the off-side clear branch, and the Claude Code fallback (`tollgate which` →
 /// `fit`) never leaks onto it.
 #[cfg(unix)]
 #[test]
@@ -3221,7 +3098,7 @@ fn an_unadopted_codex_pane_publishes_the_token_clear() {
         report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "off", info, ps, &[], None);
     let line = token_line(&lines);
     assert!(
-        line.contains("--clear-token clauth"),
+        line.contains("--clear-token tollgate"),
         "an unadopted codex login publishes the token clear: {line}"
     );
     assert!(
@@ -3229,13 +3106,13 @@ fn an_unadopted_codex_pane_publishes_the_token_clear() {
         "no token publish beside the clear: {line}"
     );
     assert!(
-        !line.contains("clauth=fit"),
+        !line.contains("tollgate=fit"),
         "the claude account never leaks onto a codex pane: {line}"
     );
 }
 
 /// The empty resolution still spawns the per-pane watcher through the pidfile
-/// gate, so a mid-pane `clauth login <name> --codex` is picked up on the next
+/// gate, so a mid-pane `tollgate login <name> --codex` is picked up on the next
 /// tick instead of waiting for a herdr event.
 #[cfg(unix)]
 #[test]
@@ -3291,7 +3168,7 @@ exit 0
     );
 }
 
-/// A sandbox armed for a report→spawned-watcher chain: herdr/ps/clauth shims,
+/// A sandbox armed for a report→spawned-watcher chain: herdr/ps/tollgate shims,
 /// a state dir, and the `agent` file the herdr shim's `pane get` reads (the
 /// pane's live agent, mutable mid-run to model a harness transition).
 #[cfg(unix)]
@@ -3316,9 +3193,9 @@ fn chain_setup_labeled(
     border_label: &str,
 ) -> ChainSetup {
     let home = crate::testutil::HomeSandbox::new();
-    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
+    std::fs::create_dir_all(home.home().join(".tollgate/live_sessions")).expect("sessions dir");
     if let Some(name) = adopted_codex {
-        let store = home.home().join(".clauth/profiles").join(name);
+        let store = home.home().join(".tollgate/profiles").join(name);
         std::fs::create_dir_all(&store).expect("profile store");
         std::fs::write(store.join("auth.json"), "{}").expect("chain written");
         let codex = home.home().join(".codex");
@@ -3337,7 +3214,7 @@ fn chain_setup_labeled(
     );
     write_shim(
         home.home(),
-        "clauth",
+        "tollgate",
         &format!(
             "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
         ),
@@ -3357,7 +3234,7 @@ fn chain_report(setup: &ChainSetup, event_json: &str) {
 }
 
 /// [`chain_report`], returning the script's stdout: the profile name it
-/// printed, empty for an agentless pane (which is what the `clauth.which`
+/// printed, empty for an agentless pane (which is what the `tollgate.which`
 /// action shows).
 #[cfg(unix)]
 fn chain_report_out(setup: &ChainSetup, event_json: &str) -> String {
@@ -3367,13 +3244,13 @@ fn chain_report_out(setup: &ChainSetup, event_json: &str) -> String {
             "/herdr-plugin/report-profile.sh"
         ))
         .env("HERDR_BIN_PATH", setup.home.home().join("herdr"))
-        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PLUGIN_ID", "tollgate")
         .env("HERDR_PANE_ID", "p1")
         .env("HERDR_PLUGIN_EVENT_JSON", event_json)
         .env("HERDR_PLUGIN_CONTEXT_JSON", "")
         .env("HERDR_PLUGIN_STATE_DIR", setup.home.home().join("state"))
         // Never the host's /proc: see `report_profile_resolve_run_in`.
-        .env("CLAUTH_PROC_ROOT", setup.home.home().join("proc"))
+        .env("TOLLGATE_PROC_ROOT", setup.home.home().join("proc"))
         .env("HOME", setup.home.home())
         .env_remove("CODEX_HOME")
         .env(
@@ -3432,7 +3309,7 @@ fn wait_until(setup: &ChainSetup, pred: impl Fn(&[String]) -> bool) -> Vec<Strin
 /// Claude Code account on its tag: the watcher spawned for the codex pane's
 /// empty resolution must not clear the tag the claude hook publishes. Each
 /// tick the watcher re-reads the pane's live agent, so it re-reports as claude
-/// once the pane runs claude — the claude hook's `--token clauth=fit` and the
+/// once the pane runs claude — the claude hook's `--token tollgate=fit` and the
 /// watcher's re-reported one both land, never a clear on top.
 #[cfg(unix)]
 #[test]
@@ -3443,14 +3320,14 @@ fn a_codex_watcher_never_clears_the_claude_tag_that_follows_it() {
     chain_report(&setup, r#"{"agent":"claude"}"#);
     let lines = wait_until(&setup, |ls| {
         ls.iter()
-            .filter(|l| l.contains("--token clauth=fit"))
+            .filter(|l| l.contains("--token tollgate=fit"))
             .count()
             >= 2
     });
     assert!(
         lines
             .iter()
-            .filter(|l| l.contains("--token clauth=fit"))
+            .filter(|l| l.contains("--token tollgate=fit"))
             .count()
             >= 2,
         "the watcher re-reports as the live claude agent instead of clearing it: {lines:?}"
@@ -3458,7 +3335,7 @@ fn a_codex_watcher_never_clears_the_claude_tag_that_follows_it() {
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--token clauth=fit")),
+            .is_some_and(|l| l.contains("--token tollgate=fit")),
         "the claude tag is the last publish, not a codex clear: {lines:?}"
     );
     chain_stop(&setup);
@@ -3474,12 +3351,13 @@ fn a_claude_watcher_reports_the_codex_pane_as_codex() {
     chain_report(&setup, r#"{"agent":"claude"}"#);
     std::fs::write(&setup.agent_file, "codex").expect("agent switched");
     let lines = wait_until(&setup, |ls| {
-        ls.last().is_some_and(|l| l.contains("--token clauth=work"))
+        ls.last()
+            .is_some_and(|l| l.contains("--token tollgate=work"))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--token clauth=work")),
+            .is_some_and(|l| l.contains("--token tollgate=work")),
         "the claude-spawned watcher follows the pane to codex: {lines:?}"
     );
     chain_stop(&setup);
@@ -3496,12 +3374,12 @@ fn the_watcher_clears_and_exits_when_the_pane_runs_another_agent() {
     std::fs::write(&setup.agent_file, "cursor").expect("agent switched");
     let lines = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token clauth"))
+            .is_some_and(|l| l.contains("--clear-token tollgate"))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--clear-token clauth")),
+            .is_some_and(|l| l.contains("--clear-token tollgate")),
         "the watcher clears the tag when the pane runs another agent: {lines:?}"
     );
     join_watcher(&setup.home.home().join("state"), "p1");
@@ -3520,12 +3398,12 @@ fn an_idle_pane_with_a_persisted_codex_session_clears_and_exits() {
     std::fs::write(&setup.agent_file, "").expect("agent cleared");
     let lines = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token clauth"))
+            .is_some_and(|l| l.contains("--clear-token tollgate"))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--clear-token clauth")),
+            .is_some_and(|l| l.contains("--clear-token tollgate")),
         "the idle pane clears the tag instead of answering the session's codex: {lines:?}"
     );
     join_watcher(&setup.home.home().join("state"), "p1");
@@ -3544,7 +3422,7 @@ fn an_agentless_status_event_after_the_watchers_exit_clear_leaves_the_pane_untag
     assert!(
         chain_lines(&setup)
             .first()
-            .is_some_and(|l| l.contains("--token clauth=work")),
+            .is_some_and(|l| l.contains("--token tollgate=work")),
         "the adopted codex pane is tagged first: {:?}",
         chain_lines(&setup)
     );
@@ -3553,12 +3431,12 @@ fn an_agentless_status_event_after_the_watchers_exit_clear_leaves_the_pane_untag
     std::fs::write(&setup.agent_file, "").expect("pane goes idle");
     let cleared = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token clauth"))
+            .is_some_and(|l| l.contains("--clear-token tollgate"))
     });
     assert!(
         cleared
             .last()
-            .is_some_and(|l| l.contains("--clear-token clauth")),
+            .is_some_and(|l| l.contains("--clear-token tollgate")),
         "the watcher clears the tag on the idle pane: {cleared:?}"
     );
     join_watcher(&setup.home.home().join("state"), "p1");
@@ -3571,11 +3449,13 @@ fn an_agentless_status_event_after_the_watchers_exit_clear_leaves_the_pane_untag
     let lines = chain_lines(&setup);
     assert_eq!(
         lines.last().map(String::as_str),
-        Some("pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"),
+        Some(
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
+        ),
         "the agentless event after the watcher's exit clear leaves the pane untagged: {lines:?}"
     );
     assert!(
-        !lines.iter().any(|l| l.contains("clauth=fit")),
+        !lines.iter().any(|l| l.contains("tollgate=fit")),
         "the claude-arm account never reaches the idle pane: {lines:?}"
     );
 }
@@ -3592,17 +3472,17 @@ fn a_claude_pane_with_a_persisted_codex_session_tags_as_claude() {
     assert!(
         lines
             .first()
-            .is_some_and(|l| l.contains("--token clauth=fit")),
+            .is_some_and(|l| l.contains("--token tollgate=fit")),
         "the pane's own claude agent wins over the codex session record: {lines:?}"
     );
     assert!(
-        lines.iter().all(|l| !l.contains("clauth=work")),
+        lines.iter().all(|l| !l.contains("tollgate=work")),
         "the codex session record never reaches the tag: {lines:?}"
     );
     chain_stop(&setup);
 }
 
-/// The `clauth.which` action carries no event agent (only the focused pane),
+/// The `tollgate.which` action carries no event agent (only the focused pane),
 /// so a codex pane would fall to the claude arm and get the Claude Code
 /// account. The pane's live agent is read instead: the action tags a codex
 /// pane with its adopted codex profile, never `fit`.
@@ -3615,17 +3495,17 @@ fn the_which_action_tags_a_codex_pane_with_the_codex_account() {
     assert!(
         lines
             .first()
-            .is_some_and(|l| l.contains("--token clauth=work")),
+            .is_some_and(|l| l.contains("--token tollgate=work")),
         "the which action tags the codex pane with the codex account: {lines:?}"
     );
     assert!(
-        lines.iter().all(|l| !l.contains("clauth=fit")),
+        lines.iter().all(|l| !l.contains("tollgate=fit")),
         "the claude account never reaches a codex pane: {lines:?}"
     );
     chain_stop(&setup);
 }
 
-/// The `clauth.which` action carries no event agent and reads the focused
+/// The `tollgate.which` action carries no event agent and reads the focused
 /// pane's live agent; a plain shell (none) publishes both clears, spawns no
 /// watcher, and prints nothing — where it once named the global claude
 /// account.
@@ -3638,7 +3518,7 @@ fn the_which_action_on_an_agentless_pane_publishes_the_clears_and_prints_nothing
     assert_eq!(
         chain_lines(&setup),
         vec![
-            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
                 .to_string()
         ],
         "the which action clears both artifacts instead of painting the global account"
@@ -3651,7 +3531,7 @@ fn the_which_action_on_an_agentless_pane_publishes_the_clears_and_prints_nothing
 
 /// The TUI knob push re-runs the reporter per pane with the pane id set and
 /// the event/context JSON cleared (`rerun_pane_report`); on a pane running
-/// another agent (cursor, which spends no clauth account) it publishes the
+/// another agent (cursor, which spends no tollgate account) it publishes the
 /// same clears and spawns no watcher, so toggling a knob never paints the
 /// global account onto a non-claude/codex pane.
 #[cfg(unix)]
@@ -3666,7 +3546,7 @@ fn the_tui_knob_push_rerun_on_an_agentless_pane_publishes_the_clears() {
     assert_eq!(
         chain_lines(&setup),
         vec![
-            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
                 .to_string()
         ],
         "the knob push clears both artifacts instead of painting the global account"
@@ -3691,7 +3571,7 @@ fn a_hook_on_an_agentless_event_publishes_the_clears() {
     assert_eq!(
         chain_lines(&setup),
         vec![
-            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
                 .to_string()
         ],
         "an agentless event clears both artifacts, never the claude arm"
@@ -3719,7 +3599,7 @@ fn a_released_event_on_a_pane_that_now_runs_no_agent_publishes_the_clears() {
     assert_eq!(
         lines,
         vec![
-            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
                 .to_string()
         ],
         "the released event's exited agent is not re-published: {lines:?}"
@@ -3731,13 +3611,13 @@ fn a_released_event_on_a_pane_that_now_runs_no_agent_publishes_the_clears() {
 }
 
 /// A failed `pane get` (non-zero exit) is not a definitive "no agent": the
-/// `clauth.which` action (no event agent) must keep the pane's last tag rather
+/// `tollgate.which` action (no event agent) must keep the pane's last tag rather
 /// than clear it. It publishes nothing and spawns no watcher.
 #[cfg(unix)]
 #[test]
 fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
     let home = crate::testutil::HomeSandbox::new();
-    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
+    std::fs::create_dir_all(home.home().join(".tollgate/live_sessions")).expect("sessions dir");
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
     write_shim(
         home.home(),
@@ -3753,7 +3633,7 @@ fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
     );
     write_shim(
         home.home(),
-        "clauth",
+        "tollgate",
         "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
     );
     let out = std::process::Command::new("sh")
@@ -3762,12 +3642,12 @@ fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
             "/herdr-plugin/report-profile.sh"
         ))
         .env("HERDR_BIN_PATH", home.home().join("herdr"))
-        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PLUGIN_ID", "tollgate")
         .env("HERDR_PANE_ID", "p1")
         .env_remove("HERDR_PLUGIN_EVENT_JSON")
         .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
         // Never the host's /proc: see `report_profile_resolve_run_in`.
-        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
+        .env("TOLLGATE_PROC_ROOT", home.home().join("proc"))
         .env("HOME", home.home())
         .env_remove("CODEX_HOME")
         .env(
@@ -3805,15 +3685,15 @@ fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
     );
 }
 
-/// A claude-arm failure (`clauth which` exiting non-zero) is not a definitive
+/// A claude-arm failure (`tollgate which` exiting non-zero) is not a definitive
 /// empty resolution: it publishes nothing and spawns no watcher, whatever the
-/// caller. `clauth which` prints `unknown` at exit 0 when nothing resolves, so
+/// caller. `tollgate which` prints `unknown` at exit 0 when nothing resolves, so
 /// an empty claude arm is always a failure.
 #[cfg(unix)]
 #[test]
 fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {
     let home = crate::testutil::HomeSandbox::new();
-    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
+    std::fs::create_dir_all(home.home().join(".tollgate/live_sessions")).expect("sessions dir");
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
     write_shim(
         home.home(),
@@ -3829,7 +3709,7 @@ fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {
     );
     write_shim(
         home.home(),
-        "clauth",
+        "tollgate",
         "case \"$1:$4\" in\n  which:) exit 1 ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
     );
     let out = std::process::Command::new("sh")
@@ -3838,12 +3718,12 @@ fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {
             "/herdr-plugin/report-profile.sh"
         ))
         .env("HERDR_BIN_PATH", home.home().join("herdr"))
-        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PLUGIN_ID", "tollgate")
         .env("HERDR_PANE_ID", "p1")
         .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"claude"}"#)
         .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
         // Never the host's /proc: see `report_profile_resolve_run_in`.
-        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
+        .env("TOLLGATE_PROC_ROOT", home.home().join("proc"))
         .env("HOME", home.home())
         .env_remove("CODEX_HOME")
         .env(
@@ -3888,13 +3768,14 @@ fn an_empty_codex_resolution_with_border_label_on_publishes_the_display_agent_cl
         report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "on", info, ps, &[], None);
     let line = token_line(&lines);
     assert_eq!(
-        line, "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent",
+        line,
+        "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent",
         "the empty resolution publishes both clears in one call: {line}"
     );
 }
 
-/// A `clauth delete <name>` detaches the adopted login's link with no herdr
-/// event, so the stale `clauth=<name>` tag would stand until the pane closed.
+/// A `tollgate delete <name>` detaches the adopted login's link with no herdr
+/// event, so the stale `tollgate=<name>` tag would stand until the pane closed.
 /// The spawned watcher's re-report resolves the now-empty profile and
 /// publishes the token clear on its next tick. Drives the real
 /// `report-profile.sh` → spawned `watch-profile.sh` chain and removes the
@@ -3908,25 +3789,25 @@ fn a_deleted_adopted_login_clears_the_tag_on_the_watchers_next_tick() {
     assert!(
         before
             .first()
-            .is_some_and(|l| l.contains("--token clauth=work")),
+            .is_some_and(|l| l.contains("--token tollgate=work")),
         "the adopted login was tagged before the delete: {before:?}"
     );
     std::fs::remove_file(setup.home.home().join(".codex/auth.json"))
         .expect("detach removes the link");
     let lines = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token clauth"))
+            .is_some_and(|l| l.contains("--clear-token tollgate"))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--clear-token clauth")),
+            .is_some_and(|l| l.contains("--clear-token tollgate")),
         "the deleted adoption clears the tag on the watcher's next tick: {lines:?}"
     );
     chain_stop(&setup);
 }
 
-/// A mid-pane `clauth login <name> --codex` creates the adopted link with no
+/// A mid-pane `tollgate login <name> --codex` creates the adopted link with no
 /// herdr event. With a watcher already spawned for the empty resolution, the
 /// adoption is picked up on its next tick and the token publish replaces the
 /// earlier clear. Drives the real `report-profile.sh` → spawned
@@ -3940,10 +3821,10 @@ fn the_spawned_watcher_picks_up_a_mid_pane_adoption() {
     assert!(
         before
             .first()
-            .is_some_and(|l| l.contains("--clear-token clauth")),
+            .is_some_and(|l| l.contains("--clear-token tollgate")),
         "the empty resolution cleared the tag before the adoption: {before:?}"
     );
-    let store = setup.home.home().join(".clauth/profiles/work");
+    let store = setup.home.home().join(".tollgate/profiles/work");
     std::fs::create_dir_all(&store).expect("profile store");
     std::fs::write(store.join("auth.json"), "{}").expect("chain written");
     let codex = setup.home.home().join(".codex");
@@ -3951,12 +3832,13 @@ fn the_spawned_watcher_picks_up_a_mid_pane_adoption() {
     std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
         .expect("adopted link");
     let lines = wait_until(&setup, |ls| {
-        ls.last().is_some_and(|l| l.contains("--token clauth=work"))
+        ls.last()
+            .is_some_and(|l| l.contains("--token tollgate=work"))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--token clauth=work")),
+            .is_some_and(|l| l.contains("--token tollgate=work")),
         "the spawned watcher picks up the mid-pane adoption: {lines:?}"
     );
     chain_stop(&setup);
@@ -3989,7 +3871,7 @@ fn the_fg_sed_reads_the_real_process_info_shape() {
 
     // The real 0.8.2 bytes: `process_info` carries the field before the
     // process array, compact JSON, one line.
-    let real = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":1822495,"foreground_processes":[{"argv":["clauth","start","uwuclxdy","--effort","max","/handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1."],"cmdline":"clauth start uwuclxdy --effort max /handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1.","pid":1822495,"ppid":2719707,"cwd":"/home/uwuclxdy/repos/py/nyatrade"}]}}}"#;
+    let real = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":1822495,"foreground_processes":[{"argv":["tollgate","start","uwuclxdy","--effort","max","/handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1."],"cmdline":"tollgate start uwuclxdy --effort max /handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1.","pid":1822495,"ppid":2719707,"cwd":"/home/uwuclxdy/repos/py/nyatrade"}]}}}"#;
     // The capture ends without a trailing newline, and the script consumes the
     // answer through command substitution, so the pin compares trimmed.
     assert_eq!(

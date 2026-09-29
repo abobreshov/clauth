@@ -28,12 +28,12 @@ fn installed_records_parses_entry() {
         &plugins_path("installed_plugins.json"),
         &json!({
             "plugins": {
-                "clauth@clauth": [{
+                "tollgate@tollgate": [{
                     "scope": "user",
                     "version": "0.1.0",
                     "gitCommitSha": "aab3e45deadbeef",
                     "installedAt": "2026-06-19T00:00:00Z",
-                    "installPath": "/home/u/.claude/plugins/clauth",
+                    "installPath": "/home/u/.claude/plugins/tollgate",
                 }]
             }
         }),
@@ -67,15 +67,15 @@ fn marketplace_known_parses_source_repo() {
     write_json(
         &plugins_path("known_marketplaces.json"),
         &json!({
-            "clauth": {
-                "source": { "source": "github", "repo": "uwuclxdy/clauth" },
-                "installLocation": "/home/u/.claude/plugins/marketplaces/clauth"
+            "tollgate": {
+                "source": { "source": "github", "repo": "abobreshov/clauth" },
+                "installLocation": "/home/u/.claude/plugins/marketplaces/tollgate"
             }
         }),
     );
 
     let info = marketplace_known().expect("marketplace present");
-    assert_eq!(info.repo.as_deref(), Some("uwuclxdy/clauth"));
+    assert_eq!(info.repo.as_deref(), Some("abobreshov/clauth"));
     assert!(info.install_location.is_some());
     // Missing file → None.
     fs::remove_file(plugins_path("known_marketplaces.json")).expect("rm");
@@ -91,7 +91,7 @@ fn manual_mcp_wiring_detects_global_config() {
 
     write_json(
         &path,
-        &json!({ "mcpServers": { "clauth": { "command": "clauth", "args": ["mcp"] } } }),
+        &json!({ "mcpServers": { "tollgate": { "command": "tollgate", "args": ["mcp"] } } }),
     );
     assert_eq!(manual_mcp_wiring(), McpWiring::GlobalConfig);
 }
@@ -108,9 +108,9 @@ fn wire_mcp_server_writes_entry_and_preserves_other_fields() {
     // Other fields untouched.
     assert_eq!(root.get("userID").and_then(Value::as_str), Some("abc123"));
     assert!(root.get("tips").is_some());
-    // The clauth entry matches the plugin manifest's stdio shape.
-    let entry = &root["mcpServers"]["clauth"];
-    assert_eq!(entry["command"].as_str(), Some("clauth"));
+    // The tollgate entry matches the plugin manifest's stdio shape.
+    let entry = &root["mcpServers"]["tollgate"];
+    assert_eq!(entry["command"].as_str(), Some("tollgate"));
     assert_eq!(entry["args"][0].as_str(), Some("mcp"));
     assert_eq!(entry["type"].as_str(), Some("stdio"));
     // And the file now reads as wired.
@@ -129,11 +129,11 @@ fn wire_mcp_server_preserves_other_servers() {
     wire_mcp_server().expect("wire");
 
     let root: Value = serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
-    // The pre-existing server must survive alongside the new clauth entry.
+    // The pre-existing server must survive alongside the new tollgate entry.
     assert_eq!(root["mcpServers"]["other"]["command"].as_str(), Some("x"));
     assert_eq!(
-        root["mcpServers"]["clauth"]["command"].as_str(),
-        Some("clauth")
+        root["mcpServers"]["tollgate"]["command"].as_str(),
+        Some("tollgate")
     );
 }
 
@@ -148,8 +148,8 @@ fn wire_mcp_server_replaces_non_object_mcpservers() {
 
     let root: Value = serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
     assert_eq!(
-        root["mcpServers"]["clauth"]["command"].as_str(),
-        Some("clauth")
+        root["mcpServers"]["tollgate"]["command"].as_str(),
+        Some("tollgate")
     );
     assert_eq!(root.get("userID").and_then(Value::as_str), Some("keep"));
 }
@@ -181,21 +181,21 @@ fn global_entry_drifted_flags_stale_command_and_args() {
     // A stale absolute command no longer matches the launch line → drift.
     write_json(
         &path,
-        &json!({ "mcpServers": { "clauth": { "command": "/old/bin/clauth", "args": ["mcp"] } } }),
+        &json!({ "mcpServers": { "tollgate": { "command": "/old/bin/tollgate", "args": ["mcp"] } } }),
     );
     assert_eq!(global_entry_drifted(), Some(true));
 
     // Args missing the `mcp` subcommand → drift.
     write_json(
         &path,
-        &json!({ "mcpServers": { "clauth": { "command": "clauth", "args": [] } } }),
+        &json!({ "mcpServers": { "tollgate": { "command": "tollgate", "args": [] } } }),
     );
     assert_eq!(global_entry_drifted(), Some(true));
 }
 
 /// Both `_meta` keys are required on every request now that no handshake
 /// carries them. Drop one and a conforming server answers `-32602`, which the
-/// probe would report as a broken clauth.
+/// probe would report as a broken tollgate.
 #[test]
 fn the_probe_frame_is_a_well_formed_stateless_opener() {
     let frame = discover_frame();
@@ -233,7 +233,7 @@ fn the_discover_probe_needs_an_advertised_tools_capability() {
     );
 }
 
-/// A `clauth` too old to know `server/discover` answers method-not-found, and
+/// A `tollgate` too old to know `server/discover` answers method-not-found, and
 /// the tab's one line of reason is the only place that can say so.
 #[test]
 fn the_discover_probe_names_a_pre_stateless_binary() {
@@ -263,7 +263,7 @@ fn the_discover_probe_names_a_pre_stateless_binary() {
     );
 }
 
-/// The probe's child is a full `clauth mcp` server, so it must say who spawned
+/// The probe's child is a full `tollgate mcp` server, so it must say who spawned
 /// it: without this the handshake registers a bare session for its own lifetime
 /// and the live tally counts a session nobody is running.
 #[test]

@@ -48,7 +48,7 @@ fn status_code_reports_parent_signal_after_successful_child_exit() {
 #[test]
 fn apply_spawn_cwd_pins_child_to_workspace() {
     let mut cmd = Command::new("true");
-    let ws = std::path::Path::new("/tmp/clauth-resume-ws");
+    let ws = std::path::Path::new("/tmp/tollgate-resume-ws");
     let resolved = apply_spawn_cwd(&mut cmd, Some(ws));
     assert_eq!(
         cmd.get_current_dir(),
@@ -74,14 +74,14 @@ fn apply_spawn_cwd_none_inherits_process_cwd() {
 
 // ── rescue: the isolated-store teardown every isolated run gets ──
 
-/// A bare `clauth start --isolated`, with no flag and no config key asked for,
+/// A bare `tollgate start --isolated`, with no flag and no config key asked for,
 /// lifts both legs into the global store: the transcript becomes resumable
 /// (mirrored `<slug>/<id>.jsonl`) and the session sidecars follow it, each moved
 /// rather than copied — the isolated tree is discarded right after.
 #[test]
 fn an_isolated_teardown_moves_the_session_into_the_global_store() {
     let sb = HomeSandbox::new();
-    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let iso = sb.home().join(".tollgate/profiles/iso/runtime-isolated");
     let claude_home = sb.home().join(".claude");
     let src = iso.join("projects/-w-iso/s1.jsonl");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
@@ -193,9 +193,9 @@ fn live_marker(path: &std::path::Path) -> fs::File {
 #[test]
 fn rescue_moves_nothing_while_a_sibling_session_is_live() {
     let sb = HomeSandbox::new();
-    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let iso = sb.home().join(".tollgate/profiles/iso/runtime-isolated");
     let claude_home = sb.home().join(".claude");
-    let sessions = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions).unwrap();
     fs::create_dir_all(iso.join("shell-snapshots")).unwrap();
     fs::write(iso.join("shell-snapshots/snap.sh"), "live shell").unwrap();
@@ -230,7 +230,7 @@ fn rescue_moves_nothing_while_a_sibling_session_is_live() {
 #[test]
 fn sidecar_failure_leaves_teardown_and_transcript_rescue_intact() {
     let sb = HomeSandbox::new();
-    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let iso = sb.home().join(".tollgate/profiles/iso/runtime-isolated");
     let claude_home = sb.home().join(".claude");
     fs::create_dir_all(iso.join("projects/-w-iso")).unwrap();
     fs::write(iso.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
@@ -427,7 +427,7 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
     assert_eq!(
         err.to_string(),
         "'undaemoned': --with-fallback needs a running daemon to decide switches, \
-         run `clauth daemon`"
+         run `tollgate daemon`"
     );
 
     let _daemon = crate::daemon::hold_daemon_lock();
@@ -549,7 +549,7 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     assert_eq!(
         err.to_string(),
         "'untouched': --with-fallback needs a running daemon to decide switches, \
-         run `clauth daemon`"
+         run `tollgate daemon`"
     );
     assert!(
         !profile_dir_of("untouched").exists(),
@@ -629,7 +629,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
 
 // ── the plugin pre-flight ─────────────────────────────────────────────────
 
-/// The migration trigger's own pin: a `clauth start` heals a broken plugin
+/// The migration trigger's own pin: a `tollgate start` heals a broken plugin
 /// registration before `claude` launches, and a healthy one costs no `claude
 /// plugin` spawn at all. Both halves drive the real `run` chokepoint against
 /// the fake-`claude` harness, so the shim's call log is the evidence.
@@ -646,10 +646,10 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     // `acquire` re-reads the account record from disk under the state flock, so
     // the sandbox needs the profile the run starts under persisted the way
     // `load_config` walks it.
-    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    let tollgate_dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    std::fs::create_dir_all(&tollgate_dir).expect("tollgate dir");
     std::fs::write(
-        clauth_dir.join("profiles.toml"),
+        tollgate_dir.join("profiles.toml"),
         "profiles = [\"wired\", \"spare\"]\n",
     )
     .expect("profiles.toml");
@@ -666,11 +666,11 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     .expect("manifest");
     let path = expected.to_string_lossy().into_owned();
     let marketplaces = serde_json::json!({
-        "clauth": {"source": {"source": "directory", "path": path}, "installLocation": path, "lastUpdated": "2026-08-26T00:00:00.000Z"}
+        "tollgate": {"source": {"source": "directory", "path": path}, "installLocation": path, "lastUpdated": "2026-08-26T00:00:00.000Z"}
     });
     let plugins = serde_json::json!({
         "version": 2,
-        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
+        "plugins": {"tollgate@tollgate": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
     });
     let plugins_dir = claude.join("plugins");
     std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
@@ -729,7 +729,7 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
 #[test]
 fn the_codex_spawn_command_carries_the_wire_facts() {
     let home = crate::testutil::HomeSandbox::new();
-    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let session_home = home.home().join(".tollgate/profiles/cx/codex-home-4242-0");
     let cmd = codex_spawn_command(
         &session_home,
         &["exec".to_string(), "--full-auto".to_string()],
@@ -771,7 +771,7 @@ fn the_codex_spawn_command_carries_the_wire_facts() {
 #[test]
 fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     let home = crate::testutil::HomeSandbox::new();
-    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let session_home = home.home().join(".tollgate/profiles/cx/codex-home-4242-0");
     std::fs::create_dir_all(&session_home).expect("mkdir home");
     // The operator's own setting, faithfully copied into the session home by
     // `build_codex_home` — codex would resolve its DBs there, not here.
@@ -799,7 +799,7 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
 
 /// codex layers its managed config ABOVE the session's `-c` flags, so a key
 /// set there defeats the forced store and state-DB home the spawn pins, and
-/// nothing clauth passes can outrank it. The two keys that kill the chain
+/// nothing tollgate passes can outrank it. The two keys that kill the chain
 /// refuse the spawn with a line naming the file, the key, its value and the
 /// fix; the moved state-DB home warns; anything else, absent or unparseable
 /// included, is clear.
@@ -824,9 +824,9 @@ fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() 
         managed_config_verdict(&path),
         ManagedConfigVerdict::Refuse(format!(
             "{file} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
-             the file store clauth forces at spawn, so codex would ignore this session's \
+             the file store tollgate forces at spawn, so codex would ignore this session's \
              linked auth.json. ask whoever manages this machine to remove the key or set it \
-             to \"file\"; clauth cannot override a managed config"
+             to \"file\"; tollgate cannot override a managed config"
         ))
     );
 
@@ -842,9 +842,9 @@ fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() 
         managed_config_verdict(&path),
         ManagedConfigVerdict::Refuse(format!(
             "{file} sets debug.config_lockfile.load_path = \"/x\", and a managed config \
-             outranks the flags clauth passes at spawn, so codex would replay that lockfile \
+             outranks the flags tollgate passes at spawn, so codex would replay that lockfile \
              as its whole config and drop the file store this session's linked auth.json \
-             depends on. ask whoever manages this machine to remove the key; clauth cannot \
+             depends on. ask whoever manages this machine to remove the key; tollgate cannot \
              override a managed config"
         ))
     );
@@ -865,7 +865,7 @@ fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() 
         managed_config_verdict(&path),
         ManagedConfigVerdict::Warn(format!(
             "{file} sets sqlite_home = \"/y\", which outranks the per-session home \
-             clauth pins at spawn, so every profile's state dbs land in that one directory"
+             tollgate pins at spawn, so every profile's state dbs land in that one directory"
         ))
     );
 
@@ -898,8 +898,8 @@ fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() 
 #[test]
 fn run_codex_refuses_on_the_managed_config_before_building_a_home() {
     let sb = HomeSandbox::new();
-    fs::create_dir_all(sb.home().join(".clauth")).expect("mkdir .clauth");
-    fs::write(sb.home().join(".clauth/profiles"), b"").expect("wall off the profile root");
+    fs::create_dir_all(sb.home().join(".tollgate")).expect("mkdir .tollgate");
+    fs::write(sb.home().join(".tollgate/profiles"), b"").expect("wall off the profile root");
     let managed = sb.home().join("managed_config.toml");
     fs::write(&managed, "cli_auth_credentials_store = \"keyring\"\n").expect("write managed");
     let _managed = ManagedConfigSandbox::new(&sb, &managed);
@@ -914,9 +914,9 @@ fn run_codex_refuses_on_the_managed_config_before_building_a_home() {
         err.to_string(),
         format!(
             "{} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
-             the file store clauth forces at spawn, so codex would ignore this session's \
+             the file store tollgate forces at spawn, so codex would ignore this session's \
              linked auth.json. ask whoever manages this machine to remove the key or set it \
-             to \"file\"; clauth cannot override a managed config",
+             to \"file\"; tollgate cannot override a managed config",
             managed.display()
         )
     );
@@ -928,12 +928,12 @@ fn run_codex_refuses_on_the_managed_config_before_building_a_home() {
 #[test]
 fn a_quoted_home_path_falls_back_to_a_basic_toml_string() {
     assert_eq!(
-        toml_path_value(std::path::Path::new("/Users/o'brien/.clauth")),
-        "\"/Users/o'brien/.clauth\""
+        toml_path_value(std::path::Path::new("/Users/o'brien/.tollgate")),
+        "\"/Users/o'brien/.tollgate\""
     );
     assert_eq!(
-        toml_path_value(std::path::Path::new("/Users/plain/.clauth")),
-        "'/Users/plain/.clauth'"
+        toml_path_value(std::path::Path::new("/Users/plain/.tollgate")),
+        "'/Users/plain/.tollgate'"
     );
 }
 
@@ -946,7 +946,7 @@ fn a_quoted_home_path_falls_back_to_a_basic_toml_string() {
 /// account's `[env]` entries in the base untouched, and the merge then pairs
 /// them with the started account's endpoint in the runtime settings.
 /// Reach: `switch_off` (clears the marker, never the file), then
-/// `clauth start <other>`.
+/// `tollgate start <other>`.
 ///
 /// Drives the real `run` against a slow shim, so the list under test is the
 /// one `run` itself computes, and reads the runtime settings.json MID-run:

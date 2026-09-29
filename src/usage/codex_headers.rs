@@ -1,5 +1,5 @@
 //! The headers codex's own CLI sends on its WHAM endpoints, applied to every
-//! clauth call against `chatgpt.com/backend-api`: the usage poll
+//! tollgate call against `chatgpt.com/backend-api`: the usage poll
 //! ([`super::codex`]) and the reset spend ([`super::codex_reset`]).
 //!
 //! Wire parity is with a logged-in codex CLI's backend client, verified
@@ -9,7 +9,7 @@
 //! `login/src/auth/default_client.rs` (`get_codex_user_agent`) and
 //! `terminal-detection/src/lib.rs` (`user_agent_token`, ported below). That
 //! client sends no `Accept` and no `originator` header on this path — the
-//! originator rides inside the UA string alone — so clauth sends neither.
+//! originator rides inside the UA string alone — so tollgate sends neither.
 //! `X-OpenAI-Fedramp` rides only when the stored tokens carry
 //! `chatgpt_account_is_fedramp`, the same field codex reads it from.
 
@@ -22,7 +22,7 @@ use std::time::Duration;
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 /// The codex UA is process-constant (OS, terminal and codex's version do not
-/// change under a running clauth), so it is resolved once.
+/// change under a running tollgate), so it is resolved once.
 static CODEX_USER_AGENT: LazyLock<String> = LazyLock::new(codex_user_agent_now);
 
 /// The agent every WHAM call rides. Same shape as the shared usage agent; the

@@ -57,7 +57,7 @@ pub fn wait_until(what: &str, within: Duration, mut ready: impl FnMut() -> bool)
 ///
 /// The trap is set before the run's record is written, so a test that has
 /// read the record knows the trap is in place. The script stays the process
-/// clauth spawned (no `exec`), since an `exec` drops a trap; its `sleep`s run
+/// tollgate spawned (no `exec`), since an `exec` drops a trap; its `sleep`s run
 /// with the pipe closed and are waited for in the background, so a signal is
 /// handled at once and the pipe closes the moment the script dies.
 pub fn write_stub(dir: &Path) -> PathBuf {

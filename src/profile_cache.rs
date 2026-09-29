@@ -49,8 +49,8 @@ pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 /// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
 /// against the fingerprint of the credential that produced it.
 ///
-/// It exists for the surfaces with no scheduler in the process — `clauth list`
-/// and `clauth status --json` — which otherwise derive freshness from the usage
+/// It exists for the surfaces with no scheduler in the process — `tollgate list`
+/// and `tollgate status --json` — which otherwise derive freshness from the usage
 /// cache's mtime alone and so report a warm cache behind a dead session as
 /// `Fresh`: a live measurement, over a credential that will never come back.
 /// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
@@ -91,7 +91,7 @@ pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool 
         .is_some_and(|v| v.credential == credential)
 }
 
-/// The one credential-store mtime bump clauth makes with NO bytes behind it
+/// The one credential-store mtime bump tollgate makes with NO bytes behind it
 /// ([`TouchReceipt`]). Sits beside the store it describes, so
 /// [`effective_write_time`] resolves it from the store's own path.
 /// Per-profile parked MCP-server logins (`claude::park_mcp_logins_from_store`),
@@ -103,7 +103,7 @@ pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
 
 pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
 
-/// A store mtime clauth moved without writing the store.
+/// A store mtime tollgate moved without writing the store.
 ///
 /// The per-session swap executor must move the mtime of the store it repoints to
 /// — Claude Code re-reads credentials only when that value changes, so an
@@ -181,7 +181,7 @@ pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
 pub(crate) fn profile_cache_path(name: &ProfileName, file: &str) -> Option<PathBuf> {
     // `profile_dir` (override-aware) rather than raw `dirs::home_dir`, so tests
-    // never touch the real `~/.clauth`.
+    // never touch the real `~/.tollgate`.
     crate::profile::profile_dir(name).ok().map(|p| p.join(file))
 }
 

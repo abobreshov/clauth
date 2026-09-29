@@ -1,6 +1,6 @@
-//! `clauth sessions [--json] [--tokens]`, `clauth resume <id|latest>
-//! [--profile <name>]`, `clauth info <id|latest>`, and the two-name form of
-//! `clauth switch <sid> <profile>` (one name is the global account switch,
+//! `tollgate sessions [--json] [--tokens]`, `tollgate resume <id|latest>
+//! [--profile <name>]`, `tollgate info <id|latest>`, and the two-name form of
+//! `tollgate switch <sid> <profile>` (one name is the global account switch,
 //! `main::cmd_switch`) — the CLI surface over the session index
 //! ([`crate::sessions`]). The index owns the heavy work (transcript walk,
 //! preview redaction, token/cost annotation, owner stamping); this module
@@ -19,11 +19,11 @@
 //! figures are a third tier above even the index — a full read of every
 //! transcript — so `sessions` leaves them blank until `--tokens` asks.
 //!
-//! Over the maintainer's own 12k-session, 5.4 GB store: `clauth info latest`
-//! 11.3 s → 44 ms, `clauth sessions` 20.7 s → 11.3 s, and `--tokens` reproduces
+//! Over the maintainer's own 12k-session, 5.4 GB store: `tollgate info latest`
+//! 11.3 s → 44 ms, `tollgate sessions` 20.7 s → 11.3 s, and `--tokens` reproduces
 //! the old listing byte for byte.
 //!
-//! # Exit codes (the `clauth sessions` scripting contract)
+//! # Exit codes (the `tollgate sessions` scripting contract)
 //! - `0` success.
 //! - `1` a genuine error, INCLUDING "no sessions found".
 //! - `2` a usage error (bad flag/args).
@@ -43,7 +43,7 @@ use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
 use crate::sessions::{IsolatedHold, SessionInfo, SessionRef, WorkspaceGroup};
 
-/// `clauth sessions [--json] [--tokens]` — the full inventory, newest-first.
+/// `tollgate sessions [--json] [--tokens]` — the full inventory, newest-first.
 /// Both a TTY and a pipe print a table (the `--json` flag, not the tty, selects
 /// machine output; this is deliberately NOT showagent's pipe-prints-different
 /// behavior). An empty index is exit 1 ("no sessions found") on both paths, per
@@ -83,11 +83,11 @@ fn build_listing(tokens: bool) -> Vec<WorkspaceGroup> {
     groups
 }
 
-/// `clauth resume <id|latest> [--profile <name>]` — resume a session through the
-/// existing `clauth start` spawn path (runtime prep, signal forwarding, lifetime
+/// `tollgate resume <id|latest> [--profile <name>]` — resume a session through the
+/// existing `tollgate start` spawn path (runtime prep, signal forwarding, lifetime
 /// guard), with `--resume <id>` injected and the session's recorded workspace as
 /// the child cwd. Never a second spawn implementation. `latest` = the newest
-/// session `clauth sessions` would list first; any other value is an exact id
+/// session `tollgate sessions` would list first; any other value is an exact id
 /// match. Either can name a session a live isolated run holds, which is refused
 /// by name rather than resumed or silently swapped for another.
 pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()> {
@@ -133,7 +133,7 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
 
     let resume_args = vec!["--resume".to_string(), session.id];
     // Shared isolation: a resume adopts the chosen account against the shared
-    // store, the same lifecycle a bare `clauth start <name>` uses. A resume never
+    // store, the same lifecycle a bare `tollgate start <name>` uses. A resume never
     // opts into the fallback chain — there is no `--with-fallback` on this
     // surface to ask for it.
     crate::start::run(
@@ -147,7 +147,7 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
     )
 }
 
-/// `clauth info <id|latest>` — print the exact `clauth resume` command, the
+/// `tollgate info <id|latest>` — print the exact `tollgate resume` command, the
 /// workspace, and the on-disk storage path. Never launches anything.
 pub(crate) fn run_info(target: &str) -> Result<()> {
     let (session, held_by) = match resolve_session(target) {
@@ -162,7 +162,7 @@ pub(crate) fn run_info(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// The three lines `clauth info` prints. Pure, so both variants are assertable
+/// The three lines `tollgate info` prints. Pure, so both variants are assertable
 /// without capturing stdout. A held session gets no resume command: printing one
 /// that Claude Code would answer `No conversation found` for is worse than
 /// saying why there isn't one.
@@ -171,7 +171,7 @@ fn info_lines(session: &SessionRef, held_by: Option<&str>) -> String {
         Some(profile) => {
             format!("unavailable while a live isolated run under '{profile}' holds this session")
         }
-        None => format!("clauth resume {}", session.id),
+        None => format!("tollgate resume {}", session.id),
     };
     format!(
         "resume:    {resume}\nworkspace: {}\nstorage:   {}",
@@ -180,7 +180,7 @@ fn info_lines(session: &SessionRef, held_by: Option<&str>) -> String {
     )
 }
 
-/// `clauth switch <sid> <profile>` — point a live session at another
+/// `tollgate switch <sid> <profile>` — point a live session at another
 /// profile.
 ///
 /// Intent only, by design: the row's intended member moves through the same
@@ -201,11 +201,11 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
                 .ok()
                 .is_some_and(|state| state.canonical_name(sid).is_some());
         let hint = if resolves_anywhere {
-            format!("\nto switch the global account: `clauth switch {sid}`")
+            format!("\nto switch the global account: `tollgate switch {sid}`")
         } else {
             String::new()
         };
-        anyhow::bail!("no live session '{sid}'\nsee `clauth sessions`{hint}");
+        anyhow::bail!("no live session '{sid}'\nsee `tollgate sessions`{hint}");
     };
     // A codex row has no executor: codex reads auth.json once at start, so a
     // mid-session intent would stand forever as a silent no-op.
@@ -221,7 +221,7 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
     if !crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id) {
         anyhow::bail!(
             "session '{sid}' is no longer running\n\
-             its row is reaped by the next `clauth daemon` or `clauth resume`"
+             its row is reaped by the next `tollgate daemon` or `tollgate resume`"
         );
     }
 
@@ -247,7 +247,7 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
 /// wording for when a switch lands.
 fn switch_receipt(sid: &str, profile: &str) -> String {
     format!(
-        "clauth: pointed session '{sid}' at '{profile}'\n\
+        "tollgate: pointed session '{sid}' at '{profile}'\n\
          the switch lands at the session's next request, never before it — \
          a refused move is logged and the session stays put"
     )
@@ -257,7 +257,7 @@ fn switch_receipt(sid: &str, profile: &str) -> String {
 /// executor treats an intent equal to the current member as the steady state,
 /// so writing one would promise a move that never comes.
 fn already_on_line(sid: &str, profile: &str) -> String {
-    format!("clauth: session '{sid}' is already on '{profile}'")
+    format!("tollgate: session '{sid}' is already on '{profile}'")
 }
 
 /// Pick the resume profile default and whether to prompt for it, across the four
@@ -349,7 +349,7 @@ fn flatten_newest_first(groups: &[WorkspaceGroup]) -> Vec<&SessionInfo> {
 }
 
 /// What a `<id|latest>` target resolved to. "Not in the shared store" is not
-/// "not there": `clauth sessions` browses live isolated stores too, so a target
+/// "not there": `tollgate sessions` browses live isolated stores too, so a target
 /// naming one of those is a real session that a resume simply cannot reach yet,
 /// and saying "no session found" for it would be false.
 enum Resolved {
@@ -436,12 +436,12 @@ fn held_refusal(target: &str, hold: &IsolatedHold) -> anyhow::Error {
     )
 }
 
-/// The stable `clauth sessions --json` array (newest-first). Documented fields
+/// The stable `tollgate sessions --json` array (newest-first). Documented fields
 /// only: `id`, `last_ran_profile`, `workspace`, `updated`, `first_message`,
 /// `last_message`, `tokens`, `cost`. Absent `tokens`/`cost` serialize to JSON
 /// `null` (never `0`) — and without `--tokens` nothing asked for them, so every
 /// row's pair is `null`. `updated` is ISO-8601 UTC
-/// (`YYYY-MM-DDTHH:MM:SS+00:00`), matching the rest of clauth's timestamps —
+/// (`YYYY-MM-DDTHH:MM:SS+00:00`), matching the rest of tollgate's timestamps —
 /// and deliberately NOT the human table's shape, which renders the same
 /// instant in local wall clock with a relative age (the 2026-08-22
 /// prose-stamp ruling).
@@ -533,7 +533,7 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
 }
 
 /// The first block of a uuid session id, enough to eyeball in the table (the
-/// full id is what `clauth resume`/`info` take). A non-uuid stem shows whole.
+/// full id is what `tollgate resume`/`info` take). A non-uuid stem shows whole.
 fn short_id(id: &str) -> &str {
     id.split('-').next().unwrap_or(id)
 }

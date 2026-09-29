@@ -7,8 +7,8 @@ const BASE_UTC: i64 = 1_779_027_600;
 #[test]
 fn daemon_mode_prefixes_an_iso_utc_stamp() {
     assert_eq!(
-        render(true, BASE_UTC, "clauth daemon: switched to 'b'"),
-        "2026-05-17T14:20:00+00:00 clauth daemon: switched to 'b'",
+        render(true, BASE_UTC, "tollgate daemon: switched to 'b'"),
+        "2026-05-17T14:20:00+00:00 tollgate daemon: switched to 'b'",
         "daemon.log lines must be self-dating — incident forensics depend on it"
     );
 }
@@ -16,8 +16,8 @@ fn daemon_mode_prefixes_an_iso_utc_stamp() {
 #[test]
 fn daemon_mode_stays_bare_on_stderr() {
     assert_eq!(
-        render(false, BASE_UTC, "clauth: 'a' re-authenticated"),
-        "clauth: 'a' re-authenticated",
+        render(false, BASE_UTC, "tollgate: 'a' re-authenticated"),
+        "tollgate: 'a' re-authenticated",
         "the daemon's redirected stderr keeps the historical bare format"
     );
 }
@@ -49,7 +49,7 @@ fn only_a_non_daemon_line_on_a_terminal_diverts_to_the_log_file() {
 fn to_logfile_calls_the_durable_sink() {
     let rendered = std::cell::RefCell::new(None);
     to_logfile_with(
-        format_args!("clauth: census collected {0}", "deadbeef"),
+        format_args!("tollgate: census collected {0}", "deadbeef"),
         |line| {
             *rendered.borrow_mut() = Some(line.to_string());
         },
@@ -57,7 +57,7 @@ fn to_logfile_calls_the_durable_sink() {
 
     let rendered = rendered.into_inner().expect("the durable sink was called");
     assert!(
-        rendered.ends_with(" clauth: census collected deadbeef"),
+        rendered.ends_with(" tollgate: census collected deadbeef"),
         "the durable sink receives the stamped census diagnostic: {rendered}"
     );
 }
@@ -65,7 +65,7 @@ fn to_logfile_calls_the_durable_sink() {
 /// The census diagnostics' call sites: every branch of the Keychain census
 /// raises its line through `census_log!`, and that macro's one emission arm is
 /// the durable logfile sink — never `line()`, whose route sends an unstamped
-/// non-tty process (exactly `clauth mcp`) to captured stderr, the #81
+/// non-tty process (exactly `tollgate mcp`) to captured stderr, the #81
 /// reporting defect. The census body is macOS-only code no Linux run compiles,
 /// so the pin is a source scan, the same mechanism the `run_delegate` wiring
 /// pins use.
@@ -109,7 +109,7 @@ fn the_census_diagnostics_route_through_the_durable_logfile_sink() {
 
 #[test]
 fn write_log_line_appends_each_call() {
-    let path = std::env::temp_dir().join(format!("clauth-logline-{}.log", std::process::id()));
+    let path = std::env::temp_dir().join(format!("tollgate-logline-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&path);
     write_log_line(&path, "first");
     write_log_line(&path, "second");
@@ -125,25 +125,25 @@ fn write_log_line_appends_each_call() {
 /// succeeds at all: `capture_here` asserts the slot is free, so a drop that
 /// left the first capture standing panics right there. Emitting into no capture
 /// to check the same thing would write the line for real, and on a developer's
-/// terminal that sink is the operator's own `~/.clauth/clauth.log`.
+/// terminal that sink is the operator's own `~/.tollgate/tollgate.log`.
 #[test]
 fn a_capture_takes_the_formatted_line_until_its_guard_drops() {
     let first = LogLines::new();
     let guard = first.capture_here();
-    logline!("clauth: {} of {} seen", 2, 3);
+    logline!("tollgate: {} of {} seen", 2, 3);
     assert_eq!(
         first.snapshot(),
-        vec!["clauth: 2 of 3 seen".to_string()],
+        vec!["tollgate: 2 of 3 seen".to_string()],
         "the capture must carry the line as its call site formatted it"
     );
     drop(guard);
 
     let second = LogLines::new();
     let _guard = second.capture_here();
-    logline!("clauth: after the first guard");
+    logline!("tollgate: after the first guard");
     assert_eq!(
         second.snapshot(),
-        vec!["clauth: after the first guard".to_string()],
+        vec!["tollgate: after the first guard".to_string()],
         "the line went somewhere other than the capture standing when it was raised"
     );
 }
@@ -155,37 +155,37 @@ fn a_capture_takes_the_formatted_line_until_its_guard_drops() {
 ///
 /// Asked of [`captured`] directly rather than by raising a line there: a thread
 /// with no capture routes to the real sink, and on a developer's terminal that
-/// sink is the operator's own `~/.clauth/clauth.log`. The predicate is the same
+/// sink is the operator's own `~/.tollgate/tollgate.log`. The predicate is the same
 /// one [`line`] branches on, and it appends nothing when it answers false.
 #[test]
 fn a_capture_takes_only_the_lines_raised_on_its_own_thread() {
     let mine = LogLines::new();
     let _guard = mine.capture_here();
-    logline!("clauth: raised before the sibling");
+    logline!("tollgate: raised before the sibling");
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
             assert!(
-                !captured("clauth: probed from the sibling thread"),
+                !captured("tollgate: probed from the sibling thread"),
                 "a thread that installed nothing was handed another thread's capture"
             );
             let theirs = LogLines::new();
             let _guard = theirs.capture_here();
-            logline!("clauth: raised on the sibling thread");
+            logline!("tollgate: raised on the sibling thread");
             assert_eq!(
                 theirs.snapshot(),
-                vec!["clauth: raised on the sibling thread".to_string()],
+                vec!["tollgate: raised on the sibling thread".to_string()],
                 "the sibling's own capture must take its line"
             );
         });
     });
 
-    logline!("clauth: raised after the sibling");
+    logline!("tollgate: raised after the sibling");
     assert_eq!(
         mine.snapshot(),
         vec![
-            "clauth: raised before the sibling".to_string(),
-            "clauth: raised after the sibling".to_string(),
+            "tollgate: raised before the sibling".to_string(),
+            "tollgate: raised after the sibling".to_string(),
         ],
         "the sibling's install and its drop both reached across threads"
     );
@@ -207,7 +207,7 @@ fn a_capture_guard_cannot_be_carried_to_another_thread() {
     );
 }
 
-/// The log lands in `~/.clauth` and carries whatever an event line names
+/// The log lands in `~/.tollgate` and carries whatever an event line names
 /// (profiles, endpoints, failure bodies), so it rides the same owner-only rule
 /// as the rest of the tree.
 #[cfg(unix)]
@@ -215,13 +215,14 @@ fn a_capture_guard_cannot_be_carried_to_another_thread() {
 fn write_log_line_creates_an_owner_only_file() {
     use std::os::unix::fs::PermissionsExt;
 
-    let path = std::env::temp_dir().join(format!("clauth-logline-perm-{}.log", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("tollgate-logline-perm-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&path);
     write_log_line(&path, "first");
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     let _ = std::fs::remove_file(&path);
     assert_eq!(
         mode, 0o600,
-        "clauth.log mode should be 0o600, got {mode:#o}"
+        "tollgate.log mode should be 0o600, got {mode:#o}"
     );
 }

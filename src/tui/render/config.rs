@@ -81,7 +81,7 @@ struct Snap {
     /// The global active profile — one of the two gates (mirroring
     /// `actions::disable_profile`'s own gate) that dims the `disabled` row inert.
     is_active: bool,
-    /// A live `clauth start` session — the other gate.
+    /// A live `tollgate start` session — the other gate.
     has_live_session: bool,
     /// Whether the profile holds a stored credential — the OAuth token or, for an
     /// API account, the api key. Drives the `Login` row's re-login vs first-login
@@ -356,7 +356,7 @@ fn session_token_lines(
                     charged(
                         "rolling token stalled".to_string(),
                         &format!(
-                            "nothing re-stamped it before expiry · clauth rolling-token {name} re-arms"
+                            "nothing re-stamped it before expiry · tollgate rolling-token {name} re-arms"
                         ),
                     )
                 } else {
@@ -598,7 +598,7 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
-        // state. `live session` is the app-wide noun for a running `clauth
+        // state. `live session` is the app-wide noun for a running `tollgate
         // start`; the CLI's wording is its own.
         ConfigRow::Disabled if snap.is_active => "cannot disable the global active account",
         ConfigRow::Disabled if snap.has_live_session => {

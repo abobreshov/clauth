@@ -286,7 +286,7 @@ pub(crate) struct OAuthToken {
     /// both boundaries of every store rewrite. Claude Code writes fields of its
     /// own into `claudeAiOauth` (`rateLimitTier`, `refreshTokenExpiresAt`,
     /// `clientId`) and re-emits them only on a token save, so a typed model
-    /// that silently dropped them made every clauth write of the store sticky
+    /// that silently dropped them made every tollgate write of the store sticky
     /// (issue #75): the parse lost them before any merge could see them, and
     /// the serialize never emitted them. This is the login block's share of
     /// [`preserve_extra_blocks`]'s rule — the store's own value is the record,
@@ -302,7 +302,7 @@ pub(crate) struct OAuthToken {
 /// `/profile` at login and reads it back as a feature-flag targeting attribute,
 /// so a login block without it evaluates the server's plan-gated flags as an
 /// untiered account. Lives in [`OAuthToken::extra`]: the field is Claude Code's,
-/// not part of the model clauth owns.
+/// not part of the model tollgate owns.
 pub(crate) const RATE_LIMIT_TIER_KEY: &str = "rateLimitTier";
 
 impl OAuthToken {
@@ -320,7 +320,7 @@ impl OAuthToken {
     }
 
     /// `..Self::default_extra()` — the struct-update tail for every constructor
-    /// minting a login from clauth's own flow, where no outside writer has put
+    /// minting a login from tollgate's own flow, where no outside writer has put
     /// anything into the block yet. `Default` is deliberately not derived: the
     /// named fields carry no defaults (`access_token` has none), so this named
     /// constructor is the one spelling of "starts empty".
@@ -383,7 +383,7 @@ pub(crate) struct Profile {
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
     /// usage chain's current access token on every rotation (full scopes,
     /// `subscriptionType` and `rateLimitTier`, no refresh token — sessions get
-    /// plan-gated-model bearers while the refresh chain stays clauth-private).
+    /// plan-gated-model bearers while the refresh chain stays tollgate-private).
     /// Off — the default — keeps the sidecar exactly what was captured (static
     /// mint).
     pub(crate) rolling_token: bool,
@@ -501,7 +501,7 @@ impl Profile {
             .or(self.base_url.as_deref())
     }
 
-    /// Whether this account's endpoint is one clauth has a TYPED integration
+    /// Whether this account's endpoint is one tollgate has a TYPED integration
     /// for. Answers "is this a recognised provider", nothing else — a generic
     /// api-key endpoint is `false` here while still being an api-key account in
     /// every other sense. For "where do this account's usage figures live", ask
@@ -538,7 +538,7 @@ impl Profile {
 
     /// The vendor console page where this account's api key is minted, for a
     /// surface offering to open it. `None` for an OAuth account and for an
-    /// endpoint no provider claims, neither of which clauth knows a page for.
+    /// endpoint no provider claims, neither of which tollgate knows a page for.
     ///
     /// Reads the two fields that were derived together, so the page always
     /// belongs to the endpoint the account actually calls.
@@ -732,7 +732,7 @@ pub(crate) enum PopupWidth {
 }
 
 impl PopupWidth {
-    /// The `clauth herdr config get popup_width` spelling.
+    /// The `tollgate herdr config get popup_width` spelling.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             PopupWidth::Fit => "fit",
@@ -745,7 +745,7 @@ impl PopupWidth {
 
 /// The herdr knobs, persisted under `[herdr]` in profiles.toml. Written by the
 /// Plugin tab's herdr-options form rows, read by the plugin scripts through
-/// `clauth herdr config get <key>` and by the TUI at launch — so the on-disk
+/// `tollgate herdr config get <key>` and by the TUI at launch — so the on-disk
 /// shape is also a published read contract. The `[herdr]` table itself may be
 /// absent (defaults) or partial: a missing field fills from [`Default`]
 /// rather than erroring.
@@ -755,18 +755,18 @@ pub(crate) struct HerdrSettings {
     /// Which open shape `open-pane.sh` resolves per open: popup sizing for
     /// `fit`/`half`, a real split pane for `split-right`/`split-top`.
     pub(crate) popup_width: PopupWidth,
-    /// Publish the `clauth=$profile` pane-metadata token (the sidebar tag).
+    /// Publish the `tollgate=$profile` pane-metadata token (the sidebar tag).
     pub(crate) pane_tag: bool,
     /// The per-pane tag watcher interval, seconds.
     pub(crate) tag_watch_secs: u64,
     /// Also publish `--display-agent "$profile"` so split-pane borders name
     /// the account.
     pub(crate) border_label: bool,
-    /// The `clauth mcp` server reports `clauth_delegate=working|idle` pane
+    /// The `tollgate mcp` server reports `tollgate_delegate=working|idle` pane
     /// metadata while delegates run.
     pub(crate) delegate_dot: bool,
-    /// The sidebar row `clauth herdr install` appends gains the
-    /// `$clauth_delegate` token, so a running delegate reads as text.
+    /// The sidebar row `tollgate herdr install` appends gains the
+    /// `$tollgate_delegate` token, so a running delegate reads as text.
     pub(crate) delegate_row_text: bool,
     /// Set once the first herdr-mode landing fires, so that landing happens
     /// exactly once; every later launch — herdr mode included — opens the
@@ -805,10 +805,10 @@ pub(crate) struct ServeSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateSettings {
-    /// Run the background update work (default on): the binary check on
-    /// launch and the daemon's remote herdr reinstall. `CLAUTH_NO_UPDATE=1`
-    /// still disables every leg even when this is on — the env kill-switch
-    /// stays authoritative.
+    /// Run the background update work: the binary check on launch and the
+    /// daemon's remote herdr reinstall. Kept so the saved table round-trips,
+    /// but inert in this build: self-update is compiled out
+    /// (`update::updates_enabled` is always false, plan §4.0).
     pub(crate) auto_update: bool,
 }
 
@@ -839,7 +839,7 @@ pub(crate) enum WalkOrder {
     SoonestWeeklyReset,
 }
 
-/// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
+/// Stored at ~/.tollgate/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppState {
@@ -864,7 +864,7 @@ pub(crate) struct AppState {
     /// Incident C) — a transient network/5xx blip never lands here. Excluded from
     /// the fallback chain walk and refused as a switch target so a dead token is
     /// never installed into the Keychain (which would log out every running
-    /// `claude`); cleared on a successful refresh or `clauth login`.
+    /// `claude`); cleared on a successful refresh or `tollgate login`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) auth_broken: Vec<ProfileName>,
     /// When true, the fallback-chain auto-switch decision for the ACTIVE
@@ -917,7 +917,7 @@ pub(crate) struct AppState {
     pub(crate) switch_off_when_budget_spent: bool,
     /// Rotate a profile ahead of its access-token expiry instead of waiting for
     /// a 401. Default ON: the lead clears the running `claude`'s own refresh
-    /// threshold, so clauth's stored pair stays the live one instead of lagging
+    /// threshold, so tollgate's stored pair stays the live one instead of lagging
     /// a chain the session advanced. Off falls back to rotating only on
     /// rejection. See `usage::scheduler::proactive_rotation_due`.
     #[serde(
@@ -1670,10 +1670,10 @@ struct ProfileConfig {
     #[serde(default)]
     last_resort: bool,
     /// CLA-ROLL. No alias for the pre-rename `session_feed` spelling: no
-    /// released clauth ever wrote that key, so carrying it here would be a
+    /// released tollgate ever wrote that key, so carrying it here would be a
     /// permanent legacy alias for something that never shipped. Installs that
     /// ran the feature branch under its old name re-run
-    /// `clauth rolling-token <profile>` once after upgrading.
+    /// `tollgate rolling-token <profile>` once after upgrading.
     #[serde(default)]
     rolling_token: bool,
     #[serde(default)]
@@ -1703,7 +1703,7 @@ struct ProfileConfig {
     console: ConsoleConfig,
 }
 
-/// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
+/// Test-only home-dir override. Redirects all reads/writes away from real `~/.tollgate`.
 /// Never compiled into the binary.
 #[cfg(test)]
 static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -1742,9 +1742,9 @@ pub(crate) fn home_override_active() -> bool {
     HOME_OVERRIDE.lock().is_ok_and(|g| g.is_some())
 }
 
-/// The home every `~/.clauth` and `~/.claude` path is built from. Under `cfg(test)`
+/// The home every `~/.tollgate` and `~/.claude` path is built from. Under `cfg(test)`
 /// the override is the ONLY answer: falling back to the operator's real home there
-/// writes into their live tree and takes the `~/.clauth/.lock` a running clauth
+/// writes into their live tree and takes the `~/.tollgate/.lock` a running tollgate
 /// holds, so the test fails on contention it never staged while disturbing the
 /// operator it never meant to touch. Panicking names the test that forgot its
 /// sandbox at the moment it reaches for the home, which a returned `Err` would not:
@@ -1766,8 +1766,8 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
     }
 }
 
-pub(crate) fn clauth_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".clauth"))
+pub(crate) fn tollgate_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(crate::identity::DATA_DIR_NAME))
 }
 
 pub(crate) fn claude_dir() -> Result<PathBuf> {
@@ -1853,11 +1853,11 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
 }
 
 fn profiles_root() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("profiles"))
+    Ok(tollgate_dir()?.join("profiles"))
 }
 
 fn app_state_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("profiles.toml"))
+    Ok(tollgate_dir()?.join("profiles.toml"))
 }
 
 pub(crate) fn profile_dir(name: &ProfileName) -> Result<PathBuf> {
@@ -1931,12 +1931,12 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
         // 0o600: the rename swaps the inode, so a plain write would revert the
         // history log (re-created 0o600 by the appender) to the umask.
         if let Err(e) = atomic_write_600(&path, body) {
-            logline!("clauth: failed to prune usage history for {name}: {e}");
+            logline!("tollgate: failed to prune usage history for {name}: {e}");
         }
     }
 }
 
-/// Open an append-only log under `~/.clauth` (a profile's
+/// Open an append-only log under `~/.tollgate` (a profile's
 /// `usage_history.jsonl` / `wallet_history.jsonl`, the gateway's
 /// `gateway.log`), creating it 0o600 on Unix, so it rides the owner-only
 /// invariant rather than the process umask.
@@ -2027,7 +2027,7 @@ pub(crate) fn append_usage_sample_at(
     if let Some(dir) = path.parent()
         && let Err(e) = mkdir_700(dir)
     {
-        logline!("clauth: failed to create the profile dir for {name}: {e}");
+        logline!("tollgate: failed to create the profile dir for {name}: {e}");
         return;
     }
     let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
@@ -2043,10 +2043,10 @@ pub(crate) fn append_usage_sample_at(
         Ok(mut file) => {
             use std::io::Write;
             if let Err(e) = file.write_all(body.as_bytes()) {
-                logline!("clauth: failed to append usage history for {name}: {e}");
+                logline!("tollgate: failed to append usage history for {name}: {e}");
             }
         }
-        Err(e) => logline!("clauth: failed to open usage history for {name}: {e}"),
+        Err(e) => logline!("tollgate: failed to open usage history for {name}: {e}"),
     }
 }
 
@@ -2140,17 +2140,17 @@ pub(crate) fn append_wallet_readings_at(name: &ProfileName, stats: &ThirdPartySt
     if let Some(dir) = path.parent()
         && let Err(e) = mkdir_700(dir)
     {
-        logline!("clauth: failed to create the profile dir for {name}: {e}");
+        logline!("tollgate: failed to create the profile dir for {name}: {e}");
         return;
     }
     match open_append_600(&path) {
         Ok(mut file) => {
             use std::io::Write;
             if let Err(e) = file.write_all(body.as_bytes()) {
-                logline!("clauth: failed to append wallet history for {name}: {e}");
+                logline!("tollgate: failed to append wallet history for {name}: {e}");
             }
         }
-        Err(e) => logline!("clauth: failed to open wallet history for {name}: {e}"),
+        Err(e) => logline!("tollgate: failed to open wallet history for {name}: {e}"),
     }
 }
 
@@ -2219,7 +2219,7 @@ pub(crate) fn prune_wallet_history(name: &ProfileName) {
         // 0o600: the rename swaps the inode, so a plain write would revert the
         // history log (re-created 0o600 by the appender) to the umask.
         if let Err(e) = atomic_write_600(&path, body) {
-            logline!("clauth: failed to prune wallet history for {name}: {e}");
+            logline!("tollgate: failed to prune wallet history for {name}: {e}");
         }
     }
 }
@@ -2325,7 +2325,7 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
 
 /// Open an owner-only advisory-lock/state file (`read+write`, create without
 /// truncating so a sibling's held lock survives the race) at mode 0o600. Every
-/// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `clauthd-standby.lock`,
+/// `~/.tollgate` lock file (`.lock`, `tollgated.lock`, `tollgated-standby.lock`,
 /// `usage-fetch.lock`, session PID files, `rotation-locks/<name>.lock`) routes
 /// through here so no lock is born at the process umask — the file itself
 /// carries nothing secret, but a blanket owner-only tree is the invariant the
@@ -2341,14 +2341,14 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
-/// Retighten an existing `~/.clauth` tree to the owner-only invariant (0o700
+/// Retighten an existing `~/.tollgate` tree to the owner-only invariant (0o700
 /// dirs, 0o600 files). Installs created before the invariant carry umask modes
 /// no writer revisits once the bytes stop changing, so [`load_config`] runs
 /// this on every entry point. Symlinks are skipped and never traversed: a
 /// shared-mode runtime is full of links into the operator's `~/.claude`, and
-/// following one would chmod a file clauth does not own. Best-effort per entry
+/// following one would chmod a file tollgate does not own. Best-effort per entry
 /// — a chmod failure on one path never aborts the walk or the load.
-pub(crate) fn enforce_clauth_perms(root: &Path) {
+pub(crate) fn enforce_tollgate_perms(root: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2374,7 +2374,7 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
         }
         if is_dir && let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
-                enforce_clauth_perms(&entry.path());
+                enforce_tollgate_perms(&entry.path());
             }
         }
     }
@@ -2409,7 +2409,7 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
 ///
 /// For a caller that must ask this while holding the state flock. [`load_config`]
 /// answers the same question, but per profile it adopts a pending credential
-/// sidecar and rewrites `config.toml`, and it chmod-walks the whole `~/.clauth`
+/// sidecar and rewrites `config.toml`, and it chmod-walks the whole `~/.tollgate`
 /// tree first. The standing ruling that rules it out there is not a cost
 /// argument: the state flock is a cross-process serialization point nothing
 /// holds across IO. That is why [`crate::lockorder::rank::ProfileTtl`] ranks
@@ -2476,7 +2476,7 @@ pub(crate) fn load_app_state() -> Result<AppState> {
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     with_state_lock(|_held| {
-        mkdir_700(&clauth_dir()?)?;
+        mkdir_700(&tollgate_dir()?)?;
         let path = app_state_path()?;
         let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
         atomic_write_600(&path, preserve_unmodelled_state_keys(rendered, &path))
@@ -2491,7 +2491,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 ///
 /// `AppState` is a closed struct, so a plain re-serialize deletes unknown keys
 /// on every save, and the writers that put them there are exactly the ones
-/// clauth must not overrule: a NEWER clauth whose keys this binary has not
+/// tollgate must not overrule: a NEWER tollgate whose keys this binary has not
 /// learned (an older install against a newer config silently erases them —
 /// the `auto_start_queue` regression, issue #75) and an operator's hand-edit.
 /// The carry is recursive: a future TOP-LEVEL key re-attaches whole, and a
@@ -2622,7 +2622,7 @@ fn nested_unmodelled(
 /// Marker comment written above keys `AppState` does not model, so a hand-editor
 /// sees they were carried rather than authored by this save.
 const PRESERVED_KEYS_MARKER: &str =
-    "# keys preserved from the previous file; not modelled by this clauth:";
+    "# keys preserved from the previous file; not modelled by this tollgate:";
 
 /// Splice `carried` top-level keys into a rendered TOML document, preserving
 /// table-header scoping — the shared core of the `profiles.toml` and
@@ -3041,10 +3041,10 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// key so the CLI's keyless-refusal surface has an endpoint to name its fix
 /// (`rolling_token_on_a_flagged_third_party_hybrid_names_the_split_state`).
 /// Normalized at the LOAD boundary, same discipline as the `max_auto_spend`
-/// case. This governs the managed base_url FIELD only: clauth never copies
+/// case. This governs the managed base_url FIELD only: tollgate never copies
 /// `ANTHROPIC_BASE_URL` into `profile.env`, so an env override is always
 /// operator-authored and is never normalized here — normalize the state
-/// clauth authors, not an explicit one.
+/// tollgate authors, not an explicit one.
 ///
 /// "Never normalized" is not "never read". An env override still ROUTES the
 /// account (`build_claude_settings_json` applies `profile.env` last), so a
@@ -3122,9 +3122,9 @@ fn usage_cache_is_third_party(
 }
 
 /// [`Profile::usage_cache_is_third_party`] for a caller holding only a name,
-/// read from `config.toml` plus one stat. A config clauth cannot read or parse
+/// read from `config.toml` plus one stat. A config tollgate cannot read or parse
 /// proves no endpoint, so it answers `false` and its reader falls back to the
-/// OAuth cache, whose absence renders `unknown` — the honest reading when clauth
+/// OAuth cache, whose absence renders `unknown` — the honest reading when tollgate
 /// cannot classify.
 ///
 /// Deliberately NOT `load_profile(name)`: that path recovers a staged rotation,
@@ -3186,7 +3186,7 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
 /// bar count. Classified off the managed `base_url` only, matching the typed
 /// integration an account is scheduled under — an operator-authored
 /// `ANTHROPIC_BASE_URL` reroutes the request but does not change which provider
-/// clauth typed it as.
+/// tollgate typed it as.
 pub(crate) fn stored_provider(name: &ProfileName) -> Option<Provider> {
     let Ok(config_path) = profile_config_path(name) else {
         return None;
@@ -3228,7 +3228,7 @@ pub(crate) enum StoredEndpoint {
     Anthropic,
     /// Requests go to this endpoint.
     Custom(String),
-    /// The stored config could not be read or parsed, so clauth cannot say.
+    /// The stored config could not be read or parsed, so tollgate cannot say.
     /// A distinct arm rather than a fallback to [`Self::Anthropic`], because
     /// every caller so far is deciding whether a figure may be presented as
     /// Anthropic's, and guessing that on an unreadable config asserts the one
@@ -3581,10 +3581,10 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 /// `ProfileConfig` does not model re-attached under a marker — the
 /// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
 /// states for the credential store. The writers that put such keys there are
-/// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
+/// the ones tollgate must not overrule: a newer tollgate (whose `auto_start`/
 /// `fallback_threshold` ancestors were themselves once new keys) and an
 /// operator's hand-edit; deleting them on every config mutation (issue #75's
-/// `clauth disable` erasure) loses data no other writer holds.
+/// `tollgate disable` erasure) loses data no other writer holds.
 ///
 /// "Modelled" is decided by round-tripping the ON-DISK file through
 /// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
@@ -3728,8 +3728,8 @@ pub(crate) fn load_config() -> Result<AppConfig> {
     mkdir_700(&profiles_root()?)?;
     // Every entry point loads config early, so this is the tree-wide chokepoint
     // that retightens an install created before the owner-only invariant.
-    if let Ok(dir) = clauth_dir() {
-        enforce_clauth_perms(&dir);
+    if let Ok(dir) = tollgate_dir() {
+        enforce_tollgate_perms(&dir);
     }
     let state = load_app_state()?;
     let profiles = state
@@ -3772,7 +3772,7 @@ fn render_config_toml(profile: &Profile) -> String {
         toml::Value::String(s.to_string()).to_string()
     }
 
-    let mut out = String::from("# clauth profile configuration\n\n");
+    let mut out = String::from("# tollgate profile configuration\n\n");
 
     out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
     out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
@@ -3789,7 +3789,7 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
+    out.push_str("# Auto-start the 5-hour usage window for this profile. tollgate fires a\n");
     out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
     out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
     out.push_str("# Old name `kick_timer = true` is still accepted.\n");
@@ -3800,9 +3800,9 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
+    out.push_str("# 5-hour utilization percentage at/above which tollgate will auto-switch\n");
     out.push_str("# off this profile, provided the profile is also a member of the\n");
-    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
+    out.push_str("# fallback chain configured in ~/.tollgate/profiles.toml. Range 0..=100.\n");
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
         None => out.push_str("# fallback_threshold = 95.0\n"),
@@ -3872,8 +3872,8 @@ fn render_config_toml(profile: &Profile) -> String {
 
     out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
     out.push_str("# chain's current access token on every rotation (plan-gated models\n");
-    out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
-    out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+    out.push_str("# work in sessions, refresh chain stays tollgate-private). Managed by\n");
+    out.push_str("# `tollgate rolling-token <profile>` / `tollgate static-token <profile>`.\n");
     if profile.rolling_token {
         out.push_str("rolling_token = true\n");
     } else {
@@ -3914,7 +3914,7 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth fires a bell\n");
+    out.push_str("# 5-hour utilization percentage at/above which tollgate fires a bell\n");
     out.push_str("# notification in the overview tab. Range 0..=100.\n");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
@@ -3936,7 +3936,7 @@ fn render_config_toml(profile: &Profile) -> String {
     // this block and the two below must follow every scalar key above.
     out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
     out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
-    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
+    out.push_str("# by the quota surface. Captured by `tollgate login <name>` on an Alibaba\n");
     out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
     out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
     out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");

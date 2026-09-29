@@ -1,7 +1,7 @@
 use super::*;
 
 /// The body is DURATION-keyed, never name-keyed, so the mapping is what decides
-/// which of clauth's two named slots a window becomes. A 5-hour window and a
+/// which of tollgate's two named slots a window becomes. A 5-hour window and a
 /// 7-day one land where a human means, whichever order the server sends them.
 #[test]
 fn duration_decides_the_slot_whatever_the_position() {
@@ -139,7 +139,7 @@ fn the_absolute_reset_wins_over_the_relative_one() {
 }
 
 /// Banked reset credits ride this same body, so reading them costs no extra
-/// request. The poll only reads the count; spending one is `clauth limit-reset`.
+/// request. The poll only reads the count; spending one is `tollgate limit-reset`.
 #[test]
 fn banked_reset_credits_ride_the_same_body() {
     let info = map_usage(
@@ -166,7 +166,7 @@ fn an_unknown_shape_reads_as_no_data_and_bad_json_as_a_parse_error() {
     assert_eq!(
         info.plan.as_ref().and_then(|p| p.codex_plan.as_deref()),
         Some("future_tier"),
-        "held verbatim — clauth does not close this set"
+        "held verbatim — tollgate does not close this set"
     );
 
     assert!(map_usage("not json", 1_600_000_000).is_err());

@@ -29,7 +29,7 @@ fn ctx() -> std::sync::Arc<ApiContext> {
     ));
     ApiContext::for_tests(
         config,
-        clauth_dir().expect("dir").join("status.json"),
+        tollgate_dir().expect("dir").join("status.json"),
         None,
         crate::daemon::api::panes::absent_probe(),
     )
@@ -216,7 +216,7 @@ fn the_pairing_file_is_owner_only_and_holds_no_code() {
         (live.name.as_str(), &live.tier, live.attempts_left),
         ("phone", &Tier::View, CODE_ATTEMPTS)
     );
-    let loose = crate::testutil::owner_only_violations(&clauth_dir().expect("dir"));
+    let loose = crate::testutil::owner_only_violations(&tollgate_dir().expect("dir"));
     assert!(loose.is_empty(), "loose: {loose:#?}");
 }
 
@@ -229,7 +229,7 @@ fn pairing_refuses_a_name_a_device_holds() {
     };
     assert_eq!(
         err.to_string(),
-        "a device named 'phone' already exists; revoke it first: clauth devices revoke phone"
+        "a device named 'phone' already exists; revoke it first: tollgate devices revoke phone"
     );
     assert!(live_pairing().is_none(), "a refused pair mints no code");
 }
@@ -337,7 +337,8 @@ fn the_fifth_wrong_try_burns_the_code() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth api: the pairing code for 'phone' was dropped after 5 wrong tries".to_string()
+            "tollgate api: the pairing code for 'phone' was dropped after 5 wrong tries"
+                .to_string()
         ]
     );
 }
@@ -517,7 +518,7 @@ fn concurrent_wrong_codes_burn_the_code_at_the_fifth() {
     assert!(live_pairing().is_none(), "five wrong codes delete it");
     assert_eq!(
         logged,
-        vec!["clauth api: the pairing code for 'phone' was dropped after 5 wrong tries"]
+        vec!["tollgate api: the pairing code for 'phone' was dropped after 5 wrong tries"]
     );
 }
 
@@ -548,7 +549,7 @@ fn the_201_carries_the_token_and_no_log_line_carries_a_secret() {
     assert_eq!(
         logged,
         vec![format!(
-            "clauth api: {} paired device 'phone' (control)",
+            "tollgate api: {} paired device 'phone' (control)",
             peer()
         )]
     );
@@ -573,7 +574,7 @@ fn the_pairing_line_sanitizes_the_tier_it_read() {
     let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let path = pairing_path().expect("path");
     let mut file = read_pairing(&path).expect("read").expect("live");
-    file.tier = Tier::Unknown("view\nclauth api: forged".to_string());
+    file.tier = Tier::Unknown("view\ntollgate api: forged".to_string());
     write_pairing(&path, &file).expect("rewrite the tier");
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
@@ -583,7 +584,7 @@ fn the_pairing_line_sanitizes_the_tier_it_read() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: {} paired device 'phone' (view clauth api: forged)",
+            "tollgate api: {} paired device 'phone' (view tollgate api: forged)",
             peer()
         )]
     );
@@ -622,7 +623,7 @@ fn every_failed_redemption_answers_the_same_bytes() {
             serde_json::json!({
                 "ok": false,
                 "error": "pairing_refused",
-                "reason": "that code did not pair a device: check it, or run `clauth devices \
+                "reason": "that code did not pair a device: check it, or run `tollgate devices \
                            pair <name>` on the host for a new one",
             })
         )
@@ -788,10 +789,10 @@ fn every_other_ending_exits_one_with_its_reason() {
     assert_eq!(
         failures.each_ref().map(ToString::to_string),
         [
-            "a newer `clauth devices pair` replaced this code before anyone entered it",
-            "the code was dropped after 5 wrong tries; run `clauth devices pair phone` for a new \
+            "a newer `tollgate devices pair` replaced this code before anyone entered it",
+            "the code was dropped after 5 wrong tries; run `tollgate devices pair phone` for a new \
              one",
-            "the code expired unused; run `clauth devices pair phone` for a new one",
+            "the code expired unused; run `tollgate devices pair phone` for a new one",
         ]
     );
     assert!(
@@ -842,7 +843,7 @@ fn a_signal_after_the_code_was_replaced_reports_the_replacement() {
 
     assert_eq!(
         err.to_string(),
-        "a newer `clauth devices pair` replaced this code before anyone entered it"
+        "a newer `tollgate devices pair` replaced this code before anyone entered it"
     );
     assert!(live_pairing().is_some(), "the newer code stays live");
 }
@@ -875,7 +876,7 @@ fn a_code_whose_name_was_taken_is_refused_and_consumed() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth api: the pairing code for 'phone' was refused: a device took that name first"
+            "tollgate api: the pairing code for 'phone' was refused: a device took that name first"
                 .to_string()
         ]
     );
@@ -1011,7 +1012,7 @@ fn a_lost_code_line_on_a_replaced_code_says_replaced() {
     let err = withdraw_lost(&first, None).expect_err("the code is already gone");
     assert_eq!(
         err.to_string(),
-        "the pairing code for 'tray' never reached its reader; a newer `clauth devices pair` had already replaced it"
+        "the pairing code for 'tray' never reached its reader; a newer `tollgate devices pair` had already replaced it"
     );
 }
 
@@ -1026,7 +1027,7 @@ fn a_lost_code_line_with_a_write_error_and_a_replaced_code_pins_its_sentence() {
     let err = withdraw_lost(&first, Some(write_err)).expect_err("the code is already gone");
     assert_eq!(
         err.to_string(),
-        "the pairing code for 'tray' never reached its reader (full disk); a newer `clauth devices pair` had already replaced it"
+        "the pairing code for 'tray' never reached its reader (full disk); a newer `tollgate devices pair` had already replaced it"
     );
 }
 

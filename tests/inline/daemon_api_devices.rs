@@ -1,5 +1,5 @@
 //! The device list: its file, its checks, and the legacy import. Every test
-//! that touches `~/.clauth` holds a [`HomeSandbox`], so nothing here reads or
+//! that touches `~/.tollgate` holds a [`HomeSandbox`], so nothing here reads or
 //! writes the operator's real tree.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -27,7 +27,7 @@ fn seed_legacy(body: &str) {
     std::fs::write(&path, body).expect("seed auth_token.json");
 }
 
-/// An `auth_token.json` as the clauth before pairing wrote it; `tier: None` is
+/// An `auth_token.json` as the tollgate before pairing wrote it; `tier: None` is
 /// a file from before that field existed.
 fn legacy_body(token: &str, tier: Option<&str>) -> String {
     let mut body = serde_json::json!({
@@ -51,9 +51,9 @@ fn lines_containing(lines: &crate::logline::LogLines, needle: &str) -> usize {
 
 /// What an import that makes `legacy` logs.
 const IMPORTED: &str =
-    "clauth daemon: device 'legacy' is imported (control); auth_token.json is deleted";
+    "tollgate daemon: device 'legacy' is imported (control); auth_token.json is deleted";
 /// What an import of a token revoked since its import logs.
-const REVOKED: &str = "clauth daemon: device 'legacy' was revoked since this token was imported, \
+const REVOKED: &str = "tollgate daemon: device 'legacy' was revoked since this token was imported, \
                        so it is not imported again; auth_token.json is deleted";
 
 /// Run the import with every line it logs captured, and hold each line to the
@@ -162,7 +162,7 @@ fn a_device_rows_debug_never_renders_its_digest() {
 fn the_store_and_its_dir_are_owner_only() {
     let _home = HomeSandbox::new();
     add(&name("tray"), Tier::View, false).expect("add");
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     assert!(
         store_path().expect("path").is_file(),
         "the store was written"
@@ -191,7 +191,7 @@ fn the_legacy_name_is_reserved_in_any_case() {
         let err = DeviceName::parse(reserved).expect_err("the import owns this name");
         assert_eq!(
             err.to_string(),
-            "'legacy' is the name clauth gives the token it imports from an older build; pick \
+            "'legacy' is the name tollgate gives the token it imports from an older build; pick \
              another name"
         );
     }
@@ -204,7 +204,7 @@ fn add_refuses_a_taken_name_in_any_case() {
     let err = add(&name("phone"), Tier::Control, false).expect_err("the name is taken");
     assert_eq!(
         err.to_string(),
-        "a device named 'Phone' already exists; revoke it first: clauth devices revoke Phone"
+        "a device named 'Phone' already exists; revoke it first: tollgate devices revoke Phone"
     );
     assert_eq!(read_store().expect("read").devices.len(), 1);
 }
@@ -232,7 +232,7 @@ fn revoking_an_unknown_name_names_it() {
     let err = revoke("ghost").expect_err("nothing to revoke");
     assert_eq!(
         err.to_string(),
-        "no device named 'ghost'; `clauth devices` lists the paired ones"
+        "no device named 'ghost'; `tollgate devices` lists the paired ones"
     );
 }
 
@@ -248,7 +248,7 @@ fn a_lost_token_line_with_a_failed_revoke_names_the_remove_command() {
     assert_eq!(
         err.to_string(),
         "the token for 'tray' never reached its reader and the device could not be removed: \
-         injected failure writing the device list; remove it with `clauth devices revoke tray`"
+         injected failure writing the device list; remove it with `tollgate devices revoke tray`"
     );
 }
 
@@ -267,7 +267,7 @@ fn a_lost_token_line_with_a_write_error_and_a_failed_revoke_pins_its_sentence() 
     assert_eq!(
         err.to_string(),
         "the token for 'tray' never reached its reader (full disk) and the device could not be \
-         removed: injected failure writing the device list; remove it with `clauth devices revoke tray`"
+         removed: injected failure writing the device list; remove it with `tollgate devices revoke tray`"
     );
 }
 
@@ -322,7 +322,7 @@ fn an_unreadable_store_refuses_and_is_never_rewritten() {
 }
 
 /// A tier and a field this build does not know survive its rewrite: the row
-/// was written by a newer clauth, and a downgrade adding a device must not
+/// was written by a newer tollgate, and a downgrade adding a device must not
 /// erase what that build meant.
 #[test]
 fn what_a_newer_build_wrote_survives_a_rewrite() {
@@ -420,7 +420,7 @@ fn a_legacy_file_from_before_the_tier_field_imports_as_control() {
 }
 
 /// A file carrying any tier but `control` is neither imported nor served, and
-/// stays where it is for the clauth that wrote it: `view` as much as a tier
+/// stays where it is for the tollgate that wrote it: `view` as much as a tier
 /// this build does not know.
 #[test]
 fn a_legacy_file_of_any_tier_but_control_is_neither_imported_nor_served() {
@@ -444,8 +444,8 @@ fn a_legacy_file_of_any_tier_but_control_is_neither_imported_nor_served() {
         assert_eq!(
             logged,
             vec![format!(
-                "clauth daemon: auth_token.json carries tier {tier:?} rather than control, so \
-                 it is neither imported nor served; run the clauth that wrote it, or delete \
+                "tollgate daemon: auth_token.json carries tier {tier:?} rather than control, so \
+                 it is neither imported nor served; run the tollgate that wrote it, or delete \
                  the file"
             )],
             "the operator is told once why the token stopped working"
@@ -474,16 +474,16 @@ fn an_unusable_legacy_file_is_not_imported_and_says_so_once() {
         assert_eq!(
             logged,
             vec![
-                "clauth daemon: auth_token.json holds no usable token (bad JSON, or a token that \
+                "tollgate daemon: auth_token.json holds no usable token (bad JSON, or a token that \
                  is not 64 lowercase hex characters), so it is not imported; pair the client \
-                 again with `clauth devices pair <name>` and delete the file"
+                 again with `tollgate devices pair <name>` and delete the file"
             ],
             "{bad:?}"
         );
     }
 }
 
-/// A downgraded clauth minted a fresh `auth_token.json` after the import
+/// A downgraded tollgate minted a fresh `auth_token.json` after the import
 /// deleted the old one; the next import hands `legacy` that token, the one the
 /// client was given last.
 #[test]
@@ -518,7 +518,7 @@ fn a_downgrade_minted_legacy_file_takes_over_the_legacy_device() {
     assert_eq!(
         logged,
         vec![
-            "clauth daemon: device 'legacy' now holds the token a downgraded clauth minted; \
+            "tollgate daemon: device 'legacy' now holds the token a downgraded tollgate minted; \
              auth_token.json is deleted"
         ]
     );
@@ -571,7 +571,7 @@ fn an_interrupted_import_finishes_on_the_next_start() {
     assert!(!legacy_path().expect("path").exists());
     assert_eq!(
         logged,
-        vec!["clauth daemon: device 'legacy' already held its token; auth_token.json is deleted"]
+        vec!["tollgate daemon: device 'legacy' already held its token; auth_token.json is deleted"]
     );
 }
 
@@ -634,7 +634,7 @@ fn an_unparseable_stamp_renders_as_no_data() {
 fn an_empty_list_names_the_pair_command() {
     assert_eq!(
         render_table(&[], 0),
-        "no devices are paired. `clauth devices pair <name>` pairs one.\n"
+        "no devices are paired. `tollgate devices pair <name>` pairs one.\n"
     );
 }
 
@@ -666,7 +666,7 @@ fn an_unreadable_store_is_announced_at_listener_start() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth daemon: every REST request is refused until the device list reads: {err:#}"
+            "tollgate daemon: every REST request is refused until the device list reads: {err:#}"
         )]
     );
 }
@@ -830,7 +830,7 @@ fn allow_sessions_refuses_a_view_device() {
     );
 }
 
-/// A row a newer clauth paired carries a tier this build does not know; the
+/// A row a newer tollgate paired carries a tier this build does not know; the
 /// refusal names the control tier, not "view", so it holds for both.
 #[test]
 fn allow_sessions_refuses_a_device_of_an_unknown_tier() {
@@ -876,7 +876,7 @@ fn revoke_and_allow_sessions_share_the_missing_name_sentence_and_trim() {
     );
     assert_eq!(
         from_revoke,
-        "no device named ' ghost '; `clauth devices` lists the paired ones"
+        "no device named ' ghost '; `tollgate devices` lists the paired ones"
     );
 
     // A padded, case-folded name resolves on both verbs.

@@ -40,10 +40,10 @@ fn expected_row0(tag_wanted: bool, info_width: usize) -> String {
     let tag = "  [ herdr ]";
     // The minimum the chip keeps from the content to its left.
     let content_gap = 3;
-    let base = "clauth".chars().count() + ver.chars().count();
+    let base = "tollgate".chars().count() + ver.chars().count();
     let tag_fits = base + tag.chars().count() + chip.chars().count() + content_gap <= info_width;
 
-    let mut row = String::from("clauth");
+    let mut row = String::from("tollgate");
     if tag_wanted && tag_fits {
         row.push_str(tag);
     }
@@ -69,7 +69,7 @@ fn the_version_sits_behind_the_brand_and_the_chip_holds_the_right_edge() {
 
     let (row0, _buf) = row0_render(&app, width);
     assert!(
-        row0.starts_with(&format!("clauth v{VERSION}")),
+        row0.starts_with(&format!("tollgate v{VERSION}")),
         "the version must sit directly behind the brand: {row0:?}"
     );
     assert!(
@@ -92,7 +92,7 @@ fn herdr_mode_shows_the_tag_between_the_brand_and_the_version() {
 
     let (row0, buf) = row0_render(&app, width);
     assert!(
-        row0.starts_with(&format!("clauth  [ herdr ] v{VERSION}")),
+        row0.starts_with(&format!("tollgate  [ herdr ] v{VERSION}")),
         "the tag sits beside the brand, the version behind both: {row0:?}"
     );
     assert_eq!(
@@ -124,7 +124,7 @@ fn row0_sheds_the_tag_first_then_the_chip_never_the_version() {
     let mut app = app_with_mode(true);
     app.daemon_health = crate::daemon::DaemonHealth::Fresh;
     let ver = format!(" v{VERSION}");
-    let base = "clauth".chars().count() + ver.chars().count();
+    let base = "tollgate".chars().count() + ver.chars().count();
     let tag_w = "  [ herdr ]".chars().count();
     let chip_w = "[ daemon ]".chars().count();
     let content_gap = 3;
@@ -152,7 +152,7 @@ fn row0_sheds_the_tag_first_then_the_chip_never_the_version() {
         "the chip survives the tag it displaced: {tag_shed:?}"
     );
     assert!(
-        tag_shed.starts_with(&format!("clauth v{VERSION}")),
+        tag_shed.starts_with(&format!("tollgate v{VERSION}")),
         "the version keeps the brand's side through the tag's shed: {tag_shed:?}"
     );
 
@@ -168,7 +168,7 @@ fn row0_sheds_the_tag_first_then_the_chip_never_the_version() {
         "one column narrower the chip must shed rather than crowd the content: {chip_shed:?}"
     );
     assert!(
-        chip_shed.starts_with(&format!("clauth v{VERSION}")),
+        chip_shed.starts_with(&format!("tollgate v{VERSION}")),
         "brand + version never clip, even with both shed: {chip_shed:?}"
     );
 
@@ -188,14 +188,14 @@ fn the_plain_launch_chip_seam_holds_the_same_content_gap() {
     let mut app = app_with_mode(false);
     app.daemon_health = crate::daemon::DaemonHealth::Fresh;
     let ver = format!(" v{VERSION}");
-    let base = "clauth".chars().count() + ver.chars().count();
+    let base = "tollgate".chars().count() + ver.chars().count();
     let chip_w = "[ daemon ]".chars().count();
     let seam = 10 + base + chip_w + 3;
 
     let (at, _buf) = row0_render(&app, seam as u16);
     assert_eq!(
         at.trim_end(),
-        format!("clauth v{VERSION}   [ daemon ]"),
+        format!("tollgate v{VERSION}   [ daemon ]"),
         "at the exact width the chip keeps three cells from the version"
     );
     assert_eq!(at, expected_row0(false, seam - 10));

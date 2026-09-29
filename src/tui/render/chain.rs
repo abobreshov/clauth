@@ -427,7 +427,7 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
-        BlockedReason::AuthBroken => format!("re-login with clauth login {name}"),
+        BlockedReason::AuthBroken => format!("re-login with tollgate login {name}"),
         BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
         BlockedReason::WeeklySpent { .. } => "weekly limit is spent".to_string(),
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
@@ -441,7 +441,7 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
     }
 }
 
-/// The member card's live-session block: how many `clauth start` sessions are
+/// The member card's live-session block: how many `tollgate start` sessions are
 /// running as THIS member, plus — only once one of them has actually swapped —
 /// when that happened and the caveat that makes the figure honest.
 ///
@@ -467,7 +467,7 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
 /// Claude Code re-reads its credentials on its NEXT REQUEST, an mtime `stat` on
 /// the request path with no watcher behind it, so a session that just swapped
 /// keeps authenticating as the old member until it next talks. `current_member`
-/// is therefore where clauth PUT the link, not who is being billed this second,
+/// is therefore where tollgate PUT the link, not who is being billed this second,
 /// and nothing in the registry can observe the pickup — hence a caveat rather
 /// than an invented "not yet picked up" state. A session that never swapped has
 /// no repointed link and so gets no caveat.
@@ -1430,7 +1430,7 @@ fn add_detail(
     ];
     lines.extend(
         wrap_words(
-            "when an account runs out, clauth points claude code at the next one.",
+            "when an account runs out, tollgate points claude code at the next one.",
             width,
         )
         .into_iter()

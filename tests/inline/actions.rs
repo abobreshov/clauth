@@ -52,7 +52,7 @@ fn persisted_active() -> String {
 
 fn feed_active(home: &HomeSandbox) -> String {
     let body: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(home.home().join(".clauth/status.json")).expect("read status feed"),
+        &std::fs::read(home.home().join(".tollgate/status.json")).expect("read status feed"),
     )
     .expect("status feed json");
     body["active_profile"]
@@ -190,11 +190,11 @@ fn classify_env_key_base_settings_only_for_external_keys() {
 }
 
 /// macOS reality: `~/.claude/.credentials.json` is a regular-file Keychain mirror
-/// of the ACTIVE account (not clauth's symlink). Switching to another profile must
+/// of the ACTIVE account (not tollgate's symlink). Switching to another profile must
 /// succeed — the live file matches the active profile (already captured), so it is
 /// safe to replace even though it legitimately differs from the target. Regression
 /// for `Error: refusing to replace .credentials.json — live file differs from
-/// profile 'xfx'; resolve divergence first` on every `clauth <name>`.
+/// profile 'xfx'; resolve divergence first` on every `tollgate <name>`.
 #[test]
 fn switch_replaces_active_account_mirror_without_refusing() {
     let _home = HomeSandbox::new();
@@ -299,9 +299,9 @@ fn two_profiles_active_on_one() -> AppConfig {
 
 /// The published feed must name the account the switch just landed on.
 ///
-/// `~/.clauth/status.json` is the contract external readers follow
-/// (`wiki/Daemon.md`), and only `clauth daemon` ever wrote it — so a switch made
-/// in the TUI, by `clauth <name>`, or through the MCP tool left the published
+/// `~/.tollgate/status.json` is the contract external readers follow
+/// (`wiki/Daemon.md`), and only `tollgate daemon` ever wrote it — so a switch made
+/// in the TUI, by `tollgate <name>`, or through the MCP tool left the published
 /// `active_profile` naming the account the operator had just switched away
 /// from: until the next tick when a daemon happened to be running to notice the
 /// `profiles.toml` mtime, and forever when one was not.
@@ -310,7 +310,7 @@ fn switch_publishes_the_status_feed_when_no_daemon_owns_it() {
     let home = HomeSandbox::new();
     let config = two_profiles_active_on_one();
 
-    let feed = home.home().join(".clauth").join("status.json");
+    let feed = home.home().join(".tollgate").join("status.json");
     assert!(!feed.exists(), "nothing has published a feed yet");
 
     through_handle(config, |h| {
@@ -353,7 +353,7 @@ fn a_no_op_switch_does_not_republish_the_feed() {
     });
 
     assert!(
-        !home.home().join(".clauth").join("status.json").exists(),
+        !home.home().join(".tollgate").join("status.json").exists(),
         "a switch that changed nothing must not write the feed"
     );
 }
@@ -374,7 +374,7 @@ fn switch_leaves_the_feed_to_a_running_daemon() {
     });
     // Off disk, not the handle clone: the closure's return is `()`, so the
     // switch's landed marker is observable here only through the store it
-    // persisted, which is also what any later clauth process would read.
+    // persisted, which is also what any later tollgate process would read.
     assert!(
         crate::profile::load_config()
             .expect("load")
@@ -382,7 +382,7 @@ fn switch_leaves_the_feed_to_a_running_daemon() {
         "the switch itself still lands"
     );
     assert!(
-        !home.home().join(".clauth").join("status.json").exists(),
+        !home.home().join(".tollgate").join("status.json").exists(),
         "a daemon owns status.json; its own next tick republishes it",
     );
 }
@@ -391,7 +391,7 @@ fn switch_leaves_the_feed_to_a_running_daemon() {
 /// effect. Pre-fix the existence check lived in `finish_switch` — LAST in the
 /// sequence — so `force_link_profile_credentials` had already torn down the
 /// live `.credentials.json` for a ghost target (a profile deleted by
-/// `clauth delete` while a queued auto-switch — e.g. a daemon's pending
+/// `tollgate delete` while a queued auto-switch — e.g. a daemon's pending
 /// switch — MCP switch, or CLI switch still held its name), destroying the
 /// live login even though the switch itself failed.
 #[test]
@@ -560,7 +560,7 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
     });
     assert_eq!(
         err.to_string(),
-        "'target': account is disabled, run `clauth enable target`"
+        "'target': account is disabled, run `tollgate enable target`"
     );
     assert!(
         config.is_active(&crate::profile::ProfileName::from("active")),
@@ -1036,7 +1036,7 @@ fn assert_explicit_switch_waits_out_the_auto_transaction(
     // Registered so a red that unwinds the driver while the writer is still
     // queued on the state lock still joins it BEFORE `HomeSandbox::drop`
     // clears the home override — the writer's switch must never resolve
-    // against the operator's real `~/.clauth`.
+    // against the operator's real `~/.tollgate`.
     let worker_done = crate::testutil::register_background_task();
     let explicit_worker = std::thread::spawn(move || {
         let writer_handle = switch_handle_from_disk();
@@ -1120,7 +1120,7 @@ fn auto_switch_with_headroom_yields_no_dispatch_and_leaves_an_explicit_switch_in
     });
     assert_eq!(action, None, "a healthy active yields no decision");
     assert!(
-        !home.home().join(".clauth").join("status.json").exists(),
+        !home.home().join(".tollgate").join("status.json").exists(),
         "no decision means no dispatch and no republish"
     );
 
@@ -1204,8 +1204,8 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
     );
 }
 
-// ── set_profile_default_model (`clauth login --model`, &crate::profile::ProfileName::from(the create-form row)) ──
-// (the ensure_login_profile tests were dropped with the fn — `clauth login` now
+// ── set_profile_default_model (`tollgate login --model`, &crate::profile::ProfileName::from(the create-form row)) ──
+// (the ensure_login_profile tests were dropped with the fn — `tollgate login` now
 //  mints tokens via the browser flow and captures a profile, rather than
 //  pre-creating a blank one; `--model` is applied to the captured profile.)
 
@@ -1498,8 +1498,8 @@ fn delete_codex_removes_the_dir_and_every_slot() {
     // The chain slot too — asserted on the saved bytes, since the chain has
     // no accessor yet: the name must be gone from the whole file.
     let raw = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("codex-profiles.toml"),
     )
     .expect("read state");
@@ -1510,7 +1510,7 @@ fn delete_codex_removes_the_dir_and_every_slot() {
     #[cfg(unix)]
     {
         let violations = crate::testutil::owner_only_violations(
-            &crate::profile::clauth_dir().expect("clauth dir"),
+            &crate::profile::tollgate_dir().expect("tollgate dir"),
         );
         assert!(
             violations.is_empty(),
@@ -1584,8 +1584,8 @@ fn a_noop_codex_switch_leaves_the_file_untouched() {
     let _home = HomeSandbox::new();
     let body = "# hand note\nactive_profile = \"cx\"\nprofiles = [\"cx\"]\nfrom_the_future = 1\n";
     write_codex_state(body);
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("codex-profiles.toml");
     let epoch = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
     crate::testutil::set_mtime(&path, epoch);
@@ -1615,7 +1615,7 @@ fn delete_codex_refuses_a_live_session_unforced() {
     crate::testutil::write_codex_roster(&["busy"]);
     let sessions = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("busy")
         .join("sessions");
@@ -1725,7 +1725,7 @@ fn switch_codex_refuses_a_quarantined_chain_until_a_fresh_one_lands() {
     let err = switch_codex_profile("cx2").expect_err("a dead chain is no switch target");
     assert_eq!(
         err.to_string(),
-        "'cx2': codex chain is broken (reused since 2026-08-13T00:00:00Z), run `clauth login cx2 --codex --browser`"
+        "'cx2': codex chain is broken (reused since 2026-08-13T00:00:00Z), run `tollgate login cx2 --codex --browser`"
     );
     assert_eq!(
         crate::codex_profiles::CodexState::load()
@@ -2044,7 +2044,7 @@ fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
 }
 
 /// A switch that follows `switch_off` has no outgoing marker to read, and a
-/// cleared `active_profile` is clauth's record rather than a statement about
+/// cleared `active_profile` is tollgate's record rather than a statement about
 /// `settings.json` — `switch_off` never touches the file. Stripping nothing
 /// there leaves the departed account's `[env]` entries live while the same
 /// write repoints the endpoint and `apiKeyHelper` at the incoming account.
@@ -2159,7 +2159,7 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
     assert_eq!(
         config_provider_of(&generic),
         None,
-        "fixture: the endpoint must be one clauth has no provider for",
+        "fixture: the endpoint must be one tollgate has no provider for",
     );
 
     let mut config = AppConfig {
@@ -2240,7 +2240,7 @@ fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
         assert_eq!(
             config_provider_of(&profile),
             None,
-            "fixture: the endpoint must be one clauth has no provider for, so \
+            "fixture: the endpoint must be one tollgate has no provider for, so \
              the preserve gate cannot pass through provider recognition"
         );
 
@@ -2342,7 +2342,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
     save_profile(&ds).expect("save ds");
 
     // A DEPARTING account whose env entry is still sitting in the live
-    // settings: a cleared `active_profile` is clauth's record, not a statement
+    // settings: a cleared `active_profile` is tollgate's record, not a statement
     // about the file (`switch_off` and the TUI divergence arm clear the marker
     // without touching it), so this is the state the activation write lands on.
     // NOT `ANTHROPIC_AUTH_TOKEN`: `build_claude_settings_json` clears that one
@@ -2645,7 +2645,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
 /// the `base_url` alone would leave the freshly minted ANTHROPIC bearer
 /// pointed at the third-party host, which the `was_active` leg writes into the
 /// live settings at once. Reachable through `clear_profile_api_key` (the TUI
-/// clears the key and keeps the endpoint) followed by a bare `clauth login`.
+/// clears the key and keeps the endpoint) followed by a bare `tollgate login`.
 #[test]
 fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
     let _home = HomeSandbox::new();
@@ -2938,7 +2938,7 @@ fn a_credentials_less_recapture_still_drops_the_stored_chain() {
 
 /// Reachable via login → switch away → disable → delete the (now-inactive)
 /// active (clears `active_profile` to `None` — `AppConfig::remove`) →
-/// `clauth login <disabled>`, the documented revoked-token recovery: the
+/// `tollgate login <disabled>`, the documented revoked-token recovery: the
 /// auto-activate branch must never make a disabled profile active, though it
 /// still captures the fresh credentials the operator asked for. Condensed to
 /// the minimal repro: a disabled profile + no active profile + a reauth
@@ -3119,8 +3119,8 @@ fn capture_into_profile_anchors_the_account_it_committed() {
 // ── first-account create over a foreign live login (issue #72) ────────────────
 
 /// The #72 fixture: `claude` itself logged in on this box, so the live
-/// `.credentials.json` is a plain file holding a login clauth never saved, and
-/// clauth holds zero accounts.
+/// `.credentials.json` is a plain file holding a login tollgate never saved, and
+/// tollgate holds zero accounts.
 fn foreign_plain_live_login() -> std::path::PathBuf {
     let live = crate::profile::claude_dir()
         .expect("claude dir")
@@ -3171,7 +3171,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("clauth capture"),
+        msg.contains("tollgate capture"),
         "names the cli way out: {msg}"
     );
     assert!(
@@ -3210,8 +3210,8 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
         "in-memory config matches disk again"
     );
     let state_toml = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .expect("profiles.toml readable");
@@ -3250,7 +3250,7 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("clauth capture"),
+        msg.contains("tollgate capture"),
         "names the cli way out: {msg}"
     );
     assert!(
@@ -3283,9 +3283,9 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
     );
 }
 
-/// The reporter's fixed flow: `clauth capture work` over the foreign plain file
+/// The reporter's fixed flow: `tollgate capture work` over the foreign plain file
 /// saves the login, becomes the active account, and the live path ends up
-/// clauth's own link.
+/// tollgate's own link.
 #[test]
 fn capture_current_login_saves_a_foreign_live_login_as_the_first_account() {
     let _home = HomeSandbox::new();
@@ -3299,7 +3299,7 @@ fn capture_current_login_saves_a_foreign_live_login_as_the_first_account() {
     assert!(
         live.symlink_metadata()
             .is_ok_and(|m| m.file_type().is_symlink()),
-        "the live path is now clauth's link"
+        "the live path is now tollgate's link"
     );
     assert_eq!(
         crate::claude::classify_credentials_link(&ProfileName::from("work")).expect("classify"),
@@ -3342,7 +3342,7 @@ fn capture_current_login_refuses_an_existing_name_pointing_at_login() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("clauth login work"),
+        msg.contains("tollgate login work"),
         "points at the re-auth verb with the canonical name: {msg}"
     );
     assert_eq!(config.profiles.len(), 1, "no second profile added");
@@ -3429,7 +3429,7 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("'first'") && msg.contains("clauth first"),
+        msg.contains("'first'") && msg.contains("tollgate first"),
         "names the owning profile and the switch to it: {msg}"
     );
     assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
@@ -3719,7 +3719,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
 /// resolve a divergence whose other half was overwritten a few lines earlier.
 ///
 /// A regular live file is CC's own shape after a re-login on any host, and it is
-/// what clauth itself leaves on a host whose `create_symlink` degrades to a copy
+/// what tollgate itself leaves on a host whose `create_symlink` degrades to a copy
 /// (Windows without `SeCreateSymbolicLinkPrivilege`) — where it is the ONLY
 /// shape, so that host could not recapture an active profile at all. Measured
 /// there 2026-08-12; this pins the fix without needing that host.
@@ -3740,8 +3740,8 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
     });
     save_profile(&acme).expect("save acme");
 
-    // A REGULAR file, not clauth's symlink: what CC leaves after a re-login, and
-    // what clauth itself writes wherever the OS denies symlinks.
+    // A REGULAR file, not tollgate's symlink: what CC leaves after a re-login, and
+    // what tollgate itself writes wherever the OS denies symlinks.
     let live_path = crate::profile::claude_dir()
         .unwrap()
         .join(".credentials.json");
@@ -3799,7 +3799,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
 /// The other arm of the same branch: a recapture that stores NO credentials (a
 /// third-party snapshot) must leave a clean absence, not a live slot still
 /// serving the account that was just replaced. `overwrite_captured_profile_…_when_active`
-/// pins this where the slot is clauth's symlink; this pins it where the slot is
+/// pins this where the slot is tollgate's symlink; this pins it where the slot is
 /// a regular file, which is the shape a host that cannot symlink always has and
 /// the one the forcing relink changed most.
 ///
@@ -3920,7 +3920,7 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
     );
 }
 
-/// #4: a profile held by a live `clauth start` session must not be deleted
+/// #4: a profile held by a live `tollgate start` session must not be deleted
 /// without `--force` — the running session's account can't be pulled out from
 /// under it. An unforced delete refuses and leaves the record intact; `force`
 /// overrides and removes it.
@@ -3940,7 +3940,7 @@ fn delete_refuses_live_session_unless_forced() {
     // separate fd fails while this fd holds the flock).
     let sessions = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("busy")
         .join("sessions");
@@ -4162,7 +4162,7 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
-/// A profile held by a live `clauth start` session must not be renamed — the
+/// A profile held by a live `tollgate start` session must not be renamed — the
 /// rename moves the whole profile directory, which holds the session's runtime
 /// tree, markers and env paths, and nothing rekeys the live-session registry
 /// rows. Same predicate and copy as the disable sibling.
@@ -4182,7 +4182,7 @@ fn rename_refuses_a_live_session() {
     // separate fd fails while this fd holds the flock).
     let sessions = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("busy")
         .join("sessions");
@@ -4338,7 +4338,7 @@ fn a_cache_write_does_not_resurrect_a_deleted_profiles_directory() {
 /// of one profile's lock, and recreated the profile directory to put it in.
 ///
 /// The lock now lives outside the profile tree, so the delete cannot unlink it.
-/// This closes the same-version race only: an older clauth still locks the old
+/// This closes the same-version race only: an older tollgate still locks the old
 /// path, and the two do not serialize against each other.
 #[test]
 fn a_delete_does_not_release_the_lock_it_is_holding() {
@@ -4405,7 +4405,7 @@ fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
     let lock = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("broken"))
         .expect("rotation lock path");
     let locks_dir = lock.parent().expect("lock parent");
-    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    std::fs::create_dir_all(locks_dir.parent().expect("tollgate dir")).expect("tollgate dir");
     std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
 
     let err = match rotation_guard_for_mutation(&crate::profile::ProfileName::from("broken")) {
@@ -4481,7 +4481,7 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
     );
 }
 
-/// The refusal an operator meets from `clauth delete` / the TUI and the one the
+/// The refusal an operator meets from `tollgate delete` / the TUI and the one the
 /// scheduler's re-stamp leg logs are ONE condition, so they are one sentence.
 /// Derived from both sides rather than spelled twice: the literal lives in the
 /// `format` copy table alone.
@@ -4554,7 +4554,7 @@ fn disable_refuses_a_profile_with_a_live_session() {
     // a locked pid file in the profile's sessions dir reads as alive.
     let sessions = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("busy")
         .join("sessions");
@@ -5172,7 +5172,7 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
-/// AUTH-1 reauth: `clauth login <existing>` overwrites a quarantined profile's
+/// AUTH-1 reauth: `tollgate login <existing>` overwrites a quarantined profile's
 /// stored tokens through `overwrite_captured_profile` — the documented recovery
 /// for a revoked login — and must clear its auth-broken flag so the recovered
 /// account rejoins the fallback chain and is a valid switch target again. The
@@ -5226,7 +5226,7 @@ fn reauth_overwrite_clears_broken_flag() {
 
 /// AUTH-1 switch gate (Incident C): a CLI switch to a target whose OAuth login
 /// is dead — expired access token, no refresh token, so unrecoverable without a
-/// re-login — is refused with the exact `clauth login <name>` recovery hint
+/// re-login — is refused with the exact `tollgate login <name>` recovery hint
 /// instead of installing the dead token into the Keychain. The no-refresh-token
 /// path reaches `AuthGate::Broken` with no network call, so the assertion stays
 /// hermetic.
@@ -5258,7 +5258,7 @@ fn switch_cli_refuses_dead_target_with_login_hint() {
     let err = switch_profile_cli(config, &crate::profile::ProfileName::from("dead-acct"))
         .expect_err("a dead target must be refused");
     assert!(
-        err.to_string().contains("clauth login dead-acct"),
+        err.to_string().contains("tollgate login dead-acct"),
         "the refusal must name the recovery command, got: {err}",
     );
 }
@@ -5782,7 +5782,7 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     );
 }
 
-// ── codex login capture (`clauth login <name> --codex`) ────────────────────
+// ── codex login capture (`tollgate login <name> --codex`) ────────────────────
 
 fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&str>) {
     let operator = home.home().join(".codex");
@@ -5796,7 +5796,7 @@ fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&
 }
 
 // Deliberately NON-canonical JSON (spacing, key order, a unicode escape, keys
-// clauth never wrote): the capture re-stamps `last_refresh` and must carry
+// tollgate never wrote): the capture re-stamps `last_refresh` and must carry
 // every other key and value across, which the parsed-map pin catches.
 const OPERATOR_AUTH: &str = r#"{ "tokens": {"id_token": "id.x", "access_token": "at.x", "refresh_token": "rt.x", "account_id": "acc"},
   "auth_mode": "chatgpt",  "last_refresh": "2026-08-13T00:00:00Z", "note": "\u0063odex", "from_the_future": 1 }"#;
@@ -5905,7 +5905,7 @@ fn codex_recapture_replaces_the_chain_unless_a_session_holds_it() {
     std::fs::write(&operator_auth, &fresh).expect("write fresh login");
 
     // A live session on the profile blocks the replacement.
-    let sessions = home.home().join(".clauth/profiles/cx/sessions");
+    let sessions = home.home().join(".tollgate/profiles/cx/sessions");
     std::fs::create_dir_all(&sessions).expect("mkdir sessions");
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
@@ -6055,7 +6055,7 @@ fn codex_recapture_refuses_a_different_account() {
 /// the operator's bare codex is never left pointing at nothing in silence. A
 /// slot linked to ANOTHER profile's store, or a regular file, survives
 /// byte-identical; a refused delete touches nothing; and a `CODEX_HOME` inside
-/// a clauth session home (a delete typed from a shell inside `clauth start`)
+/// a tollgate session home (a delete typed from a shell inside `tollgate start`)
 /// still finds the operator's real slot under the default `~/.codex`.
 #[test]
 fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
@@ -6147,7 +6147,7 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
         OPERATOR_AUTH.as_bytes()
     );
 
-    // `CODEX_HOME` inside a clauth session home: the shell is inside a codex
+    // `CODEX_HOME` inside a tollgate session home: the shell is inside a codex
     // session, but the operator's real `~/.codex/auth.json` is still the link
     // the capture installed, and the delete detaches that one.
     drop(cx_home);
@@ -6161,7 +6161,9 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
         std::fs::read_link(&default_slot).expect("adopted"),
         cx4_store
     );
-    let session_home = home.home().join(".clauth/profiles/cx4/codex-home-sessionx");
+    let session_home = home
+        .home()
+        .join(".tollgate/profiles/cx4/codex-home-sessionx");
     std::fs::create_dir_all(&session_home).expect("mkdir session home");
     #[cfg(unix)]
     {
@@ -6314,7 +6316,7 @@ fn a_late_commit_does_not_replace_a_newer_same_active_publication() {
 
     assert_eq!(persisted_active(), "b");
     let body: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(home.home().join(".clauth/status.json")).expect("read status feed"),
+        &std::fs::read(home.home().join(".tollgate/status.json")).expect("read status feed"),
     )
     .expect("status feed json");
     let b_entry = body["profiles"]
@@ -6338,7 +6340,7 @@ fn a_daemonless_publish_skips_when_a_later_switch_never_published() {
 
     // An older feed from before the switches: nothing newer lands while P1 is
     // paused, so the publication-recency guard alone cannot explain a skip.
-    let feed = home.home().join(".clauth/status.json");
+    let feed = home.home().join(".tollgate/status.json");
     std::fs::write(&feed, br#"{"active_profile": "a", "sentinel": true}"#)
         .expect("seed pre-switch feed");
 
@@ -6416,7 +6418,7 @@ fn the_daemonless_commit_serializes_on_the_state_flock() {
         release_tx.send(()).expect("release P1 commit");
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(
-            !home.home().join(".clauth/status.json").exists(),
+            !home.home().join(".tollgate/status.json").exists(),
             "the commit must not write status.json while another holder owns the state flock"
         );
         drop(state);
@@ -6478,7 +6480,7 @@ fn slot_points_at(slot: &std::path::Path) -> String {
 
 #[cfg(unix)]
 #[test]
-fn a_switch_moves_the_operator_link_clauth_installed() {
+fn a_switch_moves_the_operator_link_tollgate_installed() {
     let home = HomeSandbox::new();
     let slot = cx_pair_linked_onto(&home, "cx1", "cx1");
 
@@ -6522,7 +6524,7 @@ fn switching_to_the_active_account_repairs_a_drifted_link() {
 
 #[test]
 fn the_operators_own_login_is_never_touched_by_a_switch() {
-    // A regular file is the operator's own `codex login`, not a link clauth made.
+    // A regular file is the operator's own `codex login`, not a link tollgate made.
     let home = HomeSandbox::new();
     write_codex_state("active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\n");
     for name in ["cx1", "cx2"] {
@@ -6550,7 +6552,7 @@ fn an_absent_operator_slot_stays_absent() {
     assert!(!home.home().join(".codex").join("auth.json").exists());
 }
 
-/// A link clauth did not install (it points outside any profile's store) is
+/// A link tollgate did not install (it points outside any profile's store) is
 /// the operator's own arrangement: a switch leaves it exactly as found.
 #[cfg(unix)]
 #[test]

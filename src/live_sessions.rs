@@ -1,7 +1,7 @@
-//! Registry of live `clauth start` sessions.
+//! Registry of live `tollgate start` sessions.
 //!
-//! One file per session at `~/.clauth/live_sessions/<sid>.json`, mirroring the
-//! `~/.clauth/jobs/` convention ([`crate::mcp::jobs`]): a row is keyed by a
+//! One file per session at `~/.tollgate/live_sessions/<sid>.json`, mirroring the
+//! `~/.tollgate/jobs/` convention ([`crate::mcp::jobs`]): a row is keyed by a
 //! session id nobody else writes, so the file needs no ownership arbitration of
 //! its own. Rows are filed by SESSION, never under the profile they launched on
 //! — a session that swaps member would be misfiled the moment it moved.
@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
-use crate::profile::{AppConfig, atomic_write_600, clauth_dir, mkdir_700};
+use crate::profile::{AppConfig, atomic_write_600, mkdir_700, tollgate_dir};
 use crate::runtime::{SessionId, is_session_id};
 
 /// One live session's row. Every field is written by exactly one of the two
@@ -50,7 +50,7 @@ pub(crate) struct LiveSession {
     /// exist (codex reads `auth.json` once at start, so a mid-session member
     /// change is a no-op the executor would publish as a success).
     /// `serde(default)` (= claude) is the upgrade gate: a row written by a
-    /// clauth that predates the axis is a claude row, which is what it was.
+    /// tollgate that predates the axis is a claude row, which is what it was.
     #[serde(default)]
     pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,
@@ -61,7 +61,7 @@ pub(crate) struct LiveSession {
     /// registration and never mutated, so it needs no view of its own — which is
     /// also why it is safe for the daemon's decision leg to READ it while the
     /// session owns it. `serde(default)` is the upgrade gate: a row written by a
-    /// clauth that predates the field must read as opted OUT, or the decision leg
+    /// tollgate that predates the field must read as opted OUT, or the decision leg
     /// would move every already-running session off its launch account.
     #[serde(default)]
     pub(crate) follows_chain: bool,
@@ -95,7 +95,7 @@ pub(crate) struct LiveSession {
     /// against this path (`runtime::live_session_holds_rotatable`).
     ///
     /// `serde(default)` is the upgrade gate and the fail-closed direction at
-    /// once: a row written by a clauth that predates the field reads `None`,
+    /// once: a row written by a tollgate that predates the field reads `None`,
     /// which every consumer must treat as "assume rotatable", so the macOS
     /// rotation refusal keeps applying to it exactly as it does today.
     #[serde(default)]
@@ -168,7 +168,7 @@ impl SessionFields<'_> {
     }
 
     /// Re-key the row onto the process that IS the session. A delegate's row is
-    /// registered by the `clauth mcp` that spawns it — `std::process::id()` at
+    /// registered by the `tollgate mcp` that spawns it — `std::process::id()` at
     /// register time reads the mcp, not the delegate child — and the herdr
     /// pane-tag walk joins rows to processes by pid, so a row keyed on the mcp
     /// names a delegate's account for the pane hosting its parent session.
@@ -214,16 +214,16 @@ impl LiveTally {
         tally
     }
 
-    /// Fold in the BARE `claude` sessions — started without `clauth start`, so
-    /// they read the `~/.claude/.credentials.json` link clauth owns and burn the
+    /// Fold in the BARE `claude` sessions — started without `tollgate start`, so
+    /// they read the `~/.claude/.credentials.json` link tollgate owns and burn the
     /// account it resolves to. They hold no registry row on purpose: a row reaches
     /// the daemon's swap-decision leg, which reads [`list`] directly, and that leg
-    /// may only move sessions clauth supervises. Counting them HERE is what keeps
+    /// may only move sessions tollgate supervises. Counting them HERE is what keeps
     /// them a display fact. What the count is actually taken from, and how loosely
     /// it stands in for a `claude` count, is
     /// [`crate::runtime::live_bare_sessions`].
     ///
-    /// Attribution is resolved at READ time and never stored: `clauth switch` and
+    /// Attribution is resolved at READ time and never stored: `tollgate switch` and
     /// the fallback chain both repoint that one shared link mid-session. It also
     /// reads the link rather than `active_profile`, which under a divergence names
     /// an account the bare session does not authenticate as.
@@ -282,7 +282,7 @@ impl LiveTally {
 }
 
 fn registry_dir() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("live_sessions"))
+    Ok(tollgate_dir()?.join("live_sessions"))
 }
 
 /// Path of one session's row. The id shape is validated first: `list` reads ids
@@ -296,7 +296,7 @@ fn row_path(session_id: &str) -> Result<PathBuf> {
     Ok(registry_dir()?.join(format!("{session_id}.json")))
 }
 
-/// Owner-only like every `~/.clauth` write: a row carries the session's cwd and
+/// Owner-only like every `~/.tollgate` write: a row carries the session's cwd and
 /// which account it is running as.
 fn write_row(row: &LiveSession) -> Result<()> {
     let path = row_path(&row.session_id)?;

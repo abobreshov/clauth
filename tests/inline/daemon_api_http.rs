@@ -628,7 +628,7 @@ fn an_idle_connection_ends_when_its_budget_runs_out() {
 /// has to lose its control characters before it reaches `daemon.log`.
 #[test]
 fn log_sanitizer_flattens_control_characters() {
-    let forged = "/api/v1/status\r\n2026-01-01 clauth daemon: switched to 'attacker'";
+    let forged = "/api/v1/status\r\n2026-01-01 tollgate daemon: switched to 'attacker'";
     let cleaned = sanitize_for_log(forged);
     assert!(!cleaned.contains('\n'));
     assert!(!cleaned.contains('\r'));

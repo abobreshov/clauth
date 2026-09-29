@@ -544,7 +544,7 @@ impl Response {
         Self::serialize(status, &ErrorBody::new(code, None))
     }
 
-    /// An error carrying clauth's own explanation (a refused switch, say).
+    /// An error carrying tollgate's own explanation (a refused switch, say).
     /// `reason` originates in this crate; serde escapes it into the JSON string
     /// either way, so it cannot break out of the body.
     pub(crate) fn refused(status: u16, code: &str, reason: &str) -> Self {

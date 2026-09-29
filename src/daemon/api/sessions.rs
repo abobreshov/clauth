@@ -1,13 +1,13 @@
 //! `GET /api/v1/sessions` and `GET /api/v1/sessions/{id}` — the Claude Code
 //! transcript index a page at a time, and one transcript's records verbatim.
 //!
-//! Both read the stores `clauth sessions` browses through [`crate::sessions`]
+//! Both read the stores `tollgate sessions` browses through [`crate::sessions`]
 //! and pay only for the rows they return: the listing walks filenames and
 //! mtimes, cuts its page, then previews those rows alone; the history page
-//! walks one transcript's lines backward from a byte cursor. clauth owns no
+//! walks one transcript's lines backward from a byte cursor. tollgate owns no
 //! transcript-turn parser: a record is one JSONL line parsed as a JSON object
 //! and handed over as it was written, so a Claude Code record change never
-//! needs a clauth release, and the clients hand-model what they render.
+//! needs a tollgate release, and the clients hand-model what they render.
 
 use std::cmp::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,7 +42,7 @@ pub(crate) struct SessionsBody {
     next_before: Option<String>,
 }
 
-/// One row of the transcript index: the fields `clauth sessions --json`
+/// One row of the transcript index: the fields `tollgate sessions --json`
 /// emits minus its `tokens`/`cost`, plus the store the transcript lives in.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionRow {
@@ -55,7 +55,7 @@ pub(crate) struct SessionRow {
     workspace: String,
     /// The transcript's mtime, ISO-8601 UTC (`+00:00`).
     updated: String,
-    /// The first user message, redacted and cut like `clauth sessions --json`,
+    /// The first user message, redacted and cut like `tollgate sessions --json`,
     /// `null` when the head held none.
     #[schema(required = true)]
     first_message: Option<String>,
@@ -172,7 +172,7 @@ fn limit_param(req: &Request, default: usize, max: usize) -> Option<usize> {
 /// The walk lists every transcript from filenames and mtimes alone, the cursor
 /// and limit cut the page, and only the rows on it are previewed (a bounded
 /// head and tail read each) and stamped with their owner — so the whole-store
-/// index `clauth sessions` builds is never paid per request.
+/// index `tollgate sessions` builds is never paid per request.
 #[utoipa::path(
     get,
     path = "/api/v1/sessions",
@@ -181,10 +181,10 @@ fn limit_param(req: &Request, default: usize, max: usize) -> Option<usize> {
         ("before" = Option<String>, Query, description = "the `next_before` of an earlier page; absent for the newest page")
     ),
     responses(
-        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`", body = SessionsBody),
+        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `tollgate sessions --json`", body = SessionsBody),
         (status = 400, description = "a limit outside 1..=200, or a before that no earlier page issued (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -250,7 +250,7 @@ pub(crate) fn sessions(_: &ApiContext, req: &Request, _: &Caller<'_>) -> Respons
         (status = 200, description = "the last records whose lines end at or before the cursor, oldest first, each one Claude Code transcript record verbatim; at most 4 MiB of records unless the page's one record is larger", body = HistoryBody),
         (status = 400, description = "a limit outside 1..=500, or a before that is not a byte offset (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 404, description = "no readable transcript of that id in the shared store or a live isolated store (`session_not_found`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
@@ -277,7 +277,7 @@ pub(crate) fn session_history(_: &ApiContext, req: &Request, caller: &Caller<'_>
         Ok(page) => page,
         Err(e) => {
             logline!(
-                "clauth api: session '{}' failed to read: {e}",
+                "tollgate api: session '{}' failed to read: {e}",
                 sanitize_for_log(id)
             );
             return Response::refused(404, "session_not_found", SESSION_NOT_FOUND);

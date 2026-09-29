@@ -1,9 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! `clauth list` table renderer (`render_table`): hide/reveal of disabled
+//! `tollgate list` table renderer (`render_table`): hide/reveal of disabled
 //! profiles, the active marker, exact column layout, and the codex section
 //! with the widths it shares with the claude table. Driven over the real
 //! `build_status` body under a `HomeSandbox`, the same data path
-//! `clauth status --json` reads, so a drift in either surface reds here.
+//! `tollgate status --json` reads, so a drift in either surface reds here.
 
 use super::*;
 
@@ -603,7 +603,7 @@ fn list_table_reports_no_accounts_when_empty() {
     let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
     assert_eq!(
         render_table(&config, &entries),
-        "no accounts yet. add one with `clauth login <name>`.\n"
+        "no accounts yet. add one with `tollgate login <name>`.\n"
     );
 }
 

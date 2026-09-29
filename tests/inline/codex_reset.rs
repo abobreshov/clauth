@@ -221,7 +221,7 @@ fn limit_reset_consume_codes_map_to_their_outcomes() {
     );
 }
 
-/// What each outcome prints or fails with. A success is one `clauth: ` line
+/// What each outcome prints or fails with. A success is one `tollgate: ` line
 /// (a caller shows it as it stands); only a success says the reset was
 /// used, and every uncertain failure says to look before retrying.
 #[test]
@@ -234,7 +234,7 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
 
     assert_eq!(
         outcome_line("work", &credits, &reply("reset", 2)),
-        Ok("clauth: used a usage-limit reset on 'work': 2 windows reopened, 2 left.".to_string())
+        Ok("tollgate: used a usage-limit reset on 'work': 2 windows reopened, 2 left.".to_string())
     );
     assert_eq!(
         outcome_line(
@@ -242,7 +242,7 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
             &list_of(Vec::new(), 1),
             &reply("already_redeemed", 1)
         ),
-        Ok("clauth: used a usage-limit reset on 'work': 1 window reopened, 0 left.".to_string())
+        Ok("tollgate: used a usage-limit reset on 'work': 1 window reopened, 0 left.".to_string())
     );
     assert_eq!(
         outcome_line("work", &credits, &reply("nothing_to_reset", 0)),
@@ -251,7 +251,7 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
     let no_credit = outcome_line("work", &credits, &reply("no_credit", 0)).expect_err("fails");
     assert!(no_credit.contains("no longer available"), "{no_credit}");
     assert!(
-        no_credit.contains("clauth limit-reset work --list"),
+        no_credit.contains("tollgate limit-reset work --list"),
         "{no_credit}"
     );
     let unknown = outcome_line("work", &credits, &reply("weird\u{1b}[2J", 0)).expect_err("fails");
@@ -294,7 +294,7 @@ fn limit_reset_failure_lines_separate_nothing_spent_from_unconfirmed() {
         "{transport}"
     );
     assert!(
-        transport.contains("clauth limit-reset work --list"),
+        transport.contains("tollgate limit-reset work --list"),
         "{transport}"
     );
     let status = consume_failure("work", &ResetCallError::Status(500));
@@ -333,8 +333,9 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
 
     let prompt = limit_reset_prompt("work", &credits, &dated);
     assert!(
-        prompt
-            .starts_with("clauth: use a usage-limit reset on 'work'? usage-limit reset · expires "),
+        prompt.starts_with(
+            "tollgate: use a usage-limit reset on 'work'? usage-limit reset · expires "
+        ),
         "{prompt}"
     );
     assert!(prompt.contains("· 1 of 2 available."), "{prompt}");
@@ -348,7 +349,7 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     let lines = describe_reset_credits("work", &credits);
     assert_eq!(
         lines[0],
-        "clauth: 'work' has 2 usage-limit resets available."
+        "tollgate: 'work' has 2 usage-limit resets available."
     );
     assert_eq!(lines.len(), 3);
     assert!(
@@ -376,7 +377,7 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     let lines = describe_reset_credits("work", &spent);
     assert_eq!(
         lines[0],
-        "clauth: no usage-limit resets available on 'work'."
+        "tollgate: no usage-limit resets available on 'work'."
     );
     assert!(!lines[1].contains("used next"), "{}", lines[1]);
 }

@@ -18,7 +18,7 @@ use utoipa::openapi::schema::{
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates
 /// session dirs, pid files, or rotation locks — otherwise those paths land in
-/// the real `~/.clauth`.
+/// the real `~/.tollgate`.
 pub(crate) struct HomeSandbox {
     // Drop order: tempdir first, then the shared lock.
     _tmp: tempfile::TempDir,
@@ -43,7 +43,7 @@ impl HomeSandbox {
         // `home_override` does not reach `CLAUDE_CONFIG_DIR`, and the operator's
         // own value names a runtime OUTSIDE this tempdir: `which::session_auth`
         // and `which::resolve_active` honor it, so a test run from inside a
-        // `clauth start` session resolves the real `~/.claude/.credentials.json`
+        // `tollgate start` session resolves the real `~/.claude/.credentials.json`
         // and reads a file it never staged. Clearing it here makes the sandbox
         // the only answer, the rule `profile::home_dir` already states for the
         // home. A test that WANTS one pins it with [`ConfigDirSandbox`], which
@@ -73,7 +73,7 @@ impl Drop for HomeSandbox {
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
         // detached worker still running when `HOME_OVERRIDE` clears resolves
-        // the operator's REAL `$HOME` and takes real locks under `~/.clauth`
+        // the operator's REAL `$HOME` and takes real locks under `~/.tollgate`
         // (`RotationGuard::acquire` alone does `mkdir_700` + a blocking
         // flock). Doing it here rather than asking each test to call the join
         // fns covers the tests that never thought about it — which is every
@@ -203,7 +203,7 @@ pub(crate) fn join_background_tasks_with(timeout: std::time::Duration) {
             // This runs inside `HomeSandbox::drop`, where panicking during an
             // unwind aborts the process and buries the original failure.
             if std::thread::panicking() {
-                crate::out::errln!("clauth: {msg}");
+                crate::out::errln!("tollgate: {msg}");
             } else {
                 panic!("{msg}");
             }
@@ -766,11 +766,11 @@ case "$1" in
   plugin)
     case "$2" in
       list)
-        # [] until an install happened, then the clauth entry with an existing
+        # [] until an install happened, then the tollgate entry with an existing
         # installPath (agentgear's verify_present checks the path on disk).
         if [ "$3" = "--json" ]; then
           if [ -f "$CLAUDE_SHIM_STATE" ]; then
-            printf '[{"id":"clauth@clauth","version":"@VERSION@","enabled":true,"installPath":"%s"}]\n' "$CLAUDE_SHIM_TREE"
+            printf '[{"id":"tollgate@tollgate","version":"@VERSION@","enabled":true,"installPath":"%s"}]\n' "$CLAUDE_SHIM_TREE"
           else
             echo '[]'
           fi
@@ -782,7 +782,7 @@ case "$1" in
             # The registered marketplace as `marketplace list --json` reads it:
             # recorded at add time, so agentgear's probe can compare the path.
             if [ -f "$CLAUDE_SHIM_MKT_STATE" ]; then
-              printf '[{"name":"clauth","path":"%s"}]\n' "$(cat "$CLAUDE_SHIM_MKT_STATE")"
+              printf '[{"name":"tollgate","path":"%s"}]\n' "$(cat "$CLAUDE_SHIM_MKT_STATE")"
             else
               echo '[]'
             fi
@@ -795,10 +795,10 @@ case "$1" in
         ;;
       install)
         : > "$CLAUDE_SHIM_STATE"
-        # The registry clauth's own probe reads: write the user-scope entry so
+        # The registry tollgate's own probe reads: write the user-scope entry so
         # the Plugin tab recompute after the install sees it.
         mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
-        printf '{"plugins":{"clauth@clauth":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+        printf '{"plugins":{"tollgate@tollgate":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
         ;;
     esac
     ;;
@@ -982,7 +982,7 @@ impl Drop for CodexHomeSandbox<'_> {
     }
 }
 
-/// Seed a plugin registration the heal gate must act on: a `clauth@clauth`
+/// Seed a plugin registration the heal gate must act on: a `tollgate@tollgate`
 /// user-scope row whose `installPath` is gone. The registry lives under the
 /// sandboxed claude dir, so this touches nothing outside it.
 #[cfg(unix)]
@@ -996,7 +996,7 @@ pub(crate) fn seed_broken_plugin_registration() {
         dir.join("installed_plugins.json"),
         serde_json::to_vec(&serde_json::json!({
             "version": 2,
-            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
+            "plugins": {"tollgate@tollgate": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
         }))
         .expect("seed json"),
     )
@@ -1069,7 +1069,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
 /// `profile::load_usage_history` parses — so a fixture can give an account a
 /// measured burn rate without running a fetch. Timestamps are `now_ms`-space
 /// epoch milliseconds. The write resolves under the process HOME: the caller's
-/// `HomeSandbox` (the HOME pin) is what keeps it off a real `~/.clauth`.
+/// `HomeSandbox` (the HOME pin) is what keeps it off a real `~/.tollgate`.
 pub(crate) fn write_usage_history(
     name: &crate::profile::ProfileName,
     entries: &[(u64, crate::usage::UsageInfo)],
@@ -1089,7 +1089,7 @@ pub(crate) fn write_usage_history(
 }
 
 /// A JWT carrying `payload` (a JSON object) — header.payload.signature in the
-/// base64url alphabet, signed by nobody: every clauth read of a codex token is
+/// base64url alphabet, signed by nobody: every tollgate read of a codex token is
 /// unverified, so this is all a schedule or label read needs.
 pub(crate) fn codex_jwt(payload: &str) -> String {
     let payload = crate::oauth_login::base64url_nopad(payload.as_bytes());
@@ -1101,7 +1101,7 @@ pub(crate) fn jwt_with_exp(exp_secs: i64) -> String {
     codex_jwt(&format!("{{\"exp\":{exp_secs}}}"))
 }
 
-/// A codex `auth.json` body holding one chain plus a key clauth never writes,
+/// A codex `auth.json` body holding one chain plus a key tollgate never writes,
 /// so a rotation's key survival is observable.
 pub(crate) fn codex_auth_body(access: &str, refresh: &str) -> String {
     format!(
@@ -1127,14 +1127,14 @@ pub(crate) fn read_codex_store(name: &str) -> String {
     .expect("read store")
 }
 
-/// Writes `body` verbatim as the sandboxed `~/.clauth/codex-profiles.toml`.
+/// Writes `body` verbatim as the sandboxed `~/.tollgate/codex-profiles.toml`.
 pub(crate) fn write_codex_state(body: &str) {
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .tollgate");
     std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex state");
 }
 
-/// Writes a roster-only `codex-profiles.toml` into the sandboxed `~/.clauth`.
+/// Writes a roster-only `codex-profiles.toml` into the sandboxed `~/.tollgate`.
 pub(crate) fn write_codex_roster(names: &[&str]) {
     let list = names
         .iter()
@@ -1158,7 +1158,7 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
     holder
 }
 
-/// Simulate a live `clauth start` session for `name`: a locked pid file in the
+/// Simulate a live `tollgate start` session for `name`: a locked pid file in the
 /// profile's sessions dir under `home` reads as alive via
 /// `runtime::has_live_session`. The caller must keep the returned file alive for
 /// as long as the session should read as live — dropping it releases the flock.
@@ -1166,7 +1166,7 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
 /// same tree `profile_dir` resolves under that sandbox.
 pub(crate) fn arm_live_session(home: &Path, name: &str) -> std::fs::File {
     let sessions = home
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join(name)
         .join("sessions");
@@ -1204,7 +1204,7 @@ pub(crate) fn register_names(names: &[&str]) {
 
 /// The balance shape: `rows` only, no `bars`, and no `plan` key at all. Its
 /// wallet row carries the CAPTURED `total`, which is also the label every cache
-/// an older clauth wrote still holds on disk today, and the one the generic
+/// an older tollgate wrote still holds on disk today, and the one the generic
 /// scanner still passes an endpoint's own key through as. Consumers must keep
 /// reading it — [`DEEPSEEK_CACHE_BYTES`] is the same shape at the current
 /// spelling, and the two together are what hold both halves of that.
@@ -1374,8 +1374,8 @@ pub(crate) fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
         .collect()
 }
 
-/// Every path under `root` breaking the owner-only invariant clauth holds over
-/// `~/.clauth` (0o700 dirs, 0o600 files), rendered as `<mode> <path>` lines.
+/// Every path under `root` breaking the owner-only invariant tollgate holds over
+/// `~/.tollgate` (0o700 dirs, 0o600 files), rendered as `<mode> <path>` lines.
 /// Symlinks are skipped — a link's own mode is meaningless and its target lives
 /// outside the tree.
 #[cfg(unix)]
@@ -1395,7 +1395,7 @@ pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
     if mode != want {
         out.push(format!("{mode:#o} {} (want {want:#o})", root.display()));
     }
-    // Mirror of `enforce_clauth_perms`: a codex home's contents are codex's
+    // Mirror of `enforce_tollgate_perms`: a codex home's contents are codex's
     // own (exec-bit helper binaries included), so the invariant covers the
     // home NODE and stops at its threshold.
     if is_dir && crate::runtime::is_codex_home_path(root) {
@@ -1869,8 +1869,8 @@ mod route_harness {
     /// [`DEVICE`].
     pub(crate) fn ctx_with(config: ConfigHandle) -> std::sync::Arc<ApiContext> {
         seed_device(DEVICE, Tier::Control, TOKEN);
-        let status_path = crate::profile::clauth_dir()
-            .expect("clauth dir")
+        let status_path = crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("status.json");
         ApiContext::for_tests(
             config,

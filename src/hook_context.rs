@@ -1,4 +1,4 @@
-//! The context-window nudge leg of `clauth hook-profile-changed-note`: one
+//! The context-window nudge leg of `tollgate hook-profile-changed-note`: one
 //! note per conversation once its CC transcript's context usage crosses the
 //! configured threshold, riding the envelope the account note and the
 //! headroom nudge share.
@@ -196,7 +196,7 @@ fn render_context_note(
     delegates: usize,
 ) -> String {
     let threshold = format_threshold_tokens(threshold);
-    let mut note = format!("clauth: context window usage has exceeded {threshold} tokens.");
+    let mut note = format!("tollgate: context window usage has exceeded {threshold} tokens.");
     if auto_compact {
         note.push_str(" auto-compaction is turned on.");
     } else {

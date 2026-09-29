@@ -1,9 +1,9 @@
 //! Interactive browser login for an Alibaba Model Studio **console** session,
-//! used by `clauth login <name>` on a profile whose `base_url` is one of the
+//! used by `tollgate login <name>` on a profile whose `base_url` is one of the
 //! Model Studio endpoints.
 //!
 //! This is not OAuth. The console hands the token straight to a loopback port:
-//! clauth mints a 16-byte hex `state`, binds `127.0.0.1:0`, and opens
+//! tollgate mints a 16-byte hex `state`, binds `127.0.0.1:0`, and opens
 //! `<console>/console-login?notice=127.0.0.1:<port>?state=<state>&needapikey=true`
 //! — that second `?` is literal, not an `&`.
 //!
@@ -27,7 +27,7 @@
 //! reads the key.
 //!
 //! **The captured session's clock is not this login's.** It expires 48h after
-//! the operator's aliyun browser sign-in, so re-running `clauth login` inherits
+//! the operator's aliyun browser sign-in, so re-running `tollgate login` inherits
 //! whatever is left — minutes, sometimes — rather than restarting it. Nothing
 //! here may promise a duration; only a fresh console sign-in buys a full window.
 
@@ -49,7 +49,7 @@ const CONSOLE_INTERNATIONAL: &str = "https://modelstudio.console.alibabacloud.co
 /// doesn't time out mid-flight.
 const IDLE_TIMEOUT_SECS: u64 = 15 * 60;
 
-/// Largest callback body clauth will read. The real payload is a handful of
+/// Largest callback body tollgate will read. The real payload is a handful of
 /// fields; the cap keeps a local process from feeding the listener forever.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
@@ -250,7 +250,7 @@ fn classify(req: &Request, expected_state: &str, opened: (ConsoleSite, &str)) ->
         return Callback::Rejected("no access_token");
     };
     let (opened_site, opened_region) = opened;
-    // An unrecognised site spelling falls back to the console clauth actually
+    // An unrecognised site spelling falls back to the console tollgate actually
     // opened — a token minted on one front is meaningless on the other, so
     // guessing from an unknown string is worse than trusting what we chose.
     let site = field(req, "console_site", "consoleSite")
@@ -343,7 +343,7 @@ pub(crate) fn login_with(
     }
 }
 
-/// One-glance summary of a captured console session for `clauth login`. Never
+/// One-glance summary of a captured console session for `tollgate login`. Never
 /// prints the token — only its length, which is enough to confirm something
 /// real landed.
 pub(crate) fn login_summary(outcome: &ConsoleLoginOutcome) -> String {

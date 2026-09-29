@@ -4,7 +4,7 @@
 //! chain assembly, and the guard on the hostname that names those files.
 //!
 //! The `tls.json` cases redirect disk state into a [`HomeSandbox`] tempdir, so
-//! nothing here reads or writes the operator's real `~/.clauth`.
+//! nothing here reads or writes the operator's real `~/.tollgate`.
 //!
 //! PEM decoding does not parse X.509, so these fixtures are synthetic blocks
 //! written into a tempdir rather than real certificates, and no private key is
@@ -19,7 +19,7 @@ use super::*;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use crate::profile::clauth_dir;
+use crate::profile::tollgate_dir;
 use crate::testutil::HomeSandbox;
 
 /// A PEM block of `kind` carrying `payload` (already base64).
@@ -292,7 +292,7 @@ fn the_default_certificate_directory_matches_the_platform() {
 #[test]
 fn tls_config_is_written_with_the_platform_default_on_first_use() {
     let _home = HomeSandbox::new();
-    let path = clauth_dir().expect("clauth dir").join("tls.json");
+    let path = tollgate_dir().expect("tollgate dir").join("tls.json");
     assert!(!path.exists(), "sandbox starts without one");
 
     let dir = cert_dir().expect("first read creates the file");
@@ -324,7 +324,7 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
     );
 }
 
-/// `tls.json` inherits the tree's 0600, like every other file clauth writes.
+/// `tls.json` inherits the tree's 0600, like every other file tollgate writes.
 ///
 /// It holds no key material — it names a directory — but the pin is on the tree
 /// and not on the secrecy of any one file: a mode that drifts loose here is a
@@ -334,7 +334,7 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
 fn tls_config_is_owner_only() {
     let _home = HomeSandbox::new();
     cert_dir().expect("first read creates the file");
-    let left = crate::testutil::owner_only_violations(&clauth_dir().expect("clauth dir"));
+    let left = crate::testutil::owner_only_violations(&tollgate_dir().expect("tollgate dir"));
     assert!(
         left.is_empty(),
         "tls.json must inherit the 0600 tree invariant; still loose: {left:#?}"
@@ -344,7 +344,7 @@ fn tls_config_is_owner_only() {
 #[test]
 fn an_edited_cert_dir_is_honored_across_restarts() {
     let _home = HomeSandbox::new();
-    let path = clauth_dir().expect("clauth dir").join("tls.json");
+    let path = tollgate_dir().expect("tollgate dir").join("tls.json");
     cert_dir().expect("create the default");
 
     std::fs::write(&path, r#"{"schema":1,"cert_dir":"/opt/certs/lego"}"#).expect("edit");
@@ -365,8 +365,8 @@ fn an_edited_cert_dir_is_honored_across_restarts() {
 #[test]
 fn a_malformed_tls_config_refuses_rather_than_reverting_to_the_default() {
     let _home = HomeSandbox::new();
-    let path = clauth_dir().expect("clauth dir").join("tls.json");
-    // Nothing has created ~/.clauth yet: these cases seed the file directly
+    let path = tollgate_dir().expect("tollgate dir").join("tls.json");
+    // Nothing has created ~/.tollgate yet: these cases seed the file directly
     // instead of letting `cert_dir` write it.
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
 
@@ -391,7 +391,7 @@ fn a_malformed_tls_config_refuses_rather_than_reverting_to_the_default() {
 #[test]
 fn a_newer_schema_is_still_read() {
     let _home = HomeSandbox::new();
-    let path = clauth_dir().expect("clauth dir").join("tls.json");
+    let path = tollgate_dir().expect("tollgate dir").join("tls.json");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(
         &path,
@@ -451,11 +451,11 @@ fn an_ipv4_mapped_tailnet_address_canonicalizes_to_the_ipv4_range() {
 /// The tailnet refusal for a known IPv4 bind, word-for-word. Pinned by
 /// equality, never by substring: a wording drift or a wrong range name must
 /// fail the suite, not pass on a fragment.
-const TAILNET_REFUSAL_V4: &str = "100.64.1.2 is in the 100.64.0.0/10 range Tailscale assigns addresses from, and this host's lego certificate is not available; run `tailscale cert <machine>.<tailnet>.ts.net` and pass `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` to `clauth daemon --listen`";
+const TAILNET_REFUSAL_V4: &str = "100.64.1.2 is in the 100.64.0.0/10 range Tailscale assigns addresses from, and this host's lego certificate is not available; run `tailscale cert <machine>.<tailnet>.ts.net` and pass `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` to `tollgate daemon --listen`";
 
 /// The same refusal for a known IPv6 bind. Repeated rather than derived: the
 /// interpolated range must be the IPv6 one.
-const TAILNET_REFUSAL_V6: &str = "fd7a:115c:a1e0::1 is in the fd7a:115c:a1e0::/48 range Tailscale assigns addresses from, and this host's lego certificate is not available; run `tailscale cert <machine>.<tailnet>.ts.net` and pass `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` to `clauth daemon --listen`";
+const TAILNET_REFUSAL_V6: &str = "fd7a:115c:a1e0::1 is in the fd7a:115c:a1e0::/48 range Tailscale assigns addresses from, and this host's lego certificate is not available; run `tailscale cert <machine>.<tailnet>.ts.net` and pass `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` to `tollgate daemon --listen`";
 
 /// The seam that takes the lego paths: a missing `.crt` on a tailnet-range
 /// bind becomes the tailnet refusal, pinned word-for-word, with the lego cause

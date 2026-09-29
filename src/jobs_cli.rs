@@ -1,6 +1,6 @@
-//! `clauth jobs` — the operator's enumeration of the delegate job store.
+//! `tollgate jobs` — the operator's enumeration of the delegate job store.
 //!
-//! Reads `~/.clauth/jobs/` through `mcp::jobs::list`, the same parser the MCP
+//! Reads `~/.tollgate/jobs/` through `mcp::jobs::list`, the same parser the MCP
 //! surface and the TUI's delegates pane read it through, and classifies each row
 //! with the same `StoredJob::phase`. Two readers of one store is already a drift
 //! risk this store carries; a third PARSER would be the drift itself, so there
@@ -11,7 +11,7 @@
 //! `monitor({job_ids, cancel: true})`'s job — one stop path, which is also why
 //! the TUI pane binds no key.
 //!
-//! Why a separate command rather than a column on `clauth list`: a job is a
+//! Why a separate command rather than a column on `tollgate list`: a job is a
 //! transient run, not an account, and its rows come and go inside one 5h window.
 
 use anyhow::Result;
@@ -26,7 +26,7 @@ use crate::{out, outln};
 /// very long line cannot push the table off the screen.
 const TAIL_W: usize = 100;
 
-/// `clauth jobs [--json]` — print the delegate job store.
+/// `tollgate jobs [--json]` — print the delegate job store.
 ///
 /// An empty store is a success, not a failure: no delegate has run recently is
 /// the normal state, and exiting non-zero for it would break every script that
@@ -125,7 +125,7 @@ fn row(job: &StoredJob, now: u64) -> JobRow {
     }
 }
 
-/// The table `clauth jobs` prints.
+/// The table `tollgate jobs` prints.
 ///
 /// Each time column asks ONE question and renders `-` where the record has no
 /// answer, rather than one column meaning "elapsed" on a live row and "finished
@@ -182,7 +182,7 @@ fn render_table(rows: &[JobRow]) -> String {
 /// next reader has to be able to tell what is and is not handled here.
 ///
 /// **Controls** (`char::is_control`, so C0 + DEL + C1): the table is the first
-/// clauth surface that prints a tail raw — the MCP replies are JSON (serde
+/// tollgate surface that prints a tail raw — the MCP replies are JSON (serde
 /// escapes C0 as `\uXXXX`) and the TUI goes through ratatui. `tail_line`
 /// collapses whitespace runs, which removes newlines and tabs and leaves
 /// `\x1b`, `\x07` and `\x00` alone, since none of those is
@@ -212,12 +212,12 @@ fn render_table(rows: &[JobRow]) -> String {
 /// `\u0007`; every bidi character above it is emitted as its literal UTF-8
 /// bytes. That is correct for a machine format — a `jq` consumer should get what
 /// the delegate actually wrote — but it means an operator eyeballing
-/// `clauth jobs --json` in a terminal sees the reordering this function strips
+/// `tollgate jobs --json` in a terminal sees the reordering this function strips
 /// from the table. Measured, not assumed: an earlier version of this sentence
 /// said `--json` "escapes rather than drops", which is true of C0 and false of
 /// everything here.
 ///
-/// Only the TAIL is filtered. The other columns are clauth-minted (`job_id`,
+/// Only the TAIL is filtered. The other columns are tollgate-minted (`job_id`,
 /// the state word, the figures) or roster-resolved (`profile`, which
 /// `preflight_target` takes as an already-resolved account), so none of them
 /// carries model-supplied text today. **That is a provenance argument, not a
@@ -300,7 +300,7 @@ fn last_output_cell(row: &JobRow) -> String {
 /// would be a second derivation of a question the TUI pane already answers its
 /// own way for a row that has one cell to spend.
 ///
-/// A dash here does NOT mean "clauth knows there is no deadline". A new record
+/// A dash here does NOT mean "tollgate knows there is no deadline". A new record
 /// carries no deadline pair because a delegate has none anymore; an old record
 /// carried neither only if its server recorded none. This column renders both as
 /// `-` and claims neither.
@@ -330,7 +330,7 @@ fn duration_cell(secs: u64) -> String {
 /// The `--json` array: newest-mattering first, one object per stored job.
 ///
 /// The field set is FIXED and every key is always present, a figure the record
-/// does not have rendering `null` — the shape `clauth sessions --json` already
+/// does not have rendering `null` — the shape `tollgate sessions --json` already
 /// established, and the one a `jq` filter can be written against without
 /// probing for keys. That is deliberately the opposite of the MCP surface's
 /// absent-means-structurally-none rule: a model reads prose and pays for every

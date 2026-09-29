@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "clauth hook-profile-changed-note",
+            "command": "tollgate hook-profile-changed-note",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "clauth hook-profile-changed-note",
+            "command": "tollgate hook-profile-changed-note",
             "timeout": 10
           }
         ]
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "clauth self-heal",
+            "command": "tollgate self-heal",
             "timeout": 60
           }
         ]
@@ -33,15 +33,15 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_clauth_clauth__delegate$",
+        "matcher": "mcp__plugin_tollgate_tollgate__delegate$",
         "hooks": [
           {
             "type": "command",
-            "command": "clauth mcp-await-job",
+            "command": "tollgate mcp-await-job",
             "asyncRewake": true,
             "timeout": 4260,
-            "rewakeMessage": "A backgrounded clauth delegate finished; its result envelope follows.",
-            "rewakeSummary": "clauth delegate results"
+            "rewakeMessage": "A backgrounded tollgate delegate finished; its result envelope follows.",
+            "rewakeSummary": "tollgate delegate results"
           }
         ]
       },
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "clauth hook-profile-changed-note",
+            "command": "tollgate hook-profile-changed-note",
             "timeout": 10
           }
         ]

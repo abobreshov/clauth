@@ -1,6 +1,6 @@
-//! Paired devices: who may call `clauth daemon --listen`, and at which tier.
+//! Paired devices: who may call `tollgate daemon --listen`, and at which tier.
 //!
-//! `~/.clauth/devices.json` holds one row per device: its name, its tier, its
+//! `~/.tollgate/devices.json` holds one row per device: its name, its tier, its
 //! sessions grant, how it joined, and the SHA-256 of its bearer token. Never
 //! the token itself, which exists on the device and in the one response that
 //! mints it, so a read of the store yields nothing a client could present.
@@ -20,11 +20,11 @@ use subtle::ConstantTimeEq;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::out::{Wrote, errln, out, outln, write_chunk_result};
-use crate::profile::{atomic_write_600, clauth_dir};
+use crate::profile::{atomic_write_600, tollgate_dir};
 use crate::usage::{epoch_secs_to_iso, humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 
 const STORE_FILE: &str = "devices.json";
-/// Where a clauth from before pairing kept its one global bearer token.
+/// Where a tollgate from before pairing kept its one global bearer token.
 const LEGACY_FILE: &str = "auth_token.json";
 /// Bumped only on a breaking change to the file's shape, like `status.json`.
 const SCHEMA: u64 = 1;
@@ -43,7 +43,7 @@ pub(crate) enum Tier {
     View,
     /// Everything `View` may, plus switch accounts.
     Control,
-    /// A tier a newer clauth wrote. Carried through every rewrite, so this
+    /// A tier a newer tollgate wrote. Carried through every rewrite, so this
     /// build cannot erase it, and granted nothing: serving it as either known
     /// tier would guess at what the newer build meant by it.
     Unknown(String),
@@ -96,11 +96,11 @@ impl std::fmt::Display for Tier {
 pub(crate) enum Joined {
     /// Redeemed a pairing code.
     Pair,
-    /// Minted by `clauth devices add` on this machine.
+    /// Minted by `tollgate devices add` on this machine.
     Add,
     /// Imported from [`LEGACY_FILE`].
     Legacy,
-    /// A value a newer clauth wrote, carried verbatim.
+    /// A value a newer tollgate wrote, carried verbatim.
     Other(String),
 }
 
@@ -147,7 +147,7 @@ pub(crate) struct Device {
     /// before the field existed loads `false`.
     #[serde(default)]
     pub(crate) sessions: bool,
-    /// Fields a newer clauth added, kept through this build's rewrites.
+    /// Fields a newer tollgate added, kept through this build's rewrites.
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -190,7 +190,7 @@ impl Device {
     }
 }
 
-/// `~/.clauth/devices.json`.
+/// `~/.tollgate/devices.json`.
 #[derive(Serialize, Deserialize)]
 pub(super) struct Store {
     #[serde(default)]
@@ -243,7 +243,7 @@ impl DeviceName {
         let name = raw.trim();
         if name.eq_ignore_ascii_case(LEGACY_NAME) {
             bail!(
-                "'{LEGACY_NAME}' is the name clauth gives the token it imports from an older \
+                "'{LEGACY_NAME}' is the name tollgate gives the token it imports from an older \
                  build; pick another name"
             );
         }
@@ -262,11 +262,11 @@ impl std::fmt::Display for DeviceName {
 }
 
 fn store_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join(STORE_FILE))
+    Ok(tollgate_dir()?.join(STORE_FILE))
 }
 
 fn legacy_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join(LEGACY_FILE))
+    Ok(tollgate_dir()?.join(LEGACY_FILE))
 }
 
 /// A fresh token: 32 CSPRNG bytes through SHA-256, hex-encoded.
@@ -305,7 +305,7 @@ pub(super) fn read_store() -> Result<Store> {
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
     };
     let mut store: Store = serde_json::from_slice(&bytes)
-        .with_context(|| format!("{} is not a device list clauth can read", path.display()))?;
+        .with_context(|| format!("{} is not a device list tollgate can read", path.display()))?;
     store.schema = store.schema.max(SCHEMA);
     Ok(store)
 }
@@ -384,7 +384,7 @@ pub(crate) fn authenticate(presented: Option<&str>) -> Result<Option<Device>> {
 pub(super) fn refuse_taken(store: &Store, name: &DeviceName) -> Result<()> {
     if let Some(existing) = store.named(name.as_str()) {
         bail!(
-            "a device named '{0}' already exists; revoke it first: clauth devices revoke {0}",
+            "a device named '{0}' already exists; revoke it first: tollgate devices revoke {0}",
             existing.name
         );
     }
@@ -434,7 +434,7 @@ pub(super) fn append_paired(
 /// The fixed sentence both name-lookup verbs use for a name the store does not
 /// hold, so the two cannot drift apart.
 fn missing_device(name: &str) -> anyhow::Error {
-    anyhow::anyhow!("no device named '{name}'; `clauth devices` lists the paired ones")
+    anyhow::anyhow!("no device named '{name}'; `tollgate devices` lists the paired ones")
 }
 
 /// Remove the device named `name`; its next request finds no row to verify.
@@ -475,7 +475,7 @@ pub(crate) fn allow_sessions(name: &str) -> Result<(String, bool)> {
     })
 }
 
-/// `~/.clauth/auth_token.json`, as the clauth before pairing wrote it.
+/// `~/.tollgate/auth_token.json`, as the tollgate before pairing wrote it.
 #[derive(Deserialize)]
 struct LegacyTokenFile {
     token: String,
@@ -490,7 +490,7 @@ fn control_tier() -> String {
     Tier::Control.as_str().to_string()
 }
 
-/// Fold `auth_token.json`, the one bearer a clauth before pairing served, into
+/// Fold `auth_token.json`, the one bearer a tollgate before pairing served, into
 /// the store as the control device [`LEGACY_NAME`], then delete the plaintext.
 /// The client holding those bytes keeps working as that device.
 ///
@@ -499,7 +499,7 @@ fn control_tier() -> String {
 /// promote a token its writer restricted. So does a file holding no usable
 /// token. A `legacy` device that already exists takes the file's digest,
 /// because the file is newer than the import that made the device: a
-/// downgraded clauth minted it after the import deleted the old one, and it is
+/// downgraded tollgate minted it after the import deleted the old one, and it is
 /// the token the client was handed last.
 pub(crate) fn import_legacy() -> Result<()> {
     with_state_lock(|held| {
@@ -508,15 +508,15 @@ pub(crate) fn import_legacy() -> Result<()> {
             Ok(body) => body,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
-                logline!("clauth daemon: not importing {LEGACY_FILE}, which cannot be read: {e}");
+                logline!("tollgate daemon: not importing {LEGACY_FILE}, which cannot be read: {e}");
                 return Ok(());
             }
         };
         let legacy = match serde_json::from_str::<LegacyTokenFile>(&body) {
             Ok(legacy) if legacy.tier != Tier::Control.as_str() => {
                 logline!(
-                    "clauth daemon: {LEGACY_FILE} carries tier {:?} rather than control, so it is \
-                     neither imported nor served; run the clauth that wrote it, or delete the \
+                    "tollgate daemon: {LEGACY_FILE} carries tier {:?} rather than control, so it is \
+                     neither imported nor served; run the tollgate that wrote it, or delete the \
                      file",
                     legacy.tier
                 );
@@ -525,9 +525,9 @@ pub(crate) fn import_legacy() -> Result<()> {
             Ok(legacy) if is_well_formed(&legacy.token) => legacy,
             _ => {
                 logline!(
-                    "clauth daemon: {LEGACY_FILE} holds no usable token (bad JSON, or a token \
+                    "tollgate daemon: {LEGACY_FILE} holds no usable token (bad JSON, or a token \
                      that is not 64 lowercase hex characters), so it is not imported; pair the \
-                     client again with `clauth devices pair <name>` and delete the file"
+                     client again with `tollgate devices pair <name>` and delete the file"
                 );
                 return Ok(());
             }
@@ -536,7 +536,7 @@ pub(crate) fn import_legacy() -> Result<()> {
             Ok(store) => store,
             Err(e) => {
                 logline!(
-                    "clauth daemon: not importing {LEGACY_FILE} while the device list is \
+                    "tollgate daemon: not importing {LEGACY_FILE} while the device list is \
                      unreadable: {e:#}"
                 );
                 return Ok(());
@@ -550,7 +550,7 @@ pub(crate) fn import_legacy() -> Result<()> {
                 store.devices[index].paired_at = legacy.created_at;
                 store.legacy_digest = Some(digest);
                 write_store(held, &store)?;
-                "now holds the token a downgraded clauth minted"
+                "now holds the token a downgraded tollgate minted"
             }
             // This list imported this very token and `legacy` is gone since:
             // it was revoked, and a file a failed delete left behind must not
@@ -575,10 +575,10 @@ pub(crate) fn import_legacy() -> Result<()> {
         };
         match std::fs::remove_file(&path) {
             Ok(()) => logline!(
-                "clauth daemon: device '{LEGACY_NAME}' {imported}; {LEGACY_FILE} is deleted"
+                "tollgate daemon: device '{LEGACY_NAME}' {imported}; {LEGACY_FILE} is deleted"
             ),
             Err(e) => logline!(
-                "clauth daemon: device '{LEGACY_NAME}' {imported}, but {LEGACY_FILE} could not be \
+                "tollgate daemon: device '{LEGACY_NAME}' {imported}, but {LEGACY_FILE} could not be \
                  deleted ({e}); delete it by hand, it holds the plaintext token"
             ),
         }
@@ -592,17 +592,17 @@ pub(crate) fn import_legacy() -> Result<()> {
 pub(crate) fn note_at_start() {
     match read_store() {
         Ok(store) if store.devices.is_empty() => logline!(
-            "clauth daemon: no device is paired yet, so every REST request but a pairing is \
-             refused; pair one with `clauth devices pair <name>`"
+            "tollgate daemon: no device is paired yet, so every REST request but a pairing is \
+             refused; pair one with `tollgate devices pair <name>`"
         ),
         Ok(_) => {}
         Err(e) => logline!(
-            "clauth daemon: every REST request is refused until the device list reads: {e:#}"
+            "tollgate daemon: every REST request is refused until the device list reads: {e:#}"
         ),
     }
 }
 
-/// `clauth devices [--json]`.
+/// `tollgate devices [--json]`.
 pub(crate) fn run_list(json: bool) -> Result<()> {
     let store = read_store()?;
     if json {
@@ -632,7 +632,7 @@ fn list_json(devices: &[Device]) -> String {
 
 fn render_table(devices: &[Device], now: i64) -> String {
     if devices.is_empty() {
-        return "no devices are paired. `clauth devices pair <name>` pairs one.\n".to_string();
+        return "no devices are paired. `tollgate devices pair <name>` pairs one.\n".to_string();
     }
     let paired: Vec<String> = devices
         .iter()
@@ -684,7 +684,7 @@ fn paired_cell(iso: &str, now: i64) -> String {
     }
 }
 
-/// `clauth devices add <name> [--control] [--sessions]`: the token alone on
+/// `tollgate devices add <name> [--control] [--sessions]`: the token alone on
 /// stdout, so a `$(...)` capture holds exactly it, and everything else on stderr.
 pub(crate) fn run_add(name: &str, control: bool, sessions: bool) -> Result<()> {
     let name = DeviceName::parse(name)?;
@@ -700,11 +700,11 @@ pub(crate) fn run_add(name: &str, control: bool, sessions: bool) -> Result<()> {
         revoke_lost(&name, write_err)?;
     }
     errln!(
-        "clauth: added device '{name}' ({tier}). That token is its only copy: clauth keeps just \
+        "tollgate: added device '{name}' ({tier}). That token is its only copy: tollgate keeps just \
          a SHA-256 of it and cannot show it again."
     );
     if sessions {
-        errln!("clauth: '{name}' may mint sessions");
+        errln!("tollgate: '{name}' may mint sessions");
     }
     Ok(())
 }
@@ -727,33 +727,33 @@ fn revoke_lost(name: &DeviceName, write_err: Option<std::io::Error>) -> Result<(
         Err(e) => match write_err {
             Some(write) => bail!(
                 "the token for '{name}' never reached its reader ({write}) and the device could \
-                 not be removed: {e:#}; remove it with `clauth devices revoke {name}`"
+                 not be removed: {e:#}; remove it with `tollgate devices revoke {name}`"
             ),
             None => bail!(
                 "the token for '{name}' never reached its reader and the device could not be \
-                 removed: {e:#}; remove it with `clauth devices revoke {name}`"
+                 removed: {e:#}; remove it with `tollgate devices revoke {name}`"
             ),
         },
     }
 }
 
-/// `clauth devices revoke <name>`.
+/// `tollgate devices revoke <name>`.
 pub(crate) fn run_revoke(name: &str) -> Result<()> {
     let removed = revoke(name)?;
     outln!(
-        "clauth: revoked device '{}'; its next request is refused.",
+        "tollgate: revoked device '{}'; its next request is refused.",
         removed.name
     );
     Ok(())
 }
 
-/// `clauth devices allow-sessions <name>`.
+/// `tollgate devices allow-sessions <name>`.
 pub(crate) fn run_allow_sessions(name: &str) -> Result<()> {
     let (name, granted) = allow_sessions(name)?;
     if granted {
-        outln!("clauth: '{name}' may now mint sessions");
+        outln!("tollgate: '{name}' may now mint sessions");
     } else {
-        outln!("clauth: '{name}' already may mint sessions");
+        outln!("tollgate: '{name}' already may mint sessions");
     }
     Ok(())
 }

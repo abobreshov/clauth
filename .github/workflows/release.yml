@@ -52,19 +52,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            asset_name: clauth-linux-x86_64
+            asset_name: tollgate-linux-x86_64
             ext: ""
           - target: aarch64-apple-darwin
             os: macos-latest
-            asset_name: clauth-macos-aarch64
+            asset_name: tollgate-macos-aarch64
             ext: ""
           - target: x86_64-apple-darwin
             os: macos-latest
-            asset_name: clauth-macos-x86_64
+            asset_name: tollgate-macos-x86_64
             ext: ""
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            asset_name: clauth-windows-x86_64
+            asset_name: tollgate-windows-x86_64
             ext: .exe
     steps:
       - uses: actions/checkout@v7
@@ -75,7 +75,7 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Prepare asset
-        run: cp "target/${{ matrix.target }}/release/clauth${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
+        run: cp "target/${{ matrix.target }}/release/tollgate${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
       - name: Attest build provenance   # keyless SLSA provenance; audit with `gh attestation verify`
         uses: actions/attest-build-provenance@v4
         with:
@@ -110,7 +110,7 @@ jobs:
         # this signature when (and only when) MINISIGN_PUBLIC_KEY is pinned.
         run: |
           cd artifacts
-          sha256sum clauth-* > sha256sums.txt
+          sha256sum tollgate-* > sha256sums.txt
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
             echo "MINISIGN_SECRET_KEY not set — shipping sha256-only (no signature)."
             exit 0
@@ -120,7 +120,7 @@ jobs:
           # Remove the key file on ANY exit (incl. a signing failure under `set -e`).
           trap 'rm -f minisign.key' EXIT
           printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
-          minisign -S -s minisign.key -m sha256sums.txt -t "clauth ${GITHUB_REF_NAME} checksums"
+          minisign -S -s minisign.key -m sha256sums.txt -t "tollgate ${GITHUB_REF_NAME} checksums"
           echo "Signed → sha256sums.txt.minisig"
       - name: Upload assets to the release
         env:
@@ -133,6 +133,6 @@ jobs:
           cd artifacts
           gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
             || gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes "" --verify-tag
-          files=(clauth-* sha256sums.txt)
+          files=(tollgate-* sha256sums.txt)
           [ -f sha256sums.txt.minisig ] && files+=(sha256sums.txt.minisig)
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"

@@ -249,7 +249,7 @@ fn a_reentrant_hold_keeps_spending_the_outer_budget() {
     .expect("nested hold");
 }
 
-/// The cross-process flock wait is bounded. With `~/.clauth/.lock` already held
+/// The cross-process flock wait is bounded. With `~/.tollgate/.lock` already held
 /// (here by a second, independent open file description — `flock(2)` locks are
 /// per-description, so this conflicts exactly as a second process would), an
 /// acquisition times out with a [`StateLockTimeout`] instead of hanging; once the
@@ -258,8 +258,8 @@ fn a_reentrant_hold_keeps_spending_the_outer_budget() {
 #[test]
 fn held_flock_times_out_then_recovers_on_release() {
     let _home = crate::testutil::HomeSandbox::new();
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&dir).expect("mkdir ~/.clauth");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir ~/.tollgate");
     let lock_path = dir.join(LOCK_FILENAME);
 
     // Stand in for a second process holding the state lock.
@@ -305,8 +305,8 @@ fn held_flock_times_out_then_recovers_on_release() {
 fn an_armed_budget_clamps_the_flock_wait() {
     let _home = crate::testutil::HomeSandbox::new();
     set_state_lock_timeout_override(Some(std::time::Duration::from_secs(1)));
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&dir).expect("mkdir ~/.clauth");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir ~/.tollgate");
     let holder =
         crate::profile::open_state_file(&dir.join(LOCK_FILENAME)).expect("open holder handle");
     holder.lock().expect("hold the flock");
@@ -370,8 +370,8 @@ fn an_armed_budget_clamps_the_flock_wait() {
 fn a_plain_budget_does_not_clamp_the_flock_wait() {
     let _home = crate::testutil::HomeSandbox::new();
     set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&dir).expect("mkdir ~/.clauth");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir ~/.tollgate");
     let holder =
         crate::profile::open_state_file(&dir.join(LOCK_FILENAME)).expect("open holder handle");
     holder.lock().expect("hold the flock");

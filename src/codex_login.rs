@@ -1,9 +1,9 @@
-//! `clauth login <name> --codex --browser` — codex's own OAuth PKCE flow,
+//! `tollgate login <name> --codex --browser` — codex's own OAuth PKCE flow,
 //! reimplemented rather than shelled out to `codex login` (settled question 7).
 //!
 //! Shelling out would write the operator's LIVE `~/.codex/auth.json` and fork
 //! the chain — the very two-carrier death the whole codex design avoids. So
-//! clauth runs the loopback dance itself and lands the minted chain straight
+//! tollgate runs the loopback dance itself and lands the minted chain straight
 //! into the profile store, touching nothing of the operator's.
 //!
 //! Every wire fact here was read from openai/codex at tag `rust-v0.145.0`
@@ -46,7 +46,7 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The minted login, ready to land in a profile store.
 pub(crate) struct CodexLoginOutcome {
-    /// The full `auth.json` bytes clauth will write — `auth_mode`, the token
+    /// The full `auth.json` bytes tollgate will write — `auth_mode`, the token
     /// chain, `last_refresh`, and `OPENAI_API_KEY` when the secondary exchange
     /// succeeded.
     pub(crate) auth_json: Vec<u8>,
@@ -83,7 +83,7 @@ fn bind_registered_port() -> Result<(TcpListener, u16)> {
     }
     bail!(
         "codex's login ports ({PRIMARY_PORT} and {FALLBACK_PORT}) are both in use — \
-         close whatever holds them (another codex or clauth login?) and retry"
+         close whatever holds them (another codex or tollgate login?) and retry"
     )
 }
 
@@ -214,7 +214,7 @@ fn handle_callback(
             let (page, line) = rejection_copy(&rejection);
             write_reply(&mut stream, page);
             logline!(
-                "clauth: the codex authorize callback refused the login: {}",
+                "tollgate: the codex authorize callback refused the login: {}",
                 rejection.log_detail()
             );
             bail!("{line}");
@@ -229,17 +229,17 @@ fn rejection_copy(rejection: &AuthorizeRejection) -> (&'static str, &'static str
     match rejection {
         AuthorizeRejection::Declined => (
             "codex login canceled: you declined the authorization request. close this tab; \
-             you can retry from clauth any time.",
+             you can retry from tollgate any time.",
             rejection.user_message(),
         ),
         AuthorizeRejection::Upstream(_) => (
             "codex login failed: openai is having trouble. close this tab and retry from \
-             clauth in a moment.",
+             tollgate in a moment.",
             "openai is having trouble",
         ),
         AuthorizeRejection::Refused(_) | AuthorizeRejection::Unrecognized => (
             "codex login failed: openai refused the login. close this tab and retry from \
-             clauth.",
+             tollgate.",
             "openai refused the login",
         ),
     }
@@ -369,7 +369,7 @@ fn exchange_api_key_at(url: &str, id_token: &str) -> Result<Option<String>> {
     {
         Ok(r) => r,
         Err(e) => {
-            logline!("clauth: codex api-key exchange skipped (transport): {e}");
+            logline!("tollgate: codex api-key exchange skipped (transport): {e}");
             return Ok(None);
         }
     };

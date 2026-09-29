@@ -14,7 +14,7 @@ use crate::cli::StartArgs;
 /// Parse an argv WITHOUT the binary name, the way `main` does (it passes
 /// `args_os()`, whose first element is the binary).
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-    Cli::try_parse_from(std::iter::once("clauth").chain(args.iter().copied()))
+    Cli::try_parse_from(std::iter::once("tollgate").chain(args.iter().copied()))
 }
 
 /// Parse and unwrap to the subcommand, for the arms that must parse.
@@ -36,14 +36,14 @@ fn parse_exit_code(args: &[&str]) -> i32 {
 
 // ── the three shapes that are not plain subcommands ─────────────────────────
 
-/// A bare `clauth` selects no subcommand, which is what routes `dispatch` to
+/// A bare `tollgate` selects no subcommand, which is what routes `dispatch` to
 /// the TUI (on a terminal; a piped stdout prints the help instead — pinned
 /// against the real binary in `tests/bare_non_tty.rs`, since the arm reads
 /// `stdout().is_terminal()` live and an in-process pin would depend on the
 /// runner's own terminal).
 #[test]
 fn bare_invocation_selects_no_subcommand() {
-    let cli = parse(&[]).expect("bare clauth must parse");
+    let cli = parse(&[]).expect("bare tollgate must parse");
     assert!(
         cli.command.is_none(),
         "no subcommand is what sends dispatch to the TUI"
@@ -67,21 +67,21 @@ fn bare_word_is_captured_as_a_profile_name() {
 fn a_subcommand_name_shadows_a_same_named_profile() {
     assert!(
         matches!(command(&["which"]), Command::Which { .. }),
-        "`clauth which` must stay the subcommand even if a profile is named `which`"
+        "`tollgate which` must stay the subcommand even if a profile is named `which`"
     );
     assert!(
         matches!(command(&["mcp"]), Command::Mcp),
-        "`clauth mcp` must stay the subcommand"
+        "`tollgate mcp` must stay the subcommand"
     );
-    // clap generates a `help` subcommand, so `clauth help` prints the command
+    // clap generates a `help` subcommand, so `tollgate help` prints the command
     // table (exit 0) where it used to try switching to a profile named `help`.
-    // That follows the same precedence rather than breaking it, and `clauth
+    // That follows the same precedence rather than breaking it, and `tollgate
     // help <cmd>` is worth the one name; pinned so it stays a decision.
     let err = parse(&["help"]).expect_err("clap reports its help subcommand as an Err");
     assert_eq!(err.exit_code(), 0);
 }
 
-// ── clauth switch: one verb, two forms split by arity ───────────────────────
+// ── tollgate switch: one verb, two forms split by arity ───────────────────────
 
 /// One positional is the global form (the bare-word act under its own verb),
 /// two positionals the session form — arity alone decides, so a sid-shaped
@@ -115,7 +115,7 @@ fn switch_splits_the_forms_on_arity_alone() {
 
 /// `start` hands `claude` everything after the profile byte-identically,
 /// leading hyphens included, so a passthrough `-p`/`--model` is never eaten as
-/// a clauth flag.
+/// a tollgate flag.
 #[test]
 fn start_forwards_claude_args_verbatim_including_leading_hyphens() {
     let Command::Start(a) = command(&["start", "acme", "-p", "hi", "--model", "opus"]) else {
@@ -126,14 +126,14 @@ fn start_forwards_claude_args_verbatim_including_leading_hyphens() {
     assert_eq!(a.isolation(), Isolation::Shared);
 }
 
-/// Where clauth's half of the grammar actually ends, pinned because it MOVED in
+/// Where tollgate's half of the grammar actually ends, pinned because it MOVED in
 /// the clap port and the difference is silent. The hand-rolled parser stopped at
 /// the profile name and forwarded every later token; clap keeps recognizing
 /// `start`'s own flags past it, and only hands over on a token `start` does not
 /// declare. `claude` has no `--isolated`/`--with-fallback`, so the only spelling
 /// this reaches in practice is `--help`, and `--` forwards even that.
 #[test]
-fn clauths_own_start_flags_are_still_recognized_after_the_profile_name() {
+fn tollgates_own_start_flags_are_still_recognized_after_the_profile_name() {
     let Command::Start(a) = command(&["start", "acme", "--isolated"]) else {
         panic!("start must parse");
     };
@@ -150,7 +150,7 @@ fn clauths_own_start_flags_are_still_recognized_after_the_profile_name() {
     };
     assert!(
         !b.isolated,
-        "once the passthrough starts, a clauth spelling is claude's"
+        "once the passthrough starts, a tollgate spelling is claude's"
     );
     assert_eq!(b.claude_args, ["-p", "hi", "--isolated"]);
 
@@ -162,7 +162,7 @@ fn clauths_own_start_flags_are_still_recognized_after_the_profile_name() {
     assert_eq!(c.claude_args, ["--isolated"]);
 }
 
-/// The README documents `clauth start <profile> -- <claude args>`. clap eats a
+/// The README documents `tollgate start <profile> -- <claude args>`. clap eats a
 /// first bare `--` as its end-of-flags marker, so it does NOT reach `claude`;
 /// every arg after it does, unchanged. Pinned because the separator is a
 /// documented spelling and its handling is silent either way.
@@ -221,7 +221,7 @@ fn start_auto_folds_a_bare_first_argument_too() {
 
 /// Why the `--` is documented rather than worked around: with no name in the
 /// profile slot, clap has nothing to tell a passthrough `-p` from a misspelled
-/// clauth flag, so it refuses instead of guessing. Pinned so the day someone
+/// tollgate flag, so it refuses instead of guessing. Pinned so the day someone
 /// makes the positional take hyphen values, this says what it costs.
 #[test]
 fn start_auto_refuses_a_bare_hyphen_argument_without_a_separator() {
@@ -562,7 +562,7 @@ fn login_value_flags_reject_a_missing_or_flag_shaped_value() {
     }
 }
 
-/// `clauth login --model` (value forgotten, name missing) must be refused
+/// `tollgate login --model` (value forgotten, name missing) must be refused
 /// instead of creating a profile literally named `--model`.
 #[test]
 fn login_rejects_flag_shaped_profile_names_and_a_second_positional() {
@@ -773,7 +773,7 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
     assert_eq!(
         (standby, no_standby, replace, status),
         (false, false, false, false),
-        "bare `clauth daemon` picks no mode, which dispatch reads as exit-if-running"
+        "bare `tollgate daemon` picks no mode, which dispatch reads as exit-if-running"
     );
     assert!(
         !dump_openapi,
@@ -848,12 +848,12 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
 /// serves the API) but not to the one-shots, which print and exit.
 #[test]
 fn listen_parses_an_address_and_composes_with_the_start_modes() {
-    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "0.0.0.0:8443"]) else {
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "0.0.0.0:8453"]) else {
         panic!("must parse");
     };
     assert_eq!(
         listen,
-        Some(std::net::SocketAddr::from(([0, 0, 0, 0], 8443))),
+        Some(std::net::SocketAddr::from(([0, 0, 0, 0], 8453))),
         "clap parses the address, so a typo fails before the daemon starts"
     );
 
@@ -866,7 +866,7 @@ fn listen_parses_an_address_and_composes_with_the_start_modes() {
     );
 
     for mode in ["--standby", "--no-standby", "--replace"] {
-        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen", "0.0.0.0:8443"])
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen", "0.0.0.0:8453"])
         else {
             panic!("daemon {mode} --listen must parse");
         };
@@ -874,7 +874,7 @@ fn listen_parses_an_address_and_composes_with_the_start_modes() {
     }
 
     assert_eq!(
-        parse_exit_code(&["daemon", "--status", "--listen", "0.0.0.0:8443"]),
+        parse_exit_code(&["daemon", "--status", "--listen", "0.0.0.0:8453"]),
         2,
         "daemon --status --listen must be refused as a conflict"
     );
@@ -1177,7 +1177,7 @@ fn revoking_an_unknown_device_exits_one_naming_it() {
     .expect_err("no device holds that name");
     assert_eq!(
         err.to_string(),
-        "no device named 'ghost'; `clauth devices` lists the paired ones"
+        "no device named 'ghost'; `tollgate devices` lists the paired ones"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1343,7 +1343,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     );
 }
 
-/// The bundled plugin manifest spells clauth subcommands as strings, and a
+/// The bundled plugin manifest spells tollgate subcommands as strings, and a
 /// rename on either side is silent: the hook keeps being registered and just
 /// exits non-zero on every fire. Derives both sides and compares, rather than
 /// asserting one side's spelling.
@@ -1364,7 +1364,7 @@ fn every_bundled_hook_command_parses_as_a_subcommand() {
             for hook in entry["hooks"].as_array().expect("each entry holds hooks") {
                 let command = hook["command"].as_str().expect("each hook has a command");
                 let argv: Vec<&str> = command.split_whitespace().collect();
-                assert_eq!(argv.first(), Some(&"clauth"), "{event}: {command}");
+                assert_eq!(argv.first(), Some(&"tollgate"), "{event}: {command}");
                 parse(&argv[1..]).unwrap_or_else(|e| {
                     panic!("{event} runs `{command}`, which no longer parses: {e}")
                 });
@@ -1401,14 +1401,14 @@ fn every_visible_subcommand_is_listed_in_the_root_help() {
     }
 }
 
-/// The bare `clauth <profile>` act is deprecated in favour of `clauth switch
+/// The bare `tollgate <profile>` act is deprecated in favour of `tollgate switch
 /// <name>` — said in the help and the wiki, never as a runtime warning on the
 /// most-used path.
 #[test]
 fn the_bare_profile_form_is_deprecated_in_the_help() {
     let help = Cli::command().render_help().to_string();
     assert!(
-        help.contains("deprecated, use `clauth switch <name>`"),
+        help.contains("deprecated, use `tollgate switch <name>`"),
         "the root help must name the replacement for the bare form: {help}"
     );
 }
@@ -1435,7 +1435,7 @@ fn help_and_version_exit_zero_while_parse_failures_exit_two() {
     }
 }
 
-/// `clauth start --help` prints the subcommand's own prose, not the root block
+/// `tollgate start --help` prints the subcommand's own prose, not the root block
 /// — the whole point of moving the copy onto the variants.
 #[test]
 fn per_subcommand_help_carries_that_commands_prose() {
@@ -1474,7 +1474,7 @@ fn per_subcommand_help_carries_that_commands_prose() {
 ///
 /// The third needle is the HEDGE, and it is pinned as hard as the promise. The
 /// lift runs in `start::run`'s teardown after `child.wait()` returns, so a hard
-/// kill of `clauth start` itself skips it and the store goes with the runtime.
+/// kill of `tollgate start` itself skips it and the store goes with the runtime.
 /// A help that promises the lift without that clause is a flat overclaim.
 #[test]
 fn the_isolated_help_says_the_session_outlives_the_runtime() {
@@ -1511,11 +1511,11 @@ fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
         theme: None,
         command: Some(Command::External(vec!["strat".into(), "acme".into()])),
     })
-    .expect_err("more than one bare word is nothing clauth knows");
+    .expect_err("more than one bare word is nothing tollgate knows");
     assert_eq!(crate::exit_code(Err(err)), 2);
 }
 
-/// `clauth daemon --status` with no daemon up is a plain failure (exit 1), not
+/// `tollgate daemon --status` with no daemon up is a plain failure (exit 1), not
 /// a usage error — a spawner branches on the code alone.
 #[test]
 fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
@@ -1535,7 +1535,7 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
     })
     .expect_err("no daemon is running in the sandbox");
     assert!(
-        err.to_string().contains("no clauth daemon is running"),
+        err.to_string().contains("no tollgate daemon is running"),
         "the failure must name the absence, not some incidental error: {err}"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
@@ -1600,7 +1600,7 @@ mod disabled_target_refusal {
         let err = cmd_switch("off").expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
+            "'off': account is disabled, run `tollgate enable off`"
         );
 
         let reloaded = crate::profile::load_config().expect("reload");
@@ -1622,7 +1622,7 @@ mod disabled_target_refusal {
         let err = crate::dispatch(cli).expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),
-            "'off': account is disabled, run `clauth enable off`",
+            "'off': account is disabled, run `tollgate enable off`",
             "the refusal copy is the bare form's, byte for byte"
         );
 
@@ -1648,13 +1648,13 @@ mod disabled_target_refusal {
         .expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
+            "'off': account is disabled, run `tollgate enable off`"
         );
 
         assert!(
             !home
                 .home()
-                .join(".clauth")
+                .join(".tollgate")
                 .join("profiles")
                 .join("off")
                 .join("runtime")
@@ -1678,7 +1678,7 @@ mod disabled_target_refusal {
         .expect_err("explain must run the same refusals as a launch");
         assert_eq!(
             err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
+            "'off': account is disabled, run `tollgate enable off`"
         );
     }
 }
@@ -1708,7 +1708,7 @@ mod bad_profile_name_is_a_usage_error {
         );
     }
 
-    /// `clauth switch <name>` is the bare-word act under its own verb, so an
+    /// `tollgate switch <name>` is the bare-word act under its own verb, so an
     /// unknown name is the same usage error through the same seam.
     #[test]
     fn switch_with_an_unknown_name_exits_2() {
@@ -1950,7 +1950,7 @@ fn collect_api_reauth_snapshot_empty_flag_refuses() {
     );
 }
 
-// ── login_route: `clauth login <existing>` re-authenticates instead of bailing ──
+// ── login_route: `tollgate login <existing>` re-authenticates instead of bailing ──
 
 fn config_with(names: &[&str]) -> crate::profile::AppConfig {
     let mut config = crate::profile::AppConfig {
@@ -2020,7 +2020,7 @@ fn reauth_confirmed_only_on_explicit_yes() {
     }
 }
 
-// ── hidden `clauth __api-key <profile>` (CC's apiKeyHelper body) ──────────────
+// ── hidden `tollgate __api-key <profile>` (CC's apiKeyHelper body) ──────────────
 //
 // The hidden subcommand is what CC's `apiKeyHelper` runs to obtain an auth
 // value for an api-key profile (see `src/claude.rs`
@@ -2048,7 +2048,7 @@ mod api_key_helper_tests {
     /// Dispatch a hidden `__api-key <profile>` the way `main` would.
     fn dispatch_api_key(profile: &str) -> Result<()> {
         dispatch(
-            Cli::try_parse_from(["clauth", "__api-key", profile]).expect("hidden arm must parse"),
+            Cli::try_parse_from(["tollgate", "__api-key", profile]).expect("hidden arm must parse"),
         )
     }
 
@@ -2177,7 +2177,7 @@ mod api_key_helper_tests {
     }
 }
 
-/// `clauth herdr install` and its flags. The grammar is what makes the setup a
+/// `tollgate herdr install` and its flags. The grammar is what makes the setup a
 /// single command, so a rename or a dropped flag reds here rather than in a
 /// user's shell.
 #[test]
@@ -2234,13 +2234,13 @@ fn herdr_install_parses_with_every_flag() {
     };
     assert!(yes);
 
-    // A bare `clauth herdr` names no operation, and `install` is not the only
+    // A bare `tollgate herdr` names no operation, and `install` is not the only
     // one it will ever have, so it must stay a usage error rather than a default.
     assert!(parse(&["herdr"]).is_err());
     assert!(parse(&["herdr", "instal"]).is_err());
 }
 
-/// `clauth herdr uninstall` and its flags, mirroring the install grammar so the two stay siblings rather than drifting apart.
+/// `tollgate herdr uninstall` and its flags, mirroring the install grammar so the two stay siblings rather than drifting apart.
 #[test]
 fn herdr_uninstall_parses_with_every_flag() {
     let bare = command(&["herdr", "uninstall"]);
@@ -2488,7 +2488,7 @@ mod static_token_verdicts {
         assert_eq!(
             format!("{err:#}"),
             "stored OAuth chain is dead, its api key still works: rt-hybrid (run \
-             `clauth login rt-hybrid --api-key <key>` to clear the quarantine)"
+             `tollgate login rt-hybrid --api-key <key>` to clear the quarantine)"
         );
 
         // The keyless leg of the same bail. Its one reachable shape past the
@@ -2530,7 +2530,7 @@ mod static_token_verdicts {
         let err = cmd_rolling_token("rt-badkey").expect_err("a flagged keyless hybrid refuses");
         assert_eq!(
             format!("{err:#}"),
-            "profile has no api key: rt-badkey (run `clauth login rt-badkey --api-key <key>`)"
+            "profile has no api key: rt-badkey (run `tollgate login rt-badkey --api-key <key>`)"
         );
     }
 
@@ -2567,7 +2567,7 @@ mod static_token_verdicts {
 
         let err = cmd_rolling_token("rt-oauth").expect_err("no chain either");
         assert!(
-            format!("{err:#}").contains("run `clauth login rt-oauth` first"),
+            format!("{err:#}").contains("run `tollgate login rt-oauth` first"),
             "an OAuth profile keeps the recovery hint: {err:#}"
         );
     }
@@ -2789,7 +2789,7 @@ mod static_token_verdicts {
         assert!(quarantined, "the bytes survive as evidence");
 
         // The prescribed recovery: re-mint (the flag is off, so this is the
-        // plain no-backup write — exactly what `clauth login --setup-token`
+        // plain no-backup write — exactly what `tollgate login --setup-token`
         // runs), then the command reports the mint as already in front.
         crate::claude::write_session_token(
             &crate::profile::ProfileName::from("st-corrupt"),
@@ -2826,7 +2826,7 @@ mod armed_report_copy {
             "{backup}"
         );
         assert!(
-            backup.contains("`clauth static-token acme` will have nothing to restore"),
+            backup.contains("`tollgate static-token acme` will have nothing to restore"),
             "{backup}"
         );
         let disarmed = clear_disarmed_postscript("acme");
@@ -2841,7 +2841,7 @@ mod armed_report_copy {
             "{swept}"
         );
         assert!(
-            swept.contains("`clauth static-token acme` has nothing to restore now"),
+            swept.contains("`tollgate static-token acme` has nothing to restore now"),
             "{swept}"
         );
     }
@@ -2883,7 +2883,7 @@ mod armed_report_copy {
             "{line}"
         );
         assert!(
-            line.contains("`clauth static-token acme` puts the mint back"),
+            line.contains("`tollgate static-token acme` puts the mint back"),
             "{line}"
         );
     }
@@ -2899,9 +2899,9 @@ mod armed_report_copy {
             absent.contains("No daemon appears to be running"),
             "{absent}"
         );
-        assert!(absent.contains("`clauth daemon` starts"), "{absent}");
+        assert!(absent.contains("`tollgate daemon` starts"), "{absent}");
         assert!(stale.contains("looks stale"), "{stale}");
-        assert!(stale.contains("`clauth daemon --status`"), "{stale}");
+        assert!(stale.contains("`tollgate daemon --status`"), "{stale}");
         assert!(fresh.contains("re-stamps it before it expires"), "{fresh}");
         assert!(
             !fresh.contains("No daemon") && !fresh.contains("stale"),
@@ -2921,7 +2921,10 @@ mod armed_report_copy {
             "{w}"
         );
         assert!(w.contains("read-only file system"), "{w}");
-        assert!(w.contains("`clauth static-token acme` to clear it"), "{w}");
+        assert!(
+            w.contains("`tollgate static-token acme` to clear it"),
+            "{w}"
+        );
     }
 }
 
@@ -3299,7 +3302,8 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
     // holds, and this is the only fixture shape that can tell the two apart.
     // `--yes` only skips the confirm prompt; it is not a rotation override.
     let outcome = dispatch(
-        Cli::try_parse_from(["clauth", "delete", "CLI-HELD", "--yes"]).expect("delete must parse"),
+        Cli::try_parse_from(["tollgate", "delete", "CLI-HELD", "--yes"])
+            .expect("delete must parse"),
     );
 
     // Untouched state first: a guard taken for the wrong profile deletes the
@@ -3388,10 +3392,10 @@ fn codex_start_refuses_with_fallback_by_name() {
 #[test]
 fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    let tollgate = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&tollgate).expect("mkdir .tollgate");
     std::fs::write(
-        clauth.join("codex-profiles.toml"),
+        tollgate.join("codex-profiles.toml"),
         "active_profile = \"cx-held\"\nprofiles = [\"cx-held\"]\n",
     )
     .expect("write codex state");
@@ -3400,7 +3404,7 @@ fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
     let _holder = crate::testutil::hold_rotation_lock("cx-held");
 
     let outcome = dispatch(
-        Cli::try_parse_from(["clauth", "delete", "CX-HELD", "--yes"]).expect("delete must parse"),
+        Cli::try_parse_from(["tollgate", "delete", "CX-HELD", "--yes"]).expect("delete must parse"),
     );
 
     assert!(
@@ -3424,7 +3428,7 @@ fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
-/// A quarantined codex profile refuses `clauth start` by name — `--explain`
+/// A quarantined codex profile refuses `tollgate start` by name — `--explain`
 /// included, the way the claude arm runs `admit` there — naming the fix,
 /// before any spawn. The explain leg runs first: it is the one that can red by
 /// assertion if the refusal moves or goes (it prints the pick and returns
@@ -3464,7 +3468,7 @@ fn codex_start_refuses_a_quarantined_chain_by_name() {
         assert_eq!(
             err.to_string(),
             "'cx': codex chain is broken (expired since 2026-08-13T00:00:00Z), \
-             run `clauth login cx --codex --browser`",
+             run `tollgate login cx --codex --browser`",
             "explain_only = {explain_only}"
         );
     }
@@ -3782,7 +3786,7 @@ fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() 
     assert_eq!(claude.as_str(), "cl1");
 }
 
-/// Every handler passes its own verb, so `clauth <verb> cx` names the verb the
+/// Every handler passes its own verb, so `tollgate <verb> cx` names the verb the
 /// user typed; the `--clear` form of `static-token` is the same verb. Through
 /// `dispatch` the refusal maps to exit 2.
 #[test]
@@ -3821,9 +3825,9 @@ fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
 #[test]
 fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    let roster = clauth.join("codex-profiles.toml");
+    let tollgate = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&tollgate).expect("mkdir .tollgate");
+    let roster = tollgate.join("codex-profiles.toml");
     std::fs::write(&roster, "profiles = [not toml").expect("corrupt codex state");
     let config = AppConfig {
         state: crate::profile::AppState {
@@ -3887,9 +3891,9 @@ fn seed_limit_reset_rosters() {
         ..crate::profile::AppState::default()
     })
     .expect("claude state");
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    let tollgate = crate::profile::tollgate_dir().expect("tollgate dir");
     std::fs::write(
-        clauth.join("codex-profiles.toml"),
+        tollgate.join("codex-profiles.toml"),
         "profiles = [\"cx\", \"cy\"]\n",
     )
     .expect("codex state");
@@ -3945,7 +3949,7 @@ fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_
     let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
     assert_eq!(
         err.to_string(),
-        "'cy' has no stored codex login to use a reset with; run `clauth login cy --codex --browser`"
+        "'cy' has no stored codex login to use a reset with; run `tollgate login cy --codex --browser`"
     );
 
     crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
@@ -4038,5 +4042,19 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         crate::testutil::request_header(&seen[3], "chatgpt-account-id").as_deref(),
         Some("acc"),
         "the store's account id rides along"
+    );
+}
+
+/// A value-less `--listen` binds the fork's own port, never upstream's 8443,
+/// so the two daemons can listen side by side.
+#[test]
+fn a_bare_listen_binds_the_forks_own_port() {
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([0, 0, 0, 0], 8453))),
+        "bare --listen means identity::DEFAULT_LISTEN"
     );
 }

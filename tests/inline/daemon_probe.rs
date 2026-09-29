@@ -4,25 +4,25 @@
 //!   * `claim_singleton` caps the daemon tree at one active instance plus one
 //!     standby: a third arrival is `Redundant` and exits instead of parking.
 //!   * `daemon_health` drives the `[ daemon ]` header chip from two signals —
-//!     the `clauthd.lock` flock (presence) and `status.json` freshness (health):
+//!     the `tollgated.lock` flock (presence) and `status.json` freshness (health):
 //!     no lock → Absent (dim), held + fresh → Fresh (green), held + stale →
 //!     Stale (amber).
 //!   * `singleton_held` asks the same presence question as a DECISION rather
 //!     than a display: where the chip dims for an unreadable lock, `--status` fails
 //!     on it instead of telling a supervisor to spawn.
 //!   * `claim_by_replacing` (`--replace`) terminates the running daemon and takes
-//!     over, refusing to signal a pid it can't confirm is a running clauth daemon.
+//!     over, refusing to signal a pid it can't confirm is a running tollgate daemon.
 //!   * `FetchLease` is the single-fetcher lease over `usage-fetch.lock`: exactly
 //!     one holder at a time, held for life, released on drop so a waiter takes
 //!     over.
 
 use super::*;
-use crate::profile::clauth_dir;
+use crate::profile::tollgate_dir;
 use crate::testutil::HomeSandbox;
 use crate::usage::{epoch_secs_to_iso, now_epoch_secs, now_ms};
 
 fn write_status(generated_at: &str) {
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(
         dir.join(super::super::STATUS_FILE),
@@ -122,7 +122,7 @@ fn no_lock_file_reads_as_absent() {
     );
     // And the probe must not have manufactured the lock file.
     assert!(
-        !clauth_dir()
+        !tollgate_dir()
             .expect("dir")
             .join(super::super::LOCK_FILE)
             .exists(),
@@ -171,9 +171,9 @@ fn held_lock_with_stale_or_missing_status_is_stale() {
 
 // ── claim_singleton (one active + one standby, #57) ───────────────────────────
 
-/// `~/.clauth` inside the sandbox, created so the lock files have a home.
+/// `~/.tollgate` inside the sandbox, created so the lock files have a home.
 fn sandbox_dir() -> std::path::PathBuf {
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     dir
 }
@@ -400,7 +400,7 @@ fn a_won_standby_slot_is_kept_rather_than_re_taken() {
     );
 }
 
-/// `clauth daemon --status` decides on `singleton_held`, not on the header chip:
+/// `tollgate daemon --status` decides on `singleton_held`, not on the header chip:
 /// a lock it cannot read has to surface as an error there, since a `--status ||
 /// spawn` supervisor respawns on the chip's dim state ("no daemon"). These are the three
 /// answers a sandbox can produce — the io-error arm needs a filesystem without
@@ -472,7 +472,7 @@ fn replace_refuses_a_holder_whose_pid_is_unreadable() {
     );
 }
 
-/// The identity guard refuses to signal a pid that is not a running `clauth
+/// The identity guard refuses to signal a pid that is not a running `tollgate
 /// daemon` (the recycled / in-handover window). pid 1 (init/systemd) is a
 /// never-a-daemon stand-in; asserting the bail proves the guard fired before any
 /// signal reached it. Unix-only: it reads argv, which the Windows probe can't.
@@ -490,7 +490,7 @@ fn replace_refuses_a_pid_that_is_not_the_running_daemon() {
     )
     .expect_err("a pid that is not the running daemon must not be signalled");
     assert!(
-        err.to_string().contains("not a running clauth daemon"),
+        err.to_string().contains("not a running tollgate daemon"),
         "the bail flags the pid as not the daemon, got {err}"
     );
 }
@@ -545,7 +545,7 @@ fn the_replace_wait_times_out_while_the_lock_stays_held() {
 }
 
 /// A transient reader of the singleton lock (TUI header chip at 1 Hz,
-/// `clauth daemon --status`) holds the flock for microseconds and releases it.
+/// `tollgate daemon --status`) holds the flock for microseconds and releases it.
 /// Without retry, `claim_by_replacing_with`'s fast path reads this as a daemon,
 /// falls through to `holder_pid` (which returns `None` for a reader with no pid
 /// sidecar), and bails naming a daemon that isn't there. The retry clears it.
@@ -592,7 +592,7 @@ fn replace_retries_past_a_transient_lock_reader() {
 
 // ── stop_running (the TUI's `stop daemon`) ───────────────────────────────────
 
-/// A process `pid_is_clauth_daemon` accepts: argv `clauth daemon`, where
+/// A process `pid_is_tollgate_daemon` accepts: argv `tollgate daemon`, where
 /// `daemon` is a script in `dir` that sh runs by that name. `ignore_term`
 /// makes it survive SIGTERM, so only the SIGKILL pass ends it.
 #[cfg(unix)]
@@ -605,7 +605,7 @@ fn fake_daemon(dir: &std::path::Path, ignore_term: bool) -> std::process::Child 
     )
     .expect("write the fake daemon's script");
     std::process::Command::new("/bin/sh")
-        .arg0("clauth")
+        .arg0("tollgate")
         .arg("daemon")
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
@@ -801,7 +801,7 @@ fn a_stop_leaving_no_daemon_stops_the_gateway_it_left() {
 }
 
 /// A transient reader of the singleton (the TUI header's 1 Hz probe,
-/// `clauth daemon --status`) must not read as a daemon to stop: with no
+/// `tollgate daemon --status`) must not read as a daemon to stop: with no
 /// retry the stop would go after a pid sidecar no reader has.
 #[test]
 fn stop_retries_past_a_transient_lock_reader() {
@@ -830,7 +830,7 @@ fn stop_retries_past_a_transient_lock_reader() {
 }
 
 /// The same identity guard as `--replace`: a recorded pid that is not a
-/// running clauth daemon is never signalled.
+/// running tollgate daemon is never signalled.
 #[test]
 fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
     let _home = HomeSandbox::new();
@@ -846,7 +846,7 @@ fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
     .expect_err("pid 1 is not the daemon");
     assert_eq!(
         err.to_string(),
-        "the recorded daemon pid 1 is not a running clauth daemon (it exited during handover \
+        "the recorded daemon pid 1 is not a running tollgate daemon (it exited during handover \
          or was recycled); re-run once it settles, or kill the daemon manually"
     );
 }
@@ -886,7 +886,7 @@ fn an_unreadable_lock_stands_down() {
     let _home = HomeSandbox::new();
     // Make `usage-fetch.lock` a directory so the lease can never open it as a
     // file — the acquire must fail closed (stand down), never dup-fetch.
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(dir.join(super::super::FETCH_LOCK_FILE)).expect("mkdir lockpath");
     let lease = FetchLease::new();
     assert!(

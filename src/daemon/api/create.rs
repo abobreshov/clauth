@@ -29,7 +29,7 @@ const AGENT_START_TIMEOUT: Duration = Duration::from_secs(65);
 /// The fixed sentences; nothing off the wire reaches a body.
 const SESSION_CREATION_OFF: &str = "session creation is off; set `session_creation = true` \
                                    under `[serve]` in profiles.toml to enable it";
-const SESSIONS_GRANT_REQUIRED: &str = "this device lacks the sessions grant; run `clauth \
+const SESSIONS_GRANT_REQUIRED: &str = "this device lacks the sessions grant; run `tollgate \
                                        devices allow-sessions <name>` on the host to grant it";
 const CWD_NOT_ABSOLUTE: &str = "cwd must be an absolute path";
 const CWD_NOT_A_DIRECTORY: &str = "cwd must name an existing directory";
@@ -46,7 +46,7 @@ const WORKSPACE_NOT_FOUND: &str = "no herdr workspace has that id";
 pub(crate) struct SessionCreateBody {
     /// Absolute path to the directory the pane's shell starts in.
     cwd: String,
-    /// A clauth profile (claude or codex roster); mutually exclusive with
+    /// A tollgate profile (claude or codex roster); mutually exclusive with
     /// `kind`. Neither means bare `claude`.
     #[serde(default)]
     profile: Option<String>,
@@ -66,7 +66,7 @@ pub(crate) struct SessionCreated {
     tab_id: String,
     pane_id: String,
     /// herdr's `agent_status` read back after the agent call; `null` for the
-    /// `pane run` arm (a clauth profile), whose readiness herdr detects later
+    /// `pane run` arm (a tollgate profile), whose readiness herdr detects later
     /// and `/events` carries.
     #[schema(required = true)]
     agent_status: Option<String>,
@@ -76,7 +76,7 @@ pub(crate) struct SessionCreated {
 enum AgentForm<'a> {
     /// Bare `claude`, the globally linked account.
     Claude,
-    /// `clauth start <profile>`.
+    /// `tollgate start <profile>`.
     Profile(&'a str),
     /// `herdr agent start --kind <kind>`.
     Kind(&'a str),
@@ -97,7 +97,7 @@ impl AgentForm<'_> {
 enum Start<'a> {
     /// `agent start --kind <kind>`.
     Kind(&'a str),
-    /// `pane run <pane> clauth start <profile>`.
+    /// `pane run <pane> tollgate start <profile>`.
     Profile(&'a str),
 }
 
@@ -180,7 +180,7 @@ fn tab_create(
         }
         HerdrProbeOut::Ran(None) => {
             logline!(
-                "clauth api: device '{device}' tab create in cwd '{}' did not answer (deadline \
+                "tollgate api: device '{device}' tab create in cwd '{}' did not answer (deadline \
                  or spawn failure); a tab may exist unattributed",
                 sanitize_for_log(cwd)
             );
@@ -196,7 +196,7 @@ fn tab_create(
             Some("server_not_running") => Response::refused(503, "herdr_unavailable", NO_SERVER),
             _ => {
                 logline!(
-                    "clauth api: device '{device}' tab create refused by herdr: {}",
+                    "tollgate api: device '{device}' tab create refused by herdr: {}",
                     output_for_log(&out)
                 );
                 Response::refused(502, "herdr_refused", HERDR_REFUSED)
@@ -213,7 +213,7 @@ fn tab_create(
         Some(tab) => Ok(tab),
         None => {
             logline!(
-                "clauth api: device '{device}' tab create answered an unparseable envelope: {}",
+                "tollgate api: device '{device}' tab create answered an unparseable envelope: {}",
                 output_for_log(&out)
             );
             Err(Response::refused(502, "herdr_refused", HERDR_REFUSED))
@@ -244,19 +244,19 @@ fn close_tab(ctx: &ApiContext, tab_id: &str, device: &str) {
         HerdrProbeOut::Ran(Some(HerdrOut { success: true, .. })) => {}
         HerdrProbeOut::NotInstalled => {
             logline!(
-                "clauth api: device '{device}' tab close '{tab}' failed: herdr is not installed",
+                "tollgate api: device '{device}' tab close '{tab}' failed: herdr is not installed",
                 tab = sanitize_for_log(tab_id)
             );
         }
         HerdrProbeOut::Ran(None) => {
             logline!(
-                "clauth api: device '{device}' tab close '{tab}' did not answer (deadline or spawn failure)",
+                "tollgate api: device '{device}' tab close '{tab}' did not answer (deadline or spawn failure)",
                 tab = sanitize_for_log(tab_id)
             );
         }
         HerdrProbeOut::Ran(Some(out)) => {
             logline!(
-                "clauth api: device '{device}' tab close '{tab}' failed: {}",
+                "tollgate api: device '{device}' tab close '{tab}' failed: {}",
                 output_for_log(&out),
                 tab = sanitize_for_log(tab_id)
             );
@@ -270,10 +270,10 @@ fn close_tab(ctx: &ApiContext, tab_id: &str, device: &str) {
     path = "/api/v1/sessions",
     request_body = SessionCreateBody,
     responses(
-        (status = 200, description = "the pane was created and the agent started; `agent_status` is herdr's answer read back after the start, `null` for a `pane run` (a clauth profile)", body = SessionCreated),
+        (status = 200, description = "the pane was created and the agent started; `agent_status` is herdr's answer read back after the start, `null` for a `pane run` (a tollgate profile)", body = SessionCreated),
         (status = 400, description = "the body held no parseable cwd, or a cwd that is not an absolute existing directory, both a profile and a kind, a profile whose name is not shaped like one, a kind outside 1..=32 ascii lowercase letters or digits, or a workspace outside 1..=32 chars of letters, digits or colons (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), a view-only device (`control_required`), session creation off in profiles.toml (`session_creation_off`), or a device without the sessions grant (`sessions_grant_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), a view-only device (`control_required`), session creation off in profiles.toml (`session_creation_off`), or a device without the sessions grant (`sessions_grant_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored in the claude or codex roster (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "the named workspace, or the default when none is named, does not exist (`workspace_not_found`)", body = ErrorBody),
         (status = 502, description = "herdr refused the creation for another reason, recorded in daemon.log (`herdr_refused`)", body = ErrorBody),
@@ -289,7 +289,7 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
     let state = match crate::profile::load_app_state() {
         Ok(state) => state,
         Err(e) => {
-            logline!("clauth api: session creation refused, profiles.toml does not read: {e:#}");
+            logline!("tollgate api: session creation refused, profiles.toml does not read: {e:#}");
             return Response::error(500, "internal");
         }
     };
@@ -339,7 +339,7 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
             Ok(false) => return Response::refused(404, "profile_not_found", PROFILE_NOT_FOUND),
             Err(e) => {
                 logline!(
-                    "clauth api: session creation refused, the profile rosters do not read: {e:#}"
+                    "tollgate api: session creation refused, the profile rosters do not read: {e:#}"
                 );
                 return Response::error(500, "internal");
             }
@@ -372,7 +372,14 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
 
     let agent_status = match start {
         Start::Profile(profile) => {
-            let args = ["pane", "run", &created.pane_id, "clauth", "start", profile];
+            let args = [
+                "pane",
+                "run",
+                &created.pane_id,
+                crate::identity::NAME,
+                "start",
+                profile,
+            ];
             match drive_agent(ctx, &args, &device, crate::herdr::PROBE_TIMEOUT, "pane run") {
                 Ok(()) => None,
                 Err(response) => {
@@ -405,7 +412,7 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
     };
 
     logline!(
-        "clauth api: device '{}' created a session form='{}' cwd='{}' tab='{}' pane='{}'",
+        "tollgate api: device '{}' created a session form='{}' cwd='{}' tab='{}' pane='{}'",
         device,
         sanitize_for_log(&form.for_log()),
         sanitize_for_log(&body.cwd),
@@ -440,7 +447,7 @@ fn drive_agent(
         }
         HerdrProbeOut::Ran(None) => {
             logline!(
-                "clauth api: device '{device}' {what} did not answer (deadline or spawn failure)"
+                "tollgate api: device '{device}' {what} did not answer (deadline or spawn failure)"
             );
             return Err(Response::refused(502, "herdr_refused", HERDR_REFUSED));
         }
@@ -454,20 +461,20 @@ fn drive_agent(
     let response = match code.as_deref() {
         Some("server_not_running") => Response::refused(503, "herdr_unavailable", NO_SERVER),
         _ => {
-            logline!("clauth api: device '{device}' {what} refused by herdr: {output}");
+            logline!("tollgate api: device '{device}' {what} refused by herdr: {output}");
             Response::refused(502, "herdr_refused", HERDR_REFUSED)
         }
     };
     Err(response)
 }
 
-/// herdr's agent name for the pane: `clauth-` plus the pane id, spelled to fit
+/// herdr's agent name for the pane: `tollgate-` plus the pane id, spelled to fit
 /// herdr's rule (a lowercase letter first, then lowercase letters, digits, `-`
 /// or `_`). herdr 0.9.1 numbers panes past `p9` with letters, uppercase among
 /// them (`w1:pD`), which the rule refuses; an uppercase letter becomes `_` plus
 /// its lowercase, so `pD` and `pd` stay distinct.
 fn agent_name(pane_id: &str) -> String {
-    let mut name = String::from("clauth-");
+    let mut name = String::from("tollgate-");
     for c in pane_id.chars() {
         match c {
             ':' => name.push('-'),

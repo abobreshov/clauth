@@ -1,15 +1,15 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "clauth",
-  "description": "Expose clauth profiles to the session: list/usage, switch, delegate.",
+  "name": "tollgate",
+  "description": "Expose tollgate profiles to the session: list/usage, switch, delegate.",
   "owner": {
-    "name": "uwuclxdy"
+    "name": "abobreshov"
   },
   "plugins": [
     {
-      "name": "clauth",
+      "name": "tollgate",
       "source": "./plugins",
-      "description": "Expose clauth profiles to the session: list/usage, switch, delegate.",
+      "description": "Expose tollgate profiles to the session: list/usage, switch, delegate.",
       "category": "developer-tools"
     }
   ]

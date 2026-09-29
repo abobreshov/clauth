@@ -43,8 +43,8 @@ fn a_view_device_reads_the_published_slot_and_the_feed_carries_the_same_object()
         state: AppState::default(),
         profiles: Vec::new(),
     }));
-    let status_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let status_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json");
     let ctx = ApiContext::for_tests(
         config,

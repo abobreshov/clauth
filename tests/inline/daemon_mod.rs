@@ -5,7 +5,7 @@
 //!
 //! All disk state is redirected into a [`HomeSandbox`] tempdir, and
 //! `keychain::enabled()` is false under `cfg(test)`, so the switch paths exercise
-//! the file/symlink model only and NEVER touch the operator's real `~/.clauth`,
+//! the file/symlink model only and NEVER touch the operator's real `~/.tollgate`,
 //! `~/.claude`, or the `Claude Code-credentials` Keychain item (Incident C
 //! guardrail). No network: every OAuth token is minted with a future expiry so the
 //! pre-install auth gate returns `Ready` without a refresh.
@@ -14,8 +14,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
-    reload_fingerprint, save_app_state, save_profile,
+    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, reload_fingerprint,
+    save_app_state, save_profile, tollgate_dir,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
 #[cfg(unix)]
@@ -111,7 +111,7 @@ fn persist(profiles: Vec<Profile>, active: Option<&str>, refresh_interval_ms: u6
 
 /// Build a daemon over `config`, writing `status.json` beside the sandbox root.
 fn daemon_for(config: AppConfig) -> Daemon {
-    let status_path = clauth_dir().expect("clauth dir").join("status.json");
+    let status_path = tollgate_dir().expect("tollgate dir").join("status.json");
     Daemon::new(config, status_path)
 }
 
@@ -211,21 +211,20 @@ fn tick_heals_a_broken_plugin_registration() {
     );
 }
 
-/// The tick's herdr leg is the herdr-heal call site twin: one tick over a
-/// stale registry reaches the fake herdr install when the saved `[update]`
-/// toggle is on, and — after the tick's own reload picks a freshly persisted
-/// `auto_update = false` up — spawns nothing, leaving the throttle floor
-/// unclaimed (the re-enabled tick after it still installs).
+/// The tick's herdr leg is the herdr-heal call site twin. Self-update is
+/// compiled out of this build (plan §4.0), so one tick over a stale registry
+/// reinstalls nothing whether the tick's reload picks a saved
+/// `auto_update = false` or a saved on up.
 #[cfg(unix)]
 #[test]
-fn tick_herdr_heal_follows_the_saved_update_toggle() {
+fn tick_herdr_heal_is_a_noop_in_this_build() {
     use std::ffi::OsStr;
 
     use crate::testutil::join_background_tasks;
 
     let home = HomeSandbox::new();
     let stale = crate::herdr::plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -264,19 +263,16 @@ fn tick_herdr_heal_follows_the_saved_update_toggle() {
         "a tick after a reload with the saved toggle off reinstalls nothing"
     );
 
-    // The saved-off tick must not have claimed the throttle: back on (again
-    // through the tick's reload), the very next tick installs.
+    // Back on (again through the tick's reload): still nothing installs.
     let mut state = crate::profile::load_app_state().expect("load state");
     state.update.auto_update = true;
     save_app_state(&state).expect("persist on toggle");
 
     daemon.tick();
     join_background_tasks();
-    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
-    assert_eq!(
-        log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
-        "a tick with the saved toggle on reaches the fake install"
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "self-update is compiled out: a tick with the saved toggle on installs nothing either"
     );
 }
 
@@ -310,7 +306,7 @@ fn tick_skips_the_second_drain_once_a_wedged_flock_spends_the_budget() {
     link_active_clean("alpha");
     // A second open file description holding the state flock — conflicts with
     // the daemon's acquisition exactly as a wedged peer would.
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
         .expect("open holder handle");
     holder.lock().expect("hold the flock");
@@ -884,7 +880,7 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
     );
 }
 
-/// A clauth-owned symlink in the live slot is never "unsaved credentials":
+/// A tollgate-owned symlink in the live slot is never "unsaved credentials":
 /// capturing a long-lived `setup-token` sidecar for the ACTIVE profile flips its
 /// install source from `credentials.json` to `session-token.json`, so the live
 /// symlink — still pointing at the old `credentials.json` store — classifies
@@ -893,7 +889,7 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
 /// credentials" until its retry TTL (observed live 2026-07-21 on the macOS fork).
 #[cfg(unix)]
 #[test]
-fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
+fn drain_pending_switch_proceeds_over_a_stale_tollgate_symlink() {
     let _home = HomeSandbox::new();
     let config = persist(
         vec![
@@ -903,7 +899,7 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
         Some("alpha"),
         90_000,
     );
-    // The live slot is clauth's own symlink into alpha's rotating store — clean.
+    // The live slot is tollgate's own symlink into alpha's rotating store — clean.
     link_active_clean("alpha");
     // A long-lived session token appears for alpha (no refresh token → never
     // rotates), flipping its install source to session-token.json while the live
@@ -934,7 +930,7 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
     assert_eq!(
         active_of(&daemon).as_deref(),
         Some("beta"),
-        "a clauth-owned symlink holds nothing unsaved — the switch must proceed"
+        "a tollgate-owned symlink holds nothing unsaved — the switch must proceed"
     );
     assert_eq!(
         queued_targets(&daemon),
@@ -1046,7 +1042,7 @@ fn drain_pending_switch_still_defers_on_a_torn_live_file() {
 }
 
 /// A queued switch whose target no longer resolves (deleted out-of-process
-/// after the enqueue — `clauth delete` can't purge this daemon's in-memory
+/// after the enqueue — `tollgate delete` can't purge this daemon's in-memory
 /// queue) is DROPPED with a last_error, never attempted. Pre-fix, the drain
 /// ran `switch_profile` on the ghost: `force_link` removed the live
 /// credentials file BEFORE the existence check fired, the entry re-queued,
@@ -1170,7 +1166,7 @@ fn reload_if_changed_fires_on_external_mtime_change() {
         ..AppState::default()
     };
     save_app_state(&external).expect("external app-state write");
-    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    let state_path = tollgate_dir().unwrap().join("profiles.toml");
     set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
 
     daemon.reload_if_changed();
@@ -1232,7 +1228,7 @@ fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
         ..AppState::default()
     };
     save_app_state(&external).expect("external write");
-    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    let state_path = tollgate_dir().unwrap().join("profiles.toml");
     set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
     daemon.reload_if_changed();
     assert_eq!(
@@ -1307,34 +1303,34 @@ fn switch_failure_backoff_dedups_log_over_many_ticks() {
     );
 }
 
-// ── ~/.clauth 0700 enforcement ────────────────────────────────────────────────
+// ── ~/.tollgate 0700 enforcement ────────────────────────────────────────────────
 
-/// A boot must tighten an existing world-traversable `~/.clauth` tree to 0o700
+/// A boot must tighten an existing world-traversable `~/.tollgate` tree to 0o700
 /// (older builds / a permissive umask could leave it 0o755) AND chmod the
 /// launchd-created `daemon.log` (which lands ~0o644) to 0o600 to match SECURITY.md.
 #[cfg(unix)]
 #[test]
-fn clauth_tree_migrated_to_0700_on_boot() {
+fn tollgate_tree_migrated_to_0700_on_boot() {
     use std::os::unix::fs::PermissionsExt;
     let _home = HomeSandbox::new();
-    let clauth = clauth_dir().unwrap();
-    let profiles = clauth.join("profiles");
+    let tollgate = tollgate_dir().unwrap();
+    let profiles = tollgate.join("profiles");
     std::fs::create_dir_all(&profiles).unwrap();
     // Simulate an older, world-traversable tree + a launchd-created 0o644 log.
-    std::fs::set_permissions(&clauth, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&tollgate, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let log = clauth.join("daemon.log");
+    let log = tollgate.join("daemon.log");
     std::fs::write(&log, b"boot\n").unwrap();
     std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    super::migrate_clauth_perms_700(&clauth);
+    super::migrate_tollgate_perms_700(&tollgate);
 
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&clauth), 0o700, "~/.clauth tightened to 0o700");
+    assert_eq!(mode(&tollgate), 0o700, "~/.tollgate tightened to 0o700");
     assert_eq!(
         mode(&profiles),
         0o700,
-        "~/.clauth/profiles tightened to 0o700"
+        "~/.tollgate/profiles tightened to 0o700"
     );
     assert_eq!(mode(&log), 0o600, "daemon.log tightened to 0o600");
 }
@@ -1430,7 +1426,7 @@ fn stand_by_tightens_the_tree_before_parking_not_after_promotion() {
     use std::time::Instant;
 
     let _home = HomeSandbox::new();
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     // A loose dir standing in for the log: the pre-park walk tightens it.
     let loose = dir.join("loose");
@@ -1479,20 +1475,20 @@ fn stand_by_tightens_the_tree_before_parking_not_after_promotion() {
     drop(promoted);
 }
 
-/// A `clauth daemon` that loses the singleton race must exit having touched
+/// A `tollgate daemon` that loses the singleton race must exit having touched
 /// nothing shared. The pile-up in #57 was 25 of these, each having already run
 /// the runtime GC and the tree-wide chmod walk against the live daemon's state
 /// before parking forever.
 #[test]
 fn a_redundant_instance_exits_without_touching_the_shared_tree() {
     let _home = HomeSandbox::new();
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
 
     // A runtime tree with no live session: `gc_stale_runtimes` deletes it.
     let ghost = dir.join("profiles").join("ghost").join("runtime");
     std::fs::create_dir_all(&ghost).expect("mkdir ghost runtime");
-    // A loose dir: `migrate_clauth_perms_700` tightens it to 0o700.
+    // A loose dir: `migrate_tollgate_perms_700` tightens it to 0o700.
     let loose = dir.join("loose");
     std::fs::create_dir_all(&loose).expect("mkdir loose");
     #[cfg(unix)]
@@ -1537,7 +1533,7 @@ fn a_redundant_instance_exits_without_touching_the_shared_tree() {
 #[test]
 fn redundant_reason_names_the_pid_for_the_default_and_the_queue_for_standby() {
     let _home = HomeSandbox::new();
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
 
     // No pid sidecar staged: the default still reads "already running", pid unknown.
@@ -1714,10 +1710,10 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
     );
 }
 
-// ── CLAUTH_NO_API ───────────────────────────────────────────────────────────
+// ── TOLLGATE_NO_API ───────────────────────────────────────────────────────────
 
 /// The kill switch pinned at its CALL SITE, not just its predicate: with
-/// `CLAUTH_NO_API=1` and a `--listen` address, `serve`'s listener decision must
+/// `TOLLGATE_NO_API=1` and a `--listen` address, `serve`'s listener decision must
 /// yield the no-api arm — no certificate read, nothing for
 /// `api::serve_prepared` to bind or import later. Deleting the `api_enabled()`
 /// guard from the start path (leaving the predicate test green) re-arms a
@@ -1727,7 +1723,7 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
 /// opt-out the decision never reads the certificate, so the arm is decided by
 /// the env var alone. The pin's RED CHAIN is the certificate read: `prepare`
 /// looks up this host's FQDN, then finds lego's directory through
-/// `~/.clauth/tls.json` (which resolves `home_dir()`), so a regression that
+/// `~/.tollgate/tls.json` (which resolves `home_dir()`), so a regression that
 /// deletes the guard dies at the sandbox panic — "test resolved the operator's
 /// real home" — before any certificate file is opened, or at the `expect`
 /// below when the FQDN lookup fails first. Both `assert`s never evaluate on
@@ -1743,7 +1739,7 @@ fn the_kill_switch_suppresses_the_listener_at_the_start_path() {
                 .expect("the opt-out is a decision, not a failure");
         assert!(
             prepared.is_none(),
-            "CLAUTH_NO_API=1 must suppress the listener at the start path"
+            "TOLLGATE_NO_API=1 must suppress the listener at the start path"
         );
         assert_eq!(
             no_api,
@@ -1779,7 +1775,7 @@ fn with_no_api_env<F: FnOnce()>(val: Option<&str>, f: F) {
     }
 }
 
-/// `CLAUTH_NO_API=1` and nothing else disables the listener.
+/// `TOLLGATE_NO_API=1` and nothing else disables the listener.
 ///
 /// The exact-`"1"` rule matters more here than for its siblings: this is the
 /// kill switch an operator reaches for when a listening socket has to go and the
@@ -1793,13 +1789,13 @@ fn the_rest_api_is_disabled_only_by_exactly_one() {
         assert!(super::api_enabled(), "unset → the listener is available");
     });
     with_no_api_env(Some("1"), || {
-        assert!(!super::api_enabled(), "CLAUTH_NO_API=1 → no listener");
+        assert!(!super::api_enabled(), "TOLLGATE_NO_API=1 → no listener");
     });
     for other in ["0", "true", "yes", "", "11", " 1"] {
         with_no_api_env(Some(other), || {
             assert!(
                 super::api_enabled(),
-                "CLAUTH_NO_API={other:?} is not the opt-out spelling"
+                "TOLLGATE_NO_API={other:?} is not the opt-out spelling"
             );
         });
     }
@@ -1809,14 +1805,14 @@ fn the_rest_api_is_disabled_only_by_exactly_one() {
 
 /// The feed currently sitting in the sandbox, as a `Value`.
 fn feed_on_disk() -> serde_json::Value {
-    let path = clauth_dir().expect("clauth dir").join("status.json");
+    let path = tollgate_dir().expect("tollgate dir").join("status.json");
     serde_json::from_str(&std::fs::read_to_string(&path).expect("read status.json"))
         .expect("status.json is json")
 }
 
 /// Seed a feed the daemon could have written, naming `active` at `stamp`.
 fn seed_feed(active: &str, stamp: &str) {
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     crate::profile::mkdir_700(&dir).expect("mkdir");
     std::fs::write(
         dir.join("status.json"),
@@ -1826,7 +1822,7 @@ fn seed_feed(active: &str, stamp: &str) {
 }
 
 /// A switch landing outside the daemon republishes the feed, but keeps the
-/// daemon's last `generated_at`: readers (`clauth-tray`, the TUI's daemon chip)
+/// daemon's last `generated_at`: readers (`tollgate-tray`, the TUI's daemon chip)
 /// treat a fresh stamp as proof a daemon is alive, and stamping `now` from the
 /// CLI would forge that proof with no daemon running.
 #[test]
@@ -1916,7 +1912,7 @@ fn a_daemonless_publish_yields_to_a_feed_written_after_its_build_started() {
         30_000,
     );
 
-    let feed = clauth_dir().expect("feed dir").join("status.json");
+    let feed = tollgate_dir().expect("feed dir").join("status.json");
     let incumbent: &[u8] = br#"{"sentinel": "incumbent"}"#;
     std::fs::write(&feed, incumbent).expect("seed incumbent feed");
     set_mtime(&feed, SystemTime::now() + Duration::from_secs(3600));
@@ -2076,7 +2072,7 @@ fn the_status_writer_reads_the_schedulers_own_streak_store() {
 
 // ── the TUI's `start daemon` ─────────────────────────────────────────────────
 
-/// A stand-in `clauth`: prints what `spawn_detached` handed it, one fact per
+/// A stand-in `tollgate`: prints what `spawn_detached` handed it, one fact per
 /// line, to its stdout and a marker to its stderr.
 #[cfg(unix)]
 const SPAWN_PROBE: &str = r#"printf 'argv=%s\n' "$*"
@@ -2086,20 +2082,20 @@ printf 'claude=%s\n' "${CLAUDE_CONFIG_DIR-unset}"
 printf 'codex=%s\n' "${CODEX_HOME-unset}"
 echo stderr >&2"#;
 
-/// The spawn runs `<exe> daemon` from `~/.clauth` in its own process group,
+/// The spawn runs `<exe> daemon` from `~/.tollgate` in its own process group,
 /// appends both streams to an owner-only `daemon.log`, and drops a session
-/// home the caller inherited only when clauth built it.
+/// home the caller inherited only when tollgate built it.
 #[cfg(unix)]
 #[test]
 fn start_runs_the_daemon_detached_into_its_log() {
     use std::os::unix::fs::PermissionsExt as _;
     let home = HomeSandbox::new();
     let bin = tempfile::tempdir().expect("tempdir");
-    let exe = crate::testutil::write_shim(bin.path(), "clauth", SPAWN_PROBE);
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    let runtime = clauth.join("profiles/p/runtime");
-    let codex_home = clauth.join("profiles/p/codex-home");
-    let log = clauth.join("daemon.log");
+    let exe = crate::testutil::write_shim(bin.path(), "tollgate", SPAWN_PROBE);
+    let tollgate = crate::profile::tollgate_dir().expect("tollgate dir");
+    let runtime = tollgate.join("profiles/p/runtime");
+    let codex_home = tollgate.join("profiles/p/codex-home");
+    let log = tollgate.join("daemon.log");
     let run = || {
         let status = super::spawn_detached(&exe)
             .expect("spawn")
@@ -2134,7 +2130,7 @@ fn start_runs_the_daemon_detached_into_its_log() {
         run();
     }
 
-    let cwd = clauth.canonicalize().expect("canonical clauth dir");
+    let cwd = tollgate.canonicalize().expect("canonical tollgate dir");
     let cwd = cwd.display();
     assert_eq!(
         std::fs::read_to_string(&log).expect("log"),
@@ -2142,7 +2138,7 @@ fn start_runs_the_daemon_detached_into_its_log() {
             "argv=daemon\ncwd={cwd}\nleads=yes\nclaude=unset\ncodex=/custom/codex\nstderr\n\
              argv=daemon\ncwd={cwd}\nleads=yes\nclaude=/custom/claude\ncodex=unset\nstderr\n"
         ),
-        "two starts append in order; each scrubs only the clauth-built home"
+        "two starts append in order; each scrubs only the tollgate-built home"
     );
 }
 

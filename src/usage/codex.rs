@@ -8,7 +8,7 @@
 //! generated wire models under `codex-backend-openapi-models/src/models/` for
 //! the body. The body is duration-keyed, not name-keyed — it says "a window of
 //! N seconds is P percent spent", never "this is the weekly one" — so the
-//! mapping below is where a duration becomes one of clauth's two named slots.
+//! mapping below is where a duration becomes one of tollgate's two named slots.
 
 use serde::Deserialize;
 
@@ -16,7 +16,7 @@ use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_i
 
 /// The ChatGPT-flavored usage endpoint. codex's client also knows an
 /// `/api/codex/usage` spelling for API-key accounts (`PathStyle::CodexApi`);
-/// clauth only ever holds ChatGPT logins, so only this one is reachable here.
+/// tollgate only ever holds ChatGPT logins, so only this one is reachable here.
 pub(crate) const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Anything longer than a day is the weekly slot; anything shorter is the 5h
@@ -84,7 +84,7 @@ fn slot_for_duration(secs: i64) -> Option<bool> {
     (secs > 0).then_some(secs > WEEKLY_CUTOFF_SECS)
 }
 
-/// Turn one raw window into clauth's shape. `reset_at` is the server's absolute
+/// Turn one raw window into tollgate's shape. `reset_at` is the server's absolute
 /// answer; `reset_after_seconds` is the relative one, used only when the
 /// absolute is missing, so a clock skew between us and the server cannot move a
 /// reset the server stated outright.
@@ -189,7 +189,7 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
 
 /// Poll one codex account's usage at `url`. Read-only: it neither mints nor
 /// spends anything — spending a banked reset is [`super::codex_reset`]'s, and
-/// only when the operator runs `clauth limit-reset`. Split from
+/// only when the operator runs `tollgate limit-reset`. Split from
 /// [`fetch_codex_usage`] so tests drive the wire shape against a local stub.
 ///
 /// A 401 is the caller's signal that the access token is stale — it feeds

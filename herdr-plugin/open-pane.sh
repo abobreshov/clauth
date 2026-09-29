@@ -7,7 +7,7 @@
 # they take no sizing flags and never swallow that answer.
 #
 # The popup_width knob picks the open's shape, failing safe to the shipped
-# default (fit) when the clauth binary predates the subcommand: fit and half
+# default (fit) when the tollgate binary predates the subcommand: fit and half
 # size the popup, split-right and split-top open a real pane beside or above
 # the focused one. A herdr that refuses the sizing flags (measured
 # 2026-08-26: 0.8.2 accepts them, hidden from --help) gets the plain call as
@@ -24,9 +24,9 @@ set -eu
 
 entrypoint="${1:?usage: open-pane.sh <entrypoint-id>}"
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
-plugin_id="${HERDR_PLUGIN_ID:-clauth}"
+plugin_id="${HERDR_PLUGIN_ID:-tollgate}"
 
-width_mode=$(clauth herdr config get popup_width 2>/dev/null || printf 'fit')
+width_mode=$(tollgate herdr config get popup_width 2>/dev/null || printf 'fit')
 
 # Reads the snapshot into $snap and the focused pane id into $focused. The
 # sed program is pinned against the real 0.8.2 snapshot shape by

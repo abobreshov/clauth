@@ -66,7 +66,7 @@ pub(crate) struct Timings {
     /// refresh token chain.
     pub(crate) credential_poll: Duration,
     /// Swap-poll cadence, on BOTH paths. The daemon's intent lands in
-    /// `~/.clauth/live_sessions/`, which no watch covers, so this leg has no
+    /// `~/.tollgate/live_sessions/`, which no watch covers, so this leg has no
     /// filesystem signal to key on. Its own field rather than a second use of
     /// `credential_poll`: the two happen to share a value but are bounded by
     /// different things — that one by the single-use refresh chain, this one by
@@ -74,7 +74,7 @@ pub(crate) struct Timings {
     pub(crate) swap_poll: Duration,
 }
 
-/// What `clauth start` runs on.
+/// What `tollgate start` runs on.
 pub(crate) const PRODUCTION: Timings = Timings {
     debounce: Duration::from_millis(200),
     cooldown: Duration::from_millis(500),
@@ -89,7 +89,7 @@ pub(crate) const PRODUCTION: Timings = Timings {
 pub(crate) enum Interest {
     /// Only these names. Used where the directory holds unrelated hot state.
     Names(Vec<OsString>),
-    /// Every child except clauth's own staging files — the tree mirror's
+    /// Every child except tollgate's own staging files — the tree mirror's
     /// surface, where the set of interesting names is the tree itself.
     AnyChild,
 }
@@ -194,7 +194,7 @@ fn classify<'a>(specs: &[WatchSpec], event: &'a notify::Event) -> EventVerdict<'
 /// itself: inotify leaves `name` empty there and notify then reports the watch
 /// root (`inotify.rs`, `None => self.paths.get(&event.wd).cloned()`), with
 /// `WatchMask::OPEN` armed, so every `opendir` of a watched directory lands
-/// here. clauth's own config leg does two of them per reconcile
+/// here. tollgate's own config leg does two of them per reconcile
 /// (`runtime::shared_runtime_dirs` reads the profile store directory), which
 /// is enough on its own to cross the orphan floor on a healthy install. Such
 /// an event came from a watch we armed, so it is accounted for by definition.
@@ -362,7 +362,7 @@ impl DeadFilter {
     }
 }
 
-/// clauth publishes every file as a hidden `.<name>.tmp.<pid>[.<seq>]` sibling
+/// tollgate publishes every file as a hidden `.<name>.tmp.<pid>[.<seq>]` sibling
 /// renamed into place (`profile::tmp_sibling`, `relink_to_canonical`). Waking on
 /// the staging half costs a reconcile per publish and can only ever observe a
 /// path that is about to move anyway.
@@ -474,7 +474,7 @@ pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<Event
     ) {
         Ok(w) => w,
         Err(e) => {
-            logline!("clauth: fs watcher unavailable: {e}");
+            logline!("tollgate: fs watcher unavailable: {e}");
             return None;
         }
     };
@@ -484,7 +484,7 @@ pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<Event
         match handle.watch(&spec.dir, RecursiveMode::NonRecursive) {
             Ok(()) => armed += 1,
             Err(e) => logline!(
-                "clauth: fs watcher cannot watch {}: {e}",
+                "tollgate: fs watcher cannot watch {}: {e}",
                 spec.dir.display()
             ),
         }
@@ -499,7 +499,7 @@ pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<Event
     // it ends when `RecommendedWatcher`'s drop disconnects `raw_rx`, and its
     // exit drops `wake_tx`, which is how the loop learns the debouncer died.
     std::thread::Builder::new()
-        .name("clauth-wdog-evt".into())
+        .name("tollgate-wdog-evt".into())
         .spawn(move || debounce_loop(&raw_rx, &wake_tx, debounce))
         .ok()?;
 
@@ -626,7 +626,7 @@ pub(crate) fn run_with_watcher(
             // Said once here rather than left to the per-directory arm errors:
             // those name a moment, this names a cost the whole session pays.
             logline!(
-                "clauth: fs watcher armed {} of {} directories; the rest reconcile \
+                "tollgate: fs watcher armed {} of {} directories; the rest reconcile \
                  every {:?} instead of on their events",
                 watcher.armed,
                 requested,
@@ -637,7 +637,7 @@ pub(crate) fn run_with_watcher(
         match run_events(&watcher.wake, shutdown, &t, r, health) {
             Exit::Shutdown => return,
             Exit::WatcherLost => {
-                logline!("clauth: fs watcher event channel disconnected, switching to poll")
+                logline!("tollgate: fs watcher event channel disconnected, switching to poll")
             }
         }
     }
@@ -695,7 +695,7 @@ pub(crate) fn run_events(
                     // latency back while hiding the defect that has to be fixed.
                     match kind {
                         DeadFilterKind::Unaccountable => logline!(
-                            "clauth: fs watcher is being handed events under a directory it \
+                            "tollgate: fs watcher is being handed events under a directory it \
                              cannot account for ({} of {} seen{}), so that surface reconciles \
                              on the {:?} fallback rather than on its own events. Watched: {}",
                             counts.orphans,
@@ -705,7 +705,7 @@ pub(crate) fn run_events(
                             health.dirs
                         ),
                         DeadFilterKind::NothingMatched => logline!(
-                            "clauth: fs watcher armed every directory but matched none of its \
+                            "tollgate: fs watcher armed every directory but matched none of its \
                              {} events, so every change reconciles on the {:?} fallback rather \
                              than on its own event. Watched: {}",
                             counts.seen,

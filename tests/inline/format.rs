@@ -13,11 +13,11 @@ fn login_expired_shares_one_head_across_line_and_toast() {
     let m = login_expired(&crate::profile::ProfileName::from("work"));
     assert_eq!(
         m.line(),
-        "login for 'work' has expired: refresh token revoked or invalid: run clauth login work"
+        "login for 'work' has expired: refresh token revoked or invalid: run tollgate login work"
     );
     assert_eq!(
         m.toast(),
-        "login for 'work' has expired\nrefresh token revoked or invalid: run clauth login work"
+        "login for 'work' has expired\nrefresh token revoked or invalid: run tollgate login work"
     );
     // The bold toast head is exactly the line() prefix before the separator.
     assert_eq!(
@@ -90,7 +90,7 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
     );
     assert_eq!(
         stated.text(),
-        "could not lock 'work' for a token refresh; check permissions on ~/.clauth"
+        "could not lock 'work' for a token refresh; check permissions on ~/.tollgate"
     );
 }
 
@@ -208,12 +208,12 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::RotationLockUnavailable("work".to_string()),
-            bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+            bare: "could not lock 'work' for a token refresh; check permissions on ~/.tollgate",
             names_next_step: true,
         },
         Row {
             cause: Cause::InternalLock,
-            bare: "clauth hit an internal lock error, restart clauth",
+            bare: "tollgate hit an internal lock error, restart tollgate",
             names_next_step: true,
         },
         Row {
@@ -223,12 +223,12 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::SidecarWriteFailed("work".to_string()),
-            bare: "could not write 'work' session token · check permissions on ~/.clauth",
+            bare: "could not write 'work' session token · check permissions on ~/.tollgate",
             names_next_step: true,
         },
         Row {
             cause: Cause::LiveSessionOnRotatingChain("work".to_string()),
-            bare: "'work' has a live clauth start session still on its rotating login; retry in a moment",
+            bare: "'work' has a live tollgate start session still on its rotating login; retry in a moment",
             names_next_step: true,
         },
         Row {
@@ -239,24 +239,24 @@ fn every_transient_cause_renders_its_own_copy() {
         Row {
             cause: Cause::RollingGrantUnrecorded("work".to_string()),
             bare: "'work' usage chain has no recorded grant beyond the setup-token scopes, \
-                    so a rolling bearer cannot be told from a mint · run `clauth login work` \
+                    so a rolling bearer cannot be told from a mint · run `tollgate login work` \
                     to record the chain's real grant",
             names_next_step: true,
         },
         Row {
             cause: Cause::SidecarMisfilled("work".to_string()),
             bare: "'work' session token holds a rotating pair and no live mint backup exists \
-                    to heal it · re-capture with `clauth login work --setup-token`",
+                    to heal it · re-capture with `tollgate login work --setup-token`",
             names_next_step: true,
         },
         Row {
             cause: Cause::StateLockBusy("work".to_string()),
-            bare: "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
+            bare: "another tollgate process holds ~/.tollgate's state lock · 'work' left unchanged",
             names_next_step: false,
         },
         Row {
             cause: Cause::StateLockUnavailable("work".to_string()),
-            bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+            bare: "could not lock 'work' for a token refresh; check permissions on ~/.tollgate",
             names_next_step: true,
         },
     ] {
@@ -264,7 +264,10 @@ fn every_transient_cause_renders_its_own_copy() {
         for (retry, suffix) in [
             (Retry::Wait, ": retry in a moment"),
             (Retry::Connection, ": check your connection and retry"),
-            (Retry::Restart, ": run clauth login again for a fresh code"),
+            (
+                Retry::Restart,
+                ": run tollgate login again for a fresh code",
+            ),
         ] {
             let retry_name = format!("{retry:?}");
             if names_next_step {
@@ -317,7 +320,7 @@ fn only_the_relogin_causes_read_as_permanent() {
 fn detail_returns_the_next_step_alone_and_falls_back_to_the_head() {
     assert_eq!(
         login_expired(&crate::profile::ProfileName::from("work")).detail(),
-        "refresh token revoked or invalid: run clauth login work"
+        "refresh token revoked or invalid: run tollgate login work"
     );
     let bare = Message {
         head: "done".to_string(),
@@ -337,8 +340,8 @@ fn line_and_toast_collapse_to_the_head_when_detail_is_absent() {
 }
 
 #[test]
-fn resolve_in_tui_names_the_clauth_surface() {
-    assert!(RESOLVE_IN_TUI.contains("clauth TUI"));
+fn resolve_in_tui_names_the_tollgate_surface() {
+    assert!(RESOLVE_IN_TUI.contains("tollgate TUI"));
 }
 
 #[test]
@@ -421,7 +424,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     assert_eq!(account_tier(&bare), None);
 
-    // A token whose `subscription_type` is not one clauth classifies is the
+    // A token whose `subscription_type` is not one tollgate classifies is the
     // same "we do not know" — never a fabricated tier.
     let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     unclassified.credentials = Some(crate::profile::ClaudeCredentials {
@@ -571,17 +574,17 @@ fn the_split_state_sentences_render_their_ruled_bytes() {
     let name = crate::profile::ProfileName::from("qwen");
     assert_eq!(
         third_party_keyless(&name),
-        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+        "profile has no api key: qwen (run `tollgate login qwen --api-key <key>`)"
     );
     assert_eq!(
         third_party_dead_chain(&name),
         "stored OAuth chain is dead, its api key still works: qwen \
-         (run `clauth login qwen --api-key <key>` to clear the quarantine)"
+         (run `tollgate login qwen --api-key <key>` to clear the quarantine)"
     );
     assert_eq!(
         third_party_dead_console(&name),
         "console session expired, stored OAuth chain is dead: qwen \
-         (run `clauth login qwen` to re-capture the console; the api key still serves inference)"
+         (run `tollgate login qwen` to re-capture the console; the api key still serves inference)"
     );
 }
 
@@ -684,9 +687,9 @@ fn start_lines_match_the_approved_copy() {
     assert_eq!(start_pick_line("D1", &none), "would start on 'D1'");
     assert_eq!(
         start_launch_line("D2", &two),
-        "clauth: starting on 'D2' for opus + sonnet"
+        "tollgate: starting on 'D2' for opus + sonnet"
     );
-    assert_eq!(start_launch_line("D1", &none), "clauth: starting on 'D1'");
+    assert_eq!(start_launch_line("D1", &none), "tollgate: starting on 'D1'");
     assert_eq!(
         start_refusal(&one, &rows),
         "--auto found no chain member with headroom for opus\n  D1  7d opus 100%, other models ok   usage 4m ago\n  D2  ok                              usage 4m ago"

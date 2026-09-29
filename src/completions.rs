@@ -7,13 +7,13 @@ use crate::cli::LOGIN_FLAGS;
 use crate::out::{errln, out, outln};
 use crate::profile::{home_dir, load_config};
 
-const BASH_TEMPLATE: &str = r#"_clauth() {
+const BASH_TEMPLATE: &str = r#"_tollgate() {
     local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
-        profiles=$(clauth __complete 2>/dev/null)
+        profiles=$(tollgate __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
@@ -25,26 +25,26 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --dump-openapi" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ] || [ "$prev" = "--explain" ]; then
         local profiles
-        profiles=$(clauth __complete 2>/dev/null)
+        profiles=$(tollgate __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
         local profiles
-        profiles=$(clauth __complete 2>/dev/null)
+        profiles=$(tollgate __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
-        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "$(tollgate __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
         local profiles sids
-        profiles=$(clauth __complete 2>/dev/null)
-        sids=$(clauth __complete --live-sessions 2>/dev/null)
+        profiles=$(tollgate __complete 2>/dev/null)
+        sids=$(tollgate __complete --live-sessions 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} ${sids}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
         local profiles
-        profiles=$(clauth __complete 2>/dev/null)
+        profiles=$(tollgate __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
@@ -79,14 +79,14 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     fi
     return 0
 }
-complete -F _clauth clauth
+complete -F _tollgate tollgate
 "#;
 
-const ZSH_TEMPLATE: &str = r#"#compdef clauth
-_clauth() {
+const ZSH_TEMPLATE: &str = r#"#compdef tollgate
+_tollgate() {
     if (( CURRENT == 2 )); then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
         _values 'subcommand' \
             'start[launch claude with that profile]' \
@@ -100,7 +100,7 @@ _clauth() {
             'static-token[restore the static setup-token mint, or --clear the long-lived token]' \
             'which[print profile owning the loaded credentials]' \
             'list[list accounts as a table with per-profile usage]' \
-            'jobs[list the delegate jobs clauth is holding (add --json)]' \
+            'jobs[list the delegate jobs tollgate is holding (add --json)]' \
             'switch[switch the global account, or move a live session to another profile]' \
             'sessions[list Claude Code sessions (add --json / --tokens)]' \
             'resume[resume a session under a chosen profile]' \
@@ -116,7 +116,7 @@ _clauth() {
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
@@ -124,15 +124,15 @@ _clauth() {
             '--explain[print the account that would be launched, without launching]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete --codex 2>/dev/null)}")
         _describe 'profile' profiles
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain) ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
         _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]' \
@@ -162,13 +162,13 @@ _clauth() {
             '--tokens[add token totals + cost; reads every transcript in full]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles sids
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
-        sids=("${(@f)$(clauth __complete --live-sessions 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
+        sids=("${(@f)$(tollgate __complete --live-sessions 2>/dev/null)}")
         _describe 'profile' profiles
         _describe 'session' sids
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
@@ -190,7 +190,7 @@ _clauth() {
             '--no-standby[explicit spelling of the default]' \
             '--replace[terminate the running daemon and take over]' \
             '--status[print the running daemon, or exit 1 when none is]' \
-            '--listen[also serve the REST API over TLS, default 0.0.0.0:8443]' \
+            '--listen[also serve the REST API over TLS, default 0.0.0.0:8453]' \
             '--cert[serve this certificate instead of the lego one; needs --key]' \
             '--key[private key for --cert]' \
             '--dump-openapi[print the OpenAPI document the REST API serves, and start nothing]'
@@ -200,97 +200,97 @@ _clauth() {
         _values 'flag' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     fi
 }
-_clauth "$@"
+_tollgate "$@"
 "#;
 
-const FISH_TEMPLATE: &str = r#"function __clauth_profiles
-    clauth __complete 2>/dev/null
+const FISH_TEMPLATE: &str = r#"function __tollgate_profiles
+    tollgate __complete 2>/dev/null
 end
-function __clauth_sessions
-    clauth __complete --live-sessions 2>/dev/null
+function __tollgate_sessions
+    tollgate __complete --live-sessions 2>/dev/null
 end
-complete -c clauth -f
-complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
-complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
-complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
-complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
-complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
-complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
-complete -c clauth -f -n __fish_is_first_token -a limit-reset -d "Spend a banked usage-limit reset on a codex account"
-complete -c clauth -f -n __fish_is_first_token -a rolling-token -d "Serve a profile a rolling token from its usage chain"
-complete -c clauth -f -n __fish_is_first_token -a static-token -d "Restore the static setup-token mint, or --clear the long-lived token"
-complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
-complete -c clauth -f -n __fish_is_first_token -a list -d "List accounts as a table with per-profile usage"
-complete -c clauth -f -n __fish_is_first_token -a jobs -d "List the delegate jobs clauth is holding"
-complete -c clauth -f -n __fish_is_first_token -a switch -d "Switch the global account, or move a live session to another profile"
-complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
-complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
-complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
-complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
-complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
-complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
-complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
-complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
-complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a config -d "Print one herdr knob"
-complete -c clauth -f -n "__fish_seen_subcommand_from config" -a get -d "Print the knob value on one line"
-complete -c clauth -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -d "Knob name"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --key -d "Key that opens the dashboard"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --no-config -d "Leave herdr's config.toml alone"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
-complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
-complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
-complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
-complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --explain -d "Print the account that would be launched, without launching"
-complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
-complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
-complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session
-complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
-complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
-complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
+complete -c tollgate -f
+complete -c tollgate -f -n __fish_is_first_token -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
+complete -c tollgate -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
+complete -c tollgate -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
+complete -c tollgate -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
+complete -c tollgate -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
+complete -c tollgate -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
+complete -c tollgate -f -n __fish_is_first_token -a limit-reset -d "Spend a banked usage-limit reset on a codex account"
+complete -c tollgate -f -n __fish_is_first_token -a rolling-token -d "Serve a profile a rolling token from its usage chain"
+complete -c tollgate -f -n __fish_is_first_token -a static-token -d "Restore the static setup-token mint, or --clear the long-lived token"
+complete -c tollgate -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
+complete -c tollgate -f -n __fish_is_first_token -a list -d "List accounts as a table with per-profile usage"
+complete -c tollgate -f -n __fish_is_first_token -a jobs -d "List the delegate jobs tollgate is holding"
+complete -c tollgate -f -n __fish_is_first_token -a switch -d "Switch the global account, or move a live session to another profile"
+complete -c tollgate -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
+complete -c tollgate -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
+complete -c tollgate -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
+complete -c tollgate -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
+complete -c tollgate -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
+complete -c tollgate -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
+complete -c tollgate -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
+complete -c tollgate -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
+complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a config -d "Print one herdr knob"
+complete -c tollgate -f -n "__fish_seen_subcommand_from config" -a get -d "Print the knob value on one line"
+complete -c tollgate -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -d "Knob name"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --key -d "Key that opens the dashboard"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --no-config -d "Leave herdr's config.toml alone"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
+complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c tollgate -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
+complete -c tollgate -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
+complete -c tollgate -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a "(tollgate __complete --codex 2>/dev/null)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
+complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
+complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"
+complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --explain -d "Print the account that would be launched, without launching"
+complete -c tollgate -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_sessions)" -d Session
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
+complete -c tollgate -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
+complete -c tollgate -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
 __CLATHA_LOGIN_FLAGS__
-complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"
-complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --clear -d "Remove the long-lived token"
-complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a --list -d "Show the resets and which one would be used; spend none"
-complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
-complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --all -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --disabled -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --listen -d "Also serve the REST API over TLS, default 0.0.0.0:8443"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --cert -d "Serve this certificate instead of the lego one; needs --key"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --key -d "Private key for --cert"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --dump-openapi -d "Print the OpenAPI document the REST API serves, and start nothing"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a pair -d "Print a one-time pairing code and wait for it"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a add -d "Mint a token for a device here and print it once"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a revoke -d "Remove a device"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a allow-sessions -d "Grant a control device the sessions flag"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a --json -d "Emit the device list as JSON"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --control -d "The device may switch accounts, not only read"
-complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --sessions -d "The device may mint sessions through the API"
+complete -c tollgate -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"
+complete -c tollgate -f -n "__fish_seen_subcommand_from static-token" -a --clear -d "Remove the long-lived token"
+complete -c tollgate -f -n "__fish_seen_subcommand_from static-token" -a --yes -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from static-token" -a -y -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from disable" -a --yes -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a --list -d "Show the resets and which one would be used; spend none"
+complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a --yes -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
+complete -c tollgate -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
+complete -c tollgate -f -n "__fish_seen_subcommand_from list" -a --all -d "Also list disabled profiles"
+complete -c tollgate -f -n "__fish_seen_subcommand_from list" -a --disabled -d "Also list disabled profiles"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --listen -d "Also serve the REST API over TLS, default 0.0.0.0:8453"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --cert -d "Serve this certificate instead of the lego one; needs --key"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --key -d "Private key for --cert"
+complete -c tollgate -f -n "__fish_seen_subcommand_from daemon" -a --dump-openapi -d "Print the OpenAPI document the REST API serves, and start nothing"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices" -a pair -d "Print a one-time pairing code and wait for it"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices" -a add -d "Mint a token for a device here and print it once"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices" -a revoke -d "Remove a device"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices" -a allow-sessions -d "Grant a control device the sessions flag"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices" -a --json -d "Emit the device list as JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --control -d "The device may switch accounts, not only read"
+complete -c tollgate -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --sessions -d "The device may mint sessions through the API"
 "#;
 
 /// The placeholder each script carries where its `login` flag list goes; the
@@ -360,10 +360,10 @@ fn fish_login_flags() -> String {
         .iter()
         .map(|f| match desc_of(FISH_LOGIN_DESCS, f) {
             Some(d) => format!(
-                "complete -c clauth -f -n \"__fish_seen_subcommand_from login\" -a {f} -d \"{d}\""
+                "complete -c tollgate -f -n \"__fish_seen_subcommand_from login\" -a {f} -d \"{d}\""
             ),
             None => {
-                format!("complete -c clauth -f -n \"__fish_seen_subcommand_from login\" -a {f}")
+                format!("complete -c tollgate -f -n \"__fish_seen_subcommand_from login\" -a {f}")
             }
         })
         .collect::<Vec<_>>()
@@ -397,15 +397,15 @@ pub(crate) fn print_profile_names() {
     }
 }
 
-/// Live-session id stems for `clauth switch`'s first completion position: the
-/// filenames under `~/.clauth/live_sessions/` minus their `.json`, never a
-/// transcript read. The dir derives from the same [`crate::profile::clauth_dir`]
+/// Live-session id stems for `tollgate switch`'s first completion position: the
+/// filenames under `~/.tollgate/live_sessions/` minus their `.json`, never a
+/// transcript read. The dir derives from the same [`crate::profile::tollgate_dir`]
 /// base the registry writer keys its rows on, so the listing and the writer
 /// cannot drift onto different paths. Sorted so the order a shell shows is
 /// stable; a missing or unreadable dir answers empty, never an error, like
 /// [`print_profile_names`].
 fn live_session_stems() -> Vec<String> {
-    let Ok(dir) = crate::profile::clauth_dir().map(|home| home.join("live_sessions")) else {
+    let Ok(dir) = crate::profile::tollgate_dir().map(|home| home.join("live_sessions")) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -463,22 +463,24 @@ pub(crate) fn install(shell: Option<&str>) -> Result<()> {
 
 fn detect_shell() -> Result<String> {
     let path = std::env::var("SHELL").context(
-        "$SHELL not set; pass the shell explicitly: clauth completions install <bash|zsh|fish>",
+        "$SHELL not set; pass the shell explicitly: tollgate completions install <bash|zsh|fish>",
     )?;
     let name = path.rsplit('/').next().unwrap_or("");
     match name {
         "bash" | "zsh" | "fish" => Ok(name.to_string()),
         other => bail!(
-            "unrecognized shell '{other}' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
+            "unrecognized shell '{other}' from $SHELL; pass it explicitly: tollgate completions install <bash|zsh|fish>"
         ),
     }
 }
 
 fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
     let home = home_dir()?;
-    let completions_dir = home.join(".clauth").join("completions");
+    let completions_dir = home
+        .join(crate::identity::DATA_DIR_NAME)
+        .join("completions");
     crate::profile::mkdir_700(&completions_dir)?;
-    let script_path = completions_dir.join(format!("clauth.{shell}"));
+    let script_path = completions_dir.join(format!("tollgate.{shell}"));
     crate::profile::atomic_write_600(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
 
@@ -493,7 +495,7 @@ fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
         if !new.is_empty() && !new.ends_with('\n') {
             new.push('\n');
         }
-        new.push_str(&format!("\n# clauth completions\n{source_line}\n"));
+        new.push_str(&format!("\n# tollgate completions\n{source_line}\n"));
         fs::write(&rc_path, new)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
     }
@@ -502,8 +504,8 @@ fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
 }
 
 /// Env var: set to `1` to skip the first-launch completions auto-install
-/// entirely (only `"1"` opts out, matching `CLAUTH_NO_UPDATE`).
-const NO_COMPLETIONS_ENV: &str = "CLAUTH_NO_COMPLETIONS";
+/// entirely (only `"1"` opts out, matching `TOLLGATE_NO_API`).
+const NO_COMPLETIONS_ENV: &str = "TOLLGATE_NO_COMPLETIONS";
 
 fn completions_opt_out() -> bool {
     std::env::var(NO_COMPLETIONS_ENV).as_deref() == Ok("1")
@@ -535,7 +537,7 @@ fn ask_install_completions(rc_name: &str) -> Consent {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Consent::CannotAsk;
     }
-    out!("clauth: install shell completions? appends a source line to ~/{rc_name} [Y/n] ");
+    out!("tollgate: install shell completions? appends a source line to ~/{rc_name} [Y/n] ");
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
         return Consent::CannotAsk;
@@ -552,8 +554,8 @@ pub(crate) fn auto_install_once() {
         return;
     }
     let Ok(home) = home_dir() else { return };
-    let clauth_dir = home.join(".clauth");
-    let sentinel = clauth_dir.join(".completions_installed");
+    let tollgate_dir = home.join(crate::identity::DATA_DIR_NAME);
+    let sentinel = tollgate_dir.join(".completions_installed");
     if sentinel.exists() {
         return;
     }
@@ -575,14 +577,14 @@ pub(crate) fn auto_install_once() {
         return; // don't record the sentinel — re-prompt on the next interactive launch
     }
 
-    let _ = crate::profile::mkdir_700(&clauth_dir);
+    let _ = crate::profile::mkdir_700(&tollgate_dir);
     let _ = crate::profile::atomic_write_600(&sentinel, "");
 
     if matches!(consent, Consent::Yes)
         && let Err(e) = install(Some(&shell))
     {
-        errln!("clauth: could not install completions: {e}");
-        errln!("clauth: run `clauth completions install` later to retry");
+        errln!("tollgate: could not install completions: {e}");
+        errln!("tollgate: run `tollgate completions install` later to retry");
     }
 }
 
@@ -590,7 +592,7 @@ fn install_fish() -> Result<()> {
     let home = home_dir()?;
     let dir = home.join(".config").join("fish").join("completions");
     fs::create_dir_all(&dir)?;
-    let path = dir.join("clauth.fish");
+    let path = dir.join("tollgate.fish");
     fs::write(&path, &*FISH).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

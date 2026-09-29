@@ -232,7 +232,7 @@ fn distill_skips_rows_with_malformed_price_fields() {
 
 #[test]
 fn distill_ignores_the_v4_keys_it_models_nothing_for() {
-    // A real v4 row carries a great deal clauth prices nothing off:
+    // A real v4 row carries a great deal tollgate prices nothing off:
     // `schema` / `source` / `model_id` / `observed_at` / `first_seen`
     // bookkeeping, `provenance`, `fees`, `limits` (the flat `max_tokens`
     // family's replacement), `currency`, and six rate axes with no token
@@ -734,9 +734,9 @@ fn distill_keeps_quota_only_windows_as_window_only_entries() {
 
 #[test]
 fn distill_skips_volume_tier_overrides() {
-    // v3 parked token-volume tiers in a `volume_rates` key clauth never
+    // v3 parked token-volume tiers in a `volume_rates` key tollgate never
     // declared, so they could not leak; v4 sits them in the same `overrides`
-    // list as the time windows, keyed by `when.min_tokens`. clauth prices per
+    // list as the time windows, keyed by `when.min_tokens`. tollgate prices per
     // HOUR and has no volume dimension, so the entry is dropped like a
     // quota-only one — kept, it would be unconstrained and would price every
     // request at the tier's rate, 9× the base here.
@@ -1536,7 +1536,7 @@ fn cache_round_trip_preserves_history() {
     };
     let path = sandbox
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
@@ -1558,7 +1558,7 @@ fn load_cache_rejects_empty_history() {
     let sandbox = HomeSandbox::new();
     let path = sandbox
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("ai_pricelog_v4_price_cache.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(&path, r#"{"fetched_at_ms": 1, "history": []}"#).expect("write");
@@ -1574,7 +1574,7 @@ fn stale_caches_deleted_once() {
     // allowlist, so a v4 build reading it would serve the rows this change
     // drops for as long as `first_delay` holds off the first fetch.
     let sandbox = HomeSandbox::new();
-    let dir = sandbox.home().join(".clauth");
+    let dir = sandbox.home().join(".tollgate");
     let new_path = dir.join("ai_pricelog_v4_price_cache.json");
     let stale: Vec<PathBuf> = [
         "price_cache.json",
@@ -1614,7 +1614,7 @@ fn the_v3_cache_name_is_not_the_one_this_build_reads() {
     // and `first_delay` would hold the first v4 fetch off by the interval
     // minus the cache's age.
     let sandbox = HomeSandbox::new();
-    let dir = sandbox.home().join(".clauth");
+    let dir = sandbox.home().join(".tollgate");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let old = dir.join("ai_pricelog_price_cache.json");
     std::fs::write(
@@ -1988,7 +1988,7 @@ fn zai_quota_entries_mark_windows_but_never_price() {
 fn removed_at_stamped_entries_price_nothing() {
     // The index's removal convention keeps a row with its last prices and
     // stamps it `removed_at`; the stamp is what makes a delisting effective
-    // in clauth. deepseek's own deepseek-r1 row is the pin that isolates the
+    // in tollgate. deepseek's own deepseek-r1 row is the pin that isolates the
     // stamp — it is FIRST-PARTY, so the resold guard cannot be what dashes
     // it. The dashscope ids beside it drop for the other reason and stay
     // unpriced too, having no live twin.
@@ -2406,7 +2406,7 @@ fn cache_round_trips_the_store_dating_source() {
     };
     let path = sandbox
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
@@ -2727,7 +2727,7 @@ fn canonical_map_round_trips_and_old_caches_load_identity() {
     let table = twin_table();
     let path = sandbox
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
@@ -2773,7 +2773,7 @@ fn a_pre_source_cache_loads_with_empty_sources_and_stays_identity() {
     let table = twin_table();
     let path = sandbox
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
@@ -2875,7 +2875,7 @@ fn the_catalog_keys_a_pair_on_the_source_the_feeds_spell() {
     // The four feed files spell all 29 sources identically (measured
     // 2026-09-03), so the canonical map's key and a `StoreKey`'s source come
     // from one vocabulary and no rename sits between them: `xai` on both
-    // sides, never a clauth-side alias for it.
+    // sides, never a tollgate-side alias for it.
     let canonical = fixture_canonical();
     assert_eq!(
         canonical.get("xai").and_then(|m| m.get("grok-4.5")),
@@ -3043,7 +3043,7 @@ fn a_verbatim_id_is_never_remapped_by_the_variant_strip() {
 
 #[test]
 fn history_rows_with_unmodeled_keys_parse_and_a_resold_one_stays_dropped() {
-    // openrouter's real row carries a `fees` object and two rate axes clauth
+    // openrouter's real row carries a `fees` object and two rate axes tollgate
     // has no bucket for. A FIRST-PARTY row carrying the same keys must PARSE
     // — the line's survival is the parser's tolerance, not the resold guard's
     // drop — and price its four modeled axes.
@@ -3108,7 +3108,7 @@ fn cache_round_trips_the_alias_table_and_old_caches_load_without_it() {
     };
     let path = sandbox
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 

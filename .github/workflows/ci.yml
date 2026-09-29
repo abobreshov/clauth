@@ -58,7 +58,7 @@ jobs:
   # clippy → test → release build as sequential steps in ONE job per OS so the
   # dep compile happens once: clippy builds deps + lints, test (nextest) reuses
   # target/, the release binary falls out of it, then uploads as a 1-day
-  # artifact. Matrixed across all 3 OSes: clauth ships native Windows + macOS
+  # artifact. Matrixed across all 3 OSes: tollgate ships native Windows + macOS
   # binaries (release.yml) and has real cfg(windows) code (src/platform.rs,
   # src/runtime.rs), so ubuntu-only clippy would never see it. mold self-gates
   # on linux. Trade: a clippy failure aborts before test/build on that OS.
@@ -103,7 +103,7 @@ jobs:
       # these installs the skip would be indistinguishable from a pass and the
       # leg would quietly never run: neither zsh nor fish is in the runner
       # images (macOS ships zsh as an OS component, not as an image addition).
-      # CLAUTH_REQUIRE_SHELL_LINT turns a skip into a failure, so a runner image
+      # TOLLGATE_REQUIRE_SHELL_LINT turns a skip into a failure, so a runner image
       # that later drops one of them reds the build instead of going silent.
       # Windows needs nothing: the leg is `#[cfg(unix)]`.
       - name: shells for the completion-script lint
@@ -118,7 +118,7 @@ jobs:
             # lint with a missing-shell message that reads like a test bug.
             *)       echo "unrecognised runner.os '${{ runner.os }}'" >&2; exit 1 ;;
           esac
-          echo "CLAUTH_REQUIRE_SHELL_LINT=1" >> "$GITHUB_ENV"
+          echo "TOLLGATE_REQUIRE_SHELL_LINT=1" >> "$GITHUB_ENV"
       # `--locked` on every leg that resolves dependencies, so a `Cargo.lock` the
       # committed manifest no longer matches reds here instead of being silently
       # updated in the runner and thrown away with it.
@@ -135,7 +135,7 @@ jobs:
           # in the summary line, over the listener's ONLY coverage. The Linux and
           # macOS images carry openssl, so require it there; Windows images do
           # not reliably, and a hard requirement would red on that alone.
-          CLAUTH_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
+          TOLLGATE_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo llvm-cov nextest --lcov --output-path lcov.info --locked --release --all-targets --all-features --no-fail-fast
@@ -153,7 +153,7 @@ jobs:
       - name: debug clippy + test
         shell: bash
         env:
-          CLAUTH_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
+          TOLLGATE_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
         run: |
           if grep -rqs --include='*.rs' --exclude-dir=target --exclude-dir=.git -e debug_assertions .; then
             cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -183,12 +183,12 @@ jobs:
       - name: upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: clauth-${{ matrix.os }}
+          name: tollgate-${{ matrix.os }}
           if-no-files-found: error
           retention-days: 1
           path: |
-            target/release/clauth
-            target/release/clauth.exe
+            target/release/tollgate
+            target/release/tollgate.exe
 
   deny:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}

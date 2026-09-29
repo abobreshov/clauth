@@ -1,6 +1,6 @@
-//! The agentgear [`PluginHost`] derive plus the four lifecycle wrappers clauth
+//! The agentgear [`PluginHost`] derive plus the four lifecycle wrappers tollgate
 //! calls: the Plugin tab's one-key install, the SessionStart self-heal hook, the
-//! `clauth start` pre-flight, and the throttled detached heal `clauth mcp` and
+//! `tollgate start` pre-flight, and the throttled detached heal `tollgate mcp` and
 //! the daemon share. The hook cannot be the migration trigger — a marketplace
 //! that fails to load means the plugin never loads, so the hook never fires —
 //! which is why the pre-flight and the detached heal both key off the same gate.
@@ -10,7 +10,7 @@
 //! a binary install) re-roots the dead ones to their `~/.claude` twins through
 //! agentgear's byte-surgical re-point.
 //!
-//! clauth's plugin tree lives in `plugins/` (not the default `plugin/`), so the
+//! tollgate's plugin tree lives in `plugins/` (not the default `plugin/`), so the
 //! derive's `tree` attr and `build.rs`'s `assert_plugin_version_at` both name
 //! it. The tree itself stays a stock Claude Code plugin — `plugin.json` + the
 //! `hooks/` dir — and agentgear supplies the lifecycle around it: materialize
@@ -34,24 +34,24 @@ use agentgear::{Outcome, PluginHost, Scope, Source};
 /// `agents` list already names just `claude`, so no agent feature flags beyond
 /// the crate defaults (derive + claude + embed) are enabled.
 #[derive(PluginHost)]
-#[plugin(name = "clauth", tree = "$CARGO_MANIFEST_DIR/plugins")]
-pub(crate) struct ClauthPlugin;
+#[plugin(name = "tollgate", tree = "$CARGO_MANIFEST_DIR/plugins")]
+pub(crate) struct TollgatePlugin;
 
 /// The Plugin tab's one-key install: a user-scope install from the embedded
 /// tree. The single spelling site — the tab's confirm handler and its pin test
 /// both go through here, so `Scope::User` + `Source::Embedded` live in one
 /// place and the copy-paste hint they replace has no other home to drift into.
 pub(crate) fn install() -> anyhow::Result<Outcome> {
-    Ok(ClauthPlugin::install(Scope::User, Source::Embedded)?)
+    Ok(TollgatePlugin::install(Scope::User, Source::Embedded)?)
 }
 
-/// The SessionStart hook body (`clauth self-heal`). Repairs a broken
+/// The SessionStart hook body (`tollgate self-heal`). Repairs a broken
 /// registration, never resurrects an uninstall — agentgear's marker gate makes
 /// a deliberately removed plugin stay removed. A healthy session prints
 /// nothing, so a hook that fires on every session start injects no noise into
 /// the conversation; a repair (or a failure) is worth saying out loud. The
 /// installPath convergence leg runs beside the heal: a CC install recorded
-/// through a dead runtime tree dangles even when clauth's own registration is
+/// through a dead runtime tree dangles even when tollgate's own registration is
 /// healthy, so neither leg gates the other.
 pub(crate) fn self_heal() -> anyhow::Result<()> {
     if let Some(line) = self_heal_line()? {
@@ -84,7 +84,7 @@ pub(crate) struct RepointOutcome {
 /// dies converges it. Rewrites and skips both name themselves in the line;
 /// `changed` separates the two for call sites that rate-limit reporting.
 pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
-    let Ok(clauth) = crate::profile::clauth_dir() else {
+    let Ok(tollgate) = crate::profile::tollgate_dir() else {
         return Ok(RepointOutcome {
             line: None,
             changed: false,
@@ -99,7 +99,7 @@ pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
     let registry = claude.join("plugins").join("installed_plugins.json");
     // Hoisted: the two prefix spellings are one computation, not one per
     // quoted value the remap is asked about.
-    let profiles = clauth.join("profiles");
+    let profiles = tollgate.join("profiles");
     let prefix_fwd = format!("{}/", profiles.display());
     let prefix_back = format!("{}\\", profiles.display());
     let report = agentgear::repoint_install_paths(&registry, |path: &str| {
@@ -120,7 +120,7 @@ pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
         parts.push(format!("left {} ({})", s.path, s.reason));
     }
     Ok(RepointOutcome {
-        line: Some(format!("clauth self-heal: {}", parts.join("; "))),
+        line: Some(format!("tollgate self-heal: {}", parts.join("; "))),
         changed,
     })
 }
@@ -205,12 +205,12 @@ pub(crate) fn reset_skip_report_for_test() {
 /// becomes a line only when the heal changed something. Split from
 /// [`self_heal`] so a test can pin the contract without a terminal.
 pub(crate) fn self_heal_line() -> anyhow::Result<Option<String>> {
-    let outcome = ClauthPlugin::self_heal()?;
-    Ok((!matches!(outcome, Outcome::NoOp)).then(|| format!("clauth self-heal: {outcome}")))
+    let outcome = TollgatePlugin::self_heal()?;
+    Ok((!matches!(outcome, Outcome::NoOp)).then(|| format!("tollgate self-heal: {outcome}")))
 }
 
-/// The `clauth start` pre-flight: the migration trigger that heals a broken or
-/// divergent clauth marketplace registration before `claude` launches. The hook
+/// The `tollgate start` pre-flight: the migration trigger that heals a broken or
+/// divergent tollgate marketplace registration before `claude` launches. The hook
 /// self-heal cannot be this trigger — a marketplace that fails to load means the
 /// plugin never loads, so the hook never fires.
 ///
@@ -224,13 +224,13 @@ pub(crate) fn preflight() {
                 crate::out::outln!("{line}");
             }
         }
-        Err(e) => crate::logline::logline!("clauth: plugin path re-point failed: {e:#}"),
+        Err(e) => crate::logline::logline!("tollgate: plugin path re-point failed: {e:#}"),
     }
     if !preflight_gate() {
         return;
     }
     if let Err(e) = self_heal() {
-        crate::logline::logline!("clauth: plugin pre-flight heal failed: {e:#}");
+        crate::logline::logline!("tollgate: plugin pre-flight heal failed: {e:#}");
     }
 }
 
@@ -241,7 +241,7 @@ pub(crate) static HEAL_THROTTLE: HealThrottle = HealThrottle::new();
 
 /// One heal's attempt limiter: at most one attempt per process every
 /// [`HEAL_THROTTLE_MS`], success or failure, and never two in flight. Both
-/// detached callers (`clauth mcp` boot, daemon tick) can fire once per second
+/// detached callers (`tollgate mcp` boot, daemon tick) can fire once per second
 /// on a box whose `claude` is missing, and an untried retry every tick would
 /// spawn + fail forever. The in-flight flag bounds overlap; the floor bounds
 /// frequency from the attempt STARTING (not finishing), so a slow heal still
@@ -317,20 +317,20 @@ impl HealThrottle {
     }
 }
 
-/// The shared detached heal: `clauth mcp` runs it before its stdio handshake and
+/// The shared detached heal: `tollgate mcp` runs it before its stdio handshake and
 /// the daemon once per tick. The gate runs INLINE (two registry reads, no
 /// spawn); only a "heal" verdict spawns anything, and then on its own thread so
 /// neither caller is ever blocked by a `claude plugin` spawn. The throttle lives
 /// here, not at either call site, so a call site cannot forget it.
 ///
 /// The outcome and any failure go through [`logline!`] — stderr for both callers
-/// — never `out::outln!`: `clauth mcp`'s stdout is a JSON-RPC stream, and one
+/// — never `out::outln!`: `tollgate mcp`'s stdout is a JSON-RPC stream, and one
 /// stray line corrupts the session.
 pub(crate) fn heal_detached() {
     match detached_repoint_line() {
         Ok(Some(line)) => crate::logline::logline!("{line}"),
         Ok(None) => {}
-        Err(e) => crate::logline::logline!("clauth: plugin path re-point failed: {e:#}"),
+        Err(e) => crate::logline::logline!("tollgate: plugin path re-point failed: {e:#}"),
     }
     if !preflight_gate() {
         return;
@@ -342,7 +342,7 @@ pub(crate) fn heal_detached() {
     // agentgear write its marker tree, and BOTH resolve off the process
     // environment: `PATH`, `HOME`, `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`. Only
     // `FakeClaude` pins those, which is why the predicate is its sentinel rather
-    // than clauth's own home override — that override is real and is still not
+    // than tollgate's own home override — that override is real and is still not
     // the thing making this hermetic.
     #[cfg(test)]
     assert!(
@@ -356,7 +356,7 @@ pub(crate) fn heal_detached() {
     // the moment it runs, so registering inside the worker lets a sandbox
     // teardown clear the home override with a heal still running — which then
     // resolves the operator's REAL `$HOME` and takes real locks under
-    // `~/.clauth`.
+    // `~/.tollgate`.
     #[cfg(test)]
     let done = crate::testutil::register_background_task();
     std::thread::spawn(move || {
@@ -364,7 +364,7 @@ pub(crate) fn heal_detached() {
         match self_heal_line() {
             Ok(Some(line)) => crate::logline::logline!("{line}"),
             Ok(None) => {}
-            Err(e) => crate::logline::logline!("clauth: plugin heal failed: {e:#}"),
+            Err(e) => crate::logline::logline!("tollgate: plugin heal failed: {e:#}"),
         }
         // Last action, after every `$HOME`-touching step: `HealInFlight` touches
         // one atomic and nothing else, so its later drop is safe past the send.
@@ -410,7 +410,7 @@ pub(crate) fn preflight_gate() -> bool {
     let marketplaces = read_registry(&dir.join("plugins").join("known_marketplaces.json"));
     let installed = read_registry(&dir.join("plugins").join("installed_plugins.json"));
 
-    // The "never installed" box. A false positive here makes every `clauth mcp`
+    // The "never installed" box. A false positive here makes every `tollgate mcp`
     // boot and daemon tick spawn `claude plugin list --json` for nothing, and
     // agentgear can never install from a heal anyway, so it converges nothing.
     // ABSENT is the load-bearing half: a config dir that has never held a plugin
@@ -420,7 +420,7 @@ pub(crate) fn preflight_gate() -> bool {
     let marketplaces_empty = match &marketplaces {
         Registry::Missing => true,
         Registry::Unreadable => false,
-        Registry::Parsed(doc) => doc.get("clauth").is_none(),
+        Registry::Parsed(doc) => doc.get(crate::identity::NAME).is_none(),
     };
     let installed_empty = match &installed {
         Registry::Missing => true,
@@ -428,7 +428,7 @@ pub(crate) fn preflight_gate() -> bool {
         // Absence of the KEY, never "not an array": a foreign or corrupt value
         // under it is still something of ours registered, and the old gate healed
         // on it. Matches the marketplace conjunct above.
-        Registry::Parsed(doc) => doc["plugins"]["clauth@clauth"].is_null(),
+        Registry::Parsed(doc) => doc["plugins"][crate::identity::CC_PLUGIN].is_null(),
     };
     if marketplaces_empty && installed_empty {
         return false;
@@ -441,10 +441,10 @@ pub(crate) fn preflight_gate() -> bool {
 /// The materialized pointer agentgear's `materialize` publishes: its locked
 /// layout is `<data_dir>/<plugin>/current@<client>` (agentgear design
 /// §materialize), which the lifecycle's own re-point logic compares against
-/// too. Derived here rather than called because clauth builds against the
+/// too. Derived here rather than called because tollgate builds against the
 /// published agentgear crate, and the layout is the contract either way.
 pub(crate) fn expected_pointer() -> Option<PathBuf> {
-    dirs::data_dir().map(|base| base.join("clauth").join("current@claude"))
+    dirs::data_dir().map(|base| base.join(crate::identity::NAME).join("current@claude"))
 }
 
 /// The config dir the heal itself operates on. agentgear's CLI wrapper keeps
@@ -491,7 +491,7 @@ fn read_registry(path: &Path) -> Registry {
     serde_json::from_slice(&bytes).map_or(Registry::Unreadable, Registry::Parsed)
 }
 
-/// The marketplace half of the gate: the `clauth` entry must be a directory
+/// The marketplace half of the gate: the `tollgate` entry must be a directory
 /// source registered exactly at the materialized pointer, with its generated
 /// manifest present. Absent, github-sourced, diverged, or manifest-deleted all
 /// heal — that is the deadlock the migration exists to break (a github entry's
@@ -501,7 +501,7 @@ fn marketplace_needs_heal(doc: Option<&serde_json::Value>, expected: &Path) -> b
     let Some(doc) = doc else {
         return true;
     };
-    let Some(entry) = doc.get("clauth") else {
+    let Some(entry) = doc.get(crate::identity::NAME) else {
         return true;
     };
     if entry["source"]["source"].as_str() != Some("directory") {
@@ -517,7 +517,7 @@ fn marketplace_needs_heal(doc: Option<&serde_json::Value>, expected: &Path) -> b
             .exists()
 }
 
-/// The plugin half of the gate: a user-scope `clauth@clauth` entry whose files or
+/// The plugin half of the gate: a user-scope `tollgate@tollgate` entry whose files or
 /// load state are gone. A per-session config dir leaves exactly this behind when
 /// its runtime tree is collected — the entry survives, its `installPath` dies —
 /// and only the heal can rewrite it. Project-scope entries never decide here: the
@@ -527,7 +527,7 @@ fn plugin_entries_need_heal(doc: Option<&serde_json::Value>) -> bool {
     let Some(doc) = doc else {
         return true;
     };
-    let Some(rows) = doc["plugins"]["clauth@clauth"].as_array() else {
+    let Some(rows) = doc["plugins"][crate::identity::CC_PLUGIN].as_array() else {
         return false;
     };
     rows.iter()

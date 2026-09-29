@@ -3,7 +3,7 @@
 //!
 //! herdr injects `HERDR_PANE_ID` and `HERDR_BIN_PATH` into every pane process,
 //! so the server (a Claude Code child) inherits its pane id. While a
-//! `delegate` is in flight the pane carries a `clauth_delegate` metadata token
+//! `delegate` is in flight the pane carries a `tollgate_delegate` metadata token
 //! reading `working`; when the last in-flight delegate ends it reads `idle`.
 //! One process-local counter tracks sync and background delegates together, so
 //! a background job finalizing mid-run can never clear the reading while a
@@ -20,11 +20,11 @@
 //! `--state-label` relabels states herdr itself computes instead of reporting
 //! one, so a background delegate — the case the counter exists for — could
 //! never light it: the pane's own agent is idle while the delegate runs. The
-//! token key `clauth_delegate` is distinct from the `clauth` key the
-//! herdr-plugin's profile tag owns; both spell `--source clauth`, and herdr
+//! token key `tollgate_delegate` is distinct from the `tollgate` key the
+//! herdr-plugin's profile tag owns; both spell `--source tollgate`, and herdr
 //! 0.8.2 merges tokens per key and expires them per key (both measured
 //! 2026-08-25 on an anchored pane: a probe token applied beside the standing
-//! `clauth` tag, and a 20 s TTL cleared it on its own clock while the tag's
+//! `tollgate` tag, and a 20 s TTL cleared it on its own clock while the tag's
 //! watcher kept re-reporting beside it).
 //!
 //! The icon itself stays herdr's own: on a pane its integration has anchored
@@ -34,9 +34,9 @@
 //! (the pane's own agent sits idle while the delegate spends), an unanchored
 //! pane, and a dead server (the TTL clears the stale `working`). herdr renders
 //! a token only where a sidebar row template names it — the same rule the
-//! profile tag lives under — and the row `clauth herdr install` writes
-//! (`herdr.rs`) names `$clauth` alone, the profile tag, unless the
-//! `delegate_row_text` knob is on, which appends `$clauth_delegate` to it.
+//! profile tag lives under — and the row `tollgate herdr install` writes
+//! (`herdr.rs`) names `$tollgate` alone, the profile tag, unless the
+//! `delegate_row_text` knob is on, which appends `$tollgate_delegate` to it.
 //! With the knob off the state reads on the pane JSON (`pane get` / `pane
 //! list`), not on the pane row. Measured 2026-08-25 on 0.8.2: an applied
 //! token rendered nowhere on the agent row, and rendered `working` beside the
@@ -60,7 +60,7 @@
 //! found on `PATH` (the same resolution `crate::herdr::herdr_bin` names). The
 //! knob reads once at server start off the on-demand config, defaulting on
 //! when profiles.toml is missing or unreadable. Resolution happens once, in
-//! the serve path (`ClauthServer::with_herdr_pane`); a server built without
+//! the serve path (`TollgateServer::with_herdr_pane`); a server built without
 //! it is a silent no-op.
 //!
 //! TTL and refresh: every report carries `--ttl-ms` [`STATE_TTL_MS`], so the
@@ -76,8 +76,8 @@
 //! so the thread ends once the last reporter clone drops. The `idle` report
 //! replaces `working` at once and then self-clears at the TTL.
 //!
-//! Ceiling (survives): two clauth servers sharing one pane both spell
-//! `--source clauth`, the token key is shared, and an epoch-ms seq is
+//! Ceiling (survives): two tollgate servers sharing one pane both spell
+//! `--source tollgate`, the token key is shared, and an epoch-ms seq is
 //! comparable across processes, so one session's `idle` can outrank the
 //! other's live `working` and clear the reading under it. Only two
 //! independent Claude Code sessions in one pane reach that; a delegate's own
@@ -110,11 +110,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// cannot stretch the interval past that margin under a green gate.
 const _: () = assert!(STATE_TTL_MS >= REFRESH_INTERVAL.as_millis() as u64 * 4);
 
-/// The metadata token key carrying the state. Distinct from `clauth`, the key
+/// The metadata token key carrying the state. Distinct from `tollgate`, the key
 /// the herdr-plugin's profile tag owns (`report-profile.sh`); herdr merges
-/// tokens per key within one source, so a shared `--source clauth` lets the
+/// tokens per key within one source, so a shared `--source tollgate` lets the
 /// state read beside the profile tag instead of replacing it.
-const TOKEN_KEY: &str = "clauth_delegate";
+const TOKEN_KEY: &str = "tollgate_delegate";
 
 /// Process-local delegate tracking for one herdr pane. Cheap to clone: every
 /// handle shares the same counters.
@@ -257,7 +257,7 @@ impl PaneReporter {
 fn spawn_refresher(shared: &Arc<Shared>, interval: Duration) {
     let weak = Arc::downgrade(shared);
     let spawned = std::thread::Builder::new()
-        .name("clauth-herdr-refresh".to_string())
+        .name("tollgate-herdr-refresh".to_string())
         .spawn(move || {
             loop {
                 std::thread::sleep(interval);
@@ -275,7 +275,7 @@ fn spawn_refresher(shared: &Arc<Shared>, interval: Duration) {
         });
     if spawned.is_err() {
         logline!(
-            "clauth: herdr pane refresh thread failed to spawn (working reads will not refresh; the TTL still bounds staleness)"
+            "tollgate: herdr pane refresh thread failed to spawn (working reads will not refresh; the TTL still bounds staleness)"
         );
     }
 }
@@ -290,7 +290,7 @@ fn report(shared: &Shared, state: &str, seq: u64) {
     let mut cmd = Command::new(&shared.bin);
     cmd.args(["pane", "report-metadata"])
         .arg(&shared.pane_id)
-        .args(["--source", "clauth", "--token", &token])
+        .args(["--source", crate::identity::NAME, "--token", &token])
         .arg("--ttl-ms")
         .arg(STATE_TTL_MS.to_string())
         .arg("--seq")
@@ -301,7 +301,7 @@ fn report(shared: &Shared, state: &str, seq: u64) {
         .stderr(Stdio::null());
     let Ok(mut child) = cmd.spawn() else {
         logline!(
-            "clauth: herdr pane report-metadata spawn failed (pane state {state} not reported)"
+            "tollgate: herdr pane report-metadata spawn failed (pane state {state} not reported)"
         );
         return;
     };
@@ -311,7 +311,7 @@ fn report(shared: &Shared, state: &str, seq: u64) {
             Ok(Some(status)) => {
                 if !status.success() {
                     logline!(
-                        "clauth: herdr pane report-metadata exited {status} (pane state {state} not reported)"
+                        "tollgate: herdr pane report-metadata exited {status} (pane state {state} not reported)"
                     );
                 }
                 return;
@@ -320,7 +320,7 @@ fn report(shared: &Shared, state: &str, seq: u64) {
                 let _ = child.kill();
                 let _ = child.wait();
                 logline!(
-                    "clauth: herdr pane report-metadata timed out (killed; pane state {state} not reported)"
+                    "tollgate: herdr pane report-metadata timed out (killed; pane state {state} not reported)"
                 );
                 return;
             }

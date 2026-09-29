@@ -90,7 +90,7 @@ fn per_profile_fields_never_propagate() {
 /// writer's mode, not the old file's: a plain write reverts a runtime copy to
 /// the umask on every tick, whatever the seed wrote. The home file is Claude
 /// Code's own: it lands at the writer's umask-moded mode (CC's own posture on
-/// this host), and clauth must not chmod it either way.
+/// this host), and tollgate must not chmod it either way.
 #[cfg(unix)]
 #[test]
 fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
@@ -98,8 +98,12 @@ fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
 
     let home = HomeSandbox::new();
     let home_file = home.home().join(".claude.json");
-    let winner = home.home().join(".clauth/profiles/p1/runtime/.claude.json");
-    let loser = home.home().join(".clauth/profiles/p2/runtime/.claude.json");
+    let winner = home
+        .home()
+        .join(".tollgate/profiles/p1/runtime/.claude.json");
+    let loser = home
+        .home()
+        .join(".tollgate/profiles/p2/runtime/.claude.json");
     for path in [&winner, &loser] {
         #[allow(clippy::expect_used)]
         fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir runtime");
@@ -123,7 +127,7 @@ fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
     assert_eq!(
         mode(&loser),
         0o600,
-        "a runtime .claude.json is clauth-owned; mode should be 0o600, got {:#o}",
+        "a runtime .claude.json is tollgate-owned; mode should be 0o600, got {:#o}",
         mode(&loser),
     );
     assert_eq!(
@@ -334,7 +338,7 @@ fn strip_home_oauth_account_removes_key_and_preserves_the_rest() {
         &json!({
             "oauthAccount": {"emailAddress": "stale@x"},
             "numStartups": 3,
-            "mcpServers": {"clauth": {"command": "clauth"}},
+            "mcpServers": {"tollgate": {"command": "tollgate"}},
         }),
     );
 
@@ -348,7 +352,7 @@ fn strip_home_oauth_account_removes_key_and_preserves_the_rest() {
     assert_eq!(after["numStartups"], json!(3));
     assert_eq!(
         after["mcpServers"],
-        json!({"clauth": {"command": "clauth"}})
+        json!({"tollgate": {"command": "tollgate"}})
     );
 }
 
@@ -425,7 +429,7 @@ fn strip_home_oauth_account_skips_missing_file() {
 fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
     let home = HomeSandbox::new();
     let global = home.home().join(".claude.json");
-    let profiles = home.home().join(".clauth/profiles");
+    let profiles = home.home().join(".tollgate/profiles");
     let legacy = profiles.join("p1/runtime/.claude.json");
     let session = profiles.join("p1/runtime-4242-0/.claude.json");
     let sibling = profiles.join("p2/runtime-4242-1/.claude.json");

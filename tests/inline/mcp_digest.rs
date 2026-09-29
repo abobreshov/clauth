@@ -92,7 +92,7 @@ fn third_party_cache_path(name: &str) -> std::path::PathBuf {
 /// the selection under test.
 ///
 /// `base_url` decides which HALF of the api-key set this is: a recognised
-/// provider host, or a generic endpoint clauth has no typed integration for.
+/// provider host, or a generic endpoint tollgate has no typed integration for.
 /// Both are fetched and cached the same way, and only the latter can catch a
 /// selector keyed on `is_third_party`.
 fn seed_api_key_state(name: &str, base_url: &str, at: SystemTime) {
@@ -138,7 +138,7 @@ fn block_text(result: &CallToolResult) -> String {
 
 /// The digest-bearing session read: `profiles({scope: "session"})`, the
 /// folded-in former `which` tool. Returns the reply's prose.
-fn call_session(server: &ClauthServer) -> String {
+fn call_session(server: &TollgateServer) -> String {
     block_text(&drive(server.profiles(Parameters(ProfilesArgs {
         names: None,
         scope: Some("session".to_string()),
@@ -146,21 +146,21 @@ fn call_session(server: &ClauthServer) -> String {
 }
 
 /// The all-scope roster, which deliberately carries no digest.
-fn call_roster(server: &ClauthServer) -> String {
+fn call_roster(server: &TollgateServer) -> String {
     block_text(&drive(server.profiles(Parameters(ProfilesArgs {
         names: None,
         scope: None,
     }))))
 }
 
-fn call_switch(server: &ClauthServer, name: &str) -> String {
+fn call_switch(server: &TollgateServer, name: &str) -> String {
     block_text(&drive(server.switch_profile(Parameters(SwitchArgs {
         name: name.to_string(),
     }))))
 }
 
 /// `monitor` on named jobs (its job mode).
-fn call_monitor_ids(server: &ClauthServer, job_ids: &[&str]) -> String {
+fn call_monitor_ids(server: &TollgateServer, job_ids: &[&str]) -> String {
     block_text(&drive(server.monitor_with(MonitorArgs {
         job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
         cancel: None,
@@ -181,7 +181,7 @@ fn call_monitor_ids(server: &ClauthServer, job_ids: &[&str]) -> String {
 /// caller's `HomeSandbox` holds `HOME_TEST_LOCK`, which is the serialization,
 /// and the prior value is restored before this returns.
 fn call_delegate_background(
-    server: &ClauthServer,
+    server: &TollgateServer,
     home: &HomeSandbox,
     profiles: &[&str],
 ) -> String {
@@ -247,7 +247,7 @@ fn seeded_world_with_a_second_account() {
 fn a_first_digest_call_reports_nothing() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
 
     let text = call_session(&server);
     assert!(
@@ -264,7 +264,7 @@ fn a_first_digest_call_reports_nothing() {
 fn a_server_clone_shares_the_digest_baseline() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     seed_state("other", t0());
@@ -280,7 +280,7 @@ fn a_server_clone_shares_the_digest_baseline() {
 fn reporting_consumes_the_delta() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     set_mtime(&credentials_path(), t1());
@@ -304,7 +304,7 @@ fn reporting_consumes_the_delta() {
 fn a_sub_millisecond_mtime_move_is_still_a_change() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     let bumped = t0() + Duration::from_micros(500);
@@ -337,7 +337,7 @@ fn a_sub_millisecond_mtime_move_is_still_a_change() {
 fn the_all_scope_roster_carries_no_digest_and_consumes_nothing() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     set_mtime(&credentials_path(), t1());
@@ -397,7 +397,7 @@ fn seed_switchable_pair() {
 fn a_successful_switch_reseeds_rather_than_reporting_its_own_write() {
     let _home = HomeSandbox::new();
     seed_switchable_pair();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     let switched = call_switch(&server, "target");
@@ -423,7 +423,7 @@ fn a_successful_switch_reseeds_rather_than_reporting_its_own_write() {
 fn a_refused_switch_reports_external_changes() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     seed_state("other", t0());
@@ -446,7 +446,7 @@ fn a_refused_switch_reports_external_changes() {
 fn a_profile_change_is_never_reported_as_a_usage_cache_refresh() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     // Another profile, carrying its own cache at its own stamp.
@@ -480,7 +480,7 @@ fn a_third_party_profiles_refresh_fires_off_the_cache_its_own_leg_writes() {
     let _home = HomeSandbox::new();
     seed_api_key_state("vendor", "https://api.deepseek.com/anthropic", t0());
     seed_credentials_file(t0());
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     set_mtime(&third_party_cache_path("vendor"), t1());
@@ -503,7 +503,7 @@ fn a_generic_api_key_profiles_refresh_fires_off_the_cache_its_own_leg_writes() {
     let _home = HomeSandbox::new();
     seed_api_key_state("litellm", "http://127.0.0.1:4000", t0());
     seed_credentials_file(t0());
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     set_mtime(&third_party_cache_path("litellm"), t1());
@@ -531,7 +531,7 @@ fn a_third_party_profiles_leftover_oauth_cache_is_not_the_file_watched() {
     .expect("cache path");
     std::fs::write(&stale_oauth_cache, b"{}").expect("leftover oauth cache");
     set_mtime(&stale_oauth_cache, t0());
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let _ = call_session(&server);
 
     set_mtime(&stale_oauth_cache, t1());
@@ -607,7 +607,7 @@ fn the_sleeping_function_never_locks_and_the_locking_functions_never_sleep() {
 fn monitor_done_envelope_reports_the_digest() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
 
     let envelope = serde_json::json!({
         "profile": "work",
@@ -651,7 +651,7 @@ fn seed_done_job(id: &str) {
 fn monitor_batch_carries_one_top_level_digest() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
 
     seed_done_job("d-batch-0");
     seed_done_job("d-batch-1");
@@ -688,7 +688,7 @@ fn monitor_batch_carries_one_top_level_digest() {
 fn monitor_batch_prose_renders_the_digest() {
     let _home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
 
     seed_done_job("d-bprose-0");
     let _ = call_monitor_ids(&server, &["d-bprose-0"]);
@@ -712,7 +712,7 @@ fn monitor_batch_prose_renders_the_digest() {
 fn a_background_handle_reports_the_digest_once_and_consumes_it() {
     let home = HomeSandbox::new();
     seeded_world();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
 
     let first = call_delegate_background(&server, &home, &["work"]);
     assert_eq!(
@@ -752,7 +752,7 @@ fn a_background_handle_reports_the_digest_once_and_consumes_it() {
 fn a_fanout_reply_carries_one_top_level_digest_and_no_row_carries_one() {
     let home = HomeSandbox::new();
     seeded_world_with_a_second_account();
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
 
     let first = call_delegate_background(&server, &home, &["work", "spare"]);
     assert_eq!(
@@ -791,7 +791,7 @@ fn a_fanout_reply_carries_one_top_level_digest_and_no_row_carries_one() {
 /// delta there consumes it, so the news is gone by the time a reply someone
 /// actually reads is built.
 ///
-/// `Skip` rather than `Reseed`: nothing of clauth's moved here, so the baseline
+/// `Skip` rather than `Reseed`: nothing of tollgate's moved here, so the baseline
 /// must stay exactly where it was and the delta must survive to the next reply.
 #[test]
 fn an_abandoned_blocking_delegate_reply_never_consumes_the_digest() {

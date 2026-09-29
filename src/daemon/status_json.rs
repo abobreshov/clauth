@@ -1,5 +1,5 @@
-//! `~/.clauth/status.json` serializer — the daemon's published feed, and the
-//! shape `clauth status --json` prints (one code path builds both, so they
+//! `~/.tollgate/status.json` serializer — the daemon's published feed, and the
+//! shape `tollgate status --json` prints (one code path builds both, so they
 //! cannot drift). Contract: wiki/Daemon.md.
 //!
 //! Usage windows/tier come from the on-disk usage caches — `usage_cache.json`
@@ -38,7 +38,7 @@ use crate::usage::{
 pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 /// Live scheduler signals a running daemon has that the single-shot
-/// `clauth status --json` cannot see. When absent, freshness and next-refresh
+/// `tollgate status --json` cannot see. When absent, freshness and next-refresh
 /// are derived from the cache-file mtime instead.
 ///
 /// These are already-snapshotted plain maps, not the live `Arc<RankedMutex<…>>`
@@ -179,7 +179,7 @@ pub(crate) struct ThirdPartyAvailability {
 
 /// One `profiles[]` entry of the published `status.json` body — the shape both
 /// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
-/// the reader (`clauth list`'s table rows) derive from, so a reader's field
+/// the reader (`tollgate list`'s table rows) derive from, so a reader's field
 /// access cannot drift from what the writer emits. Contract: wiki/Daemon.md.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ProfileEntry {
@@ -215,7 +215,7 @@ pub(crate) struct ProfileEntry {
     /// ignores the field and sees the claude accounts it always saw, because
     /// codex entries are appended after them.
     pub(crate) harness: String,
-    /// A live `clauth start` session runs for this profile.
+    /// A live `tollgate start` session runs for this profile.
     pub(crate) has_live_session: bool,
     /// `ok` / `expired` / `broken` (see [`auth_status_str`]).
     pub(crate) auth_status: String,
@@ -263,12 +263,12 @@ pub(crate) struct ProfileEntry {
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
-/// (`clauth list`) derives its fields instead of re-spelling string keys. One
+/// (`tollgate list`) derives its fields instead of re-spelling string keys. One
 /// builder for both surfaces, so they cannot drift.
 ///
 /// `include_disabled` gates whether a user-disabled account appears in the
 /// `profiles` array at all — the daemon's own `status.json` feed always passes
-/// `false` (hidden by default); the single-shot `clauth status --json --all`/
+/// `false` (hidden by default); the single-shot `tollgate status --json --all`/
 /// `--disabled` flag flips it to `true`.
 pub(crate) fn build_profile_entries(
     config: &AppConfig,
@@ -667,7 +667,7 @@ pub(crate) struct StatusBody {
     /// one with no codex support at all — from a new one reporting an empty
     /// codex roster, which are otherwise byte-identical.
     #[serde(default)]
-    pub(crate) clauth_version: String,
+    pub(crate) tollgate_version: String,
     /// Additive: the managed shunt gateway, the object `GET /api/v1/gateway`
     /// serves. `default` so a reader stays additive-tolerant of an older
     /// writer.
@@ -708,7 +708,7 @@ pub(crate) fn build_status(
         codex_fallback_chain: codex.fallback_chain().to_vec(),
         codex_wrap_off: codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
-        clauth_version: env!("CARGO_PKG_VERSION").to_string(),
+        tollgate_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         profiles,
     }

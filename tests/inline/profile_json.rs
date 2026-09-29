@@ -216,7 +216,7 @@ fn profile_windows_leaves_an_unfetched_third_party_account_without_stats() {
 /// The staleness verdict, pinned at BOTH boundaries the arithmetic sets, because
 /// only the tightening direction can fail: a figure at the longest gap a live
 /// scheduler can legally leave must NOT read stale, and one past the threshold
-/// must — while still carrying its number, since suppressing it reads as clauth
+/// must — while still carrying its number, since suppressing it reads as tollgate
 /// losing the account.
 #[test]
 fn a_figure_older_than_any_refresh_cadence_reads_stale() {
@@ -258,7 +258,7 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
     );
     assert!(
         windows.age_secs().is_some(),
-        "a stale figure keeps its age: suppressing it reads as clauth losing the account",
+        "a stale figure keeps its age: suppressing it reads as tollgate losing the account",
     );
 }
 
@@ -284,7 +284,7 @@ fn stale_after_ms_floors_at_the_degraded_ceiling_and_scales_with_interval() {
     assert!(stale_after_ms(ceiling) < stale_after_ms(crate::profile::MAX_REFRESH_INTERVAL_MS));
 }
 
-/// An OAuth body clauth cannot date reads STALE with no age published. Both
+/// An OAuth body tollgate cannot date reads STALE with no age published. Both
 /// undatable shapes take that arm: a stamp in the FUTURE, which proves the clock
 /// moved rather than that the read is fresh, and a missing stamp, which is what
 /// a plan-only cold fill and every pre-`fetched_at` cache carry. Publishing an
@@ -307,7 +307,7 @@ fn an_undatable_oauth_body_reads_stale_with_no_age() {
         assert_eq!(
             windows.age_secs(),
             None,
-            "{case}: clauth cannot date this figure, and says so by dating it not at all",
+            "{case}: tollgate cannot date this figure, and says so by dating it not at all",
         );
         assert!(windows.stale(), "{case}: an undatable figure reads stale");
         match windows {
@@ -685,7 +685,7 @@ fn published_windows_carries_an_oauth_accounts_windows() {
 
 /// A window whose `resets_at` has passed renders unknown, never as its last
 /// utilization (#74): a 19h-lapsed 5h window publishing `100%` is a spent
-/// account reading as fully used, and `clauth list`'s `-` is the honest
+/// account reading as fully used, and `tollgate list`'s `-` is the honest
 /// answer. A live window beside it stays; a live-maxed one stays too — a
 /// window pinned at the API's cap is live by definition, and the T1 stale
 /// exemption reasons about it elsewhere rather than dropping it here.

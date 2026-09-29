@@ -2,7 +2,7 @@
 
 //! Guard coverage for the MCP `profiles` tool's response shape.
 //!
-//! It is the largest single thing clauth puts in front of a model — 3,854 real
+//! It is the largest single thing tollgate puts in front of a model — 3,854 real
 //! tokens across one operator's 27 profiles before this trim, against 955 for
 //! the whole init block — and its own description tells the model to call it at
 //! session start. So the two things keeping it small are worth pinning: the
@@ -41,7 +41,7 @@ fn seed_two_profiles() {
 
 /// Drive the async tool on a current-thread runtime.
 fn call_profiles(names: Option<Vec<&str>>, scope: Option<&str>) -> CallToolResult {
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
@@ -285,7 +285,7 @@ fn seed_flag_states() {
 
 /// The three account-state markers render adjacent, so a reader meets one
 /// group, and `canceled` follows them as the informational marker it is —
-/// clauth has no cancel gate. Two of the three refuse a delegate outright;
+/// tollgate has no cancel gate. Two of the three refuse a delegate outright;
 /// `login expired` refuses only where the expired login is what the account
 /// authenticates with (`preflight_target`). Each is absent
 /// (never `false`) on an account it does not describe, the rule `keyless`
@@ -376,7 +376,7 @@ fn seed_canceled_account() {
 /// The session row resolves through the same tiers `which` used and reports
 /// `source`, on a row rendered by the roster's own `profile_line` — which is
 /// what makes the tier read the cached plan, not the login claim
-/// (`profile_json::tier_label`, the same helper `clauth which --json` and
+/// (`profile_json::tier_label`, the same helper `tollgate which --json` and
 /// `status.json` call). A canceled account reports the org's post-cancellation
 /// tier, never the one its stored token still claims.
 #[test]
@@ -388,7 +388,7 @@ fn session_scope_resolves_the_tier_through_the_which_tiers() {
     // depend on whatever `~/.claude` holds. The `<pid>-<seq>` shape is load
     // bearing — `is_session_id` rejects anything else and the session would fall
     // through unresolved.
-    let runtime = home.home().join(".clauth/profiles/kerry/runtime-4242-1");
+    let runtime = home.home().join(".tollgate/profiles/kerry/runtime-4242-1");
     std::fs::create_dir_all(&runtime).expect("runtime dir");
     let _dir = ConfigDirSandbox::new(&home, &runtime);
 
@@ -748,7 +748,7 @@ fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
         ..Default::default()
     })
     .expect("save state");
-    let runtime = home.home().join(".clauth/profiles/vendor/runtime-4242-1");
+    let runtime = home.home().join(".tollgate/profiles/vendor/runtime-4242-1");
     std::fs::create_dir_all(&runtime).expect("runtime dir");
     let _dir = ConfigDirSandbox::new(&home, &runtime);
 
@@ -777,7 +777,7 @@ fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
 fn session_scope_reply_carries_the_session_notes() {
     let home = HomeSandbox::new();
     seed_canceled_account();
-    let runtime = home.home().join(".clauth/profiles/kerry/runtime-4242-1");
+    let runtime = home.home().join(".tollgate/profiles/kerry/runtime-4242-1");
     std::fs::create_dir_all(&runtime).expect("runtime dir");
     // The runtime-paths note renders only when the probe finds a shared entry;
     // an empty tree reads `NothingShared` and earns none, so the fixture poses
@@ -862,7 +862,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
          account, which these tools do not manage — they are Claude Code only. Switch it \
-         with `clauth <name>`"
+         with `tollgate <name>`"
     );
 
     let result = call_profiles(Some(vec!["cx"]), None);
@@ -870,7 +870,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
     assert_eq!(
         first_text(&result),
         "error: profile not found: cx; cx names a CODEX account, which these tools do not \
-         manage — they are Claude Code only. Switch it with `clauth <name>`"
+         manage — they are Claude Code only. Switch it with `tollgate <name>`"
     );
 
     let result = call_profiles(Some(vec!["CX", "zz"]), None);
@@ -879,7 +879,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
          account, which these tools do not manage — they are Claude Code only. Switch it \
-         with `clauth <name>`"
+         with `tollgate <name>`"
     );
 
     let result = call_profiles(Some(vec!["CX"]), None);
@@ -887,6 +887,6 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
     assert_eq!(
         first_text(&result),
         "error: profile not found: CX; cx names a CODEX account, which these tools do not \
-         manage — they are Claude Code only. Switch it with `clauth <name>`"
+         manage — they are Claude Code only. Switch it with `tollgate <name>`"
     );
 }

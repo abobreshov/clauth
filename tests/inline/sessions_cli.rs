@@ -1,4 +1,4 @@
-//! `clauth sessions/resume/info` CLI surface tests. Fixture stores live under a
+//! `tollgate sessions/resume/info` CLI surface tests. Fixture stores live under a
 //! `HomeSandbox` so the global (`~/.claude/projects`) walk stays off the real
 //! tree. Each transcript is named `<sessionId>.jsonl` (the id is the filename
 //! stem). Pure helpers (`resume_profile_choice`, `sessions_json`) are exercised
@@ -65,7 +65,7 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
     )
 }
 
-// ── clauth sessions --json ──
+// ── tollgate sessions --json ──
 
 #[test]
 fn sessions_json_has_exact_fields_newest_first_with_null_and_redaction() {
@@ -396,7 +396,7 @@ fn sessions_bad_flag_maps_to_exit_two() {
     // dispatch, and clap's own parse-failure code is the same 2 the
     // sessions-surface `UsageError` maps to, so the contract holds either way.
     use clap::Parser as _;
-    let err = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--bogus"])
+    let err = crate::cli::Cli::try_parse_from(["tollgate", "sessions", "--bogus"])
         .expect_err("bad flag must error");
     assert_eq!(err.exit_code(), 2);
 }
@@ -471,7 +471,7 @@ fn latest_resolves_to_the_first_row_the_listing_emits() {
     assert_eq!(
         Some(latest.id.as_str()),
         flat.first().map(|s| s.id.as_str()),
-        "`latest` must be the session `clauth sessions` lists first"
+        "`latest` must be the session `tollgate sessions` lists first"
     );
     assert_eq!(latest.id, "s-newer");
 }
@@ -486,7 +486,7 @@ fn live_isolated_session(
     mtime_secs: u64,
 ) -> std::fs::File {
     let iso = sb.home().join(format!(
-        ".clauth/profiles/{profile}/runtime-isolated/projects/-w-iso/{id}.jsonl"
+        ".tollgate/profiles/{profile}/runtime-isolated/projects/-w-iso/{id}.jsonl"
     ));
     write_jsonl(&iso, &[user_line(id, workspace, "hi iso")]);
     set_mtime(
@@ -495,7 +495,7 @@ fn live_isolated_session(
     );
     let sessions_dir = sb
         .home()
-        .join(format!(".clauth/profiles/{profile}/sessions-isolated"));
+        .join(format!(".tollgate/profiles/{profile}/sessions-isolated"));
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap();
@@ -505,7 +505,7 @@ fn live_isolated_session(
 /// An id that only exists in a live isolated runtime is not resumable: the spawn
 /// is `Isolation::Shared`, so Claude Code would look in the shared store and
 /// answer `No conversation found`. Refusing it is right; calling it missing is
-/// not, when `clauth sessions` lists it two lines up.
+/// not, when `tollgate sessions` lists it two lines up.
 #[test]
 fn resume_refuses_an_isolated_held_session_without_calling_it_missing() {
     let sb = HomeSandbox::new();
@@ -545,7 +545,7 @@ fn resume_refuses_an_isolated_held_session_without_calling_it_missing() {
 
 /// `latest` means the newest session. When a live isolated run holds that one,
 /// silently resolving to the second newest would spend an account window on a
-/// conversation the operator never named — and `clauth sessions` would still be
+/// conversation the operator never named — and `tollgate sessions` would still be
 /// listing the one they meant, first.
 #[test]
 fn latest_refuses_rather_than_substituting_when_an_isolated_run_holds_the_newest() {
@@ -577,7 +577,7 @@ fn latest_refuses_rather_than_substituting_when_an_isolated_run_holds_the_newest
     // of any live isolated run at all.
     set_mtime(
         &sb.home()
-            .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl"),
+            .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl"),
         SystemTime::UNIX_EPOCH + Duration::from_secs(500),
     );
     let resolved = resolve_session("latest");
@@ -607,14 +607,14 @@ fn a_nested_isolated_transcript_does_not_shadow_latest() {
 
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso");
     let nested = iso.join("siso/subagents/agent-abc.jsonl");
     write_jsonl(
         &nested,
         &[user_line("siso", &ws.to_string_lossy(), "nested")],
     );
     set_mtime(&nested, SystemTime::UNIX_EPOCH + Duration::from_secs(9_000));
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap(); // held so the runtime reads as live
@@ -643,7 +643,7 @@ fn a_nested_isolated_transcript_does_not_shadow_latest() {
     );
 }
 
-// ── clauth info ──
+// ── tollgate info ──
 
 #[test]
 fn info_prints_the_resume_command_workspace_and_storage() {
@@ -665,7 +665,7 @@ fn info_prints_the_resume_command_workspace_and_storage() {
     assert_eq!(
         info_lines(&session, None),
         format!(
-            "resume:    clauth resume known-session\nworkspace: /ws/a\nstorage:   {}",
+            "resume:    tollgate resume known-session\nworkspace: /ws/a\nstorage:   {}",
             path.display()
         )
     );
@@ -687,7 +687,7 @@ fn info_reports_a_held_session_without_offering_a_resume_command() {
     };
     let lines = info_lines(&hold.session, Some(&hold.profile));
     assert!(
-        !lines.contains("clauth resume"),
+        !lines.contains("tollgate resume"),
         "no resume command for a session a resume can't reach: {lines}"
     );
     assert!(
@@ -767,10 +767,10 @@ fn resume_refuses_an_explicit_disabled_profile_before_any_spawn() {
         run_resume("known-session", Some("off")).expect_err("a disabled target must be refused");
     assert_eq!(
         err.to_string(),
-        "'off': account is disabled, run `clauth enable off`"
+        "'off': account is disabled, run `tollgate enable off`"
     );
     assert!(
-        !sb.home().join(".clauth/profiles/off/runtime").exists(),
+        !sb.home().join(".tollgate/profiles/off/runtime").exists(),
         "the refusal must happen before any runtime is acquired"
     );
 }
@@ -809,7 +809,7 @@ fn resume_candidates_falls_back_when_the_default_is_disabled() {
     );
 }
 
-// ── clauth switch <sid> <profile> ───────────────────────────────────────────
+// ── tollgate switch <sid> <profile> ───────────────────────────────────────────
 //
 // The verb expresses INTENT only: it moves the registry row's intended member
 // through the same `live_sessions::update_as_daemon` seam the daemon's
@@ -838,7 +838,7 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
 }
 
 /// A live claude session's row: registered plus its liveness marker held, the
-/// state a running `clauth start` keeps.
+/// state a running `tollgate start` keeps.
 fn live_claude_row(sid: &str, profile: &str) -> std::fs::File {
     registry_row(sid, profile, crate::harness::Harness::Claude);
     crate::runtime::hold_session_row_marker(&crate::profile::ProfileName::from(profile), false, sid)
@@ -869,7 +869,7 @@ fn switch_refuses_an_unknown_sid_with_the_listing_hint() {
         let err = run_switch(sid, "work").expect_err("an unknown sid must be refused");
         assert_eq!(
             err.to_string(),
-            format!("no live session '{sid}'\nsee `clauth sessions`"),
+            format!("no live session '{sid}'\nsee `tollgate sessions`"),
             "the refusal names the sid and the listing verb"
         );
         assert!(
@@ -892,13 +892,13 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
     let err = run_switch("work", "spare").expect_err("a profile name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'work'\nsee `clauth sessions`\nto switch the global account: `clauth switch work`"
+        "no live session 'work'\nsee `tollgate sessions`\nto switch the global account: `tollgate switch work`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
 /// The hint resolves against BOTH rosters, exactly as `cmd_switch` does: a
-/// codex-only name is a working `clauth switch <name>` target too (it moves
+/// codex-only name is a working `tollgate switch <name>` target too (it moves
 /// the codex active marker), so the refusal must name the fix there as well.
 #[test]
 fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() {
@@ -912,7 +912,7 @@ fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() 
     let err = run_switch("cx", "spare").expect_err("a codex name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'cx'\nsee `clauth sessions`\nto switch the global account: `clauth switch cx`"
+        "no live session 'cx'\nsee `tollgate sessions`\nto switch the global account: `tollgate switch cx`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -926,7 +926,7 @@ fn switch_refuses_a_dead_session_row() {
     let err = run_switch("4242-0", "work").expect_err("a dead row must be refused");
     assert_eq!(
         err.to_string(),
-        "session '4242-0' is no longer running\nits row is reaped by the next `clauth daemon` or `clauth resume`"
+        "session '4242-0' is no longer running\nits row is reaped by the next `tollgate daemon` or `tollgate resume`"
     );
     assert!(
         err.downcast_ref::<crate::UsageError>().is_none(),
@@ -1011,7 +1011,7 @@ fn switch_points_the_row_at_the_named_profile_through_the_registry_seam() {
 fn switch_receipt_names_when_the_move_lands() {
     assert_eq!(
         switch_receipt("4242-0", "spare"),
-        "clauth: pointed session '4242-0' at 'spare'\nthe switch lands at the session's next \
+        "tollgate: pointed session '4242-0' at 'spare'\nthe switch lands at the session's next \
          request, never before it — a refused move is logged and the session stays put"
     );
 }
@@ -1034,7 +1034,7 @@ fn switch_is_a_no_op_for_a_session_already_on_the_profile() {
     );
     assert_eq!(
         already_on_line("4242-0", "work"),
-        "clauth: session '4242-0' is already on 'work'"
+        "tollgate: session '4242-0' is already on 'work'"
     );
 }
 
@@ -1078,15 +1078,15 @@ fn the_sessions_listing_rejects_extra_arguments() {
     use clap::Parser as _;
 
     let bare =
-        crate::cli::Cli::try_parse_from(["clauth", "sessions"]).expect("bare sessions parses");
+        crate::cli::Cli::try_parse_from(["tollgate", "sessions"]).expect("bare sessions parses");
     match bare.command {
         Some(crate::cli::Command::Sessions { .. }) => {}
-        other => panic!("bare `clauth sessions` must stay the listing: {other:?}"),
+        other => panic!("bare `tollgate sessions` must stay the listing: {other:?}"),
     }
 
     // The listing's flags belong to the bare form; passing one before an extra
     // argument is a usage error, never a listing that silently ignores it.
-    let err = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--json", "extra"])
+    let err = crate::cli::Cli::try_parse_from(["tollgate", "sessions", "--json", "extra"])
         .expect_err("extra args must be a usage error");
     assert_eq!(err.exit_code(), 2);
 }

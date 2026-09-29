@@ -1,12 +1,12 @@
-//! `clauth hook-profile-changed-note` — tell a running conversation when the
+//! `tollgate hook-profile-changed-note` — tell a running conversation when the
 //! account behind it changed.
 //!
 //! A conversation can move accounts three ways and none of them says so: a
 //! resume under another profile keeps the Claude Code session id and appends to
-//! the same transcript, a `clauth switch` lands while a global session works,
+//! the same transcript, a `tollgate switch` lands while a global session works,
 //! and a `--with-fallback` session executes a credential swap mid-run. One
 //! predicate answers all three — which account this conversation's credentials
-//! resolve to right now, against the last value clauth told this conversation —
+//! resolve to right now, against the last value tollgate told this conversation —
 //! so this reads a hook payload on stdin and emits `additionalContext` when those
 //! two differ. A second emit, the headroom nudge, rides the same subcommand: a
 //! parent-scope `Task` (agent-spawn) fire whose account's 5h window is
@@ -38,7 +38,7 @@
 //!   unbounded miss into a bounded one. Two costs, and the doc used to price
 //!   only the first (both measured by review, 2026-08-21, debug build):
 //!   a fire that OPENS the gate runs `load_config`, which chmod-walks the whole
-//!   `~/.clauth` tree, so this process mutates the filesystem when it resolves
+//!   `~/.tollgate` tree, so this process mutates the filesystem when it resolves
 //!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor);
 //!   and `reload_fingerprint` runs on EVERY fire, open or closed, at a readdir
 //!   plus two stats per profile (+342 µs at 2 profiles, +523 at 30, +651 at 60).
@@ -79,14 +79,14 @@ use serde::{Deserialize, Serialize};
 use crate::out::outln;
 use crate::profile::atomic_write_600;
 
-/// Dir under `~/.clauth` holding one record per conversation scope.
+/// Dir under `~/.tollgate` holding one record per conversation scope.
 const RECORDS_DIR: &str = "conversations";
 
 /// How long a record whose transcript is not on disk survives the sweep.
 ///
 /// The grace belongs on THIS branch, not on the ageing one below: a baseline
 /// recorded at `SessionStart` can land before Claude Code has created the
-/// transcript file, and a bare `!exists()` then lets any `clauth` invocation on
+/// transcript file, and a bare `!exists()` then lets any `tollgate` invocation on
 /// the box reap a live conversation's record — after which its next real account
 /// move is absorbed as a fresh baseline and never announced.
 ///
@@ -125,7 +125,7 @@ const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 /// The noun is "session", by owner ruling on 2026-08-21, superseding an earlier
 /// one here that said "conversation" and never "session". Carry the cost that
 /// ruling turned on rather than deleting it: every other "session" in
-/// model-facing clauth copy names the PROCESS, so after a swap the MCP block's
+/// model-facing tollgate copy names the PROCESS, so after a swap the MCP block's
 /// runtime-paths note and this note both say "session" about two things that
 /// disagree. Do not resolve that by mutating the block, which is settled against.
 enum Note<'a> {
@@ -144,14 +144,14 @@ impl Note<'_> {
     fn render(&self) -> String {
         match *self {
             Note::Resumed { now, before } => format!(
-                "clauth note: session resumed under `{now}`; earlier turns ran under `{before}`."
+                "tollgate note: session resumed under `{now}`; earlier turns ran under `{before}`."
             ),
             Note::Switched {
                 from,
                 to,
                 used: Some(used),
             } => format!(
-                "clauth note: the active profile for this session switched from `{from}` to `{to}`; its 5h window is {pct}% used.",
+                "tollgate note: the active profile for this session switched from `{from}` to `{to}`; its 5h window is {pct}% used.",
                 pct = crate::format::format_pct(used).trim_end_matches('%'),
             ),
             Note::Switched {
@@ -159,7 +159,7 @@ impl Note<'_> {
                 to,
                 used: None,
             } => format!(
-                "clauth note: the active profile for this session switched from `{from}` to `{to}`."
+                "tollgate note: the active profile for this session switched from `{from}` to `{to}`."
             ),
         }
     }
@@ -348,7 +348,7 @@ struct Reading {
 }
 
 /// The account a loaded config's credentials resolve to, through the same tier
-/// walk `clauth which` uses, stamped with the instant of the credential read.
+/// walk `tollgate which` uses, stamped with the instant of the credential read.
 /// The stamp is taken IMMEDIATELY before the resolve — the credential read is
 /// the first thing `resolve_active` does.
 ///
@@ -499,7 +499,7 @@ fn parse_payload(input: &str) -> Option<Payload> {
             // Absolute and non-empty, or it is not a path the SWEEP can test for
             // liveness. `Path::new("").exists()` is false, which reaped live
             // records; a relative one resolves against the sweeping process's
-            // cwd (a daemon, a `clauth start`), never the hook's.
+            // cwd (a daemon, a `tollgate start`), never the hook's.
             .filter(|p| !p.is_empty() && Path::new(p).is_absolute())
             .map(PathBuf::from),
     })
@@ -528,7 +528,7 @@ fn is_echoable_event(s: &str) -> bool {
 }
 
 fn records_dir() -> Result<PathBuf> {
-    Ok(crate::profile::clauth_dir()?.join(RECORDS_DIR))
+    Ok(crate::profile::tollgate_dir()?.join(RECORDS_DIR))
 }
 
 /// One record per (conversation, scope). The `.` separator is what keeps the two
@@ -546,7 +546,7 @@ pub(crate) fn load_record(path: &Path) -> Option<NoteRecord> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// Owner-only like every `~/.clauth` write: a record names the account a
+/// Owner-only like every `~/.tollgate` write: a record names the account a
 /// conversation runs on and where its transcript sits.
 pub(crate) fn store_record(path: &Path, record: &NoteRecord) -> Result<()> {
     atomic_write_600(path, serde_json::to_vec(record)?)?;
@@ -647,7 +647,7 @@ fn note_for_inner(
     };
 
     // Peek UNLOCKED, only to decide whether the slow half is needed. `resolve`
-    // goes through `load_config`, which chmod-walks the whole `~/.clauth` tree,
+    // goes through `load_config`, which chmod-walks the whole `~/.tollgate` tree,
     // and that must never run inside the hold below.
     let peek = load_record(&path);
     let fresh = match peek.as_ref().filter(|p| p.cache_holds(watch)) {
@@ -817,7 +817,7 @@ fn touch_record(path: &Path) {
 /// An exclusive hold over the records dir for one read-modify-write.
 ///
 /// A LEAF in the lock order: nothing is acquired while it is held, and the
-/// resolution that would reach `~/.clauth`'s own state lock runs before it. One
+/// resolution that would reach `~/.tollgate`'s own state lock runs before it. One
 /// lock file for the whole dir rather than one per scope, because the hold is a
 /// read plus a rename and the only contention is a fan-out's own fires, so
 /// per-scope granularity would buy nothing and add a second file to reap.
@@ -882,7 +882,7 @@ fn inherited_baseline(payload: &Payload) -> Option<String> {
 }
 
 /// The change test, against the record this scope carries. `current` is `None`
-/// when clauth cannot attribute the loaded credentials. `used` is the new
+/// when tollgate cannot attribute the loaded credentials. `used` is the new
 /// account's live 5h window percent — `None` renders the switched sentence
 /// without the headroom clause, the pre-r9 spelling for a usage-less account.
 fn decide(
@@ -892,7 +892,7 @@ fn decide(
     used: Option<f64>,
 ) -> Option<String> {
     // An unattributable credential is not evidence that anything moved: a
-    // disabled profile, a `claude login` clauth holds no copy of, and a config
+    // disabled profile, a `claude login` tollgate holds no copy of, and a config
     // it could not parse all land here. Leaving `told` standing is what keeps a
     // later real move rendering both real names instead of one and a shrug.
     let current = current?;
@@ -1096,8 +1096,8 @@ fn read_nudge(payload: &Payload, shared: Option<&crate::profile::AppConfig>) -> 
     }
     // A session the chain may move already hears about the move one tool call
     // after it lands — the account note's own job. The registry row is keyed by
-    // the clauth runtime sid, which this hook child reaches through the
-    // `CLAUDE_CONFIG_DIR` `clauth start` sets (the payload's `session_id` is
+    // the tollgate runtime sid, which this hook child reaches through the
+    // `CLAUDE_CONFIG_DIR` `tollgate start` sets (the payload's `session_id` is
     // Claude Code's conversation id, a different namespace). One lock-free row
     // read; no runtime dir (a bare `claude`) means no row, and no chain may
     // move a bare session either.
@@ -1283,7 +1283,7 @@ fn render_nudge(f: &NudgeFigures) -> Option<String> {
     let when = crate::format::local_stamp(f.when)?;
     let reset = crate::format::local_stamp(f.reset)?;
     Some(format!(
-        "clauth note: 5h window {}% used ({:.1}%/h). at this rate, it reaches its cap {}, resets {}. no fallback is set; further agent spawns may fail with 429s.",
+        "tollgate note: 5h window {}% used ({:.1}%/h). at this rate, it reaches its cap {}, resets {}. no fallback is set; further agent spawns may fail with 429s.",
         crate::format::format_pct(f.used).trim_end_matches('%'),
         f.rate,
         when,
@@ -1445,7 +1445,7 @@ pub(crate) fn gc_conversation_records() {
         return;
     };
     // Peek BEFORE locking, the way `gc_bare_markers` does and for the same
-    // reason: this runs at every `clauth mcp` boot and every `clauth start`, so
+    // reason: this runs at every `tollgate mcp` boot and every `tollgate start`, so
     // nothing to sweep must not pay an acquisition. It also keeps the
     // acquisition's `mkdir_700` off a box where the hook has never fired, which
     // would otherwise grow a records dir and a lock file from a sweep alone.

@@ -1,8 +1,8 @@
-//! Per-session `CLAUDE_CONFIG_DIR` trees used by `clauth start`.
+//! Per-session `CLAUDE_CONFIG_DIR` trees used by `tollgate start`.
 //!
-//! Every `clauth start <profile>` session gets its OWN runtime tree, keyed by a
+//! Every `tollgate start <profile>` session gets its OWN runtime tree, keyed by a
 //! session id (`<pid>-<seq>`):
-//! `~/.clauth/profiles/<profile>/runtime-<sid>/`, or `runtime-isolated-<sid>/`
+//! `~/.tollgate/profiles/<profile>/runtime-<sid>/`, or `runtime-isolated-<sid>/`
 //! for an isolated run. The one exception is a SHARED session under
 //! [`LinkMode::Fake`], which shares the bare-stem tree per profile (see the
 //! keying rule below). Its `.credentials.json` still resolves to the profile's
@@ -35,7 +35,7 @@
 //!   Code's `unlink + write` re-login replaces it with a regular file.
 //!
 //! - **Fake symlinks** (symlink creation denied, or the filesystem does not
-//!   support it, so `~/.clauth` on exFAT, FAT32 or SMB lands here on unix
+//!   support it, so `~/.tollgate` on exFAT, FAT32 or SMB lands here on unix
 //!   too): the runtime tree is built by recursive copy, and `.credentials.json`
 //!   is a regular file. The watchdog walks both sides every tick and
 //!   reconciles by "latest mtime wins" so a re-login on either side propagates
@@ -50,7 +50,7 @@
 //! only on macOS ([`rotation_blocked_for`]): elsewhere the session reads the
 //! very credential file a rotation writes and simply follows it, while on macOS
 //! its Claude Code reads a Keychain item namespaced per `CLAUDE_CONFIG_DIR` that
-//! clauth cannot write. Teardown drops the marker and discards the tree. That
+//! tollgate cannot write. Teardown drops the marker and discards the tree. That
 //! tree is the session's own except for a SHARED session under
 //! [`LinkMode::Fake`], which is discarded only once the last session of the
 //! profile has left; [`gc_stale_runtimes`] collects what a crashed session left
@@ -70,8 +70,8 @@ use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, clauth_dir, home_dir,
-    profile_dir, profile_subpath,
+    ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, home_dir, profile_dir,
+    profile_subpath, tollgate_dir,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +209,7 @@ impl std::fmt::Display for Isolation {
 
 /// Per-process counter making each `acquire`'s [`SessionId`] unique. A single
 /// process can hold several live sessions of the same profile+flavor at once —
-/// the `clauth mcp` server firing overlapping `delegate`s. Keying only on the
+/// the `tollgate mcp` server firing overlapping `delegate`s. Keying only on the
 /// pid would make the second acquire block forever on the first's `flock(2)` (an
 /// exclusive lock on a second fd of the same path waits), hanging the delegate in
 /// `acquire` with no session ever spawned.
@@ -263,7 +263,7 @@ pub(crate) fn is_session_id(s: &str) -> bool {
     })
 }
 
-/// True when `name` is one of the four shapes clauth gives a paired dir with
+/// True when `name` is one of the four shapes tollgate gives a paired dir with
 /// this stem: the legacy `<stem>` and `<stem>-isolated`, or the per-session
 /// `<stem>-<sid>` and `<stem>-isolated-<sid>`. The single parser behind every
 /// strict name check below, so the flavors and the two layouts cannot drift
@@ -284,12 +284,12 @@ fn is_runtime_dir_name(name: &str) -> bool {
     is_paired_dir_name(name, RUNTIME_STEM)
 }
 
-/// Whether `path` is a clauth CLAUDE runtime tree by position as well as name
+/// Whether `path` is a tollgate CLAUDE runtime tree by position as well as name
 /// — `…/profiles/<name>/runtime*`, either flavor. The claude twin of
 /// [`is_codex_home_path`], for the cross-harness env hygiene a codex spawn
 /// performs: an inherited `CLAUDE_CONFIG_DIR` is scrubbed only when it names
-/// a tree clauth built, never the operator's own custom dir.
-pub(crate) fn is_clauth_runtime_path(path: &Path) -> bool {
+/// a tree tollgate built, never the operator's own custom dir.
+pub(crate) fn is_tollgate_runtime_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(is_runtime_dir_name)
@@ -322,7 +322,7 @@ fn is_rescuing_runtime_dir_name(name: &str) -> bool {
 /// True for a SHARED runtime dir name — a per-session `runtime-<sid>` or the
 /// legacy bare `runtime` — and false for the isolated flavor or any unrelated
 /// name. Callers that must reach only shared copies (both config reconcilers,
-/// `clauth which`) key on this rather than an exact name.
+/// `tollgate which`) key on this rather than an exact name.
 pub(crate) fn is_shared_runtime_dir_name(name: &str) -> bool {
     is_runtime_dir_name(name) && !name.starts_with(ISOLATED_RUNTIME_STEM)
 }
@@ -366,13 +366,14 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
 }
 
 /// Drop from `command` each session home it would inherit that names a tree
-/// clauth built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
-/// codex home. A process spawned from inside a clauth session otherwise
-/// answers as that session (`clauth which`, a `codex` run landing in another
+/// tollgate built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
+/// codex home. A process spawned from inside a tollgate session otherwise
+/// answers as that session (`tollgate which`, a `codex` run landing in another
 /// profile's home) and keeps pointing at its tree after teardown. The user's
 /// own custom dirs are theirs and stay.
-pub(crate) fn scrub_clauth_homes(command: &mut std::process::Command) {
-    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| is_clauth_runtime_path(Path::new(&v)))
+pub(crate) fn scrub_tollgate_homes(command: &mut std::process::Command) {
+    if std::env::var_os("CLAUDE_CONFIG_DIR")
+        .is_some_and(|v| is_tollgate_runtime_path(Path::new(&v)))
     {
         command.env_remove("CLAUDE_CONFIG_DIR");
     }
@@ -533,7 +534,7 @@ pub(crate) fn hold_session_row_marker(
 }
 
 fn profiles_root_dir() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("profiles"))
+    Ok(tollgate_dir()?.join("profiles"))
 }
 
 /// Every marker dir under the profile: each live session's own
@@ -570,7 +571,7 @@ fn session_marker_dirs(name: &ProfileName) -> Option<Vec<PathBuf>> {
     Some(dirs)
 }
 
-/// True iff the profile has at least one live `clauth start` session, in ANY of
+/// True iff the profile has at least one live `tollgate start` session, in ANY of
 /// its marker dirs and of either flavor. Gates the destructive account actions
 /// (delete, disable) everywhere, and on macOS every rotation leg too
 /// ([`rotation_blocked_for`]).
@@ -593,13 +594,13 @@ pub(crate) fn has_live_session(name: &ProfileName) -> bool {
     }
 }
 
-/// Whether a live `clauth start` session must block rotating this profile's
+/// Whether a live `tollgate start` session must block rotating this profile's
 /// chain. Kept PURE (the caller reads `cfg!`) so both arms run from a Linux
 /// test, like [`swap_support`].
 ///
 /// macOS only, and NOT for the double-spend reason the pre-2026-07-26 code gave
 /// — a double-spend costs one failed request, not the account. The real
-/// mechanism is that clauth cannot reach the credential a `clauth start`
+/// mechanism is that tollgate cannot reach the credential a `tollgate start`
 /// session's Claude Code actually reads. That child runs with
 /// `CLAUDE_CONFIG_DIR=<runtime>`, and CC namespaces its Keychain item per config
 /// dir (`Claude Code-credentials-<sha256(dir)[0:8]>`)
@@ -614,8 +615,8 @@ pub(crate) fn has_live_session(name: &ProfileName) -> bool {
 /// mid-task.
 ///
 /// A bare `claude` is deliberately NOT covered: it reads the unsuffixed item
-/// clauth does write, so rotating it propagates normally. [`has_live_session`]
-/// counts only `clauth start` sessions, so it already draws that line.
+/// tollgate does write, so rotating it propagates normally. [`has_live_session`]
+/// counts only `tollgate start` sessions, so it already draws that line.
 ///
 /// This dissolves the moment [`crate::keychain`] derives the namespaced service
 /// name. Every site that refuses goes
@@ -626,7 +627,7 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
     is_macos && has_live_session
 }
 
-/// Whether ANY live `clauth start` session that has run on `name` HOLDS a
+/// Whether ANY live `tollgate start` session that has run on `name` HOLDS a
 /// credential that carries a refresh token — the only kind a rotation can
 /// strand. The holding is read off the row's `launch_store`, which every swap
 /// repoints at the member the session then reads, so the verdict follows the
@@ -634,7 +635,7 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 ///
 /// [`rotation_blocked_by_live_session`] spells out why a live session blocks
 /// rotation on macOS: that session's Claude Code holds the pair in a Keychain
-/// item clauth cannot write, so a rotation leaves it spending a superseded
+/// item tollgate cannot write, so a rotation leaves it spending a superseded
 /// refresh token, and the `invalid_grant` that follows blanks its item and
 /// signs the session out mid-task. Every step of that mechanism needs a refresh
 /// token to attempt. A session holding a `session-token.json` sidecar has
@@ -655,7 +656,7 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 ///
 /// EVERY unknown reads as rotatable, matching [`has_live_session`]'s own
 /// fail-closed asymmetry: an unreadable marker dir, a marker with no registry
-/// row (`acquire` tolerates a failed registration), a row from a clauth that
+/// row (`acquire` tolerates a failed registration), a row from a tollgate that
 /// predates `launch_store`, and an unreadable or half-written credential file
 /// all return `true` and refuse exactly as today. The one readable shape that
 /// ALLOWS is a file that parses with no `claudeAiOauth` block at all (`{}`):
@@ -740,7 +741,7 @@ fn fanout_warning(
     let n = sessions_holding_store(profile, store, session) + 1;
     (n >= 2).then(|| {
         format!(
-            "clauth: warning: '{profile}' has {n} live sessions sharing one rotating login; run `clauth rolling-token {profile}` before one refresh signs the others out"
+            "tollgate: warning: '{profile}' has {n} live sessions sharing one rotating login; run `tollgate rolling-token {profile}` before one refresh signs the others out"
         )
     })
 }
@@ -787,7 +788,7 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
-/// Count of live `clauth start` sessions for the profile: the flock-held markers
+/// Count of live `tollgate start` sessions for the profile: the flock-held markers
 /// across every marker dir, one per session. Reports 1 on an unknown, so it never
 /// contradicts [`has_live_session`] within a tick.
 ///
@@ -841,17 +842,17 @@ pub(crate) fn live_sessions_at(sessions: &Path) -> Option<usize> {
 }
 
 /// Liveness markers standing in for BARE `claude` sessions — the ones started
-/// without `clauth start`, reading the `~/.claude/.credentials.json` link clauth
-/// owns. One flock-held `<pid>` file per `clauth mcp` server that reads those
+/// without `tollgate start`, reading the `~/.claude/.credentials.json` link tollgate
+/// owns. One flock-held `<pid>` file per `tollgate mcp` server that reads those
 /// global credentials ([`live_bare_sessions`] states how tight that stand-in is),
 /// deliberately OUTSIDE `profiles/`:
 /// [`session_marker_dirs`] scans a profile dir for names starting with
 /// `SESSIONS_STEM`, so nothing here can reach [`has_live_session`] and the
-/// delete, disable, and macOS rotation gates keep counting `clauth start`
-/// sessions only. A bare session holds no credential clauth handed it and none
+/// delete, disable, and macOS rotation gates keep counting `tollgate start`
+/// sessions only. A bare session holds no credential tollgate handed it and none
 /// it could not already read, so it is a display fact, not a gate.
 fn live_bare_dir() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("live_bare"))
+    Ok(tollgate_dir()?.join("live_bare"))
 }
 
 /// Stamp a marker for THIS process; the flock is held for exactly as long as the
@@ -882,14 +883,14 @@ pub(crate) fn register_bare_session() -> Result<File> {
 /// and the one caller that exists picks zero (see
 /// [`crate::live_sessions::LiveTally::collect`]).
 ///
-/// This is a `clauth mcp` count STANDING IN for a bare `claude` count, and the
-/// approximation is loose in both directions. Under: a `claude` with no clauth
+/// This is a `tollgate mcp` count STANDING IN for a bare `claude` count, and the
+/// approximation is loose in both directions. Under: a `claude` with no tollgate
 /// MCP server wired boots none, so it is counted nowhere. Over: a plugin install
-/// and a manual `mcpServers.clauth` entry are namespaced separately by Claude
+/// and a manual `mcpServers.tollgate` entry are namespaced separately by Claude
 /// Code and coexist after an upgrade (`plugin_global` and `manual_global` are
 /// independent in `tui::app`, and the tab stops offering the fix once either
 /// wires it), so one session can boot two servers and render as two; and any
-/// non-Claude-Code MCP client pointed at `clauth mcp` renders as a bare `claude`,
+/// non-Claude-Code MCP client pointed at `tollgate mcp` renders as a bare `claude`,
 /// since nothing here reads who the client says it is.
 pub(crate) fn live_bare_sessions() -> Option<usize> {
     live_sessions_at(&live_bare_dir().ok()?)
@@ -914,12 +915,12 @@ pub(crate) fn gc_stale_runtimes() {
     // macOS: one shared subprocess budget spans every Keychain item delete the
     // tree sweep performs below — the daemon-tick shape, not a fresh budget per
     // pair: a sweep collecting many stale trees must not multiply a stuck
-    // keychain's per-call ceiling across them on the `clauth start` / MCP-boot
+    // keychain's per-call ceiling across them on the `tollgate start` / MCP-boot
     // paths this runs on. Arm-if-not-armed, so a caller that already armed a
     // wider one is adopted rather than replaced.
     #[cfg(target_os = "macos")]
     let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
-    // The Plugin tab's boot probe kills its `clauth mcp` child within 3 s, so
+    // The Plugin tab's boot probe kills its `tollgate mcp` child within 3 s, so
     // the tree sweep skips there WHOLE: on macOS it spends `security`
     // subprocesses collecting the removed trees' Keychain items, and on every
     // platform it takes the state flock per pair against the 25 s deadline a
@@ -1183,7 +1184,7 @@ pub(crate) mod namespaced_keychain_ledger {
     }
 
     pub(crate) fn path() -> Result<PathBuf> {
-        Ok(clauth_dir()?.join(PATH))
+        Ok(tollgate_dir()?.join(PATH))
     }
 
     pub(crate) fn load() -> Result<Owners> {
@@ -1194,8 +1195,8 @@ pub(crate) mod namespaced_keychain_ledger {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Owners::default()),
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
         };
-        // The ledger is an external boundary: what a clauth writer records is
-        // always shape-valid, so anything outside the shapes clauth itself
+        // The ledger is an external boundary: what a tollgate writer records is
+        // always shape-valid, so anything outside the shapes tollgate itself
         // mints is a hand edit or corruption and must fail the WHOLE ledger
         // closed — an invalid row can never mint delete authority, and neither
         // can its valid siblings.
@@ -1230,7 +1231,7 @@ pub(crate) mod namespaced_keychain_ledger {
         if let Some(parent) = path.parent() {
             crate::profile::mkdir_700(parent)
                 .context("failed to create the namespaced Keychain ownership ledger directory")?;
-            crate::profile::enforce_clauth_perms(parent);
+            crate::profile::enforce_tollgate_perms(parent);
         }
         let bytes = serde_json::to_vec_pretty(owners)
             .context("failed to serialize the namespaced Keychain ownership ledger")?;
@@ -1329,7 +1330,7 @@ pub(crate) mod namespaced_keychain_ledger {
     }
 
     pub(crate) fn in_flight_path() -> Result<PathBuf> {
-        Ok(clauth_dir()?.join(IN_FLIGHT_PATH))
+        Ok(tollgate_dir()?.join(IN_FLIGHT_PATH))
     }
 
     /// Seconds since the UNIX epoch; 0 on a pre-epoch clock, which reads every
@@ -1383,7 +1384,7 @@ pub(crate) mod namespaced_keychain_ledger {
     }
 
     /// Load the in-flight record under the same external-boundary rule the
-    /// ownership ledger loads under: clauth-minted rows are always
+    /// ownership ledger loads under: tollgate-minted rows are always
     /// shape-valid, so anything else is a hand edit or corruption and fails
     /// the WHOLE record closed — an unreadable record must never read as "no
     /// delete in flight".
@@ -1414,7 +1415,7 @@ pub(crate) mod namespaced_keychain_ledger {
         if let Some(parent) = path.parent() {
             crate::profile::mkdir_700(parent)
                 .context("failed to create the in-flight-delete record directory")?;
-            crate::profile::enforce_clauth_perms(parent);
+            crate::profile::enforce_tollgate_perms(parent);
         }
         let bytes = serde_json::to_vec_pretty(deletes)
             .context("failed to serialize the in-flight-delete record")?;
@@ -1661,14 +1662,14 @@ pub(crate) mod namespaced_keychain_ledger {
 }
 
 /// Drop the markers of bare `claude` sessions that have exited — the ordinary
-/// case, since such a session never runs clauth code and leaves its file behind.
+/// case, since such a session never runs tollgate code and leaves its file behind.
 /// The same per-entry prune the paired trees get, minus the tree removal: this
 /// dir holds nothing but markers, so no `remove_dir_all` is handed anything here.
 fn gc_bare_markers() {
     let Ok(dir) = live_bare_dir() else {
         return;
     };
-    // Peek before locking. This runs at every `clauth mcp` boot — including the
+    // Peek before locking. This runs at every `tollgate mcp` boot — including the
     // Plugin tab's probe child, which dies at 3s — while the state flock waits up
     // to `STATE_LOCK_TIMEOUT` and is legitimately held ~20s by a macOS switch's
     // keychain shell-out. Nothing to prune must not pay that wait. A marker that
@@ -1700,7 +1701,7 @@ fn gc_live_session_rows() {
         if !session_row_is_live(&probe, row.isolated, &row.session_id)
             && let Err(e) = crate::live_sessions::unregister(&row.session_id)
         {
-            logline!("clauth: dropping stale live-session row failed: {e}");
+            logline!("tollgate: dropping stale live-session row failed: {e}");
         }
     }
 }
@@ -1719,7 +1720,7 @@ pub(crate) fn rescue_isolated_runtime(iso_root: &Path, claude_home: &Path) -> (u
     let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
     if moved > 0 || sidecars > 0 {
         logline!(
-            "clauth: rescued {moved} isolated session transcript(s) \
+            "tollgate: rescued {moved} isolated session transcript(s) \
              + {sidecars} sidecar file(s) into the global store"
         );
     }
@@ -1738,7 +1739,7 @@ fn rescue_tombstone(tombstone: &Path) {
         }
         Err(e) => {
             logline!(
-                "clauth: cannot rescue isolated runtime {}: {e}",
+                "tollgate: cannot rescue isolated runtime {}: {e}",
                 tombstone.display()
             );
             return;
@@ -1746,7 +1747,7 @@ fn rescue_tombstone(tombstone: &Path) {
     }
     if let Err(e) = std::fs::remove_dir_all(tombstone) {
         logline!(
-            "clauth: failed to remove rescued isolated runtime {}: {e}",
+            "tollgate: failed to remove rescued isolated runtime {}: {e}",
             tombstone.display()
         );
     }
@@ -1809,7 +1810,7 @@ fn gc_one_pair_synced(
                 Ok(_) => {
                     if let Err(e) = std::fs::rename(runtime, &tombstone) {
                         logline!(
-                            "clauth: failed to rename isolated runtime {} for rescue: {e}",
+                            "tollgate: failed to rename isolated runtime {} for rescue: {e}",
                             runtime.display()
                         );
                         let _ = std::fs::remove_dir(sessions);
@@ -1820,7 +1821,7 @@ fn gc_one_pair_synced(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => logline!(
-                    "clauth: cannot stat isolated runtime {} for rescue: {e}",
+                    "tollgate: cannot stat isolated runtime {} for rescue: {e}",
                     runtime.display()
                 ),
             }
@@ -1945,7 +1946,7 @@ fn gc_keychain_recheck(
             Ok(in_flight) => Ok(Some(in_flight)),
             Err(e) => {
                 logline!(
-                    "clauth: cannot stamp the in-flight-delete record for {service} ({e:#}); its \
+                    "tollgate: cannot stamp the in-flight-delete record for {service} ({e:#}); its \
                      item is not collected — a delete whose in-flight record cannot be persisted \
                      must not run"
                 );
@@ -1994,7 +1995,7 @@ fn collect_orphaned_keychain_item(in_flight: namespaced_keychain_ledger::InFligh
             let retirement = namespaced_keychain_ledger::retire(&service);
             let cleared = in_flight.clear();
             logline!(
-                "clauth: collected the orphaned per-session Keychain item {service} (its runtime tree \
+                "tollgate: collected the orphaned per-session Keychain item {service} (its runtime tree \
                  is gone); {}; {}; {}",
                 crate::claude::salvage_tail(&salvage),
                 crate::claude::retirement_tail(&retirement),
@@ -2004,7 +2005,7 @@ fn collect_orphaned_keychain_item(in_flight: namespaced_keychain_ledger::InFligh
         Err(e) => {
             let cleared = in_flight.clear();
             logline!(
-                "clauth: collecting the orphaned per-session Keychain item {service} failed: {e:#}. It \
+                "tollgate: collecting the orphaned per-session Keychain item {service} failed: {e:#}. It \
                  holds a login only the removed tree's dir resolved, so it stays inert in the Keychain \
                  until a later sweep or census removes it; {}",
                 crate::claude::in_flight_tail(&cleared)
@@ -2122,14 +2123,14 @@ fn canonical_credentials(name: &ProfileName) -> Result<PathBuf> {
     // rotations (exempted from the live-session bail only for ARMED
     // sidecars) could still race a hand-armed state. Best-effort by design.
     crate::claude::arm_rolling_from_disk(name);
-    // CLA-SPLIT: a `clauth start` session runs on what a switch would install —
+    // CLA-SPLIT: a `tollgate start` session runs on what a switch would install —
     // the static session token when the profile has one. The rotating usage
     // pair in `credentials.json` must never be handed to a session (it would
     // re-arm the session-vs-refresher single-use-chain race the split removes).
     crate::claude::install_source_path(name)
 }
 
-/// Where `name`'s rotation lock lives: `~/.clauth/rotation-locks/<name>.lock`,
+/// Where `name`'s rotation lock lives: `~/.tollgate/rotation-locks/<name>.lock`,
 /// deliberately OUTSIDE the profile directory.
 ///
 /// Inside it, `actions::delete_profile`'s `remove_dir_all` unlinked the very
@@ -2150,19 +2151,19 @@ fn canonical_credentials(name: &ProfileName) -> Result<PathBuf> {
 /// the same name locks the same inode and nothing carries over), and the ceiling
 /// is one empty file per name ever used. Its cost is one `symlink_metadata` per
 /// orphan on each unix `load_config`, which walks the whole tree through
-/// `enforce_clauth_perms` — that is the syscall the code makes, read off it and
+/// `enforce_tollgate_perms` — that is the syscall the code makes, read off it and
 /// not timed, so treat the magnitude as unmeasured. If it ever matters, the
 /// upgrade is a sweep over this directory keyed on names absent from state,
 /// taking each lock before unlinking it — never a reap inside the delete, which
 /// would unlink a lock its own caller is holding.
 pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
-    Ok(clauth_dir()?
+    Ok(tollgate_dir()?
         .join("rotation-locks")
         .join(format!("{name}.lock")))
 }
 
 /// Cross-process advisory lock serializing a token rotation against a
-/// `clauth start` session acquire for the SAME profile.
+/// `tollgate start` session acquire for the SAME profile.
 ///
 /// A refresh token is single-use: once `oauth::refresh_result` spends it the server
 /// kills it, and a second refresh of the same token returns `invalid_grant`,
@@ -2184,7 +2185,7 @@ pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
 ///   picks the new pair up on its next request, so what the lock buys there is
 ///   ordering alone: the two rotations serialize instead of double-spending.
 ///
-/// Distinct from `~/.clauth/.lock` (global state) and a session's own marker
+/// Distinct from `~/.tollgate/.lock` (global state) and a session's own marker
 /// file (per-session liveness). [`RotationGuard::acquire`] blocks with no
 /// deadline; [`RotationGuard::acquire_with_timeout`] is the bounded form a
 /// session start takes.
@@ -2225,7 +2226,7 @@ pub(crate) struct RotationGuard {
 ///   `oauth::apply_rotated_tokens_locked` runs its mirror AFTER the closure ends,
 ///   where nothing clamps it. Kept in the sum on every host, for the reason stated
 ///   at the constant.
-/// - [`SESSION_SEED_BUDGET`] — a macOS `clauth start` seeds the session's
+/// - [`SESSION_SEED_BUDGET`] — a macOS `tollgate start` seeds the session's
 ///   per-config-dir Keychain item under this same lock (past the state flock,
 ///   before the guard drops), spending one shared budget across the carry and
 ///   the write. Same non-waste reasoning off macOS as the mirror term.
@@ -2324,7 +2325,7 @@ pub(crate) fn set_rotation_lock_timeout_override(timeout: Option<Duration>) {
 }
 
 /// The profile's rotation lock could not be taken within its deadline: another
-/// clauth process is rotating this account's chain or starting a session on it.
+/// tollgate process is rotating this account's chain or starting a session on it.
 ///
 /// A recoverable, retry-later condition kept as a distinct type (surfaced through
 /// `anyhow`) so a caller can `downcast_ref` and retry rather than read it as a
@@ -2420,7 +2421,7 @@ impl RotationGuard {
     ///
     /// The helper is deliberately not joined. It resolves no path and reads no
     /// config — it holds an already-open fd and calls `lock()` — so it cannot
-    /// reach a real `~/.clauth` after a test's home override clears, which is
+    /// reach a real `~/.tollgate` after a test's home override clears, which is
     /// what `testutil::HomeSandbox`'s join is for. On the timeout path the send
     /// finds no receiver, the `File` drops with the `SendError`, and the flock
     /// releases the moment the wedge does.
@@ -2429,7 +2430,7 @@ impl RotationGuard {
     /// parked thread and one open fd per TIMED-OUT acquisition, for the wedge's
     /// lifetime, with no cap. An uncontended acquire spawns nothing and a waited-out
     /// one drains at the handoff, so only a caller retrying against a wedge
-    /// accumulates — a `clauth mcp` agent re-issuing `delegate` is the shape.
+    /// accumulates — a `tollgate mcp` agent re-issuing `delegate` is the shape.
     /// Releasing the wedge drains every one of them promptly, and each drains by
     /// taking the flock for an instant, which a concurrent `try_acquire` reads as
     /// contention. The ceiling that matters is the process fd limit: at a 1024 soft
@@ -2447,7 +2448,7 @@ impl RotationGuard {
         let (tx, rx) = crossbeam_channel::bounded::<std::io::Result<File>>(1);
         let display = path.display().to_string();
         thread::Builder::new()
-            .name(format!("clauth-rotwait-{name}"))
+            .name(format!("tollgate-rotwait-{name}"))
             .spawn(move || {
                 let taken = file.lock();
                 let _ = tx.send(taken.map(|()| file));
@@ -2473,7 +2474,7 @@ impl RotationGuard {
                 // off a TTY the logline and the error both land on stderr, and a
                 // verbatim copy of the sentence the caller is about to render
                 // helps nobody. What a wedge diagnosis wants is the file.
-                logline!("clauth: {timed_out} ({display})");
+                logline!("tollgate: {timed_out} ({display})");
                 Err(anyhow::Error::new(timed_out))
             }
         }
@@ -2482,7 +2483,7 @@ impl RotationGuard {
     /// Like [`RotationGuard::acquire`], but `Ok(None)` when another holder has
     /// the lock instead of parking behind it. For callers on threads that must
     /// never wait at all — the scheduler's tick thread above all, where a
-    /// `clauth start` holding this lock across its recursive `~/.claude` copy
+    /// `tollgate start` holding this lock across its recursive `~/.claude` copy
     /// would otherwise stall every account's poll while the heartbeat (stamped
     /// in the main loop, not here) stays fresh.
     pub(crate) fn try_acquire(name: &ProfileName) -> Result<Option<Self>> {
@@ -2501,7 +2502,7 @@ impl RotationGuard {
 /// Open or create a PID file without truncating — used for session liveness
 /// tracking via flock. `O_CREAT` without truncate preserves any existing lock
 /// held by a sibling that raced us to create the file. Owner-only (0o600) via
-/// [`crate::profile::open_state_file`], the shared opener for every `~/.clauth`
+/// [`crate::profile::open_state_file`], the shared opener for every `~/.tollgate`
 /// lock (this also covers the rotation lock at [`rotation_lock_path`], opened
 /// through here).
 pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
@@ -2949,7 +2950,7 @@ fn converge_transition_holds(current: &Path, selected: &Path) -> bool {
     refreshable && refreshless
 }
 
-/// The per-session credential swap executor: a live `clauth start` session moving
+/// The per-session credential swap executor: a live `tollgate start` session moving
 /// from the account it launched on to another chain member, without a restart and
 /// without letting a rotation spend a single-use refresh token the live Claude
 /// Code child still holds.
@@ -3079,7 +3080,7 @@ impl SessionSwap {
     /// The swap leg of this session's own watchdog tick: execute a move when the
     /// daemon has named a member that differs from the one the link resolves to.
     /// The daemon writes `intended_member` only for a row whose `follows_chain`
-    /// is set (`clauth start --with-fallback` requests that), and `clauth
+    /// is set (`tollgate start --with-fallback` requests that), and `tollgate
     /// switch <sid> <profile>` writes one for any live claude row, so a plain
     /// `start` session no writer has targeted polls and finds nothing to do.
     fn poll(&self) {
@@ -3093,10 +3094,10 @@ impl SessionSwap {
         let sid = self.session.as_str();
         match self.swap_to(&intended) {
             Ok(SwapOutcome::Swapped) => {
-                logline!("clauth: session {sid} swapped onto {intended}");
+                logline!("tollgate: session {sid} swapped onto {intended}");
             }
             Ok(SwapOutcome::Refused(why)) => self.announce_refusal(&intended, why),
-            Err(e) => logline!("clauth: session {sid} could not swap onto {intended}: {e:#}"),
+            Err(e) => logline!("tollgate: session {sid} could not swap onto {intended}: {e:#}"),
         }
     }
 
@@ -3113,13 +3114,13 @@ impl SessionSwap {
         match self.swap_to(&member) {
             Ok(SwapOutcome::Swapped) => {
                 logline!(
-                    "clauth: session {} converged onto {member}'s rolling token",
+                    "tollgate: session {} converged onto {member}'s rolling token",
                     self.session.as_str()
                 );
             }
             Ok(SwapOutcome::Refused(_)) => {}
             Err(e) => logline!(
-                "clauth: session {} could not converge onto {member}'s rolling token: {e:#}",
+                "tollgate: session {} could not converge onto {member}'s rolling token: {e:#}",
                 self.session.as_str()
             ),
         }
@@ -3132,7 +3133,7 @@ impl SessionSwap {
     fn announce_refusal(&self, intended: &str, why: SwapRefused) {
         if self.should_announce(intended, &why) {
             logline!(
-                "clauth: session {} stays on {}: {intended} is not swappable ({why})",
+                "tollgate: session {} stays on {}: {intended} is not swappable ({why})",
                 self.session.as_str(),
                 self.member()
             );
@@ -3311,7 +3312,7 @@ impl SessionSwap {
                 })
             {
                 logline!(
-                    "clauth: session {} swapped onto {} but its row did not update: {e:#}",
+                    "tollgate: session {} swapped onto {} but its row did not update: {e:#}",
                     self.session.as_str(),
                     plan.member
                 );
@@ -3403,7 +3404,7 @@ impl SessionSwap {
                                     self.retouch_after_item_leg(&plan);
                                 }
                                 Err(e) => logline!(
-                                    "clauth: session {} swapped onto {} but writing its per-session \
+                                    "tollgate: session {} swapped onto {} but writing its per-session \
                                      Keychain item failed: {e:#}. The session keeps authenticating as its \
                                      previous member; only a later swap onto another member re-runs the \
                                      write",
@@ -3440,7 +3441,7 @@ impl SessionSwap {
                                 // be spending, the same fail-closed direction
                                 // a failed write takes.
                                 Ok(crate::keychain::SignOutOutcome::SkippedLocked) => logline!(
-                                    "clauth: session {} swapped onto {} but signing its per-session \
+                                    "tollgate: session {} swapped onto {} but signing its per-session \
                                      Keychain item out was skipped: the keychain is locked, so the \
                                      item was left untouched and the session keeps authenticating as \
                                      its previous member. Rotations stay refused for it; only a later \
@@ -3449,7 +3450,7 @@ impl SessionSwap {
                                     plan.member
                                 ),
                                 Err(e) => logline!(
-                                    "clauth: session {} swapped onto {} but signing its per-session \
+                                    "tollgate: session {} swapped onto {} but signing its per-session \
                                      Keychain item out failed: {e:#}. The session keeps authenticating as \
                                      its previous member, so the file layer this swap moved is not what \
                                      its Claude Code reads; only a later swap onto another member re-runs \
@@ -3462,7 +3463,7 @@ impl SessionSwap {
                     }
                 }
                 Err(e) => logline!(
-                    "clauth: session {} swapped onto {} but carrying the previous member's \
+                    "tollgate: session {} swapped onto {} but carrying the previous member's \
                      Keychain pair back into its store failed: {e:#}. The per-session Keychain \
                      item was left untouched, so the session keeps authenticating as its \
                      previous member; only a later swap onto another member re-runs both legs",
@@ -3579,7 +3580,7 @@ impl SessionSwap {
                                     &SwapRefused::ConvergeSignOutFailed(class),
                                 ) {
                                     logline!(
-                                        "clauth: session {} could not converge onto {}'s rolling \
+                                        "tollgate: session {} could not converge onto {}'s rolling \
                                          token: signing its per-session Keychain item out failed: \
                                          {e:#}. The session stays on the rotating pair; the next \
                                          poll retries",
@@ -3616,7 +3617,7 @@ impl SessionSwap {
                         &SwapRefused::ConvergeCarryFailed(class),
                     ) {
                         logline!(
-                            "clauth: session {} could not converge onto {}'s rolling token: \
+                            "tollgate: session {} could not converge onto {}'s rolling token: \
                              carrying the per-session Keychain pair back into the rotating store \
                              failed: {e:#}. The session stays on the rotating pair; the next poll \
                              retries",
@@ -3669,7 +3670,7 @@ impl SessionSwap {
                 })
             {
                 logline!(
-                    "clauth: session {} converged onto {}'s rolling token but its row did not \
+                    "tollgate: session {} converged onto {}'s rolling token but its row did not \
                      update: {e:#}",
                     self.session.as_str(),
                     plan.member
@@ -3693,7 +3694,7 @@ impl SessionSwap {
             fields.set_launch_store(plan.store.clone())
         }) {
             logline!(
-                "clauth: session {} swapped onto {} but its row's store did not follow: {e:#}. \
+                "tollgate: session {} swapped onto {} but its row's store did not follow: {e:#}. \
                  Rotations stay refused for the member it left",
                 self.session.as_str(),
                 plan.member
@@ -3715,7 +3716,7 @@ impl SessionSwap {
     fn retouch_after_item_leg(&self, plan: &SwapPlan) {
         if let Err(e) = with_state_lock(|_held| touch_store(plan, file_mtime(&plan.store))) {
             logline!(
-                "clauth: session {} swapped onto {} but re-stamping its store after the \
+                "tollgate: session {} swapped onto {} but re-stamping its store after the \
                  Keychain leg failed: {e:#}. A request sent during the swap may keep the \
                  session on its previous member until the store is next written",
                 self.session.as_str(),
@@ -3740,7 +3741,7 @@ impl SessionSwap {
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 logline!(
-                    "clauth: remove swapped marker {} failed: {e}",
+                    "tollgate: remove swapped marker {} failed: {e}",
                     pid_file.display()
                 );
             }
@@ -3793,7 +3794,7 @@ pub(crate) struct ProfileRuntime {
 /// `try_acquire` that REFUSES rather than queues. That is the rotation guard's
 /// doing, not the flock's — against that actor this gate's placement changes no
 /// outcome at all. What the flock placement buys is the mutation holding NO
-/// rotation lock: a clauth predating the guard witness on
+/// rotation lock: a tollgate predating the guard witness on
 /// `actions::delete_profile`, where the state flock is the only serialization
 /// point the two versions share.
 ///
@@ -3825,7 +3826,7 @@ pub(crate) struct ProfileRuntime {
 fn refuse_if_unconfigured(name: &ProfileName) -> Result<()> {
     // Deliberately NOT the `cfg!(test) ||` form its two neighbours in this file
     // carry. Their escape exists because their unit tests drive them with no home
-    // sandbox, so demanding the flock would lock the operator's real `~/.clauth`.
+    // sandbox, so demanding the flock would lock the operator's real `~/.tollgate`.
     // This has one call site, inside the hold, and no test drives it as a unit —
     // so the flock is already held by construction and the escape would only make
     // the assert dead in the debug test leg, the one place a misplacement gets
@@ -3849,7 +3850,7 @@ fn refuse_if_unconfigured(name: &ProfileName) -> Result<()> {
     {
         anyhow::bail!(
             "'{name}' was deleted or renamed while this session was starting, \
-             run `clauth list` to see the accounts that are left"
+             run `tollgate list` to see the accounts that are left"
         );
     }
     Ok(())
@@ -3986,11 +3987,11 @@ impl ProfileRuntime {
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
             let mode = detect_link_mode(&profile_root)?;
             // A sid is a NAME, not a claim. `<pid>-<seq>` collides only when a
-            // second LIVE process minted the same pair, which needs a `~/.clauth`
+            // second LIVE process minted the same pair, which needs a `~/.tollgate`
             // shared across pid namespaces, or an NFS home, and the collision
             // lands on this session's OWN marker. Re-mint rather than wait: the
             // claim below runs inside the state flock, so a blocking
-            // wait there wedges every other clauth process on this home, and
+            // wait there wedges every other tollgate process on this home, and
             // `is_session_alive` reads every unknown as live, so an unreadable
             // marker moves this session aside instead of parking it.
             let mut session = SessionId::mint();
@@ -4065,7 +4066,7 @@ impl ProfileRuntime {
             // rather than dropping it quietly.
             if follows_chain && !opt_in {
                 logline!(
-                    "clauth: '{name}' cannot follow the fallback chain on this host; \
+                    "tollgate: '{name}' cannot follow the fallback chain on this host; \
                      the session stays on its launch account"
                 );
             }
@@ -4085,7 +4086,7 @@ impl ProfileRuntime {
                 Some(canonical.clone()),
             );
             if let Err(e) = crate::live_sessions::register(&row) {
-                logline!("clauth: registering the live session failed: {e}");
+                logline!("tollgate: registering the live session failed: {e}");
             }
             stamp_window_closing(&paths, &session);
             Ok::<_, anyhow::Error>((session, paths, file, mode, fresh))
@@ -4178,15 +4179,15 @@ impl ProfileRuntime {
         impl crate::watchdog::Reconcile for WatchdogLegs {
             fn config(&self) {
                 if let Err(e) = crate::claude_json::sync_once() {
-                    logline!("clauth: .claude.json sync failed: {e}");
+                    logline!("tollgate: .claude.json sync failed: {e}");
                 }
                 if let Err(e) = crate::settings_sync::sync_once() {
-                    logline!("clauth: settings.json sync failed: {e}");
+                    logline!("tollgate: settings.json sync failed: {e}");
                 }
             }
             fn credentials(&self) {
                 if let Err(e) = tick(&self.claude_home, &self.swap) {
-                    logline!("clauth: watchdog tick failed: {e}");
+                    logline!("tollgate: watchdog tick failed: {e}");
                 }
                 // After the file reconcile and outside every lock: the retry
                 // shells out, so it must never span the state flock `tick`
@@ -4229,7 +4230,7 @@ impl ProfileRuntime {
         let watcher = crate::watchdog::try_start(&specs, crate::watchdog::PRODUCTION.debounce);
         #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
         let watchdog_handle = thread::Builder::new()
-            .name(format!("clauth-wdog-{name}"))
+            .name(format!("tollgate-wdog-{name}"))
             .spawn(move || {
                 // Event-driven reconcile, polling only where events are
                 // unavailable. Exits when the shutdown sender is dropped (see
@@ -4370,17 +4371,17 @@ impl Drop for ProfileRuntime {
         }
 
         if let Err(e) = tick(&self.claude_home, &self.swap) {
-            logline!("clauth: final sync failed: {e}");
+            logline!("tollgate: final sync failed: {e}");
         }
 
         // Flush this session's last `.claude.json` / `settings.json` changes to
         // the global files and siblings before a possible teardown removes this
         // runtime's copies.
         if let Err(e) = crate::claude_json::sync_once() {
-            logline!("clauth: final .claude.json sync failed: {e}");
+            logline!("tollgate: final .claude.json sync failed: {e}");
         }
         if let Err(e) = crate::settings_sync::sync_once() {
-            logline!("clauth: final settings.json sync failed: {e}");
+            logline!("tollgate: final settings.json sync failed: {e}");
         }
 
         // One hold for the whole teardown. `unregister` takes the state lock
@@ -4393,12 +4394,12 @@ impl Drop for ProfileRuntime {
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
-                    logline!("clauth: unregistering the live session failed: {e}");
+                    logline!("tollgate: unregistering the live session failed: {e}");
                 }
                 if let Err(e) = std::fs::remove_file(&self.pid_file)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
-                    logline!("clauth: remove pid file failed: {e}");
+                    logline!("tollgate: remove pid file failed: {e}");
                 }
                 // Every member a swap moved this session onto holds a marker of
                 // its own. A dead session that keeps one blocks rotation on an
@@ -4410,12 +4411,12 @@ impl Drop for ProfileRuntime {
                     let _ = std::fs::remove_dir(&self.sessions);
                 }
             }
-            Err(e) => logline!("clauth: drop cleanup failed: {e}"),
+            Err(e) => logline!("tollgate: drop cleanup failed: {e}"),
         }
     }
 }
 
-/// clauth-owned env keys that must reach the spawned `claude` only via the
+/// tollgate-owned env keys that must reach the spawned `claude` only via the
 /// target profile's runtime `settings.json`, never inherited from the parent
 /// process. A parent `claude` running profile A had these written into its own
 /// `settings.json.env`, which Claude Code applies to `process.env` at startup;
@@ -4437,7 +4438,7 @@ pub(crate) const MANAGED_ENV_KEYS: &[&str] = &[
 /// ([`crate::actions::outgoing_env_keys`]: the active profile's, or every
 /// configured profile's with no marker to read) from `command`'s inherited
 /// env, so the target's runtime `settings.json` is the sole source for them.
-/// Shared by `clauth start` and the MCP delegate. Call before layering any
+/// Shared by `tollgate start` and the MCP delegate. Call before layering any
 /// caller-supplied env, so a caller can still set a key back deliberately.
 pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_keys: &[String]) {
     for key in MANAGED_ENV_KEYS {
@@ -4453,7 +4454,7 @@ pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_k
 /// wholly separate `<cwd>/.claude/settings.json` lookup with no ancestor walk,
 /// and it outranks the user tier on any key it defines. When the spawned
 /// `claude`'s cwd is exactly `$HOME`, `<cwd>/.claude/` IS the real
-/// `~/.claude/` — the file clauth itself writes for whichever profile is
+/// `~/.claude/` — the file tollgate itself writes for whichever profile is
 /// globally active — so that profile's `env` silently overrides the target's.
 /// Canonicalizes both sides so a symlinked `$HOME` still matches.
 fn cwd_is_real_home(dir: &Path) -> bool {
@@ -4576,8 +4577,8 @@ fn detect_link_mode(probe_dir: &Path) -> Result<LinkMode> {
     if let Some(mode) = LINK_MODE_OVERRIDE.lock().ok().and_then(|guard| *guard) {
         return Ok(mode);
     }
-    let probe_target = probe_dir.join(".clauth-probe-target");
-    let probe_link = probe_dir.join(".clauth-probe-link");
+    let probe_target = probe_dir.join(".tollgate-probe-target");
+    let probe_link = probe_dir.join(".tollgate-probe-link");
     let _ = std::fs::remove_file(&probe_target);
     let _ = std::fs::remove_file(&probe_link);
     std::fs::write(&probe_target, b"")
@@ -4689,7 +4690,7 @@ fn is_session_alive(pid_file: &Path) -> bool {
 /// `stale_env_keys` (the outgoing activation's custom env: the active
 /// profile's, or every configured profile's with no marker to read) are
 /// stripped from the shared `settings.json` base before this profile's
-/// overrides are merged, so a `clauth start <other>` session does not inherit
+/// overrides are merged, so a `tollgate start <other>` session does not inherit
 /// a departed account's custom `[env]`. Model + endpoint keys are re-derived
 /// per profile in `build_claude_settings_json`, so only custom `[env]` needs
 /// this strip.
@@ -4829,7 +4830,7 @@ fn unlink_link(path: &Path, label: &str) {
         && let Err(dir_err) = std::fs::remove_dir(path)
     {
         logline!(
-            "clauth: {label} {} could not be removed ({file_err}; as a dir: {dir_err})",
+            "tollgate: {label} {} could not be removed ({file_err}; as a dir: {dir_err})",
             path.display()
         );
     }
@@ -4844,7 +4845,7 @@ fn unlink_link(path: &Path, label: &str) {
 ///
 /// `stale_env_keys` (the outgoing activation's custom env: the active
 /// profile's, or every configured profile's with no marker to read) are
-/// stripped from the shared base first, so a `clauth start <other>` session
+/// stripped from the shared base first, so a `tollgate start <other>` session
 /// does not inherit a departed account's custom `[env]`. Model + endpoint keys
 /// are re-derived per profile in `build_claude_settings_json`, so only custom
 /// `[env]` needs this. Starting the active profile itself passes its own keys,
@@ -4870,7 +4871,7 @@ fn write_merged_settings(
     let settings_dst = runtime.join("settings.json");
     // This file carries the api-key profile's top-level `apiKeyHelper` command
     // string (plus the base_url/model env keys), so it must land 0o600 like
-    // every other clauth-owned write. The raw key itself lives in `config.toml`
+    // every other tollgate-owned write. The raw key itself lives in `config.toml`
     // (minted per request by the helper); the runtime settings.json is still
     // operator-sensitive. The write gate also fires when only the mode is wrong
     // (a byte-identical file an older build left at the umask never self-heals
@@ -5027,9 +5028,9 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
 /// Without a pre-written item, a session on a refreshable login falls
 /// through to the runtime file, migrates into the item on its first token
 /// write and DELETES that file: the store never advances, its refresh token
-/// goes stale, and the next clauth-side rotation dies into quarantine
+/// goes stale, and the next tollgate-side rotation dies into quarantine
 /// (reproduced end-to-end on-device 2026-09-11). A
-/// pre-written item means CC reads clauth's pair from its first request and
+/// pre-written item means CC reads tollgate's pair from its first request and
 /// the runtime file keeps feeding the drain.
 ///
 /// REFRESHLESS install sources skip both legs: a rolling sidecar or a
@@ -5339,7 +5340,7 @@ fn seed_session_keychain_item(
                 });
             if let Err(e) = sign_out {
                 logline!(
-                    "clauth: session {} started on {}, which stores no Claude login, but signing \
+                    "tollgate: session {} started on {}, which stores no Claude login, but signing \
                      its per-session Keychain item out failed: {e:#}. The session's Claude Code may \
                      keep serving whatever login that item still holds",
                     session.as_str(),
@@ -5419,7 +5420,7 @@ fn seed_degraded(
             "so it lands once the keychain unlocks"
         };
         logline!(
-            "clauth: session {} started on {} but {} failed: {e:#}. {}; the watchdog retries the \
+            "tollgate: session {} started on {} but {} failed: {e:#}. {}; the watchdog retries the \
              seed on this session's credential ticks while its store stays the seed's target, \
              {clears}",
             session.as_str(),
@@ -5430,7 +5431,7 @@ fn seed_degraded(
         return Some(canonical.to_path_buf());
     }
     logline!(
-        "clauth: session {} started on {} but {} failed: {e:#}. {}",
+        "tollgate: session {} started on {} but {} failed: {e:#}. {}",
         session.as_str(),
         name,
         what,
@@ -5487,7 +5488,9 @@ fn retry_seeded_keychain_item(swap: &SessionSwap, seed_retry: &std::sync::Mutex<
     }
     match failed {
         None => {
-            logline!("clauth: re-seeded the per-session Keychain item after the keychain unlocked")
+            logline!(
+                "tollgate: re-seeded the per-session Keychain item after the keychain unlocked"
+            )
         }
         Some(e) => {
             let disposition = delete_in_flight_disposition(&e)
@@ -5500,7 +5503,7 @@ fn retry_seeded_keychain_item(swap: &SessionSwap, seed_retry: &std::sync::Mutex<
                 *retry = Some(target);
             } else {
                 logline!(
-                    "clauth: retrying the per-session Keychain item seed failed: {e:#}. Its \
+                    "tollgate: retrying the per-session Keychain item seed failed: {e:#}. Its \
                      Claude Code keeps the runtime credentials file, where its next token refresh \
                      migrates into the item and strands the stored refresh token; the next start \
                      on this tree re-runs the write"
@@ -5638,7 +5641,7 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
 ///
 /// Ceiling: the assert is off under `cfg(test)`, because 20 inline tests drive
 /// this and `mirror_credentials` as units with no home sandbox, so taking the
-/// flock there would lock the operator's REAL `~/.clauth` and expose hermetic
+/// flock there would lock the operator's REAL `~/.tollgate` and expose hermetic
 /// tests to the 25s state-lock timeout against a live daemon. Upgrade path: give
 /// those tests a `HomeSandbox`, then drop the `not(test)`.
 fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool> {
@@ -5669,7 +5672,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     // file is a session-side re-login — never adopt it over the token (that
     // would clobber the long-lived login with a rotating chain). Keep
     // canonical and relink; the re-login stays recoverable in the runtime
-    // file's lineage, and `clauth login` is the supported way to refresh the
+    // file's lineage, and `tollgate login` is the supported way to refresh the
     // profile's usage OAuth pair.
     if differs
         && canonical
@@ -5677,7 +5680,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             .is_some_and(|f| f == "session-token.json")
     {
         logline!(
-            "clauth: watchdog kept the static session token \
+            "tollgate: watchdog kept the static session token \
              (a session-side re-login is never adopted over it)"
         );
         relink_to_canonical(link_path, canonical)?;
@@ -5706,7 +5709,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             // Canonical written at/after the runtime re-login (or wins the
             // tie-break); don't overwrite it with the runtime bytes.
             logline!(
-                "clauth: watchdog kept canonical credentials \
+                "tollgate: watchdog kept canonical credentials \
                  (canonical written more recently than runtime); \
                  not overwriting with runtime re-login bytes"
             );
@@ -6082,7 +6085,7 @@ fn merge_path(
         }
         if b_is_dir && !a.exists() {
             // `a` is the canonical `~/.claude/` side (see `mirror_tree`'s callers) —
-            // owner-only like every other dir clauth creates there, not the
+            // owner-only like every other dir tollgate creates there, not the
             // process umask, matching the rescue path's `mkdir_700` invariant.
             crate::profile::mkdir_700(a)
                 .with_context(|| format!("failed to create {}", a.display()))?;
@@ -6109,7 +6112,7 @@ fn merge_path(
     // which replaces the link itself with a regular file and strands the
     // operator's real file where nothing reads it.
     //
-    // Runtime (`b`) is CLAUTH's tree, built by copy, and deliberately does not
+    // Runtime (`b`) is TOLLGATE's tree, built by copy, and deliberately does not
     // follow. A link there is not the operator's intent, and following one would
     // aim a mirror write at an arbitrary absolute path outside BOTH trees;
     // renaming a
@@ -6173,7 +6176,7 @@ fn merge_path(
 ///
 /// Called on the CANONICAL side only. It hands back an absolute path that can
 /// leave both trees, which is correct for a link the operator made and wrong for
-/// one found in clauth's own copy; see [`merge_path`].
+/// one found in tollgate's own copy; see [`merge_path`].
 ///
 /// A link `canonicalize` cannot resolve falls back to `p` itself, so the write
 /// re-creates it as a regular file.
@@ -6282,7 +6285,7 @@ fn link_entry(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 fn link_entry(_src: &Path, _dst: &Path) -> Result<()> {
-    anyhow::bail!("clauth start requires symlink support");
+    anyhow::bail!("tollgate start requires symlink support");
 }
 
 // ── codex session homes ──────────────────────────────────────────────────────
@@ -6342,7 +6345,7 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
     profile_subpath(&ProfileName::from(name), CODEX_HOME_STEM)
 }
 
-/// The config keys a clauth-built codex home must not inherit, whatever the
+/// The config keys a tollgate-built codex home must not inherit, whatever the
 /// operator set for their own `~/.codex`. Each one lets a session read or write
 /// outside the boundary the home exists to draw:
 ///
@@ -6442,7 +6445,7 @@ const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
 /// The operator-`~/.codex` entries a SHARED codex session sees — instruction
 /// and extension surfaces, same reasoning as the claude shared runtime linking
 /// the operator's `~/.claude`. `hooks.json` is deliberately absent: hooks
-/// execute code inside a home clauth built, so linking it is a per-profile
+/// execute code inside a home tollgate built, so linking it is a per-profile
 /// opt-in ([`CodexProfileOpts::hooks_json`]), never a default.
 const CODEX_OPERATOR_ENTRIES: &[&str] = &[
     "skills",
@@ -6456,7 +6459,7 @@ const CODEX_OPERATOR_ENTRIES: &[&str] = &[
     // as skills and rules, so they are LINKED rather than made durable
     // per-profile: an install reaches every profile and outlives the session
     // that made it. Unlinked they were neither, and a plugin installed inside a
-    // clauth session died with the home.
+    // tollgate session died with the home.
     "plugins",
 ];
 
@@ -6550,7 +6553,7 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 /// - `auth.json` — under real symlinks, BOTH flavors link the profile's own
 ///   `profiles/<name>/auth.json`: one physical file is what makes concurrent
 ///   carriers safe (codex's own reload-and-skip handles codex-vs-codex, the
-///   rotation guard handles clauth-vs-codex). Under [`LinkMode::Fake`] it is
+///   rotation guard handles tollgate-vs-codex). Under [`LinkMode::Fake`] it is
 ///   a copy — the same consequences the claude fake-mode credential copy
 ///   already documents, sharpened by codex's single-use refresh chain: the
 ///   copy is a second carrier whose refreshes strand the store, and a
@@ -6684,7 +6687,7 @@ impl CodexRuntime {
         let profile_root = profile_dir(&owned)?;
         // Same ordering rule as the claude acquire: RotationGuard outermost,
         // state flock inside. What it buys here is the row: `launch_store` and
-        // the marker must be visible before any clauth-side codex rotation
+        // the marker must be visible before any tollgate-side codex rotation
         // (phase 4) can decide against this profile, or the rotation gate
         // reads the account as idle while a session is mid-start on it.
         let _rotation_guard = RotationGuard::acquire(&owned)?;
@@ -6788,7 +6791,7 @@ impl CodexRuntime {
                 Some(home.join("auth.json")),
             );
             if let Err(e) = crate::live_sessions::register(&row) {
-                logline!("clauth: registering the live codex session failed: {e}");
+                logline!("tollgate: registering the live codex session failed: {e}");
             }
             Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode))
         })?;
@@ -6826,7 +6829,7 @@ impl Drop for CodexRuntime {
                 ConvergePrior::Teardown,
             )
         {
-            logline!("clauth: codex auth converge at teardown failed: {e:#}");
+            logline!("tollgate: codex auth converge at teardown failed: {e:#}");
         }
         // Carry a durable store codex healed in place back into the
         // profile-global home — best-effort, never failing a completed
@@ -6853,19 +6856,19 @@ impl Drop for CodexRuntime {
                     continue;
                 }
                 if let Err(e) = copy_file(&healed, &global.join(entry)) {
-                    logline!("clauth: codex {entry} recovery sync-back failed: {e:#}");
+                    logline!("tollgate: codex {entry} recovery sync-back failed: {e:#}");
                 }
             }
         }
 
         if let Err(e) = with_state_lock(|_held| {
             if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
-                logline!("clauth: unregistering the live codex session failed: {e}");
+                logline!("tollgate: unregistering the live codex session failed: {e}");
             }
             if let Err(e) = std::fs::remove_file(&self.pid_file)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                logline!("clauth: remove pid file failed: {e}");
+                logline!("tollgate: remove pid file failed: {e}");
             }
             let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
             if still_active == 0 {
@@ -6879,7 +6882,7 @@ impl Drop for CodexRuntime {
             }
             Ok::<_, anyhow::Error>(())
         }) {
-            logline!("clauth: codex session teardown failed: {e:#}");
+            logline!("tollgate: codex session teardown failed: {e:#}");
         }
     }
 }

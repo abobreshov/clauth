@@ -2,7 +2,7 @@
 #![cfg(unix)]
 
 //! Guard coverage for the MCP `switch_profile` tool itself (the
-//! `ClauthServer::switch_profile` seam, not the `switch_profile_noninteractive`
+//! `TollgateServer::switch_profile` seam, not the `switch_profile_noninteractive`
 //! action it wraps). An unknown or
 //! wrong-case profile name must be rejected BEFORE any credential mutation:
 //! without the canonical-name guard the raw arg reaches `link_profile_credentials`,
@@ -47,7 +47,7 @@ fn seed_active_linked() {
 
 /// Drive the async `switch_profile` tool on a current-thread runtime.
 fn call_switch(name: &str) -> CallToolResult {
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");

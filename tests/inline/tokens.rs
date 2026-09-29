@@ -1527,17 +1527,17 @@ fn file_hourly_model_tokens_splits_by_model_and_day() {
 /// Write a v1-shaped ledger (flat totals, no `hours`, no `backfill_done`)
 /// holding one (day, model) row from `m`'s flat fields.
 fn write_v1_ledger(
-    clauth_dir: &std::path::Path,
+    tollgate_dir: &std::path::Path,
     recorded_through: &str,
     day: &str,
     m: &ModelTokens,
 ) {
-    std::fs::create_dir_all(clauth_dir).expect("create .clauth");
+    std::fs::create_dir_all(tollgate_dir).expect("create .tollgate");
     let json = format!(
         r#"{{"recorded_through":"{recorded_through}","days":{{"{day}":{{"{}":{{"input":{},"output":{},"cache_read":{},"cache_create":{}}}}}}}}}"#,
         m.model, m.input, m.output, m.cache_read, m.cache_create
     );
-    std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
+    std::fs::write(tollgate_dir.join("token_ledger.json"), json).expect("write ledger");
 }
 
 /// 00:00 UTC of a "YYYY-MM-DD" date as a `SystemTime`, for mtime fixtures.
@@ -1554,9 +1554,9 @@ fn epoch_day(date: &str) -> SystemTime {
 fn backfill_fills_hours_when_corpus_totals_match() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v1_ledger(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         &ModelTokens {
@@ -1595,13 +1595,13 @@ fn backfill_fills_hours_when_corpus_totals_match() {
     set_mtime(&late, epoch_day("2026-06-17") + Duration::from_secs(1));
 
     let today = today_date();
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     assert!(
         ledger.backfill_through(&today).is_some(),
         "a pre-today v1 row arms the pass"
     );
     assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {}));
-    ledger.save(&clauth_dir);
+    ledger.save(&tollgate_dir);
 
     // The filled row reaches the render path with hours and unchanged flats.
     let mut base = TokenStats::default();
@@ -1628,12 +1628,12 @@ fn backfill_fills_hours_when_corpus_totals_match() {
     // file bytes because the filled hours alone already make
     // `backfill_through` None — only the persisted flag proves the pass was
     // marked done (the state that stops the mismatch case re-sweeping).
-    let raw = std::fs::read_to_string(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    let raw = std::fs::read_to_string(tollgate_dir.join("token_ledger.json")).expect("read ledger");
     assert!(
         raw.contains("\"backfill_done\":true"),
         "the done flag persists: {raw}"
     );
-    let reloaded = crate::token_ledger::Ledger::load(&clauth_dir);
+    let reloaded = crate::token_ledger::Ledger::load(&tollgate_dir);
     assert_eq!(reloaded.backfill_through(&today), None);
 }
 
@@ -1645,9 +1645,9 @@ fn backfill_fills_hours_when_corpus_totals_match() {
 fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v1_ledger(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         &ModelTokens {
@@ -1670,9 +1670,9 @@ fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
     set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
 
     let today = today_date();
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {}));
-    ledger.save(&clauth_dir);
+    ledger.save(&tollgate_dir);
 
     let mut base = TokenStats::default();
     ledger.apply_to_base(&mut base, Some("2026-06-01"));
@@ -1702,10 +1702,10 @@ fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
 fn backfill_routes_crossing_cutoff_lines_by_line_date() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
-    std::fs::create_dir_all(&clauth_dir).expect("create .clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&tollgate_dir).expect("create .tollgate");
     std::fs::write(
-        clauth_dir.join("token_ledger.json"),
+        tollgate_dir.join("token_ledger.json"),
         r#"{
             "recorded_through": "2026-06-16",
             "days": {
@@ -1775,7 +1775,7 @@ fn backfill_routes_crossing_cutoff_lines_by_line_date() {
 
     // End to end: each line's day gains hours in its own line's hour.
     let today = today_date();
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {}));
     let mut base = TokenStats::default();
     ledger.apply_to_base(&mut base, Some("2026-06-01"));
@@ -1810,9 +1810,9 @@ fn backfill_routes_crossing_cutoff_lines_by_line_date() {
 fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v1_ledger(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         &ModelTokens {
@@ -1871,9 +1871,9 @@ fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
 fn backfill_runs_once_and_second_run_visits_nothing() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v1_ledger(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         &ModelTokens {
@@ -1901,19 +1901,19 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
     set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
 
     let today = today_date();
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut visited = 0usize;
     assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {
         visited += 1
     }));
     assert_eq!(visited, 1, "the sweep walked the one corpus file");
-    ledger.save(&clauth_dir);
+    ledger.save(&tollgate_dir);
     let bytes_after_first =
-        std::fs::read(clauth_dir.join("token_ledger.json")).expect("read ledger");
+        std::fs::read(tollgate_dir.join("token_ledger.json")).expect("read ledger");
 
     // Second run, the way the worker gates it: the persisted flag ends the
     // pass before a single file is visited, and nothing is re-saved.
-    let mut ledger2 = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger2 = crate::token_ledger::Ledger::load(&tollgate_dir);
     assert_eq!(ledger2.backfill_through(&today), None);
     let mut visited2 = 0usize;
     assert!(!run_backfill(&claude_dir, &mut ledger2, &today, |_, _| {
@@ -1921,7 +1921,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
     }));
     assert_eq!(visited2, 0, "the done flag skips the sweep entirely");
     let bytes_after_second =
-        std::fs::read(clauth_dir.join("token_ledger.json")).expect("read ledger");
+        std::fs::read(tollgate_dir.join("token_ledger.json")).expect("read ledger");
     assert_eq!(bytes_after_first, bytes_after_second);
 }
 
@@ -1933,7 +1933,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
 fn backfill_persists_when_record_has_nothing_new() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     let today = today_date();
     let yesterday = {
         let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
@@ -1942,7 +1942,7 @@ fn backfill_persists_when_record_has_nothing_new() {
     // A v1 ledger whose watermark is ALREADY at yesterday: record() has
     // nothing to advance or write, so its own save never fires.
     write_v1_ledger(
-        &clauth_dir,
+        &tollgate_dir,
         &yesterday,
         "2026-06-15",
         &ModelTokens {
@@ -1969,7 +1969,7 @@ fn backfill_persists_when_record_has_nothing_new() {
     std::fs::write(&p, format!("{line}\n")).expect("write");
     set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let base = TokenStats::default(); // nothing mergeable
     assert!(
         !ledger.record(&base, &today),
@@ -1978,19 +1978,19 @@ fn backfill_persists_when_record_has_nothing_new() {
     persist_ledger(
         &claude_dir,
         &mut ledger,
-        &clauth_dir,
+        &tollgate_dir,
         &base,
         &today,
         |_, _| {},
     );
 
     // The flag and the filled hours landed on disk without any record.
-    let raw = std::fs::read_to_string(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    let raw = std::fs::read_to_string(tollgate_dir.join("token_ledger.json")).expect("read ledger");
     assert!(
         raw.contains("\"backfill_done\":true"),
         "flag persisted without a record: {raw}"
     );
-    let reloaded = crate::token_ledger::Ledger::load(&clauth_dir);
+    let reloaded = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut fresh = TokenStats::default();
     reloaded.apply_to_base(&mut fresh, Some("2026-06-01"));
     let row = fresh
@@ -2012,14 +2012,14 @@ fn backfill_persists_when_record_has_nothing_new() {
 fn backfill_persists_flag_on_disk_when_nothing_fills() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     let today = today_date();
     let yesterday = {
         let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
         iso.get(..10).map(str::to_owned).unwrap_or(iso)
     };
     write_v1_ledger(
-        &clauth_dir,
+        &tollgate_dir,
         &yesterday,
         "2026-06-15",
         &ModelTokens {
@@ -2040,23 +2040,23 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
     std::fs::write(&p, format!("{line}\n")).expect("write");
     set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     persist_ledger(
         &claude_dir,
         &mut ledger,
-        &clauth_dir,
+        &tollgate_dir,
         &TokenStats::default(),
         &today,
         |_, _| {},
     );
 
     // The flag reached disk even though the pass filled nothing.
-    let raw = std::fs::read_to_string(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    let raw = std::fs::read_to_string(tollgate_dir.join("token_ledger.json")).expect("read ledger");
     assert!(
         raw.contains("\"backfill_done\":true"),
         "a zero-fill pass still persists the flag: {raw}"
     );
-    let reloaded = crate::token_ledger::Ledger::load(&clauth_dir);
+    let reloaded = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut fresh = TokenStats::default();
     reloaded.apply_to_base(&mut fresh, Some("2026-06-01"));
     let row = fresh
@@ -2667,14 +2667,14 @@ fn same_model_two_files_two_shapes() {
 /// Write a pre-classifier ledger row: no `shape` key on the wire, so it
 /// loads `Healthy` and owes the re-derive pass.
 fn write_v0_ledger_day(
-    clauth_dir: &std::path::Path,
+    tollgate_dir: &std::path::Path,
     recorded_through: &str,
     day: &str,
     model: &str,
     values: (u64, u64, u64, u64),
 ) {
     let (input, output, cache_read, cache_create) = values;
-    std::fs::create_dir_all(clauth_dir).expect("mkdir");
+    std::fs::create_dir_all(tollgate_dir).expect("mkdir");
     let json = r#"{"recorded_through":"RT","days":{"D":{"M":{"input":I,"output":O,"cache_read":C,"cache_create":K}}}}"#
         .replace("RT", recorded_through)
         .replace("D", day)
@@ -2683,13 +2683,13 @@ fn write_v0_ledger_day(
         .replace("O", &output.to_string())
         .replace("C", &cache_read.to_string())
         .replace("K", &cache_create.to_string());
-    std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
+    std::fs::write(tollgate_dir.join("token_ledger.json"), json).expect("write ledger");
 }
 
 /// Write a ledger row carrying an explicit `shape` — a day recorded under the
 /// v1 ratio classifier.
 fn write_v1_ledger_day(
-    clauth_dir: &std::path::Path,
+    tollgate_dir: &std::path::Path,
     recorded_through: &str,
     day: &str,
     model: &str,
@@ -2697,7 +2697,7 @@ fn write_v1_ledger_day(
     shape: &str,
 ) {
     let (input, output, cache_read, cache_create) = values;
-    std::fs::create_dir_all(clauth_dir).expect("mkdir");
+    std::fs::create_dir_all(tollgate_dir).expect("mkdir");
     let json = r#"{"recorded_through":"RT","days":{"D":{"M":{"input":I,"output":O,"cache_read":C,"cache_create":K,"shape":"S"}}}}"#
         .replace("RT", recorded_through)
         .replace("D", day)
@@ -2707,7 +2707,7 @@ fn write_v1_ledger_day(
         .replace("C", &cache_read.to_string())
         .replace("K", &cache_create.to_string())
         .replace("S", shape);
-    std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
+    std::fs::write(tollgate_dir.join("token_ledger.json"), json).expect("write ledger");
 }
 
 /// A stored pre-classifier day whose corpus re-derives as whole-prompt with exactly
@@ -2717,10 +2717,10 @@ fn write_v1_ledger_day(
 fn rederive_corrects_a1_day_from_corpus() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     // Stored (raw, poisoned) row: input contains the cached prefix.
     write_v0_ledger_day(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         "glm-5.3",
@@ -2761,7 +2761,7 @@ fn rederive_corrects_a1_day_from_corpus() {
         epoch_day("2026-06-15") + Duration::from_secs(60),
     );
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let today = "2026-06-20";
     let mut ran = false;
     let mut progress = |d: usize, t: usize| {
@@ -2769,7 +2769,7 @@ fn rederive_corrects_a1_day_from_corpus() {
     };
     // drive the worker's leg directly
     if super::run_rederive(&claude_dir, &mut ledger, today, &mut progress) {
-        ledger.save(&clauth_dir);
+        ledger.save(&tollgate_dir);
         ran = true;
     }
     assert!(ran, "the re-derive pass ran");
@@ -2795,9 +2795,9 @@ fn rederive_corrects_a1_day_from_corpus() {
 fn rederive_leaves_equal_day_untouched() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v0_ledger_day(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         "claude-opus-4",
@@ -2835,7 +2835,7 @@ fn rederive_leaves_equal_day_untouched() {
         epoch_day("2026-06-15") + Duration::from_secs(60),
     );
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut progress = |_: usize, _: usize| {};
     assert!(super::run_rederive(
         &claude_dir,
@@ -2856,9 +2856,9 @@ fn rederive_leaves_equal_day_untouched() {
 fn rederive_marks_pruned_day_unverifiable() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v0_ledger_day(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         "glm-5.3",
@@ -2866,7 +2866,7 @@ fn rederive_marks_pruned_day_unverifiable() {
     );
     // No projects dir at all: nothing covers the day.
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut progress = |_: usize, _: usize| {};
     assert!(super::run_rederive(
         &claude_dir,
@@ -2890,12 +2890,12 @@ fn rederive_marks_pruned_day_unverifiable() {
 fn rederive_unpoisons_over_subtracted_day() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     // 7 rows (in=125, cr=50) + 1 row (in=50, cr=400): sum in=925, out=50,
     // cr=750. The last row's in < cr is Anthropic-shaped evidence, so the
     // corpus classifies NoCacheWrites and keeps input unreduced.
     write_v1_ledger_day(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         "gpt-5.6-sol",
@@ -2924,7 +2924,7 @@ fn rederive_unpoisons_over_subtracted_day() {
         epoch_day("2026-06-15") + Duration::from_secs(60),
     );
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut progress = |_: usize, _: usize| {};
     assert!(super::run_rederive(
         &claude_dir,
@@ -2950,10 +2950,10 @@ fn rederive_unpoisons_over_subtracted_day() {
 fn rederive_adopts_mixed_day_beyond_exact_arithmetic() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     // Stored raw row: in=1_199_999, out=48, cr=499_995 (the corpus sums).
     write_v0_ledger_day(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         "glm-5.3",
@@ -3000,7 +3000,7 @@ fn rederive_adopts_mixed_day_beyond_exact_arithmetic() {
         epoch_day("2026-06-15") + Duration::from_secs(90),
     );
 
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut progress = |_: usize, _: usize| {};
     assert!(super::run_rederive(
         &claude_dir,
@@ -3025,14 +3025,14 @@ fn rederive_adopts_mixed_day_beyond_exact_arithmetic() {
 #[test]
 fn rederive_v1_flag_file_owes_versioned_pass() {
     let sb = HomeSandbox::new();
-    let clauth_dir = sb.home().join(".clauth");
-    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    let tollgate_dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&tollgate_dir).expect("mkdir");
     std::fs::write(
-        clauth_dir.join("token_ledger.json"),
+        tollgate_dir.join("token_ledger.json"),
         r#"{"recorded_through":"2026-06-15","days":{"2026-06-14":{"glm-5.3":{"input":100,"output":5,"cache_read":40,"cache_create":0,"shape":"no_cache_writes"}}},"rederive_done":true}"#,
     )
     .expect("write ledger");
-    let ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     assert_eq!(
         ledger.rederive_through("2026-06-20").as_deref(),
         Some("2026-06-15"),
@@ -3051,15 +3051,15 @@ fn rederive_v1_flag_file_owes_versioned_pass() {
 fn rederive_runs_once() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
-    let clauth_dir = sb.home().join(".clauth");
+    let tollgate_dir = sb.home().join(".tollgate");
     write_v0_ledger_day(
-        &clauth_dir,
+        &tollgate_dir,
         "2026-06-16",
         "2026-06-15",
         "glm-5.3",
         (1_000, 50, 400, 0),
     );
-    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
     let mut progress = |_: usize, _: usize| {};
     assert!(super::run_rederive(
         &claude_dir,

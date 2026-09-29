@@ -153,7 +153,7 @@ const CALLBACK_CANARY: &str = "CALLBACK-BYTES-CANARY";
 
 /// An OAuth `error` param is still fatal, and its bytes now reach nothing. Both
 /// params are uncapped upstream text and used to be interpolated whole into the
-/// `bail!` — which lands on `clauth login`'s stderr and the TUI Setup toast.
+/// `bail!` — which lands on `tollgate login`'s stderr and the TUI Setup toast.
 /// Worse than the token-endpoint bodies this module's sibling fix removed: those
 /// at least passed a first-line + 200-char trim first.
 #[test]
@@ -251,7 +251,7 @@ fn authorize_rejection_parses_rfc6749_codes_and_anonymizes_the_rest() {
     );
 }
 
-/// `clauth login` is the path where the status ruling bites hardest: an
+/// `tollgate login` is the path where the status ruling bites hardest: an
 /// interactive user hitting a 400 on a fresh login has no log open beside the
 /// terminal. So stderr names the status and the TUI toast does not — asserted
 /// together, because a status that silently stops reaching stderr looks exactly
@@ -264,11 +264,11 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     let rejected = LoginError::Exchange(TokenFailure::Status(400));
     assert_eq!(
         rejected.cli_message(),
-        "anthropic rejected the request (HTTP 400): run clauth login again for a fresh code"
+        "anthropic rejected the request (HTTP 400): run tollgate login again for a fresh code"
     );
     assert_eq!(
         rejected.user_message(),
-        "anthropic rejected the request: run clauth login again for a fresh code"
+        "anthropic rejected the request: run tollgate login again for a fresh code"
     );
     assert!(
         !rejected.user_message().contains("400"),
@@ -285,7 +285,7 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     for status in [400, 429, 503] {
         let m = LoginError::Exchange(TokenFailure::Status(status)).user_message();
         assert!(
-            m.ends_with(": run clauth login again for a fresh code"),
+            m.ends_with(": run tollgate login again for a fresh code"),
             "a spent authorization code is only fixed by a new login, got: {m}"
         );
         assert!(
@@ -304,7 +304,7 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     );
     assert_eq!(offline.cli_message(), offline.user_message());
 
-    // Every clauth-authored failure renders identically on both surfaces —
+    // Every tollgate-authored failure renders identically on both surfaces —
     // there is no upstream status to withhold from one of them.
     let local = LoginError::Local(anyhow::anyhow!("OAuth state mismatch (possible CSRF)"));
     assert_eq!(local.cli_message(), local.user_message());
@@ -400,7 +400,7 @@ fn wait_for_code_times_out_naming_both_doors_and_the_bound() {
     );
 }
 
-/// The `clauth login` summary names the account's plan from the token the login
+/// The `tollgate login` summary names the account's plan from the token the login
 /// just stored. `login_profile_from_raw` mints `"free"` for a Free account, so
 /// this is the round trip that keeps the line reading `Claude Free` rather than
 /// echoing a raw wire token or claiming a tier the account never had.

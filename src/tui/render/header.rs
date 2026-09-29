@@ -2,7 +2,7 @@
 //! the text column to the right. Three rows always — [`header_height`] keeps
 //! `render::draw`'s layout in step.
 //!
-//! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
+//! Row 0 reads `tollgate vX.Y.Z` on the left with the herdr tag between them,
 //! and the `[ daemon ]` health chip on the right edge; it sheds the tag first,
 //! then the chip. Row 1 carries the active-profile usage gauge and the status
 //! indicator, nothing else: the account counts and the harness filter live on
@@ -211,8 +211,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         active_gauge(app)
     };
 
-    // ── Row 0: clauth [herdr tag] vX.Y.Z ....... [ daemon ] ───────────────
-    let brand = "clauth";
+    // ── Row 0: tollgate [herdr tag] vX.Y.Z ....... [ daemon ] ───────────────
+    let brand = crate::identity::NAME;
     let ver = format!(" v{VERSION}");
     let mut row0: Vec<Span<'static>> = vec![
         Span::styled(brand, Style::default().fg(theme::text_color()).bold()),

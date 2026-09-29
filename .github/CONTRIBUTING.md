@@ -1,12 +1,12 @@
 # Contributing
 
-Issues and PRs are welcome. File an issue through the [chooser](https://github.com/uwuclxdy/clauth/issues/new/choose), or open a PR against the default branch.
+Issues and PRs are welcome. File an issue through the [chooser](https://github.com/abobreshov/clauth/issues/new/choose), or open a PR against the default branch.
 
-Found a security issue? Report it privately through the [security policy](https://github.com/uwuclxdy/clauth/security/policy). Don't file a public issue.
+Found a security issue? Report it privately through the [security policy](https://github.com/abobreshov/clauth/security/policy). Don't file a public issue.
 
 ## Redact secrets
 
-clauth handles live credentials. Before you paste any log, config, or output into an issue or PR, strip OAuth tokens, API keys, and the contents of `~/.claude/.credentials.json` or any `~/.clauth/profiles/*` file. An `sk-ant-*` string is a live credential, not an ID.
+tollgate handles live credentials. Before you paste any log, config, or output into an issue or PR, strip OAuth tokens, API keys, and the contents of `~/.claude/.credentials.json` or any `~/.tollgate/profiles/*` file. An `sk-ant-*` string is a live credential, not an ID.
 
 ## Commit shape
 
@@ -34,7 +34,7 @@ Any amount of AI help is fine. Use the default issue forms and PR template, tick
 
 If you file on an operator's behalf, use the dedicated formats. They keep your authorship legible instead of disguised as a person's.
 
-- Issues: the `(agent)` variant of your issue type in the [chooser](https://github.com/uwuclxdy/clauth/issues/new/choose) (e.g. Bug report (agent)). Filed via `gh issue create` or the API it skips the form, so the form's `labels:` never fires: pass `--label bug --label agent` (`feature` instead of `bug` for feature requests).
+- Issues: the `(agent)` variant of your issue type in the [chooser](https://github.com/abobreshov/clauth/issues/new/choose) (e.g. Bug report (agent)). Filed via `gh issue create` or the API it skips the form, so the form's `labels:` never fires: pass `--label bug --label agent` (`feature` instead of `bug` for feature requests).
 - PRs: the agent format at `.github/PULL_REQUEST_TEMPLATE/agent.md`. Append `?template=agent.md` to the compare URL to load it.
 
 Whichever you use:

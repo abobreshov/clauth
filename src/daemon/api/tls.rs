@@ -18,7 +18,7 @@
 //! ([`FQDN_COMMAND`]). Everything below them is the same code on macOS, Linux,
 //! and Windows.
 //!
-//! The directory is a default, not a rule: `~/.clauth/tls.json` carries it, is
+//! The directory is a default, not a rule: `~/.tollgate/tls.json` carries it, is
 //! written with this platform's default on first use, and is read back on every
 //! start ([`cert_dir`]). That is what lets a Windows box whose lego lives
 //! somewhere other than `%AppData%` — or a Linux one behind a packaging
@@ -81,7 +81,7 @@ fn appdata_dir() -> Result<PathBuf> {
 /// started it — so the per-user application-data root is used instead:
 /// `%AppData%\lego\certificates`. Point lego at it with `--path`.
 ///
-/// Per-user, matching where clauth keeps everything else (`~/.clauth`) rather
+/// Per-user, matching where tollgate keeps everything else (`~/.tollgate`) rather
 /// than the machine-wide `%ProgramData%`. A daemon run as the logged-in user
 /// therefore finds it; one run as a Windows *service* under `LocalSystem` would
 /// resolve a different `%AppData%` and need `tls.json` pointed somewhere both
@@ -97,12 +97,12 @@ pub(crate) fn default_cert_dir() -> Result<PathBuf> {
     }
 }
 
-/// Peer of `status.json` / `devices.json` in `~/.clauth`.
+/// Peer of `status.json` / `devices.json` in `~/.tollgate`.
 const TLS_FILE: &str = "tls.json";
 /// Bumped only on a breaking change to the file's shape, like `status.json`.
 const TLS_SCHEMA: u64 = 1;
 
-/// `~/.clauth/tls.json`. One key today, and a struct rather than a bare string
+/// `~/.tollgate/tls.json`. One key today, and a struct rather than a bare string
 /// so the next TLS knob is an additive field instead of a new file.
 #[derive(Debug, Serialize, Deserialize)]
 struct TlsConfigFile {
@@ -112,7 +112,7 @@ struct TlsConfigFile {
 }
 
 fn tls_config_path() -> Result<PathBuf> {
-    Ok(crate::profile::clauth_dir()?.join(TLS_FILE))
+    Ok(crate::profile::tollgate_dir()?.join(TLS_FILE))
 }
 
 /// The configured certificate directory, writing the platform default on first
@@ -138,10 +138,10 @@ pub(crate) fn cert_dir() -> Result<PathBuf> {
         let parsed: TlsConfigFile = serde_json::from_str(&body)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if parsed.schema > TLS_SCHEMA {
-            // Written by a newer clauth. The one field this build reads is a
+            // Written by a newer tollgate. The one field this build reads is a
             // path either way, so take it and let the newer field set be.
             logline!(
-                "clauth daemon: {TLS_FILE} is schema {} (this build knows {TLS_SCHEMA})",
+                "tollgate daemon: {TLS_FILE} is schema {} (this build knows {TLS_SCHEMA})",
                 parsed.schema
             );
         }
@@ -402,7 +402,7 @@ fn refuse_on_tailnet(listen: IpAddr, cause: anyhow::Error) -> anyhow::Error {
              and this host's lego certificate is not available; run \
              `tailscale cert <machine>.<tailnet>.ts.net` and pass \
              `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` \
-             to `clauth daemon --listen`"
+             to `tollgate daemon --listen`"
         )),
         None => cause,
     }

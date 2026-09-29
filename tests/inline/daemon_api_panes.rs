@@ -40,8 +40,8 @@ fn config() -> crate::profile::ConfigHandle {
 
 fn ctx(probe: PaneProbe) -> std::sync::Arc<ApiContext> {
     devices::seed_for_tests(DEVICE, Tier::Control, TOKEN).expect("seed the device");
-    let status_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let status_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json");
     ApiContext::for_tests(config(), status_path, None, probe)
 }
@@ -138,7 +138,7 @@ fn register_fixture_rows() {
             start_profile: "uwuclxdy".to_string(),
             pid: 3208712,
             started_at: 1789435569278,
-            cwd: Some(PathBuf::from("/home/user/repos/rs/clauth")),
+            cwd: Some(PathBuf::from("/home/user/repos/rs/tollgate")),
             isolated: false,
             follows_chain: false,
             intended_member: None,
@@ -147,7 +147,7 @@ fn register_fixture_rows() {
             current_member: None,
             last_swap_at: None,
             launch_store: Some(PathBuf::from(
-                "/home/user/.clauth/profiles/uwuclxdy/credentials.json",
+                "/home/user/.tollgate/profiles/uwuclxdy/credentials.json",
             )),
         },
         LiveSession {
@@ -164,7 +164,7 @@ fn register_fixture_rows() {
             current_member: None,
             last_swap_at: None,
             launch_store: Some(PathBuf::from(
-                "/home/user/.clauth/profiles/DS5/credentials.json",
+                "/home/user/.tollgate/profiles/DS5/credentials.json",
             )),
         },
     ];
@@ -173,14 +173,14 @@ fn register_fixture_rows() {
     }
 }
 
-/// The captured `clauth mcp` pid inside `wP:pAA`, as a delegate stand-in.
+/// The captured `tollgate mcp` pid inside `wP:pAA`, as a delegate stand-in.
 fn register_delegate_row() {
     live_sessions::register(&LiveSession {
         session_id: "3210136-0".to_string(),
         start_profile: "uwuclxdy".to_string(),
         pid: 3210136,
         started_at: 0,
-        cwd: Some(PathBuf::from("/home/user/repos/rs/clauth")),
+        cwd: Some(PathBuf::from("/home/user/repos/rs/tollgate")),
         isolated: false,
         follows_chain: false,
         intended_member: None,
@@ -213,7 +213,7 @@ fn register_orphan_row() {
     .expect("register the orphan row");
 }
 
-/// A lingering row whose profile equals `w1N:p19`'s `tokens.clauth` tag but
+/// A lingering row whose profile equals `w1N:p19`'s `tokens.tollgate` tag but
 /// whose pid is in no pane, so a join on the tag would attach it where the pid
 /// join does not.
 fn register_stale_tag_row() {
@@ -330,8 +330,8 @@ fn agent_session_id_is_the_id_kind_value_or_null() {
     );
 }
 
-/// A row whose pid is a listed `clauth mcp` (never the group leader, never a
-/// `clauth start`/`resume`) is the pane's delegate, listed after its own
+/// A row whose pid is a listed `tollgate mcp` (never the group leader, never a
+/// `tollgate start`/`resume`) is the pane's delegate, listed after its own
 /// session.
 #[test]
 fn a_delegate_pid_joins_as_delegate_after_the_own_session() {
@@ -355,7 +355,7 @@ fn a_delegate_pid_joins_as_delegate_after_the_own_session() {
             "kind": "session",
             "follows_chain": false,
             "isolated": false,
-            "cwd": "/home/user/repos/rs/clauth",
+            "cwd": "/home/user/repos/rs/tollgate",
         },
         {
             "session_id": "3210136-0",
@@ -363,7 +363,7 @@ fn a_delegate_pid_joins_as_delegate_after_the_own_session() {
             "kind": "delegate",
             "follows_chain": false,
             "isolated": false,
-            "cwd": "/home/user/repos/rs/clauth",
+            "cwd": "/home/user/repos/rs/tollgate",
         },
     ]);
     assert_eq!(
@@ -524,15 +524,15 @@ fn a_recycled_pid_keeps_only_the_newest_row() {
             "kind": "session",
             "follows_chain": false,
             "isolated": false,
-            "cwd": "/home/user/repos/rs/clauth",
+            "cwd": "/home/user/repos/rs/tollgate",
         }])
     );
 }
 
-/// A `clauth start` running under a wrapper (its pid is a listed process, not
+/// A `tollgate start` running under a wrapper (its pid is a listed process, not
 /// the group leader) reads as the pane's own session, not a delegate.
 #[test]
-fn a_wrapper_launched_clauth_start_is_the_panes_session() {
+fn a_wrapper_launched_tollgate_start_is_the_panes_session() {
     let _home = HomeSandbox::new();
     live_sessions::register(&LiveSession {
         session_id: "1002-0".to_string(),
@@ -551,7 +551,7 @@ fn a_wrapper_launched_clauth_start_is_the_panes_session() {
     })
     .expect("register the wrapper session");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/app","focused":false,"pane_id":"wX:pX","tab_id":"wX:tX","workspace_id":"wX"}]}}"#;
-    let info = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"name":"bash","pid":1001,"argv":["/usr/bin/bash"]},{"name":"clauth","pid":1002,"argv":["clauth","start","DS5"]}],"pane_id":"wX:pX","shell_pid":1001}}}"#;
+    let info = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"name":"bash","pid":1001,"argv":["/usr/bin/bash"]},{"name":"tollgate","pid":1002,"argv":["tollgate","start","DS5"]}],"pane_id":"wX:pX","shell_pid":1001}}}"#;
     let ctx = ctx(probe(
         ran_ok(list),
         vec![("wX:pX".to_string(), ran_ok(info))],
@@ -587,7 +587,7 @@ fn a_pane_with_no_foreground_job_keeps_its_row_beside_a_joined_pane() {
         start_profile: "uwuclxdy".to_string(),
         pid: 2002,
         started_at: 1,
-        cwd: Some(PathBuf::from("/home/user/repos/rs/clauth")),
+        cwd: Some(PathBuf::from("/home/user/repos/rs/tollgate")),
         isolated: false,
         follows_chain: false,
         intended_member: None,
@@ -598,7 +598,7 @@ fn a_pane_with_no_foreground_job_keeps_its_row_beside_a_joined_pane() {
         launch_store: None,
     })
     .expect("register the member row");
-    let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/rs/clauth","focused":false,"pane_id":"wM:pM","tab_id":"wM:tM","workspace_id":"wM"},{"agent_status":"idle","cwd":"/home/user/repos/shell","focused":false,"pane_id":"wE:pE","tab_id":"wE:tE","workspace_id":"wE"}]}}"#;
+    let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/rs/tollgate","focused":false,"pane_id":"wM:pM","tab_id":"wM:tM","workspace_id":"wM"},{"agent_status":"idle","cwd":"/home/user/repos/shell","focused":false,"pane_id":"wE:pE","tab_id":"wE:tE","workspace_id":"wE"}]}}"#;
     let member_info = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":2001,"foreground_processes":[{"name":"bash","pid":2001,"argv":["/usr/bin/bash"]},{"name":"claude","pid":2002,"argv":["claude","--effort","max"]}],"pane_id":"wM:pM","shell_pid":2001}}}"#;
     // The real no-job wire: herdr omits both keys.
     let empty_info = r#"{"id":"cli:pane:process_info","result":{"process_info":{"pane_id":"wE:pE","shell_pid":2003}}}"#;
@@ -630,7 +630,7 @@ fn a_pane_with_no_foreground_job_keeps_its_row_beside_a_joined_pane() {
             "kind": "delegate",
             "follows_chain": false,
             "isolated": false,
-            "cwd": "/home/user/repos/rs/clauth",
+            "cwd": "/home/user/repos/rs/tollgate",
         }])
     );
 
@@ -720,21 +720,21 @@ fn kinds(sessions: &serde_json::Value) -> Vec<String> {
 #[test]
 fn a_group_leader_is_the_panes_session_whatever_its_argv() {
     let _home = HomeSandbox::new();
-    let info: &'static str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":3001,"foreground_processes":[{"name":"clauth","pid":3001},{"name":"claude","pid":3002,"argv":["claude","--effort","max"]}],"pane_id":"wK:pK","shell_pid":3000}}}"#;
+    let info: &'static str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":3001,"foreground_processes":[{"name":"tollgate","pid":3001},{"name":"claude","pid":3002,"argv":["claude","--effort","max"]}],"pane_id":"wK:pK","shell_pid":3000}}}"#;
     assert_eq!(kinds(&sessions_for(3001, info)), vec!["session"]);
 }
 
-/// `clauth resume` registers its row like `clauth start`; under a wrapper it is
+/// `tollgate resume` registers its row like `tollgate start`; under a wrapper it is
 /// a listed member and its verb is what makes it the pane's session.
 #[test]
-fn a_wrapper_launched_clauth_resume_is_the_panes_session() {
+fn a_wrapper_launched_tollgate_resume_is_the_panes_session() {
     let _home = HomeSandbox::new();
-    let info: &'static str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":3100,"foreground_processes":[{"name":"bash","pid":3100,"argv":["/usr/bin/bash"]},{"name":"clauth","pid":3101,"argv":["/home/user/.cargo/bin/clauth","resume","latest"]}],"pane_id":"wK:pK","shell_pid":3100}}}"#;
+    let info: &'static str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":3100,"foreground_processes":[{"name":"bash","pid":3100,"argv":["/usr/bin/bash"]},{"name":"tollgate","pid":3101,"argv":["/home/user/.cargo/bin/tollgate","resume","latest"]}],"pane_id":"wK:pK","shell_pid":3100}}}"#;
     assert_eq!(kinds(&sessions_for(3101, info)), vec!["session"]);
 }
 
 /// herdr's Windows `process-info` carries one entry, the pane's agent root
-/// (`claude.exe`), as both group id and sole process; the `clauth.exe`
+/// (`claude.exe`), as both group id and sole process; the `tollgate.exe`
 /// supervisor is never listed, so no session joins on Windows and the answer
 /// says so by an empty `sessions`, never by a wrong one.
 #[test]
@@ -744,11 +744,11 @@ fn a_windows_pane_lists_only_its_agent_root_so_no_session_joins() {
     assert_eq!(kinds(&sessions_for(4002, info)), Vec::<String>::new());
 }
 
-/// A member that is not a `clauth` reads as a delegate even when its second
+/// A member that is not a `tollgate` reads as a delegate even when its second
 /// argument is `start`: the name conjunct is what keeps a recycled pid on an
 /// `npm start` from posing as the pane's session.
 #[test]
-fn a_non_clauth_member_running_start_is_a_delegate() {
+fn a_non_tollgate_member_running_start_is_a_delegate() {
     let _home = HomeSandbox::new();
     let info: &'static str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":5001,"foreground_processes":[{"name":"bash","pid":5001,"argv":["/usr/bin/bash"]},{"name":"node","pid":5002,"argv":["npm","start"]}],"pane_id":"wK:pK","shell_pid":5001}}}"#;
     assert_eq!(kinds(&sessions_for(5002, info)), vec!["delegate"]);

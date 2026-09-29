@@ -11,7 +11,7 @@ body:
         maintainer triage without a round-trip; vague entries get the issue closed.
 
         **Redact secrets before pasting anything.** Strip OAuth tokens, API keys,
-        and the contents of `~/.claude/.credentials.json` or any `~/.clauth/profiles/*`
+        and the contents of `~/.claude/.credentials.json` or any `~/.tollgate/profiles/*`
         file. `sk-ant-*` strings in logs are live credentials, not IDs.
 
   - type: input
@@ -27,7 +27,7 @@ body:
     id: what-happened
     attributes:
       label: What happened
-      description: What did clauth do wrong?
+      description: What did tollgate do wrong?
     validations:
       required: true
 
@@ -53,8 +53,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: clauth version
-      description: Output of `clauth --version`, or commit hash if built from source.
+      label: tollgate version
+      description: Output of `tollgate --version`, or commit hash if built from source.
       placeholder: e.g. v0.7.3
     validations:
       required: true

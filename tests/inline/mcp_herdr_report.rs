@@ -135,11 +135,11 @@ fn state_of(line: &str) -> Option<&str> {
         .iter()
         .position(|t| *t == "--token")
         .and_then(|i| tokens.get(i + 1))
-        .and_then(|kv| kv.strip_prefix("clauth_delegate="))
+        .and_then(|kv| kv.strip_prefix("tollgate_delegate="))
 }
 
 /// Assert one recorded report line has the settled argv shape
-/// `pane report-metadata <pane> --source clauth --token clauth_delegate=<state>
+/// `pane report-metadata <pane> --source tollgate --token tollgate_delegate=<state>
 /// --ttl-ms 60000 --seq <n>` and return its seq. The shape is the one the
 /// installed binary accepts (pane id first, herdr's parser takes args[0]),
 /// and the TTL literal is the shipped value, so a change to either reds here.
@@ -147,12 +147,12 @@ fn assert_report_shape(line: &str, pane_id: &str, state: &str) -> u64 {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(
         &tokens[..5],
-        ["pane", "report-metadata", pane_id, "--source", "clauth"],
+        ["pane", "report-metadata", pane_id, "--source", "tollgate"],
         "argv order (pane id first, herdr's parser takes args[0]): {line}"
     );
     assert_eq!(
         &tokens[5..7],
-        ["--token", &format!("clauth_delegate={state}")],
+        ["--token", &format!("tollgate_delegate={state}")],
         "argv: {line}"
     );
     assert_eq!(&tokens[7..9], ["--ttl-ms", "60000"], "argv: {line}");
@@ -202,9 +202,9 @@ fn seed(names: &[&str], disabled: bool) {
     }
 }
 
-/// Drive the async `delegate` tool with `CLAUTH_MCP_DEPTH` cleared, mirroring
+/// Drive the async `delegate` tool with `TOLLGATE_MCP_DEPTH` cleared, mirroring
 /// `mcp_delegate_args::call_delegate` (same serialization rationale).
-fn drive(server: &ClauthServer, args: DelegateArgs) -> CallToolResult {
+fn drive(server: &TollgateServer, args: DelegateArgs) -> CallToolResult {
     let saved = std::env::var(MCP_DEPTH_ENV).ok();
     // SAFETY: test-only, serialized by the sandbox's HOME_TEST_LOCK.
     unsafe { std::env::remove_var(MCP_DEPTH_ENV) };
@@ -237,9 +237,9 @@ fn drive(server: &ClauthServer, args: DelegateArgs) -> CallToolResult {
 /// DROP the pin before returning. The server must keep reporting: a per-call
 /// re-resolution would now see the ambient env (no shim), so the recorded
 /// shim lines are the construction-time pin.
-fn pinned_server(home: &HomeSandbox, pane: &str, shim: &Path) -> ClauthServer {
+fn pinned_server(home: &HomeSandbox, pane: &str, shim: &Path) -> TollgateServer {
     let _pin = EnvPin::new(home, Some(pane), Some(shim));
-    ClauthServer::new().with_herdr_pane(PaneReporter::resolve(true))
+    TollgateServer::new().with_herdr_pane(PaneReporter::resolve(true))
 }
 
 // ── gating: what `PaneReporter::resolve` accepts ─────────────────────────────
@@ -589,7 +589,7 @@ fn seq_starts_from_the_clock_so_a_restart_cannot_rewind() {
     let home = HomeSandbox::new();
     let shim = echo_shim(home.home(), "herdr");
     let reporter = pinned_reporter(&home, "pane-9", &shim);
-    // herdr's high-water for `--source clauth` outlives this process, so a
+    // herdr's high-water for `--source tollgate` outlives this process, so a
     // fresh reporter's first seq has to beat whatever the last one left there.
     // Through the transition the report path actually takes, never a clock the
     // shipped code could stop calling.
@@ -800,7 +800,7 @@ fn server_without_pane_env_spawns_nothing() {
     // Pin BOTH vars off: no pane id means the serve path resolves no
     // reporter, and the drive must spawn nothing, shim or real herdr.
     let _pin = EnvPin::new(&home, None, None);
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let result = drive(
         &server,
         DelegateArgs {
@@ -825,7 +825,7 @@ fn server_without_reporter_spawns_nothing_even_with_pane_env() {
     // ambient env says — this is what keeps the rest of the suite safe when
     // the gate runs inside a real herdr pane.
     let _pin = EnvPin::new(&home, Some("pane-7"), Some(&shim));
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let result = drive(
         &server,
         DelegateArgs {
@@ -837,7 +837,7 @@ fn server_without_reporter_spawns_nothing_even_with_pane_env() {
     assert_eq!(result.is_error, Some(true), "the delegate still runs");
     assert!(
         report_lines(home.home()).is_empty(),
-        "a plain ClauthServer::new() carries no reporter"
+        "a plain TollgateServer::new() carries no reporter"
     );
 }
 
@@ -850,7 +850,7 @@ fn server_with_knob_off_spawns_nothing_even_with_pane_env() {
     // so a knob-off resolution must be the same silent no-op as the missing
     // pane env: the delegate runs, nothing spawns.
     let _pin = EnvPin::new(&home, Some("pane-7"), Some(&shim));
-    let server = ClauthServer::new().with_herdr_pane(PaneReporter::resolve(false));
+    let server = TollgateServer::new().with_herdr_pane(PaneReporter::resolve(false));
     let result = drive(
         &server,
         DelegateArgs {

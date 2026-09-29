@@ -1,6 +1,6 @@
 //! In-place trim of the daemon's supervisor-redirected log.
 //!
-//! `~/.clauth/daemon.log` is opened by **launchd** (`StandardErrorPath`) with an
+//! `~/.tollgate/daemon.log` is opened by **launchd** (`StandardErrorPath`) with an
 //! `O_APPEND` fd that launchd holds for the daemon's whole lifetime and never
 //! reopens. That rules out rename-based rotation: renaming the file leaves
 //! launchd appending to the renamed inode, so the "new" `daemon.log` stays empty
@@ -39,7 +39,7 @@ pub(crate) fn rotate_log_if_large(
 ) -> std::io::Result<bool> {
     let len = match std::fs::metadata(path) {
         Ok(m) => m.len(),
-        // Absent — e.g. a manual `clauth daemon` whose stderr goes to the tty, not
+        // Absent — e.g. a manual `tollgate daemon` whose stderr goes to the tty, not
         // this file. Nothing to trim.
         Err(_) => return Ok(false),
     };
@@ -73,7 +73,7 @@ pub(crate) fn rotate_log_if_large(
 /// `O_APPEND`. The in-place trim moves EOF backwards, and a writer that is not in
 /// append mode keeps writing at its own stale offset — so the trim leaves a
 /// sparse hole and the file grows without bound anyway. launchd's
-/// `StandardErrorPath` opens `O_APPEND`; a hand-rolled `clauth daemon >
+/// `StandardErrorPath` opens `O_APPEND`; a hand-rolled `tollgate daemon >
 /// daemon.log` does not (`>>` does). A tty or pipe has no cap to defeat.
 #[cfg(unix)]
 fn log_cap_defeated(stderr_is_regular_file: bool, stderr_is_append: bool) -> bool {
@@ -109,7 +109,7 @@ fn stderr_file_mode() -> Option<(bool, bool)> {
 pub(crate) fn warn_if_log_cap_defeated() {
     if stderr_file_mode().is_some_and(|(file, append)| log_cap_defeated(file, append)) {
         logline!(
-            "clauth daemon: stderr is a non-append file redirect: the daemon.log size cap \
+            "tollgate daemon: stderr is a non-append file redirect: the daemon.log size cap \
              cannot hold and the file will grow unbounded; redirect with `>>` or let launchd's \
              StandardErrorPath open it"
         );

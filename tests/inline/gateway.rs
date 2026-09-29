@@ -296,7 +296,7 @@ fn a_short_admin_token_file_is_refused_and_left_alone() {
     assert_eq!(
         format!("{err:#}"),
         format!(
-            "the gateway admin token in {} is shorter than 32 characters, which shunt refuses; delete the file and clauth mints a new one",
+            "the gateway admin token in {} is shorter than 32 characters, which shunt refuses; delete the file and tollgate mints a new one",
             path.display()
         )
     );
@@ -491,7 +491,7 @@ fn a_yaml_config_shunt_loads_first_refuses_adoption() {
     assert_eq!(
         err.to_string(),
         format!(
-            "shunt would load {}, a YAML config; clauth edits the adopted config in place and has no format-preserving YAML editor, so it adopts a TOML config only",
+            "shunt would load {}, a YAML config; tollgate edits the adopted config in place and has no format-preserving YAML editor, so it adopts a TOML config only",
             cwd.join("shunt.yml").display()
         )
     );
@@ -633,13 +633,13 @@ fn an_unusable_bind_is_refused_by_its_source_never_its_value() {
             BindRefusal::OsAssignedPort {
                 source: "[server].bind",
             },
-            "[server].bind asks for an OS-assigned port, so clauth cannot know where the gateway listens; set it to a fixed port like 127.0.0.1:3001",
+            "[server].bind asks for an OS-assigned port, so tollgate cannot know where the gateway listens; set it to a fixed port like 127.0.0.1:3001",
         ),
         (
             "[server]\nbind = \"${GATEWAY_BIND}\"\n",
             None,
             BindRefusal::ConfigReference,
-            "[server].bind is a ${...} reference, which clauth does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead",
+            "[server].bind is a ${...} reference, which tollgate does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead",
         ),
     ] {
         let err = resolve_bind(config, env).expect_err(config);
@@ -758,7 +758,7 @@ fn the_inherited_bind_env_value_is_normalized_the_way_figment_reads_it() {
         .expect_err("a backslash inside the quotes");
     assert_eq!(
         err.to_string(),
-        "SHUNT_SERVER__BIND holds a backslash inside its quotes, which figment would unescape and clauth does not; write the value literally"
+        "SHUNT_SERVER__BIND holds a backslash inside its quotes, which figment would unescape and tollgate does not; write the value literally"
     );
     match err.downcast_ref::<BindRefusal>() {
         Some(BindRefusal::QuotedEscape { source }) => assert_eq!(*source, BIND_ENV),
@@ -808,7 +808,7 @@ fn the_bind_read_mirrors_figments_value_parse() {
 }
 
 /// The drain read takes a number exactly where shunt's figment layer does, so
-/// clauth's stop bound equals shunt's drain. Each row's verdict is the
+/// tollgate's stop bound equals shunt's drain. Each row's verdict is the
 /// installed shunt's `check` on that env value: a padding of Unicode whitespace
 /// around the number is accepted, while a quoted `"30"` or a trailing separator
 /// is refused (`invalid type: found string`), so it reads as shunt's maximum,
@@ -954,7 +954,7 @@ fn a_file_systemd_refuses_whole_names_the_line_never_its_text() {
                 line: 2,
                 kind: EnvFileErrorKind::NulByte,
             },
-            "line 2 holds a NUL byte; systemd refuses such a file whole, and so does clauth: remove the byte",
+            "line 2 holds a NUL byte; systemd refuses such a file whole, and so does tollgate: remove the byte",
         ),
         (
             &b"OK=1\n\nTOKEN=sk-caf\xe9\n"[..],
@@ -962,7 +962,7 @@ fn a_file_systemd_refuses_whole_names_the_line_never_its_text() {
                 line: 3,
                 kind: EnvFileErrorKind::NotUtf8,
             },
-            "the assignment on line 3 is not UTF-8; systemd refuses such a file whole, and so does clauth: save it as UTF-8",
+            "the assignment on line 3 is not UTF-8; systemd refuses such a file whole, and so does tollgate: save it as UTF-8",
         ),
         (
             &b"OK=1\nexport TOKEN=\"sk-caf\xe9\"\n"[..],
@@ -970,7 +970,7 @@ fn a_file_systemd_refuses_whole_names_the_line_never_its_text() {
                 line: 2,
                 kind: EnvFileErrorKind::NotUtf8,
             },
-            "the assignment on line 2 is not UTF-8; systemd refuses such a file whole, and so does clauth: save it as UTF-8",
+            "the assignment on line 2 is not UTF-8; systemd refuses such a file whole, and so does tollgate: save it as UTF-8",
         ),
     ] {
         assert_eq!(
@@ -1028,7 +1028,7 @@ fn the_gateway_env_is_the_env_file_then_the_stores() {
         "the invalid line is skipped, the rest loads"
     );
     let env = gateway_env(&record).expect("env");
-    let stores = home.home().join(".clauth").join("shunt");
+    let stores = home.home().join(".tollgate").join("shunt");
     assert_eq!(env.get("TOKEN"), Some(OsStr::new("from-file")));
     for (key, pinned) in [
         (
@@ -1167,13 +1167,13 @@ fn the_version_refusal_names_what_it_read_and_the_floor() {
         check_version_floor("0.47.0")
             .expect_err("below")
             .to_string(),
-        "shunt 0.47.0 is older than 0.48.0, the oldest release clauth supervises"
+        "shunt 0.47.0 is older than 0.48.0, the oldest release tollgate supervises"
     );
     assert_eq!(
         check_version_floor("garbage")
             .expect_err("unreadable")
             .to_string(),
-        "shunt reported version \"garbage\", which does not read as a release; clauth supervises 0.48.0 or newer"
+        "shunt reported version \"garbage\", which does not read as a release; tollgate supervises 0.48.0 or newer"
     );
 }
 
@@ -1269,7 +1269,7 @@ fn a_listener_that_never_answers_fails_the_probe_within_its_bound() {
 
 // ── the admin entry: pure edits ─────────────────────────────────────────────
 
-const KEY_REF: &str = "${file:/h/.clauth/gateway-admin-token}";
+const KEY_REF: &str = "${file:/h/.tollgate/gateway-admin-token}";
 
 #[test]
 fn the_admin_need_names_what_the_config_lacks() {
@@ -1287,11 +1287,11 @@ fn the_admin_need_names_what_the_config_lacks() {
             AdminNeed::WriteKey,
         ),
         (
-            "[[server.admin.write_keys]]\nid = \"ops\"\nkey = \"${file:/k}\"\n\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"${file:/h/.clauth/gateway-admin-token}\"\n",
+            "[[server.admin.write_keys]]\nid = \"ops\"\nkey = \"${file:/k}\"\n\n[[server.admin.write_keys]]\nid = \"tollgate\"\nkey = \"${file:/h/.tollgate/gateway-admin-token}\"\n",
             AdminNeed::Neither,
         ),
         (
-            "[server.admin]\nwrite_keys = [{ id = \"clauth\", key = '${file:/h/.clauth/gateway-admin-token}' }]\n",
+            "[server.admin]\nwrite_keys = [{ id = \"tollgate\", key = '${file:/h/.tollgate/gateway-admin-token}' }]\n",
             AdminNeed::Neither,
         ),
     ] {
@@ -1303,30 +1303,30 @@ fn the_admin_need_names_what_the_config_lacks() {
     }
     for (text, expected, message) in [
         (
-            "[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"${file:/other}\"\n",
-            ConfigEditRefusal::ForeignClauthKey,
-            "[server.admin] already has a write key with id \"clauth\" holding another key; clauth adds none beside it; remove that entry, then run the edit again",
+            "[[server.admin.write_keys]]\nid = \"tollgate\"\nkey = \"${file:/other}\"\n",
+            ConfigEditRefusal::ForeignTollgateKey,
+            "[server.admin] already has a write key with id \"tollgate\" holding another key; tollgate adds none beside it; remove that entry, then run the edit again",
         ),
         (
             "server = 3\n",
             ConfigEditRefusal::UnexpectedShape {
                 what: "[server] is not a table",
             },
-            "[server] is not a table; clauth edits only a [server.admin] table and its write_keys array",
+            "[server] is not a table; tollgate edits only a [server.admin] table and its write_keys array",
         ),
         (
             "[server]\nadmin = true\n",
             ConfigEditRefusal::UnexpectedShape {
                 what: "[server.admin] is not a table",
             },
-            "[server.admin] is not a table; clauth edits only a [server.admin] table and its write_keys array",
+            "[server.admin] is not a table; tollgate edits only a [server.admin] table and its write_keys array",
         ),
         (
             "[server.admin]\nwrite_keys = \"x\"\n",
             ConfigEditRefusal::UnexpectedShape {
                 what: "[server.admin].write_keys is not an array of tables",
             },
-            "[server.admin].write_keys is not an array of tables; clauth edits only a [server.admin] table and its write_keys array",
+            "[server.admin].write_keys is not an array of tables; tollgate edits only a [server.admin] table and its write_keys array",
         ),
     ] {
         let err = admin_need_of(text, KEY_REF).expect_err(text);
@@ -1359,32 +1359,32 @@ fn every_admin_shape_gains_exactly_the_entry() {
         (
             "[server.admin]\nwrite_keys = [{ id = \"ops\", key = \"${file:/k}\" }]\n",
             AdminNeed::WriteKey,
-            "[server.admin]\nwrite_keys = [{ id = \"ops\", key = \"${file:/k}\" }, { id = \"clauth\", key = \"${file:/h/.clauth/gateway-admin-token}\" }]\n",
+            "[server.admin]\nwrite_keys = [{ id = \"ops\", key = \"${file:/k}\" }, { id = \"tollgate\", key = \"${file:/h/.tollgate/gateway-admin-token}\" }]\n",
         ),
         (
             "[server]\nadmin = { header = \"h\" }\n",
             AdminNeed::WriteKey,
-            "[server]\nadmin = { header = \"h\", write_keys = [{ id = \"clauth\", key = \"${file:/h/.clauth/gateway-admin-token}\" }] }\n",
+            "[server]\nadmin = { header = \"h\", write_keys = [{ id = \"tollgate\", key = \"${file:/h/.tollgate/gateway-admin-token}\" }] }\n",
         ),
         (
             "[server]\nadmin = {header = \"h\"}\n",
             AdminNeed::WriteKey,
-            "[server]\nadmin = {header = \"h\", write_keys = [{ id = \"clauth\", key = \"${file:/h/.clauth/gateway-admin-token}\" }]}\n",
+            "[server]\nadmin = {header = \"h\", write_keys = [{ id = \"tollgate\", key = \"${file:/h/.tollgate/gateway-admin-token}\" }]}\n",
         ),
         (
             "[server]\nadmin = { header = \"h\"   }\n",
             AdminNeed::WriteKey,
-            "[server]\nadmin = { header = \"h\", write_keys = [{ id = \"clauth\", key = \"${file:/h/.clauth/gateway-admin-token}\" }]   }\n",
+            "[server]\nadmin = { header = \"h\", write_keys = [{ id = \"tollgate\", key = \"${file:/h/.tollgate/gateway-admin-token}\" }]   }\n",
         ),
         (
             "# providers only\n[providers.x]\nkind = \"a\"\n",
             AdminNeed::AdminTable,
-            "# providers only\n[providers.x]\nkind = \"a\"\n\n[server.admin]\n\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"${file:/h/.clauth/gateway-admin-token}\"\n",
+            "# providers only\n[providers.x]\nkind = \"a\"\n\n[server.admin]\n\n[[server.admin.write_keys]]\nid = \"tollgate\"\nkey = \"${file:/h/.tollgate/gateway-admin-token}\"\n",
         ),
         (
             "server = { bind = \"127.0.0.1:1\" }\n",
             AdminNeed::AdminTable,
-            "server = { bind = \"127.0.0.1:1\", admin = { write_keys = [{ id = \"clauth\", key = \"${file:/h/.clauth/gateway-admin-token}\" }] } }\n",
+            "server = { bind = \"127.0.0.1:1\", admin = { write_keys = [{ id = \"tollgate\", key = \"${file:/h/.tollgate/gateway-admin-token}\" }] } }\n",
         ),
     ] {
         assert_eq!(
@@ -1398,7 +1398,7 @@ fn every_admin_shape_gains_exactly_the_entry() {
 #[test]
 fn an_edit_for_the_wrong_step_or_an_existing_entry_plans_nothing() {
     let _home = HomeSandbox::new();
-    let present = "[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"${file:/h/.clauth/gateway-admin-token}\"\n";
+    let present = "[[server.admin.write_keys]]\nid = \"tollgate\"\nkey = \"${file:/h/.tollgate/gateway-admin-token}\"\n";
     assert_eq!(
         plan_admin_edit(present, KEY_REF, AdminNeed::WriteKey).expect("present"),
         None
@@ -1424,7 +1424,7 @@ fn an_edit_for_the_wrong_step_or_an_existing_entry_plans_nothing() {
     );
     assert_eq!(
         err.to_string(),
-        "the config already has a [server.admin] table; clauth's write key goes into it instead"
+        "the config already has a [server.admin] table; tollgate's write key goes into it instead"
     );
 }
 
@@ -1517,7 +1517,7 @@ impl Gate {
             "${{file:{}}}",
             self.home
                 .home()
-                .join(".clauth")
+                .join(".tollgate")
                 .join("gateway-admin-token")
                 .display()
         )
@@ -1531,7 +1531,7 @@ impl Gate {
 #[cfg(unix)]
 const USER_CONFIG: &str = "# my gateway, hand-tuned\n\
 [server]\n\
-bind = \"127.0.0.1:3067\" # the port clauth probes\n\
+bind = \"127.0.0.1:3067\" # the port tollgate probes\n\
 \n\
 [server.admin]\n\
 # the user's own credentials stay as they are\n\
@@ -1547,14 +1547,14 @@ key = \"${file:/etc/shunt/ops-key}\"\n\
 [providers.anthropic]\n\
 kind = \"anthropic\"\n";
 
-/// [`USER_CONFIG`] with clauth's entry added after the user's own key and
+/// [`USER_CONFIG`] with tollgate's entry added after the user's own key and
 /// every other byte kept.
 #[cfg(unix)]
 fn user_config_with_key(key_ref: &str) -> String {
     format!(
         "# my gateway, hand-tuned\n\
          [server]\n\
-         bind = \"127.0.0.1:3067\" # the port clauth probes\n\
+         bind = \"127.0.0.1:3067\" # the port tollgate probes\n\
          \n\
          [server.admin]\n\
          # the user's own credentials stay as they are\n\
@@ -1567,7 +1567,7 @@ fn user_config_with_key(key_ref: &str) -> String {
          key = \"${{file:/etc/shunt/ops-key}}\"\n\
          \n\
          [[server.admin.write_keys]]\n\
-         id = \"clauth\"\n\
+         id = \"tollgate\"\n\
          key = \"{key_ref}\"\n\
          \n\
          # providers after the admin block\n\
@@ -1835,7 +1835,7 @@ fn a_failing_check_leaves_the_config_byte_identical() {
     assert_eq!(
         err.to_string(),
         format!(
-            "`{} check` refused clauth's edit of {} (exit 1); the config is unchanged",
+            "`{} check` refused tollgate's edit of {} (exit 1); the config is unchanged",
             binary.display(),
             g.config.display()
         )
@@ -1874,7 +1874,7 @@ fn a_second_call_never_duplicates_the_entry() {
          header = \"x-shunt-admin-token\"\n\
          \n\
          [[server.admin.write_keys]]\n\
-         id = \"clauth\"\n\
+         id = \"tollgate\"\n\
          key = \"{}\"\n\
          \n\
          [providers.anthropic]\n\
@@ -1928,7 +1928,7 @@ fn the_table_offer_adds_an_admin_table_carrying_the_entry() {
              [server.admin]\n\
              \n\
              [[server.admin.write_keys]]\n\
-             id = \"clauth\"\n\
+             id = \"tollgate\"\n\
              key = \"{}\"\n\
              \n\
              [providers.anthropic]\n\
@@ -1954,7 +1954,7 @@ fn a_config_edited_during_the_check_is_never_overwritten() {
     assert_eq!(
         err.to_string(),
         format!(
-            "{} changed while clauth's edit was being checked; nothing was written; run the edit again",
+            "{} changed while tollgate's edit was being checked; nothing was written; run the edit again",
             g.config.display()
         )
     );
@@ -1988,7 +1988,7 @@ fn a_symlinked_config_is_refused() {
     assert_eq!(
         err.to_string(),
         format!(
-            "{} is a symlink; clauth lands its edit by renaming over the config, which would replace the link",
+            "{} is a symlink; tollgate lands its edit by renaming over the config, which would replace the link",
             link.display()
         )
     );
@@ -2052,9 +2052,9 @@ fn a_missing_shunt_binary_is_named_and_nothing_is_written() {
 // ── the stores ──────────────────────────────────────────────────────────────
 
 #[test]
-fn the_store_env_points_every_store_under_clauth() {
+fn the_store_env_points_every_store_under_tollgate() {
     let home = HomeSandbox::new();
-    let root = home.home().join(".clauth").join("shunt");
+    let root = home.home().join(".tollgate").join("shunt");
     let accounts = root.join("accounts");
     assert_eq!(
         store_env().expect("env"),
@@ -2141,7 +2141,7 @@ fn sandbox_home() -> [(OsString, OsString); 1] {
 fn the_store_move_lands_every_credential_owner_only() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     for (segments, bytes) in STANDALONE {
         let path = under(&src, segments);
         write(&path, bytes);
@@ -2199,7 +2199,7 @@ fn the_store_move_lands_every_credential_owner_only() {
     );
     #[cfg(unix)]
     for dir in [
-        home.home().join(".clauth"),
+        home.home().join(".tollgate"),
         dst.clone(),
         dst.join("accounts"),
         dst.join("accounts").join("claude"),
@@ -2213,7 +2213,7 @@ fn the_store_move_lands_every_credential_owner_only() {
 fn a_collision_refuses_the_whole_move_leaving_both_sides_byte_identical() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let main = ["accounts", "claude", "main.json"];
     let codex = ["accounts", "codex", "a.json"];
     let kimi = ["accounts", "kimi", "k.json"];
@@ -2293,7 +2293,7 @@ fn a_destination_appearing_after_the_collision_check_is_never_overwritten() {
 fn a_failure_part_way_leaves_each_credential_at_its_source_or_destination() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let main = ["accounts", "claude", "main.json"];
     let work = ["accounts", "claude", "work.json"];
     let codex = ["accounts", "codex", "a.json"];
@@ -2370,7 +2370,7 @@ fn a_failure_part_way_leaves_each_credential_at_its_source_or_destination() {
 fn a_failure_after_the_copy_leaves_the_credential_at_both_places_and_says_so() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let main = ["accounts", "claude", "main.json"];
     let work = ["accounts", "claude", "work.json"];
     let codex = ["accounts", "codex", "a.json"];
@@ -2448,7 +2448,7 @@ fn a_failure_after_the_copy_leaves_the_credential_at_both_places_and_says_so() {
 fn a_link_inside_a_store_is_left_behind_and_the_files_around_it_move() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let main = under(&src, &["accounts", "claude", "main.json"]);
     write(&main, "claude-main");
     let link = under(&src, &["accounts", "claude", "link.json"]);
@@ -2487,7 +2487,7 @@ fn a_link_inside_a_store_is_left_behind_and_the_files_around_it_move() {
 fn a_dir_store_moves_only_the_account_files_and_lists_the_rest_as_left_behind() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let claude = ["accounts", "claude"];
     let main = under(&src, &["accounts", "claude", "main.json"]);
     write(&main, "claude-main");
@@ -2589,7 +2589,7 @@ fn a_store_that_is_a_link_refuses_the_move_naming_the_link() {
             other => panic!("a StoreLink refusal, got {other:?}"),
         }
         assert_eq!(fs::read_to_string(&target).expect("target"), "xai-real");
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
     // A store dir root: ~/.shunt/accounts/codex linked onto a sandbox dir.
     {
@@ -2617,7 +2617,7 @@ fn a_store_that_is_a_link_refuses_the_move_naming_the_link() {
             fs::read_to_string(target.join("a.json")).expect("target"),
             "codex-a"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
 }
 
@@ -2647,7 +2647,7 @@ fn a_store_of_the_wrong_kind_refuses_naming_the_kind() {
             fs::read_to_string(&store).expect("kept"),
             "a file where a dir was expected"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
     // A single-file store (~/.shunt/xai-auth.json) that is a directory.
     {
@@ -2668,7 +2668,7 @@ fn a_store_of_the_wrong_kind_refuses_naming_the_kind() {
             other => panic!("a StoreNotFile refusal, got {other:?}"),
         }
         assert!(store.is_dir(), "the dir stays");
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
 }
 
@@ -2682,7 +2682,7 @@ fn a_store_of_the_wrong_kind_refuses_naming_the_kind() {
 fn an_env_file_names_each_store_source_and_a_blank_value_reads_as_shunt_reads_it() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let custom = home.home().join("custom").join("codex");
     let record = with_env_file(
         &home,
@@ -2760,7 +2760,7 @@ fn an_env_file_names_each_store_source_and_a_blank_value_reads_as_shunt_reads_it
 fn a_lower_case_store_key_on_unix_leaves_its_file_untouched() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let xai = under(&src, &["xai-auth.json"]);
     write(&xai, "xai");
     let other = home.home().join("other.json");
@@ -2816,7 +2816,7 @@ fn a_relative_store_source_refuses_the_move_naming_only_its_key() {
         assert_eq!(
             result.as_ref().map(|_| ()).map_err(ToString::to_string),
             Err(format!(
-                "the env file sets {key} to a relative path, and clauth cannot tell which directory the standalone resolved it against; nothing was moved; set {key} to an absolute path in the env file, then run the move again"
+                "the env file sets {key} to a relative path, and tollgate cannot tell which directory the standalone resolved it against; nothing was moved; set {key} to an absolute path in the env file, then run the move again"
             )),
             "{line}"
         );
@@ -2825,21 +2825,21 @@ fn a_relative_store_source_refuses_the_move_naming_only_its_key() {
             other => panic!("a RelativeSource refusal, got {other:?}"),
         }
         assert_eq!(fs::read_to_string(&main).expect("kept"), "claude-main");
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
 }
 
 /// A store's default is shunt's default, resolved under the standalone's own
-/// `HOME` (the env file's value over the inherited env), never clauth's home:
+/// `HOME` (the env file's value over the inherited env), never tollgate's home:
 /// an env file `HOME` pointing elsewhere moves the store from there while
-/// clauth's own `~/.shunt` stays untouched.
+/// tollgate's own `~/.shunt` stays untouched.
 #[test]
 fn the_default_store_root_is_the_home_the_env_file_gave_the_standalone() {
     let home = HomeSandbox::new();
     let alt = home.home().join("alt");
     let main = ["accounts", "claude", "main.json"];
     write(&under(&alt.join(".shunt"), &main), "alt-main");
-    // A file under clauth's own `~/.shunt`: the move reads only the
+    // A file under tollgate's own `~/.shunt`: the move reads only the
     // standalone's home (the env file's `alt`), so this stays untouched.
     let own = home
         .home()
@@ -2857,13 +2857,13 @@ fn the_default_store_root_is_the_home_the_env_file_gave_the_standalone() {
         StoreMove {
             moved: vec![MovedFile {
                 from: under(&alt.join(".shunt"), &main),
-                to: under(&home.home().join(".clauth").join("shunt"), &main),
+                to: under(&home.home().join(".tollgate").join("shunt"), &main),
             }],
             kept: Vec::new(),
         }
     );
     assert_eq!(
-        fs::read_to_string(under(&home.home().join(".clauth").join("shunt"), &main))
+        fs::read_to_string(under(&home.home().join(".tollgate").join("shunt"), &main))
             .expect("moved"),
         "alt-main"
     );
@@ -2874,7 +2874,7 @@ fn the_default_store_root_is_the_home_the_env_file_gave_the_standalone() {
     assert_eq!(
         fs::read_to_string(&own).expect("still there"),
         "own-home",
-        "clauth's own home was not read"
+        "tollgate's own home was not read"
     );
 }
 
@@ -2883,7 +2883,7 @@ fn the_default_store_root_is_the_home_the_env_file_gave_the_standalone() {
 /// `USERPROFILE` (non-empty), xai reads raw `HOME` with no `USERPROFILE`
 /// fallback. With no `HOME` and a `USERPROFILE` set, cursor's default sits
 /// under `USERPROFILE` while xai has no determinable home: it is listed, and
-/// its default under clauth's own home is never read.
+/// its default under tollgate's own home is never read.
 #[test]
 fn each_familys_default_home_follows_its_shunt_site_rule() {
     let home = HomeSandbox::new();
@@ -2906,7 +2906,7 @@ fn each_familys_default_home_follows_its_shunt_site_rule() {
     )
     .expect("move");
 
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     assert_eq!(
         result,
         StoreMove {
@@ -2930,7 +2930,7 @@ fn each_familys_default_home_follows_its_shunt_site_rule() {
     assert_eq!(
         fs::read_to_string(&sandbox_xai).expect("untouched"),
         "xai-home",
-        "xai's default under clauth's own home was not read"
+        "xai's default under tollgate's own home was not read"
     );
 }
 
@@ -2968,13 +2968,13 @@ fn a_store_with_no_home_is_listed_not_refused() {
         ]
     );
     assert_eq!(fs::read_to_string(&main).expect("kept"), "claude-main");
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
-/// A store whose default home clauth cannot determine — no `HOME`, no
+/// A store whose default home tollgate cannot determine — no `HOME`, no
 /// `USERPROFILE` — is listed with its fix, never moved from a guessed path:
 /// the env-file-named claude account moves, the default xai file under
-/// clauth's own `~/.shunt` stays untouched, and every other default store is
+/// tollgate's own `~/.shunt` stays untouched, and every other default store is
 /// listed.
 #[test]
 fn a_store_with_no_determinable_home_is_listed_not_moved() {
@@ -2989,7 +2989,7 @@ fn a_store_with_no_determinable_home_is_listed_not_moved() {
         &format!("SHUNT_CLAUDE_ACCOUNTS_DIR={}\n", quoted(&claude)),
     );
 
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let result = move_standalone_stores_in(&record, GatewaySilent::for_test(), std::iter::empty())
         .expect("move");
 
@@ -3018,12 +3018,12 @@ fn a_store_with_no_determinable_home_is_listed_not_moved() {
     assert_eq!(
         fs::read_to_string(&sandbox_xai).expect("untouched"),
         "xai-home",
-        "xai's default under clauth's own home was not read"
+        "xai's default under tollgate's own home was not read"
     );
 }
 
 /// A home the env file names as a relative path still refuses, since the
-/// standalone resolved it against a working directory clauth cannot know.
+/// standalone resolved it against a working directory tollgate cannot know.
 #[test]
 fn a_relative_home_still_refuses_the_move() {
     let home = HomeSandbox::new();
@@ -3034,11 +3034,11 @@ fn a_relative_home_still_refuses_the_move() {
     assert_eq!(
         result.map(|m| m.moved).map_err(|e| e.to_string()),
         Err(
-            "the standalone's home names no absolute directory, so shunt's default for SHUNT_CLAUDE_ACCOUNTS_DIR is relative to the standalone's working directory, which clauth cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
+            "the standalone's home names no absolute directory, so shunt's default for SHUNT_CLAUDE_ACCOUNTS_DIR is relative to the standalone's working directory, which tollgate cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
                 .to_string()
         )
     );
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
 /// Two store keys naming one file move it once: the duplicate is known at
@@ -3058,7 +3058,7 @@ fn two_store_keys_naming_one_file_move_it_once_and_list_the_second() {
         ),
     );
 
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     assert_eq!(
         move_stores(&record).expect("the duplicate is listed, never a refusal"),
         StoreMove {
@@ -3083,15 +3083,15 @@ fn two_store_keys_naming_one_file_move_it_once_and_list_the_second() {
 /// which moves in beside the other stores. A path that is another owner's
 /// login stays where it is and the move names it with the reason, decided
 /// by canonical path and never by the file's bytes: the codex CLI's own
-/// `~/.codex/auth.json` (spelled through a link, or itself a clauth codex
-/// profile's link), or anything under `~/.clauth`.
+/// `~/.codex/auth.json` (spelled through a link, or itself a tollgate codex
+/// profile's link), or anything under `~/.tollgate`.
 #[test]
 fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
     fn codex_login(home: &Path) -> PathBuf {
         home.join(".codex").join("auth.json")
     }
     fn profile_login(home: &Path) -> PathBuf {
-        home.join(".clauth")
+        home.join(".tollgate")
             .join("codex")
             .join("work")
             .join("auth.json")
@@ -3101,7 +3101,7 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
         codex_login(home)
     }
     fn named_profile(home: &Path) -> PathBuf {
-        write(&profile_login(home), "clauth-profile-login");
+        write(&profile_login(home), "tollgate-profile-login");
         profile_login(home)
     }
     #[cfg(unix)]
@@ -3114,7 +3114,7 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
     }
     #[cfg(unix)]
     fn named_default_linked_onto_a_profile(home: &Path) -> PathBuf {
-        write(&profile_login(home), "clauth-profile-login");
+        write(&profile_login(home), "tollgate-profile-login");
         fs::create_dir_all(home.join(".codex")).expect(".codex");
         std::os::unix::fs::symlink(profile_login(home), codex_login(home)).expect("symlink");
         codex_login(home)
@@ -3127,7 +3127,7 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
         let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&own)));
         let to = home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("shunt")
             .join("codex-auth.json");
 
@@ -3149,7 +3149,7 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
     #[cfg_attr(not(unix), expect(unused_mut, reason = "the unix-only legs"))]
     let mut legs: Vec<(Named, KeptReason)> = vec![
         (named_default, KeptReason::CodexLogin),
-        (named_profile, KeptReason::ClauthOwned),
+        (named_profile, KeptReason::TollgateOwned),
     ];
     #[cfg(unix)]
     legs.extend([
@@ -3177,7 +3177,7 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
         assert!(
             !home
                 .home()
-                .join(".clauth")
+                .join(".tollgate")
                 .join("shunt")
                 .join("codex-auth.json")
                 .exists()
@@ -3212,7 +3212,7 @@ fn a_hard_link_onto_the_codex_login_named_by_codex_auth_file_stays() {
         "codex-cli-login"
     );
     assert_eq!(fs::read_to_string(&hard).expect("hard"), "codex-cli-login");
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
 /// An unreadable link count keeps the file rather than moving it: the guard
@@ -3236,7 +3236,7 @@ fn an_unreadable_link_count_keeps_the_file() {
         })
     );
     assert_eq!(fs::read_to_string(&own).expect("kept"), "standalone-codex");
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
 /// A dir store file hard-linked onto the codex CLI's own login is kept even
@@ -3246,7 +3246,7 @@ fn an_unreadable_link_count_keeps_the_file() {
 fn a_dir_store_file_hard_linked_onto_the_codex_login_stays() {
     let home = HomeSandbox::new();
     let src = home.home().join(".shunt");
-    let dst = home.home().join(".clauth").join("shunt");
+    let dst = home.home().join(".tollgate").join("shunt");
     let login = home.home().join(".codex").join("auth.json");
     write(&login, "codex-cli-login");
     let me = under(&src, &["accounts", "codex", "me.json"]);
@@ -3308,7 +3308,7 @@ fn a_dir_store_at_the_codex_home_stays_whole() {
         fs::read_to_string(codex_home.join("config.toml")).expect("kept"),
         "codex-config"
     );
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
 /// `CODEX_AUTH_FILE=$CODEX_HOME/auth.json` stays, with `CODEX_HOME` from the
@@ -3365,7 +3365,7 @@ fn a_codex_file_at_a_custom_codex_home_stays() {
         })
     );
     assert_eq!(fs::read_to_string(&login).expect("kept"), "codex-cli-login");
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
 /// Every absolute `CODEX_HOME` from both sources is guarded at once: with the
@@ -3420,7 +3420,7 @@ fn both_codex_home_sources_are_guarded_at_once() {
             fs::read_to_string(b.join("auth.json")).expect("kept"),
             "codex-cli-login-b"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
 }
 
@@ -3475,7 +3475,7 @@ fn a_dir_store_at_either_codex_home_stays_whole() {
             fs::read_to_string(dir.join("x.json")).expect("kept"),
             "codex-x"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
 }
 
@@ -3534,7 +3534,7 @@ fn every_inherited_codex_home_entry_is_guarded() {
         fs::read_to_string(d.join("auth.json")).expect("kept"),
         "codex-cli-login-d"
     );
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
 
 /// A relative `CODEX_HOME` from either source refuses the whole move before
@@ -3549,9 +3549,9 @@ fn a_relative_codex_home_refuses_the_move_naming_the_key() {
         let err = move_stores(&record).expect_err("a relative CODEX_HOME in the env file");
         assert_eq!(
             err.to_string(),
-            "the env file sets CODEX_HOME to a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path in the env file, then run the move again"
+            "the env file sets CODEX_HOME to a relative path, and tollgate cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path in the env file, then run the move again"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
     {
         let home = HomeSandbox::new();
@@ -3564,9 +3564,9 @@ fn a_relative_codex_home_refuses_the_move_naming_the_key() {
         .expect_err("a relative CODEX_HOME in the inherited env");
         assert_eq!(
             err.to_string(),
-            "CODEX_HOME in clauth's own environment is a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again"
+            "CODEX_HOME in tollgate's own environment is a relative path, and tollgate cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
     {
         let home = HomeSandbox::new();
@@ -3574,9 +3574,9 @@ fn a_relative_codex_home_refuses_the_move_naming_the_key() {
         let err = move_stores(&record).expect_err("a whitespace CODEX_HOME in the env file");
         assert_eq!(
             err.to_string(),
-            "the env file sets CODEX_HOME to a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path in the env file, then run the move again"
+            "the env file sets CODEX_HOME to a relative path, and tollgate cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path in the env file, then run the move again"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
     {
         let home = HomeSandbox::new();
@@ -3589,9 +3589,9 @@ fn a_relative_codex_home_refuses_the_move_naming_the_key() {
         .expect_err("a whitespace CODEX_HOME in the inherited env");
         assert_eq!(
             err.to_string(),
-            "CODEX_HOME in clauth's own environment is a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again"
+            "CODEX_HOME in tollgate's own environment is a relative path, and tollgate cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again"
         );
-        assert!(!home.home().join(".clauth").join("shunt").exists());
+        assert!(!home.home().join(".tollgate").join("shunt").exists());
     }
 }
 
@@ -3647,5 +3647,5 @@ fn the_move_refuses_a_silent_proof_from_another_address() {
         }
         other => panic!("a SilentMismatch refusal, got {other:?}"),
     }
-    assert!(!home.home().join(".clauth").join("shunt").exists());
+    assert!(!home.home().join(".tollgate").join("shunt").exists());
 }

@@ -1,7 +1,7 @@
-//! The since-your-last-call change digest: what moved in clauth's state since
+//! The since-your-last-call change digest: what moved in tollgate's state since
 //! the last reply that reported a digest.
 //!
-//! A live Claude Code session has no push channel from clauth — MCP
+//! A live Claude Code session has no push channel from tollgate — MCP
 //! `2026-07-28` defines no custom notifications and a server cannot send a
 //! request between calls — so this is the pull-shaped answer: every reply that
 //! already carries a live-usage footer (`profiles({scope:"session"})`,

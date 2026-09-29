@@ -23,7 +23,7 @@ pub(crate) fn installed_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
 
 /// Open `url` in the operator's default browser. Used by the interactive OAuth
 /// login (`oauth_login`) to launch the authorize page. Detached (stdio nulled)
-/// so it never blocks or leaks output into clauth's own stdout/stderr.
+/// so it never blocks or leaks output into tollgate's own stdout/stderr.
 pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::process::{Command, Stdio};

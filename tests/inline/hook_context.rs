@@ -58,11 +58,11 @@ fn write_transcript(home: &Path, name: &str, lines: &[String]) -> std::path::Pat
     path
 }
 
-/// Write a job-store record into the sandboxed `~/.clauth/jobs`: a fresh
+/// Write a job-store record into the sandboxed `~/.tollgate/jobs`: a fresh
 /// `running` one reads live, a `done` one does not.
 fn write_job(id: &str, live: bool) {
-    let dir = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let dir = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("jobs");
     std::fs::create_dir_all(&dir).expect("create jobs dir");
     let now = crate::usage::now_ms();
@@ -129,7 +129,7 @@ fn a_crossing_emits_once_and_a_second_fire_stays_silent() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
     assert_eq!(told("sess-once"), Some(100_000));
@@ -200,7 +200,7 @@ fn an_anthropic_row_sums_all_three_fields() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
 }
@@ -242,7 +242,7 @@ fn an_open_task_counts_until_its_result_lands() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 2 agents running. wait for them to return before closing the session."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 2 agents running. wait for them to return before closing the session."
         )
     );
 
@@ -264,7 +264,7 @@ fn an_open_task_counts_until_its_result_lands() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
         )
     );
 }
@@ -288,7 +288,7 @@ fn repeated_partials_of_one_task_count_as_one_agent() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
         )
     );
 }
@@ -310,7 +310,7 @@ fn a_task_tool_use_on_a_user_role_message_counts() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
         )
     );
 }
@@ -340,7 +340,7 @@ fn auto_compact_on_uses_the_on_arm_and_an_absent_key_defaults_true() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
     // No settings file at all: the binding default is true, so the ON arm.
@@ -354,7 +354,7 @@ fn auto_compact_on_uses_the_on_arm_and_an_absent_key_defaults_true() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
 }
@@ -374,7 +374,7 @@ fn auto_compact_off_uses_the_off_arm_with_the_handoff_sentence() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over."
         )
     );
 }
@@ -400,7 +400,7 @@ fn the_config_dir_settings_win_over_the_home_fallback() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
 }
@@ -427,7 +427,7 @@ fn the_running_clause_lists_only_what_is_running() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 2 agents and 1 delegate running. wait for them to return before closing the session."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 2 agents and 1 delegate running. wait for them to return before closing the session."
         )
     );
 
@@ -443,7 +443,7 @@ fn the_running_clause_lists_only_what_is_running() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 delegate running. wait for them to return before closing the session."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 delegate running. wait for them to return before closing the session."
         )
     );
 
@@ -454,7 +454,7 @@ fn the_running_clause_lists_only_what_is_running() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over."
+            "tollgate: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over."
         )
     );
 }
@@ -476,7 +476,7 @@ fn the_running_clause_stays_off_the_auto_compact_on_arm() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
 }
@@ -522,7 +522,7 @@ fn a_threshold_change_re_emits_while_the_usage_stays_above() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
     // The told stamp names the threshold it last told: moving the config to a
@@ -531,7 +531,7 @@ fn a_threshold_change_re_emits_while_the_usage_stays_above() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 150k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 150k tokens. auto-compaction is turned on."
         )
     );
     assert_eq!(told("sess-th-change"), Some(150_000));
@@ -562,7 +562,7 @@ fn a_compaction_re_emits_while_the_usage_is_still_above() {
     assert_eq!(
         fire(&compact).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
     // A plain startup is a fresh context boundary: no re-announcement.
@@ -623,7 +623,9 @@ fn an_out_of_range_threshold_reads_as_off() {
     edge.transcript = Some(path);
     assert_eq!(
         fire(&edge).as_deref(),
-        Some("clauth: context window usage has exceeded 50k tokens. auto-compaction is turned on.")
+        Some(
+            "tollgate: context window usage has exceeded 50k tokens. auto-compaction is turned on."
+        )
     );
 }
 
@@ -631,11 +633,11 @@ fn an_out_of_range_threshold_reads_as_off() {
 fn a_divisible_threshold_renders_as_k_and_an_indivisible_one_as_a_plain_number() {
     assert_eq!(
         render_context_note(600_000, true, 0, 0),
-        "clauth: context window usage has exceeded 600k tokens. auto-compaction is turned on."
+        "tollgate: context window usage has exceeded 600k tokens. auto-compaction is turned on."
     );
     assert_eq!(
         render_context_note(123_456, true, 0, 0),
-        "clauth: context window usage has exceeded 123456 tokens. auto-compaction is turned on."
+        "tollgate: context window usage has exceeded 123456 tokens. auto-compaction is turned on."
     );
 }
 
@@ -643,16 +645,16 @@ fn a_divisible_threshold_renders_as_k_and_an_indivisible_one_as_a_plain_number()
 fn an_exact_million_threshold_renders_as_m() {
     assert_eq!(
         render_context_note(1_000_000, true, 0, 0),
-        "clauth: context window usage has exceeded 1M tokens. auto-compaction is turned on."
+        "tollgate: context window usage has exceeded 1M tokens. auto-compaction is turned on."
     );
     assert_eq!(
         render_context_note(2_000_000, true, 0, 0),
-        "clauth: context window usage has exceeded 2M tokens. auto-compaction is turned on."
+        "tollgate: context window usage has exceeded 2M tokens. auto-compaction is turned on."
     );
     // Above 1M but not an exact million: plain, never a k form.
     assert_eq!(
         render_context_note(1_500_000, true, 0, 0),
-        "clauth: context window usage has exceeded 1500000 tokens. auto-compaction is turned on."
+        "tollgate: context window usage has exceeded 1500000 tokens. auto-compaction is turned on."
     );
 }
 
@@ -675,7 +677,7 @@ fn the_transcript_falls_back_to_the_records_stored_path() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
 }
@@ -709,7 +711,7 @@ fn a_legacy_record_without_the_context_field_reads_as_untold() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. auto-compaction is turned on."
+            "tollgate: context window usage has exceeded 100k tokens. auto-compaction is turned on."
         )
     );
     assert_eq!(told("sess-legacy"), Some(100_000));

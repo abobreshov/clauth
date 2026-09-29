@@ -85,8 +85,8 @@ fn seed() {
 
 /// A context over `answer`; the calls it saw.
 fn ctx_over(answer: Answer) -> (std::sync::Arc<ApiContext>, Calls) {
-    let status_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let status_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json");
     let (probe, calls) = seam(answer);
     (
@@ -148,7 +148,7 @@ fn a_prompt_runs_herdr_agent_prompt_and_logs_the_texts_length() {
     );
     assert_eq!(
         lines.snapshot(),
-        vec!["clauth api: device 'test' prompted pane 'w1N:p19' text_len=13".to_string()]
+        vec!["tollgate api: device 'test' prompted pane 'w1N:p19' text_len=13".to_string()]
     );
 }
 
@@ -173,7 +173,7 @@ fn keys_run_herdr_pane_send_keys_in_order_and_log_their_count() {
     );
     assert_eq!(
         lines.snapshot(),
-        vec!["clauth api: device 'test' sent keys to pane 'w1N:p19' keys=2".to_string()]
+        vec!["tollgate api: device 'test' sent keys to pane 'w1N:p19' keys=2".to_string()]
     );
 
     let many = call(
@@ -282,7 +282,7 @@ fn a_blocked_agent_is_409_on_the_prompt_route_alone() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: device 'test' send-keys on pane 'w1N:p19' refused by herdr: {AGENT_BLOCKED_ENVELOPE}"
+            "tollgate api: device 'test' send-keys on pane 'w1N:p19' refused by herdr: {AGENT_BLOCKED_ENVELOPE}"
         )]
     );
 }
@@ -345,7 +345,7 @@ fn any_other_herdr_failure_is_502_with_its_output_in_the_log_not_the_body() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: device 'test' prompt on pane 'w1N:p19' refused by herdr: {TIMEOUT_ENVELOPE}"
+            "tollgate api: device 'test' prompt on pane 'w1N:p19' refused by herdr: {TIMEOUT_ENVELOPE}"
         )]
     );
     drop(_capture);
@@ -358,7 +358,7 @@ fn any_other_herdr_failure_is_502_with_its_output_in_the_log_not_the_body() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth api: device 'test' send-keys on pane 'w1N:p19' refused by herdr: not json second line"
+            "tollgate api: device 'test' send-keys on pane 'w1N:p19' refused by herdr: not json second line"
                 .to_string()
         ]
     );
@@ -376,7 +376,7 @@ fn any_other_herdr_failure_is_502_with_its_output_in_the_log_not_the_body() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            r#"clauth api: device 'test' prompt on pane 'w1N:p19' refused by herdr: {"id":"cli:agent:prompt","error":{"code":"agent_prompt_stalled","message":"no working or blocked state within 5000ms"}}"#
+            r#"tollgate api: device 'test' prompt on pane 'w1N:p19' refused by herdr: {"id":"cli:agent:prompt","error":{"code":"agent_prompt_stalled","message":"no working or blocked state within 5000ms"}}"#
                 .to_string()
         ]
     );
@@ -389,7 +389,7 @@ fn any_other_herdr_failure_is_502_with_its_output_in_the_log_not_the_body() {
     assert_eq!((resp.status, body_json(&resp)), (502, refused));
     assert_eq!(
         lines.snapshot(),
-        vec!["clauth api: device 'test' prompt on pane 'w1N:p19' refused by herdr: ".to_string()]
+        vec!["tollgate api: device 'test' prompt on pane 'w1N:p19' refused by herdr: ".to_string()]
     );
 }
 

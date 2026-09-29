@@ -304,7 +304,7 @@ fn dedup_rows(rows: &mut Vec<StatRow>) {
 }
 
 /// Parse a reset value: epoch-ms int (z.ai `nextResetTime`), epoch-secs int, or
-/// an ISO-8601 string — normalised to the ISO form clauth renders.
+/// an ISO-8601 string — normalised to the ISO form tollgate renders.
 fn parse_reset(value: &Value) -> Option<String> {
     if let Some(n) = value.as_i64() {
         // Heuristic: values past 10^12 (year 2001 as ms — below any real future

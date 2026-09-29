@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="uwuclxdy/clauth"
-BINARY="clauth"
+REPO="abobreshov/clauth"
+BINARY="tollgate"
 NOCARGO=0
 
 for arg in "$@"; do
@@ -15,12 +15,14 @@ done
 # If cargo is available, prefer it (unless --nocargo was passed)
 if [[ "${NOCARGO}" -eq 0 ]] && command -v cargo &>/dev/null; then
     echo "cargo detected, installing via cargo..."
-    cargo install clauth
+    # From the fork's own repo, never crates.io: a `tollgate` crate there is
+    # not this tool.
+    cargo install --locked --git "https://github.com/${REPO}" tollgate
     echo ""
     # Best-effort: converge plugin installPaths a dead session tree left behind.
-    clauth self-heal || echo "note: plugin path heal skipped" >&2
+    tollgate self-heal || echo "note: plugin path heal skipped" >&2
     echo ""
-    echo "To uninstall, run: cargo uninstall clauth"
+    echo "To uninstall, run: cargo uninstall tollgate"
     exit 0
 fi
 
@@ -31,25 +33,25 @@ ARCH=$(uname -m)
 case "${OS}" in
     linux)
         case "${ARCH}" in
-            x86_64) ASSET="clauth-linux-x86_64" ;;
+            x86_64) ASSET="tollgate-linux-x86_64" ;;
             *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
         esac
         ;;
     darwin)
         case "${ARCH}" in
-            x86_64)        ASSET="clauth-macos-x86_64" ;;
-            arm64|aarch64) ASSET="clauth-macos-aarch64" ;;
+            x86_64)        ASSET="tollgate-macos-x86_64" ;;
+            arm64|aarch64) ASSET="tollgate-macos-aarch64" ;;
             *)             echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
         esac
         ;;
     *mingw*|*msys*|*cygwin*)
-        ASSET="clauth-windows-x86_64.exe"
-        BINARY="clauth.exe"
+        ASSET="tollgate-windows-x86_64.exe"
+        BINARY="tollgate.exe"
         OS="windows"
         ;;
     *)
         echo "Unsupported OS: ${OS}" >&2
-        echo "Install via cargo: cargo install clauth"
+        echo "Install via cargo: cargo install --locked --git https://github.com/${REPO} tollgate"
         exit 1
         ;;
 esac

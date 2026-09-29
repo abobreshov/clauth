@@ -141,7 +141,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             rows.push(ListItem::new(Line::from("")));
         }
         rows.push(ListItem::new(Line::from(vec![Span::styled(
-            "  codex — switch with `clauth <name>`",
+            "  codex — switch with `tollgate <name>`",
             theme::dim(),
         )])));
         for row in codex {
@@ -410,7 +410,7 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
 
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
 /// `↺ N` chip while the account holds a banked usage-limit reset (what
-/// `clauth limit-reset` spends). The cursor and timer slots are kept blank and
+/// `tollgate limit-reset` spends). The cursor and timer slots are kept blank and
 /// no live cell is drawn — this section is read-only, and a timer would
 /// promise a countdown the Overview cannot act on.
 fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
@@ -708,7 +708,7 @@ fn render_overview_row(
     Line::from(spans)
 }
 
-/// The row's live-session cell: how many `clauth start` sessions are running as
+/// The row's live-session cell: how many `tollgate start` sessions are running as
 /// this account, with `⇄` when at least one of them follows the fallback chain.
 /// Blank for an account hosting none: a zero count is hidden.
 ///
@@ -857,7 +857,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ))];
         lines.extend(
             wrap_words(
-                "add accounts on the fallback tab and clauth switches between them \
+                "add accounts on the fallback tab and tollgate switches between them \
                  as each runs out.",
                 width,
             )

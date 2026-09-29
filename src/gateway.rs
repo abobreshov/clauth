@@ -1,4 +1,4 @@
-//! The managed shunt gateway's engine: the `~/.clauth/gateway.toml` record,
+//! The managed shunt gateway's engine: the `~/.tollgate/gateway.toml` record,
 //! the admin token file, config discovery, bind resolution, the env file
 //! reader, the admin-key edit behind its `shunt check` gate, the `/health`
 //! version floor and the standalone-store move.
@@ -31,7 +31,7 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Tab
 
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::profile::{
-    atomic_write_600, clauth_dir, home_dir, mkdir_700, read_toml_file, tmp_sibling,
+    atomic_write_600, home_dir, mkdir_700, read_toml_file, tmp_sibling, tollgate_dir,
 };
 
 /// shunt's own bind when neither `SHUNT_SERVER__BIND` nor `[server].bind`
@@ -44,7 +44,7 @@ pub(crate) const BIND_ENV: &str = "SHUNT_SERVER__BIND";
 
 const CONFIG_BIND: &str = "[server].bind";
 
-/// The oldest shunt clauth supervises: 0.48.0 is the first release carrying
+/// The oldest shunt tollgate supervises: 0.48.0 is the first release carrying
 /// antigravity pooling (`SHUNT_ANTIGRAVITY_ACCOUNTS_DIR`,
 /// `/admin/api/accounts/antigravity`).
 pub(crate) const VERSION_FLOOR: ShuntVersion = ShuntVersion {
@@ -75,8 +75,8 @@ pub(crate) const HEALTH_PROBE_TIMEOUT: Duration =
 /// shunt's `/health` body is 34 bytes; a body reaching this is not shunt.
 const HEALTH_BODY_LIMIT: u64 = 4096;
 
-/// The `id` of clauth's own `[[server.admin.write_keys]]` entry.
-pub(crate) const WRITE_KEY_ID: &str = "clauth";
+/// The `id` of tollgate's own `[[server.admin.write_keys]]` entry.
+pub(crate) const WRITE_KEY_ID: &str = "tollgate";
 
 /// shunt refuses a `write_keys` key shorter than this (`admin_keys.rs`).
 pub(crate) const MIN_ADMIN_KEY_LEN: usize = 32;
@@ -86,7 +86,7 @@ const CONFIG_FILENAMES: [&str; 3] = ["shunt.toml", "shunt.yaml", "shunt.yml"];
 
 // ── the record ──────────────────────────────────────────────────────────────
 
-/// `~/.clauth/gateway.toml`: which shunt config clauth adopted and how it
+/// `~/.tollgate/gateway.toml`: which shunt config tollgate adopted and how it
 /// runs the gateway over it. Never named `shunt.toml`: shunt's own cwd
 /// discovery would find it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,10 +180,10 @@ impl GatewayRecord {
 }
 
 pub(crate) fn record_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("gateway.toml"))
+    Ok(tollgate_dir()?.join("gateway.toml"))
 }
 
-/// clauth edits the adopted config in place, so it must be TOML, and it is
+/// tollgate edits the adopted config in place, so it must be TOML, and it is
 /// passed as `--config` from whatever working directory the daemon has, so it
 /// must be absolute.
 fn check_adoptable(config: &Path) -> Result<()> {
@@ -225,7 +225,7 @@ fn check_record(record: &GatewayRecord) -> Result<()> {
     Ok(())
 }
 
-/// A record names a YAML config, which clauth cannot edit in place.
+/// A record names a YAML config, which tollgate cannot edit in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NotToml {
     pub(crate) path: PathBuf,
@@ -253,7 +253,7 @@ fn is_yaml(path: &Path) -> bool {
 
 // ── the admin token ─────────────────────────────────────────────────────────
 
-/// The gateway admin token, alone in a clauth-owned 0600 file. No `Display`,
+/// The gateway admin token, alone in a tollgate-owned 0600 file. No `Display`,
 /// a `Debug` that never prints the value, and no `PartialEq` outside tests,
 /// where a plain compare would be a timing side channel.
 #[derive(Clone)]
@@ -274,7 +274,7 @@ impl std::fmt::Debug for AdminToken {
 }
 
 pub(crate) fn admin_token_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("gateway-admin-token"))
+    Ok(tollgate_dir()?.join("gateway-admin-token"))
 }
 
 /// The admin token, minted from the CSPRNG and written 0600 on first use.
@@ -288,7 +288,7 @@ pub(crate) fn ensure_admin_token() -> Result<AdminToken> {
                 let token = text.trim();
                 if token.len() < MIN_ADMIN_KEY_LEN {
                     bail!(
-                        "the gateway admin token in {} is shorter than {MIN_ADMIN_KEY_LEN} characters, which shunt refuses; delete the file and clauth mints a new one",
+                        "the gateway admin token in {} is shorter than {MIN_ADMIN_KEY_LEN} characters, which shunt refuses; delete the file and tollgate mints a new one",
                         path.display()
                     );
                 }
@@ -396,7 +396,7 @@ impl std::fmt::Display for YamlConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "shunt would load {}, a YAML config; clauth edits the adopted config in place and has no format-preserving YAML editor, so it adopts a TOML config only",
+            "shunt would load {}, a YAML config; tollgate edits the adopted config in place and has no format-preserving YAML editor, so it adopts a TOML config only",
             self.path.display()
         )
     }
@@ -406,7 +406,7 @@ impl std::error::Error for YamlConfig {}
 
 // ── bind ────────────────────────────────────────────────────────────────────
 
-/// Where the gateway listens, and where clauth probes it.
+/// Where the gateway listens, and where tollgate probes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GatewayBind {
     pub(crate) configured: SocketAddr,
@@ -460,7 +460,7 @@ fn parse_bind(value: &str, source: &'static str) -> Result<SocketAddr, BindRefus
 /// from figment 0.10.19 `value/parse.rs` `value()` on the string branches:
 /// the leading whitespace skip is ASCII-only, a value figment's `[`-array
 /// branch cannot parse falls back to the raw untrimmed string, and a value
-/// wholly wrapped in one pair of double quotes unwraps its inner text. clauth
+/// wholly wrapped in one pair of double quotes unwraps its inner text. tollgate
 /// mirrors only the plain pair and returns `None` for a quoted value holding a
 /// backslash (figment would unescape it), which the caller refuses rather than
 /// misread.
@@ -553,7 +553,7 @@ pub(crate) const SHUNT_MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3600
 
 /// How long shunt drains after SIGTERM: `SHUNT_SERVER__SHUTDOWN_TIMEOUT_SECONDS`
 /// (`env_value`), else `[server].shutdown_timeout_seconds` in `config_text`,
-/// else shunt's 30 s. A value clauth cannot read counts as shunt's maximum,
+/// else shunt's 30 s. A value tollgate cannot read counts as shunt's maximum,
 /// so a stop bound derived from it never cuts a drain short.
 pub(crate) fn resolve_shutdown_timeout(config_text: &str, env_value: Option<&str>) -> Duration {
     let read = match env_value {
@@ -621,10 +621,10 @@ pub(crate) enum BindRefusal {
         source: &'static str,
     },
     /// `[server].bind` holds a `${...}` reference, which shunt substitutes
-    /// before it parses the address and clauth does not.
+    /// before it parses the address and tollgate does not.
     ConfigReference,
     /// The env override is quoted with a backslash inside, which figment
-    /// unescapes (`\n`, `\u…`) and clauth does not.
+    /// unescapes (`\n`, `\u…`) and tollgate does not.
     QuotedEscape {
         source: &'static str,
     },
@@ -639,15 +639,15 @@ impl std::fmt::Display for BindRefusal {
             ),
             BindRefusal::ConfigReference => write!(
                 f,
-                "{CONFIG_BIND} is a ${{...}} reference, which clauth does not resolve; set {BIND_ENV} in the gateway's env file to the address instead"
+                "{CONFIG_BIND} is a ${{...}} reference, which tollgate does not resolve; set {BIND_ENV} in the gateway's env file to the address instead"
             ),
             BindRefusal::OsAssignedPort { source } => write!(
                 f,
-                "{source} asks for an OS-assigned port, so clauth cannot know where the gateway listens; set it to a fixed port like 127.0.0.1:3001"
+                "{source} asks for an OS-assigned port, so tollgate cannot know where the gateway listens; set it to a fixed port like 127.0.0.1:3001"
             ),
             BindRefusal::QuotedEscape { source } => write!(
                 f,
-                "{source} holds a backslash inside its quotes, which figment would unescape and clauth does not; write the value literally"
+                "{source} holds a backslash inside its quotes, which figment would unescape and tollgate does not; write the value literally"
             ),
         }
     }
@@ -680,7 +680,7 @@ impl GatewayEnv {
 
     /// The env file's lines that assigned nothing, by number: a name that is
     /// no variable name (`export KEY=...` included) or a line with no `=`.
-    /// systemd skips them and loads the rest, and so does clauth; the caller
+    /// systemd skips them and loads the rest, and so does tollgate; the caller
     /// surfaces them by number alone, since a line's text may be a secret.
     pub(crate) fn skipped_lines(&self) -> &[usize] {
         &self.skipped
@@ -802,7 +802,7 @@ fn track_trail(trail: &mut Option<usize>, at: usize, byte: u8) {
 
 /// systemd's `EnvironmentFile=` grammar, byte for byte (`parse_env_file` in
 /// its `env-file.c`, pinned against systemd 261): the env file is the one a
-/// standalone gateway's unit loaded, so clauth must read the same values.
+/// standalone gateway's unit loaded, so tollgate must read the same values.
 ///
 /// - `#` or `;` opens a comment line; whitespace before a key, after a key
 ///   and after `=` goes.
@@ -1065,11 +1065,11 @@ impl std::fmt::Display for EnvFileError {
         match &self.kind {
             EnvFileErrorKind::NotUtf8 => write!(
                 f,
-                "the assignment on line {line} is not UTF-8; systemd refuses such a file whole, and so does clauth: save it as UTF-8"
+                "the assignment on line {line} is not UTF-8; systemd refuses such a file whole, and so does tollgate: save it as UTF-8"
             ),
             EnvFileErrorKind::NulByte => write!(
                 f,
-                "line {line} holds a NUL byte; systemd refuses such a file whole, and so does clauth: remove the byte"
+                "line {line} holds a NUL byte; systemd refuses such a file whole, and so does tollgate: remove the byte"
             ),
         }
     }
@@ -1163,11 +1163,11 @@ impl std::fmt::Display for VersionRefusal {
         match self.kind {
             VersionRefusalKind::BelowFloor => write!(
                 f,
-                "shunt {read} is older than {floor}, the oldest release clauth supervises"
+                "shunt {read} is older than {floor}, the oldest release tollgate supervises"
             ),
             VersionRefusalKind::Unreadable => write!(
                 f,
-                "shunt reported version {read:?}, which does not read as a release; clauth supervises {floor} or newer"
+                "shunt reported version {read:?}, which does not read as a release; tollgate supervises {floor} or newer"
             ),
         }
     }
@@ -1290,12 +1290,12 @@ pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
 
 // ── the admin entry ─────────────────────────────────────────────────────────
 
-/// Which admin step the adopted config needs for clauth's write key.
+/// Which admin step the adopted config needs for tollgate's write key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdminNeed {
-    /// clauth's entry is already there.
+    /// tollgate's entry is already there.
     Neither,
-    /// `[server.admin]` exists without clauth's entry.
+    /// `[server.admin]` exists without tollgate's entry.
     WriteKey,
     /// No `[server.admin]` table: adding one enables shunt's admin API.
     AdminTable,
@@ -1317,9 +1317,9 @@ const WRITE_KEYS_SHAPE: &str = "[server.admin].write_keys is not an array of tab
 pub(crate) enum ConfigEditRefusal {
     /// The config needs the other step than the one asked for.
     Needs(AdminNeed),
-    /// A write key already carries the id `clauth` with another key.
-    ForeignClauthKey,
-    /// `[server]`, `[server.admin]` or `write_keys` has a shape clauth does
+    /// A write key already carries the id `tollgate` with another key.
+    ForeignTollgateKey,
+    /// `[server]`, `[server.admin]` or `write_keys` has a shape tollgate does
     /// not edit.
     UnexpectedShape { what: &'static str },
     /// The token path cannot be spelled as a `${file:}` reference.
@@ -1371,18 +1371,18 @@ impl std::fmt::Display for ConfigEditRefusal {
                 "the config has no [server.admin] table; adding one enables shunt's admin API and is its own step",
             ),
             ConfigEditRefusal::Needs(AdminNeed::WriteKey) => f.write_str(
-                "the config already has a [server.admin] table; clauth's write key goes into it instead",
+                "the config already has a [server.admin] table; tollgate's write key goes into it instead",
             ),
             ConfigEditRefusal::Needs(AdminNeed::Neither) => {
-                f.write_str("the config already carries clauth's write key")
+                f.write_str("the config already carries tollgate's write key")
             }
-            ConfigEditRefusal::ForeignClauthKey => write!(
+            ConfigEditRefusal::ForeignTollgateKey => write!(
                 f,
-                "[server.admin] already has a write key with id {WRITE_KEY_ID:?} holding another key; clauth adds none beside it; remove that entry, then run the edit again"
+                "[server.admin] already has a write key with id {WRITE_KEY_ID:?} holding another key; tollgate adds none beside it; remove that entry, then run the edit again"
             ),
             ConfigEditRefusal::UnexpectedShape { what } => write!(
                 f,
-                "{what}; clauth edits only a [server.admin] table and its write_keys array"
+                "{what}; tollgate edits only a [server.admin] table and its write_keys array"
             ),
             ConfigEditRefusal::TokenPathUnusable { path } => write!(
                 f,
@@ -1391,7 +1391,7 @@ impl std::fmt::Display for ConfigEditRefusal {
             ),
             ConfigEditRefusal::Symlink { path } => write!(
                 f,
-                "{} is a symlink; clauth lands its edit by renaming over the config, which would replace the link",
+                "{} is a symlink; tollgate lands its edit by renaming over the config, which would replace the link",
                 path.display()
             ),
             ConfigEditRefusal::ShuntMissing { binary } => write!(
@@ -1411,14 +1411,14 @@ impl std::fmt::Display for ConfigEditRefusal {
                 };
                 write!(
                     f,
-                    "`{} check` refused clauth's edit of {} ({status}); the config is unchanged",
+                    "`{} check` refused tollgate's edit of {} ({status}); the config is unchanged",
                     binary.display(),
                     config.display()
                 )
             }
             ConfigEditRefusal::ChangedDuringEdit { path } => write!(
                 f,
-                "{} changed while clauth's edit was being checked; nothing was written; run the edit again",
+                "{} changed while tollgate's edit was being checked; nothing was written; run the edit again",
                 path.display()
             ),
             ConfigEditRefusal::CheckTimedOut {
@@ -1442,12 +1442,12 @@ pub(crate) fn admin_need(config: &Path) -> Result<AdminNeed> {
     admin_need_of(&read_config_text(config)?, &admin_key_ref()?)
 }
 
-/// [`admin_need`] over a config's text and clauth's `${file:}` reference.
+/// [`admin_need`] over a config's text and tollgate's `${file:}` reference.
 fn admin_need_of(text: &str, key_ref: &str) -> Result<AdminNeed> {
     Ok(need_in(&parse_config(text)?, key_ref)?)
 }
 
-/// The candidate text for `step`, or `None` when clauth's entry is present.
+/// The candidate text for `step`, or `None` when tollgate's entry is present.
 fn plan_admin_edit(text: &str, key_ref: &str, step: AdminNeed) -> Result<Option<String>> {
     let mut doc = parse_config(text)?;
     match (need_in(&doc, key_ref)?, step) {
@@ -1459,13 +1459,13 @@ fn plan_admin_edit(text: &str, key_ref: &str, step: AdminNeed) -> Result<Option<
     Ok(Some(doc.to_string()))
 }
 
-/// Add clauth's write key to an existing `[server.admin]`, landing the edit
+/// Add tollgate's write key to an existing `[server.admin]`, landing the edit
 /// only after `shunt check` passes. shunt hot-applies it.
 pub(crate) fn add_admin_write_key(record: &GatewayRecord) -> Result<AdminEdit> {
     apply_admin_step(record, AdminNeed::WriteKey)
 }
 
-/// Add a `[server.admin]` table carrying clauth's write key, behind the same
+/// Add a `[server.admin]` table carrying tollgate's write key, behind the same
 /// check. shunt registers its admin routes at boot, so this one takes a
 /// gateway restart.
 pub(crate) fn add_admin_table(record: &GatewayRecord) -> Result<AdminEdit> {
@@ -1544,7 +1544,7 @@ fn need_in(doc: &DocumentMut, key_ref: &str) -> Result<AdminNeed, ConfigEditRefu
             return if entry.get("key").and_then(Item::as_str) == Some(key_ref) {
                 Ok(AdminNeed::Neither)
             } else {
-                Err(ConfigEditRefusal::ForeignClauthKey)
+                Err(ConfigEditRefusal::ForeignTollgateKey)
             };
         }
     }
@@ -1715,7 +1715,7 @@ fn write_checked(record: &GatewayRecord, original: &[u8], candidate: &str) -> Re
         .with_context(|| format!("failed to replace {}", config.display()))
 }
 
-/// How long `shunt check` may run before clauth stops it. Measured
+/// How long `shunt check` may run before tollgate stops it. Measured
 /// 2026-09-27 on shunt 0.47.0 with an admin `${file:}` key: 51 ms on a cold
 /// first run, 2.2 ms warm (max 2.9 ms over 20 runs). 10 s is two orders over
 /// the cold load, so only a wedged check reaches it, and no lock is held
@@ -1770,7 +1770,7 @@ impl Drop for CheckTimeoutOverride {
 
 /// `<binary> check --config <candidate>` in `cwd` under `env`, bounded by
 /// [`CHECK_TIMEOUT`]: a check that outruns it is killed and reaped, it being
-/// clauth's own child, and the edit refuses.
+/// tollgate's own child, and the edit refuses.
 fn run_check(
     binary: &Path,
     candidate: &Path,
@@ -1953,11 +1953,11 @@ enum Source {
     Raw,
     /// `CODEX_AUTH_FILE`: the raw value, and a source only where the env
     /// file sets it. shunt's fallback, `~/.codex/auth.json`, is the codex
-    /// CLI's own login or a clauth codex profile's link, never a standalone
+    /// CLI's own login or a tollgate codex profile's link, never a standalone
     /// store.
     NamedOnly,
     /// `CLAUDE_CREDENTIALS`: pinned, so shunt's admin usage view never
-    /// reads a clauth profile's login from its `~/.claude` fallback; never
+    /// reads a tollgate profile's login from its `~/.claude` fallback; never
     /// moved.
     PinnedOnly,
 }
@@ -1975,7 +1975,7 @@ enum HomeRule {
 
 /// One credential location shunt reads: the env var the gateway reads it
 /// from, and its path under both roots (`~/.shunt` standalone,
-/// `~/.clauth/shunt` managed).
+/// `~/.tollgate/shunt` managed).
 struct Store {
     env: &'static str,
     segments: &'static [&'static str],
@@ -2060,7 +2060,7 @@ fn under(root: &Path, segments: &[&str]) -> PathBuf {
 }
 
 fn managed_store_root() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("shunt"))
+    Ok(tollgate_dir()?.join("shunt"))
 }
 
 /// One credential moved out of a standalone store.
@@ -2094,8 +2094,8 @@ pub(crate) enum KeptReason {
     /// own login, or a codex home (`~/.codex`, `$CODEX_HOME`) a dir store
     /// points at.
     CodexLogin,
-    /// It lies under `~/.clauth`, which clauth owns.
-    ClauthOwned,
+    /// It lies under `~/.tollgate`, which tollgate owns.
+    TollgateOwned,
     /// The file has more than one hard link, so another name may be another
     /// owner's login.
     HardLink,
@@ -2106,7 +2106,7 @@ pub(crate) enum KeptReason {
     /// not serve, left in the old dir.
     LeftBehind,
     /// The store's shunt site has a default, but no source named a usable
-    /// home, so the default is working-directory-relative and clauth cannot
+    /// home, so the default is working-directory-relative and tollgate cannot
     /// tell where it lands: the store is left out, never moved to a guessed
     /// path.
     NoHome {
@@ -2118,8 +2118,8 @@ pub(crate) enum KeptReason {
     DuplicateSource,
 }
 
-/// Which of the two places clauth can read the codex CLI's `CODEX_HOME` set a
-/// value: the recorded env file, or clauth's own inherited environment.
+/// Which of the two places tollgate can read the codex CLI's `CODEX_HOME` set a
+/// value: the recorded env file, or tollgate's own inherited environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexHomeSource {
     EnvFile,
@@ -2143,7 +2143,7 @@ pub(crate) enum StoreMoveRefusal {
     /// The store's default resolved under a home that is relative, so shunt's
     /// default for the store is working-directory-relative; nothing moved.
     RelativeHome { store: &'static str },
-    /// `CODEX_HOME` is relative; clauth cannot tell which codex login it
+    /// `CODEX_HOME` is relative; tollgate cannot tell which codex login it
     /// names, so nothing moved.
     RelativeCodexHome { source: CodexHomeSource },
     /// The `silent` proof was minted at a different address than the one the
@@ -2196,21 +2196,21 @@ impl std::fmt::Display for StoreMoveRefusal {
             ),
             StoreMoveRefusal::RelativeSource { key } => write!(
                 f,
-                "the env file sets {key} to a relative path, and clauth cannot tell which directory the standalone resolved it against; nothing was moved; set {key} to an absolute path in the env file, then run the move again"
+                "the env file sets {key} to a relative path, and tollgate cannot tell which directory the standalone resolved it against; nothing was moved; set {key} to an absolute path in the env file, then run the move again"
             ),
             StoreMoveRefusal::RelativeHome { store } => write!(
                 f,
-                "the standalone's home names no absolute directory, so shunt's default for {store} is relative to the standalone's working directory, which clauth cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
+                "the standalone's home names no absolute directory, so shunt's default for {store} is relative to the standalone's working directory, which tollgate cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
             ),
             StoreMoveRefusal::RelativeCodexHome {
                 source: CodexHomeSource::EnvFile,
             } => f.write_str(
-                "the env file sets CODEX_HOME to a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path in the env file, then run the move again",
+                "the env file sets CODEX_HOME to a relative path, and tollgate cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path in the env file, then run the move again",
             ),
             StoreMoveRefusal::RelativeCodexHome {
                 source: CodexHomeSource::Inherited,
             } => f.write_str(
-                "CODEX_HOME in clauth's own environment is a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again",
+                "CODEX_HOME in tollgate's own environment is a relative path, and tollgate cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again",
             ),
             StoreMoveRefusal::SilentMismatch { silent, probe } => write!(
                 f,
@@ -2244,7 +2244,7 @@ impl std::fmt::Display for StoreMoveRefusal {
 impl std::error::Error for StoreMoveRefusal {}
 
 /// The store env the gateway spawns with: every credential location shunt
-/// reads, pointed under `~/.clauth/shunt/`, `CODEX_AUTH_FILE` and
+/// reads, pointed under `~/.tollgate/shunt/`, `CODEX_AUTH_FILE` and
 /// `CLAUDE_CREDENTIALS` included, so neither fallback ever reaches another
 /// owner's login.
 pub(crate) fn store_env() -> Result<Vec<(&'static str, PathBuf)>> {
@@ -2255,16 +2255,16 @@ pub(crate) fn store_env() -> Result<Vec<(&'static str, PathBuf)>> {
         .collect())
 }
 
-/// Move every standalone store under `~/.clauth/shunt/`, file by file. Each
+/// Move every standalone store under `~/.tollgate/shunt/`, file by file. Each
 /// store's source is the path the record's env file sets for its key, read
 /// as shunt reads it ([`Source`]), else shunt's default under the
 /// standalone's home (its shunt site's [`HomeRule`], the env file's `HOME`
-/// over the inherited env, not clauth's own home). A store whose default
+/// over the inherited env, not tollgate's own home). A store whose default
 /// home no source names is listed in [`StoreMove::kept`] with its fix, never
 /// moved from a guessed path, and the rest of the move still proceeds.
 /// Another owner's login never moves: the codex CLI's own login
 /// (`~/.codex/auth.json`, `$CODEX_HOME/auth.json` from the env file or the
-/// inherited env) and anything under `~/.clauth` stay at their source and are
+/// inherited env) and anything under `~/.tollgate` stay at their source and are
 /// named in [`StoreMove::kept`], as does, on every platform, any file with
 /// another name (a hard link, whoever holds the other name) or whose link
 /// count cannot be read; a dir store at a codex home stays whole. The `silent`
@@ -2386,7 +2386,7 @@ enum StoreSource {
 /// Where the standalone kept `store`: the env file's value for its key read
 /// under the store's [`Source`] rule, else shunt's default under the
 /// standalone's home (its shunt site's rule). A relative path refuses, since
-/// it resolved against a working directory clauth cannot know.
+/// it resolved against a working directory tollgate cannot know.
 fn store_source(
     store: &Store,
     named: &GatewayEnv,
@@ -2457,7 +2457,7 @@ fn default_store_path(
 /// env file over the inherited env. An empty value counts as unset, so it
 /// falls through to `USERPROFILE` (or, for xai, to no home). `None` when no
 /// source named a usable home at all; shunt then reads the default as
-/// working-directory-relative, which clauth cannot resolve, so the move
+/// working-directory-relative, which tollgate cannot resolve, so the move
 /// lists the store instead of guessing a home.
 fn resolve_home(
     store: &Store,
@@ -2494,8 +2494,8 @@ impl CodexOwnership {
         let mut homes = vec![default_home.clone()];
         let mut logins = vec![default_home.join("auth.json")];
         // The codex CLI reads `CODEX_HOME` from its own env, which a standalone
-        // could have set in either of the two places clauth can see: the
-        // recorded env file, or the env clauth itself inherited. Both are
+        // could have set in either of the two places tollgate can see: the
+        // recorded env file, or the env tollgate itself inherited. Both are
         // guarded, neither outranking the other.
         if let Some(value) = env_value_folded(&named.vars, "CODEX_HOME", var_os_key) {
             push_codex_home(&mut homes, &mut logins, value, CodexHomeSource::EnvFile)?;
@@ -2551,16 +2551,16 @@ fn another_owners_login(
     let Some(source) = canonical(source)? else {
         return Ok(None);
     };
-    // The codex-login match comes before the ~/.clauth match: `~/.codex/auth.json`
-    // linked onto a clauth profile is the codex login, not a clauth-owned file.
+    // The codex-login match comes before the ~/.tollgate match: `~/.codex/auth.json`
+    // linked onto a tollgate profile is the codex login, not a tollgate-owned file.
     let targets: &[PathBuf] = if is_dir { &codex.homes } else { &codex.logins };
     for target in targets {
         if canonical(target)?.is_some_and(|target| target == source) {
             return Ok(Some(KeptReason::CodexLogin));
         }
     }
-    if canonical(&clauth_dir()?)?.is_some_and(|clauth| source.starts_with(clauth)) {
-        return Ok(Some(KeptReason::ClauthOwned));
+    if canonical(&tollgate_dir()?)?.is_some_and(|tollgate| source.starts_with(tollgate)) {
+        return Ok(Some(KeptReason::TollgateOwned));
     }
     if !is_dir {
         match has_another_name(&source) {

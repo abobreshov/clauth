@@ -85,11 +85,11 @@ fn classify_link_diverged_when_plain_file() {
 }
 
 /// macOS reality: Claude Code rewrites `~/.claude/.credentials.json` as a plain-file
-/// mirror of the Keychain after every run, replacing clauth's symlink. When the live
+/// mirror of the Keychain after every run, replacing tollgate's symlink. When the live
 /// token still matches the active profile's stored token, that is NOT divergence —
 /// classify must report LinkedTo so an ordinary switch doesn't falsely prompt to
 /// capture credentials that already match. (Regression: the switch prompt fired on
-/// every `clauth <name>` because a plain file was unconditionally Diverged.)
+/// every `tollgate <name>` because a plain file was unconditionally Diverged.)
 #[test]
 fn classify_link_linked_to_when_plain_file_token_matches_stored() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -303,9 +303,9 @@ fn classify_link_linked_to_even_when_target_missing() {
 
 // ── account-change `[Y/n]` overwrite path ──────────────────────────────────
 //
-// When Claude Code re-logged into a different account while clauth was closed,
+// When Claude Code re-logged into a different account while tollgate was closed,
 // the live `~/.claude/.credentials.json` is a plain file diverging from the
-// active profile's stored chain. clauth shows a `[Y/n]` prompt before the
+// active profile's stored chain. tollgate shows a `[Y/n]` prompt before the
 // stored tokens are overwritten. These tests pin the prompt's GATE (when it
 // fires) and both BRANCHES (confirm overwrites/captures, cancel is a no-op) at
 // the home-derived seam the prompt actually drives, no TTY needed.
@@ -560,7 +560,7 @@ fn build_settings_writes_api_key_helper_not_env_token() {
     );
 
     // The helper command carries the exe path, the hidden subcommand, and the
-    // profile name — so CC's shell-invocation of clauth can re-derive the key.
+    // profile name — so CC's shell-invocation of tollgate can re-derive the key.
     let exe = std::env::current_exe().expect("test-bin current_exe");
     let exe_str = exe.to_string_lossy();
     // Compared through `shell_quote`: on windows it escapes every `\`, so an
@@ -640,7 +640,7 @@ fn build_settings_switch_away_from_api_key_clears_helper() {
     let base = tmp.path().join("settings.json");
     fs::write(
         &base,
-        r#"{"apiKeyHelper":"/old/clauth __api-key oldacct","env":{"ANTHROPIC_AUTH_TOKEN":"sk-old","ANTHROPIC_BASE_URL":"https://old.example.com"}}"#,
+        r#"{"apiKeyHelper":"/old/tollgate __api-key oldacct","env":{"ANTHROPIC_AUTH_TOKEN":"sk-old","ANTHROPIC_BASE_URL":"https://old.example.com"}}"#,
     )
     .expect("seed api-key base settings");
     let profile = crate::profile::Profile::new(
@@ -663,17 +663,17 @@ fn build_settings_switch_away_from_api_key_clears_helper() {
 fn build_settings_api_key_helper_shell_quotes_exe_path() {
     #[cfg(unix)]
     {
-        let quoted = shell_quote("/home/uwu clxdy/bin/clauth");
+        let quoted = shell_quote("/home/uwu clxdy/bin/tollgate");
         // POSIX single-quote, with `'` inside escaped as `'\''`.
-        assert_eq!(quoted, "'/home/uwu clxdy/bin/clauth'");
+        assert_eq!(quoted, "'/home/uwu clxdy/bin/tollgate'");
 
         // A safe-char-only path (the cargo-installed default) is left unquoted.
-        let safe = shell_quote("/home/uwuclxdy/.cargo/bin/clauth");
-        assert_eq!(safe, "/home/uwuclxdy/.cargo/bin/clauth");
+        let safe = shell_quote("/home/uwuclxdy/.cargo/bin/tollgate");
+        assert_eq!(safe, "/home/uwuclxdy/.cargo/bin/tollgate");
 
         // An embedded single-quote closes, escapes, and reopens the outer quote.
-        let tricky = shell_quote("/path/with/'/clauth");
-        assert_eq!(tricky, "'/path/with/'\\''/clauth'");
+        let tricky = shell_quote("/path/with/'/tollgate");
+        assert_eq!(tricky, "'/path/with/'\\''/tollgate'");
     }
     #[cfg(not(unix))]
     {
@@ -688,11 +688,11 @@ fn build_settings_api_key_helper_shell_quotes_exe_path() {
 /// drift from CC's documented `/bin/<script>` example shape.
 #[test]
 fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
-    let exe = std::path::Path::new("/usr/local/bin/clauth");
+    let exe = std::path::Path::new("/usr/local/bin/tollgate");
     let cmd =
         build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme_corp-1.0+@"));
     assert_eq!(
-        cmd, "/usr/local/bin/clauth __api-key acme_corp-1.0+@",
+        cmd, "/usr/local/bin/tollgate __api-key acme_corp-1.0+@",
         "validated profile names must not be over-quoted"
     );
 }
@@ -703,9 +703,9 @@ fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
 /// not a dead one — otherwise every mint 401s until a fresh process rebuilds.
 #[test]
 fn build_settings_api_key_helper_strips_deleted_exe_marker() {
-    let exe = std::path::Path::new("/home/uwuclxdy/.cargo/bin/clauth (deleted)");
+    let exe = std::path::Path::new("/home/uwuclxdy/.cargo/bin/tollgate (deleted)");
     let cmd = build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme"));
-    assert_eq!(cmd, "/home/uwuclxdy/.cargo/bin/clauth __api-key acme");
+    assert_eq!(cmd, "/home/uwuclxdy/.cargo/bin/tollgate __api-key acme");
 }
 
 // ── profile_name_from_helper: structural parse of the helper command string ──
@@ -720,18 +720,18 @@ fn build_settings_api_key_helper_strips_deleted_exe_marker() {
 fn profile_name_from_helper_parses_our_shape() {
     // The shape `build_api_key_helper_command` emits.
     assert_eq!(
-        profile_name_from_helper("/usr/local/bin/clauth __api-key acme"),
+        profile_name_from_helper("/usr/local/bin/tollgate __api-key acme"),
         Some("acme".to_string()),
     );
     // Exe path with spaces is shell-quoted; split_whitespace still yields
     // three tokens.
     assert_eq!(
-        profile_name_from_helper("'/home/uwu clxdy/bin/clauth' __api-key acme"),
+        profile_name_from_helper("'/home/uwu clxdy/bin/tollgate' __api-key acme"),
         Some("acme".to_string()),
     );
     // Profile name with every validated charset char round-trips.
     assert_eq!(
-        profile_name_from_helper("/x/clauth __api-key a_b.c@d+e-f"),
+        profile_name_from_helper("/x/tollgate __api-key a_b.c@d+e-f"),
         Some("a_b.c@d+e-f".to_string()),
     );
 }
@@ -739,12 +739,12 @@ fn profile_name_from_helper_parses_our_shape() {
 #[test]
 fn profile_name_from_helper_rejects_wrong_shape() {
     // Not enough tokens.
-    assert_eq!(profile_name_from_helper("/x/clauth"), None);
-    assert_eq!(profile_name_from_helper("/x/clauth __api-key"), None);
+    assert_eq!(profile_name_from_helper("/x/tollgate"), None);
+    assert_eq!(profile_name_from_helper("/x/tollgate __api-key"), None);
     assert_eq!(profile_name_from_helper(""), None);
     // Too many tokens — a future shape with flags after the name is NOT ours.
     assert_eq!(
-        profile_name_from_helper("/x/clauth __api-key acme --flag"),
+        profile_name_from_helper("/x/tollgate __api-key acme --flag"),
         None,
     );
     // Middle token isn't our subcommand name.
@@ -754,22 +754,22 @@ fn profile_name_from_helper_rejects_wrong_shape() {
         "a foreign helper must not trigger a profile lookup"
     );
     assert_eq!(
-        profile_name_from_helper("/x/clauth __other-hidden-cmd acme"),
+        profile_name_from_helper("/x/tollgate __other-hidden-cmd acme"),
         None,
     );
     // Profile name fails `validate_profile_name`'s charset.
     assert_eq!(
-        profile_name_from_helper("/x/clauth __api-key bad/name"),
+        profile_name_from_helper("/x/tollgate __api-key bad/name"),
         None,
         "a path-shaped third token must not parse as a profile name"
     );
     assert_eq!(
-        profile_name_from_helper("/x/clauth __api-key .hidden"),
+        profile_name_from_helper("/x/tollgate __api-key .hidden"),
         None,
         "a leading-dot profile name is rejected by validate_profile_name"
     );
     assert_eq!(
-        profile_name_from_helper("/x/clauth __api-key 'quoted'"),
+        profile_name_from_helper("/x/tollgate __api-key 'quoted'"),
         None,
         "a quoted profile name means it failed validate_profile_name's charset"
     );
@@ -1082,7 +1082,7 @@ fn install_source_prefers_session_token() {
 }
 
 /// `installed_session_token` answers with exactly the token a switch installs,
-/// which is what `clauth which` attributes the live slot by. It has to track
+/// which is what `tollgate which` attributes the live slot by. It has to track
 /// `has_session_token`: a mis-filled sidecar (one carrying a refresh token) is
 /// never installed, so attributing a profile by it would name an account no
 /// session is running as.
@@ -1106,7 +1106,7 @@ fn installed_session_token_tracks_what_a_switch_installs() {
     );
 
     // CLA-ROLL: a rolling stamp is refresh-less by construction, exactly like
-    // the mint, so it attributes the same way — `clauth which` must keep
+    // the mint, so it attributes the same way — `tollgate which` must keep
     // naming a session when the daemon swaps the mint for a rolling bearer.
     // Re-gating this on a mint-only predicate is what would silently turn
     // every rolling session's statusline to `unknown`.
@@ -1311,7 +1311,7 @@ fn has_stored_oauth_login_tracks_the_store_the_relink_would_find() {
 
 /// A live slot holding the profile's static session token is the designed
 /// steady state: LinkedTo (the divergence machinery stays dormant), and a
-/// snapshot leaves the clauth-private usage OAuth pair untouched instead of
+/// snapshot leaves the tollgate-private usage OAuth pair untouched instead of
 /// clobbering it with the token just read.
 #[test]
 fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
@@ -1446,7 +1446,7 @@ fn validate_api_key_rejects_control_and_whitespace() {
 
 /// Force-snapshot (the divergence-modal "overwrite" and the CLI reconciled
 /// switch both reach it) must never capture the live login into a session-token
-/// profile's clauth-private usage OAuth pair. Here the live slot holds a FOREIGN
+/// profile's tollgate-private usage OAuth pair. Here the live slot holds a FOREIGN
 /// login; the guard at the shared sink leaves the stored usage pair intact.
 #[test]
 fn force_snapshot_never_clobbers_the_session_token_usage_pair() {
@@ -1469,7 +1469,7 @@ fn force_snapshot_never_clobbers_the_session_token_usage_pair() {
     assert_eq!(
         stored.refresh_token(),
         Some("usage-refresh"),
-        "force-snapshot must leave the clauth-private usage OAuth pair untouched",
+        "force-snapshot must leave the tollgate-private usage OAuth pair untouched",
     );
 }
 
@@ -1576,7 +1576,7 @@ fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
 /// The macOS steady state, and the reason the exemption is content-based rather
 /// than symlink-identity: after a switch, Claude Code rewrites
 /// `~/.claude/.credentials.json` as a REGULAR-FILE mirror of the Keychain,
-/// clobbering clauth's symlink with identical content. Capturing a `setup-token`
+/// clobbering tollgate's symlink with identical content. Capturing a `setup-token`
 /// sidecar for the ACTIVE profile then flips the install source to
 /// `session-token.json`, so classify reads Diverged over that regular file —
 /// yet the live OAuth login is fully saved in the profile's `credentials.json`.
@@ -1639,14 +1639,14 @@ fn a_regular_file_mirror_of_a_stored_login_is_not_unsaved() {
 
 /// The symlink half of the same exemption, and the original 2026-07-21 repro:
 /// capturing a sidecar for the ACTIVE profile flips the install source while the
-/// live slot is still clauth's symlink into `credentials.json`. classify reads
+/// live slot is still tollgate's symlink into `credentials.json`. classify reads
 /// Diverged (the link no longer points at what a switch installs), but a
-/// clauth-owned symlink's target IS a profile store by construction, so nothing
+/// tollgate-owned symlink's target IS a profile store by construction, so nothing
 /// is unsaved — `live_login_is_stored` exempts it both structurally (it's a
 /// symlink) and by content (reading through it yields the stored login).
 #[cfg(unix)]
 #[test]
-fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
+fn a_tollgate_symlink_under_a_flipped_install_source_is_not_unsaved() {
     let _home = HomeSandbox::new();
     let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
     profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
@@ -1678,16 +1678,16 @@ fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
     );
     assert!(
         live_login_is_stored(&crate::profile::ProfileName::from("split")),
-        "…but a clauth-owned symlink holds nothing unsaved"
+        "…but a tollgate-owned symlink holds nothing unsaved"
     );
 
-    // A dangling clauth symlink (its store file removed) still has no login to
+    // A dangling tollgate symlink (its store file removed) still has no login to
     // protect — the structural half keeps exempting it, so a switch is never
     // deferred over an empty slot.
     fs::remove_file(&store).expect("drop store file");
     assert!(
         live_login_is_stored(&crate::profile::ProfileName::from("split")),
-        "a dangling clauth symlink is a store slot, not an unsaved login"
+        "a dangling tollgate symlink is a store slot, not an unsaved login"
     );
 }
 
@@ -1965,7 +1965,7 @@ fn a_store_with_no_account_keys_is_already_signed_out() {
     );
 }
 
-/// The carry is a new writer of a file under `~/.clauth`, so it owes the tree's
+/// The carry is a new writer of a file under `~/.tollgate`, so it owes the tree's
 /// 0600 invariant like every other one.
 #[cfg(unix)]
 #[test]
@@ -2031,7 +2031,7 @@ fn seed_store_with_mcp_logins(name: &str) -> std::path::PathBuf {
 }
 
 /// A profile that stops storing a login has `credentials.json` removed under it,
-/// and where the live slot is clauth's symlink that file IS what the slot
+/// and where the live slot is tollgate's symlink that file IS what the slot
 /// resolves to. So its MCP-server logins are unreachable at the removal, before
 /// any relink runs, and the switch-time carry never sees them. They belong to no
 /// Claude account, so dropping them signs the operator out of every MCP server
@@ -2058,7 +2058,7 @@ fn a_store_removal_parks_the_mcp_logins_it_was_holding() {
     );
 }
 
-/// The other half: a later `clauth login <name>` writes a store again, and the
+/// The other half: a later `tollgate login <name>` writes a store again, and the
 /// parked block goes back into it, because that store is where every reader of
 /// `mcpOAuth` looks. The parked copy is dropped once the merged write lands, so
 /// nothing keeps re-attaching a block the carry now maintains normally.
@@ -2155,7 +2155,7 @@ fn a_store_with_no_mcp_logins_parks_nothing() {
     );
 }
 
-/// `~/.clauth` is 0600 files / 0700 dirs whole-tree, and a new writer that
+/// `~/.tollgate` is 0600 files / 0700 dirs whole-tree, and a new writer that
 /// reverts to the umask is the way that has been broken before. Asserts the park
 /// HAPPENED first: a park that never runs leaves no file, and a mode check over
 /// an absent file cannot fail for the reason this test is named for.
@@ -2182,7 +2182,7 @@ fn the_parked_mcp_logins_file_is_owner_only() {
     let mode = fs::metadata(&parked).expect("stat").permissions().mode() & 0o777;
     assert_eq!(
         mode, 0o600,
-        "a parked file is owner-only like every ~/.clauth file"
+        "a parked file is owner-only like every ~/.tollgate file"
     );
 }
 
@@ -2200,7 +2200,7 @@ fn switching_accounts_preserves_mcp_oauth_end_to_end() {
     crate::profile::save_profile(&b).expect("save b");
 
     // Make A live, then simulate Claude Code authenticating an MCP server: it
-    // writes an mcpOAuth block through clauth's symlink into A's store.
+    // writes an mcpOAuth block through tollgate's symlink into A's store.
     force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
     let live_path = claude_credentials_path().expect("creds path");
     let mut live: serde_json::Value =
@@ -2475,7 +2475,7 @@ fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
     );
 }
 
-/// The rolling bearer is what a `clauth start` session's Claude Code reads at
+/// The rolling bearer is what a `tollgate start` session's Claude Code reads at
 /// startup, so the chain's `rateLimitTier` must ride along (#78) — and only
 /// that key: the projection still starts from an empty extras map otherwise.
 #[test]
@@ -2718,7 +2718,7 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
         !dir.join("session-token.static.json").exists(),
         "backup consumed"
     );
-    // Under the PROFILE, so `clauth delete` sweeps the rotating pair it holds
+    // Under the PROFILE, so `tollgate delete` sweeps the rotating pair it holds
     // along with everything else that account owns.
     let quarantine = dir.join("quarantine");
     let quarantined = std::fs::read_dir(&quarantine)
@@ -3442,7 +3442,7 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
 /// restore path read it as live, installed it, `has_session_token` went
 /// false, and sessions got the rotating pair. Not-a-mint content is
 /// quarantined (evidence, same as a mis-filled sidecar) and the slot cleared,
-/// so it also cannot trap `clauth static-token` in a loop its own recovery
+/// so it also cannot trap `tollgate static-token` in a loop its own recovery
 /// advice cannot exit.
 #[test]
 fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
@@ -3705,7 +3705,7 @@ fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
 
 /// A LIVE backup is not enough to stand — it must also be at least as FRESH
 /// as the mint the roll is about to overwrite. The subtler variant of the
-/// dead-slot failure: flag off, `clauth login --setup-token` writes the
+/// dead-slot failure: flag off, `tollgate login --setup-token` writes the
 /// sidecar alone, and "an existing backup is never replaced" let the next
 /// roll destroy the fresh year-scale mint while preserving a stale
 /// weeks-from-death one. A genuinely staler sidecar mint must NOT displace a
@@ -4239,8 +4239,8 @@ fn the_carry_never_adopts_an_item_holding_no_expiry() {
 #[test]
 fn namespaced_keychain_service_hashes_the_dir_path() {
     assert_eq!(
-        namespaced_keychain_service(Path::new("/tmp/clauth-name-fixture")),
-        "Claude Code-credentials-c56fc9bd"
+        namespaced_keychain_service(Path::new("/tmp/tollgate-name-fixture")),
+        "Claude Code-credentials-c8d5a468"
     );
     assert_eq!(
         namespaced_keychain_service(Path::new("/tmp/second-fixture-dir")),
@@ -4344,7 +4344,7 @@ attributes:
     0x00000007 <blob>=<NULL>
 class: \"genp\"
 attributes:
-    0x00000007 <blob>=\"clauth-test-1234\"
+    0x00000007 <blob>=\"tollgate-test-1234\"
 ";
     assert_eq!(
         census_orphan_keychain_services(dump, &live, &owned),

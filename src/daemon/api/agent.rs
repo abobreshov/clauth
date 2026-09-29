@@ -149,7 +149,7 @@ fn refuse(refusal: Refusal, caller: &Caller<'_>, pane: &str, what: &str) -> Resp
         Refusal::Unavailable(reason) => Response::refused(503, "herdr_unavailable", reason),
         Refusal::Herdr(output) => {
             logline!(
-                "clauth api: device '{}' {what} on pane '{}' refused by herdr: {output}",
+                "tollgate api: device '{}' {what} on pane '{}' refused by herdr: {output}",
                 caller.device_for_log(),
                 sanitize_for_log(pane)
             );
@@ -174,7 +174,7 @@ fn refuse(refusal: Refusal, caller: &Caller<'_>, pane: &str, what: &str) -> Resp
         (status = 200, description = "herdr accepted the prompt for the agent in that pane", body = AgentOk),
         (status = 400, description = "the body held no non-empty text, or a text carrying a NUL (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "no pane with that id in herdr's default session, or no agent in it; an id not shaped like herdr's workspace:pane ids (each half an alphanumeric, then alphanumerics, dashes or underscores) answers this before herdr is asked (`pane_not_found`)", body = ErrorBody),
         (status = 409, description = "the agent is waiting on a prompt of its own (`agent_blocked`)", body = ErrorBody),
         (status = 502, description = "herdr refused the prompt for another reason, recorded in daemon.log (`herdr_refused`)", body = ErrorBody),
@@ -201,7 +201,7 @@ pub(crate) fn prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
     match drive(ctx, &["agent", "prompt", pane, &body.text]) {
         Ok(()) => {
             logline!(
-                "clauth api: device '{}' prompted pane '{}' text_len={}",
+                "tollgate api: device '{}' prompted pane '{}' text_len={}",
                 caller.device_for_log(),
                 sanitize_for_log(pane),
                 body.text.len()
@@ -235,7 +235,7 @@ fn valid_key(key: &str) -> bool {
         (status = 200, description = "herdr pressed the keys in that pane, in order", body = AgentOk),
         (status = 400, description = "the body held no key list of 1 to 32 names, each 1 to 32 chars of letters, digits, dash, plus and underscore (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "no pane with that id in herdr's default session; an id not shaped like herdr's workspace:pane ids (each half an alphanumeric, then alphanumerics, dashes or underscores) answers this before herdr is asked (`pane_not_found`)", body = ErrorBody),
         (status = 502, description = "herdr refused the keys, a name it does not know included, recorded in daemon.log (`herdr_refused`)", body = ErrorBody),
         (status = 503, description = "herdr is not installed, or no server answered on its socket (`herdr_unavailable`)", body = ErrorBody),
@@ -261,7 +261,7 @@ pub(crate) fn keys(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Resp
     match drive(ctx, &args) {
         Ok(()) => {
             logline!(
-                "clauth api: device '{}' sent keys to pane '{}' keys={}",
+                "tollgate api: device '{}' sent keys to pane '{}' keys={}",
                 caller.device_for_log(),
                 sanitize_for_log(pane),
                 body.keys.len()

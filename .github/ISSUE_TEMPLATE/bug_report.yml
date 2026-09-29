@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a bug or unexpected behavior in clauth
+description: Report a bug or unexpected behavior in tollgate
 title: "Bug: "
 labels: ["bug"]
 body:
@@ -8,14 +8,14 @@ body:
       value: |
         **Before you paste any output or config here: redact secrets.** Strip OAuth
         tokens, API keys, and the contents of `~/.claude/.credentials.json` or any
-        `~/.clauth/profiles/*` file. Watch for `sk-ant-*` strings in logs or error
+        `~/.tollgate/profiles/*` file. Watch for `sk-ant-*` strings in logs or error
         output. Those are live credentials, not IDs.
 
   - type: textarea
     id: what-happened
     attributes:
       label: What happened
-      description: What did clauth do wrong?
+      description: What did tollgate do wrong?
     validations:
       required: true
 
@@ -40,8 +40,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: clauth version
-      description: Output of `clauth --version`, or commit hash if built from source.
+      label: tollgate version
+      description: Output of `tollgate --version`, or commit hash if built from source.
       placeholder: e.g. v0.7.3
     validations:
       required: true

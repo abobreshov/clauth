@@ -46,7 +46,7 @@ fn assert_one_prose_block(result: &CallToolResult) -> String {
 fn profiles_answers_prose_in_one_block() {
     let _home = HomeSandbox::new();
 
-    let prose = drive(ClauthServer::new().profiles(Parameters(ProfilesArgs {
+    let prose = drive(TollgateServer::new().profiles(Parameters(ProfilesArgs {
         names: None,
         scope: None,
     })));
@@ -57,7 +57,7 @@ fn profiles_answers_prose_in_one_block() {
 fn session_scope_answers_prose_in_one_block() {
     let _home = HomeSandbox::new();
 
-    let prose = drive(ClauthServer::new().profiles(Parameters(ProfilesArgs {
+    let prose = drive(TollgateServer::new().profiles(Parameters(ProfilesArgs {
         names: None,
         scope: Some("session".to_string()),
     })));
@@ -72,7 +72,7 @@ fn session_scope_answers_prose_in_one_block() {
 fn switch_profile_refusal_answers_prose_in_one_block() {
     let _home = HomeSandbox::new();
 
-    let prose = drive(ClauthServer::new().switch_profile(Parameters(SwitchArgs {
+    let prose = drive(TollgateServer::new().switch_profile(Parameters(SwitchArgs {
         name: "ghost".to_string(),
     })));
     assert_eq!(prose.is_error, Some(true));
@@ -101,7 +101,7 @@ fn delegate_depth_refusal_answers_prose_in_one_block() {
     // SAFETY: test-only, serialized by the lock above, restored unconditionally.
     unsafe { std::env::set_var(MCP_DEPTH_ENV, "1") };
 
-    let prose = drive(ClauthServer::new().delegate_with(
+    let prose = drive(TollgateServer::new().delegate_with(
         DelegateArgs {
             profiles: Some(vec!["any".to_string()]),
             prompt: Some("hi".to_string()),
@@ -136,7 +136,7 @@ fn delegate_depth_refusal_answers_prose_in_one_block() {
 
 #[test]
 fn monitor_invalid_job_id_answers_prose_in_one_block() {
-    let prose = drive(ClauthServer::new().monitor_with(MonitorArgs {
+    let prose = drive(TollgateServer::new().monitor_with(MonitorArgs {
         job_ids: Some(vec!["../evil".to_string()]),
         cancel: None,
     }));

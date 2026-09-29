@@ -126,7 +126,7 @@ fn live_session_included_when_force_false() {
             crate::profile::ProfileName::from(name),
             "rt-ghi".to_string()
         )],
-        "a live session shares one credential file with clauth, so it follows a \
+        "a live session shares one credential file with tollgate, so it follows a \
          rotation instead of being burned by one"
     );
 
@@ -447,7 +447,7 @@ fn gate_third_party_bypasses() {
 /// into the gate's `Broken` arm: non-OAuth targets pass through as `Ready`, so
 /// no AUTH-1 surface (CLI/MCP switch, TUI toast, daemon tick) can hand a
 /// quarantined keyless third-party target `login_expired`'s bare
-/// `clauth login <name>` — for that state the fix is the `--api-key` command,
+/// `tollgate login <name>` — for that state the fix is the `--api-key` command,
 /// and the surface that refuses on it is the MCP pre-flight's keyless arm.
 /// Reds if a gate change ever routes third-party targets into the OAuth arm
 /// without revisiting that copy.
@@ -502,10 +502,10 @@ fn gate_valid_token_ready_without_refresh() {
     ));
 }
 
-/// Off macOS a live `clauth start` session no longer short-circuits the switch
+/// Off macOS a live `tollgate start` session no longer short-circuits the switch
 /// gate to `Ready` (which installed the STALE token as-is): the session reads
 /// the same credential file, so refreshing hands it a fresh pair. On macOS the
-/// refusal stands — clauth can't write the Keychain item that session's CC
+/// refusal stands — tollgate can't write the Keychain item that session's CC
 /// reads, so a refresh signs it out
 /// (`runtime::rotation_blocked_by_live_session`). Offline: the refresher is
 /// injected, and whether it runs at all is the assertion.
@@ -911,7 +911,7 @@ fn canonicalize_scopes_matches_claude_code_order() {
 // coherence, #1): the mirror must still fire when the live `.credentials.json`
 // is merely a stale regular-file copy of OUR OWN pre-rotation pair (Claude
 // Code's Keychain mirror, one step behind), and must NOT fire over a login
-// clauth doesn't own (a real CC re-login into some other account).
+// tollgate doesn't own (a real CC re-login into some other account).
 #[cfg(target_os = "macos")]
 mod keychain_mirror_gate {
     use crate::testutil::HomeSandbox;
@@ -994,7 +994,7 @@ mod keychain_mirror_gate {
 
 // ── try_adopt_live_rotation (rotation coherence, &crate::profile::ProfileName::from(the adopt-don't-race half)) ──
 //
-// The running claude and clauth hold ONE single-use refresh family; when CC
+// The running claude and tollgate hold ONE single-use refresh family; when CC
 // rotates first, its file mirror (~/.claude/.credentials.json) carries the
 // fresher pair. Adopting it — identity-guarded — replaces racing for the
 // chain. All offline: identity is injected, the "mirror" is a sandboxed file.
@@ -1305,9 +1305,9 @@ mod adopt_live_rotation {
         assert_eq!(
             sink.snapshot(),
             vec![
-                "clauth: live login for 'adopt-refusal-once' is newer but its identity can't \
+                "tollgate: live login for 'adopt-refusal-once' is newer but its identity can't \
                  be proven (no cached account id and the stored token is dead). Not adopting; \
-                 resolve in the clauth TUI or re-run clauth login adopt-refusal-once"
+                 resolve in the tollgate TUI or re-run tollgate login adopt-refusal-once"
                     .to_string(),
             ],
         );
@@ -1370,12 +1370,12 @@ mod adopt_live_rotation {
         assert_eq!(
             sink.snapshot(),
             vec![
-                "clauth: live login for 'adopt-refusal-flip' is newer but its identity can't \
+                "tollgate: live login for 'adopt-refusal-flip' is newer but its identity can't \
                  be proven (no cached account id and the stored token is dead). Not adopting; \
-                 resolve in the clauth TUI or re-run clauth login adopt-refusal-flip"
+                 resolve in the tollgate TUI or re-run tollgate login adopt-refusal-flip"
                     .to_string(),
-                "clauth: live login for 'adopt-refusal-flip' belongs to a DIFFERENT account. \
-                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                "tollgate: live login for 'adopt-refusal-flip' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the tollgate TUI divergence flow if that was \
                  intentional"
                     .to_string(),
             ],
@@ -1562,12 +1562,12 @@ mod adopt_live_rotation {
         assert_eq!(
             sink.snapshot(),
             vec![
-                "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
-                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                "tollgate: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the tollgate TUI divergence flow if that was \
                  intentional"
                     .to_string(),
-                "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
-                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                "tollgate: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the tollgate TUI divergence flow if that was \
                  intentional"
                     .to_string(),
             ],
@@ -1827,7 +1827,7 @@ mod adopt_live_rotation {
     /// is stale — same lift as the scheduler's `carry_external_rotation`.
     /// Without it, an active recovered by a CC-side re-login stays excluded
     /// from the fallback walk and refused as a switch target until a manual
-    /// `clauth login` (the cross-PR seam the adopt PR deferred to the rebase).
+    /// `tollgate login` (the cross-PR seam the adopt PR deferred to the rebase).
     #[test]
     fn adopting_a_live_rotation_lifts_a_stale_quarantine() {
         let _home = HomeSandbox::new();
@@ -1856,7 +1856,7 @@ mod adopt_live_rotation {
     /// CLA-SPLIT: a session-token profile's live slot holds its STATIC token,
     /// so `classify_credentials_link` compares against `session-token.json`
     /// while the adopt's expiry gate and its write both target the
-    /// clauth-private usage pair in `credentials.json` — two different
+    /// tollgate-private usage pair in `credentials.json` — two different
     /// surfaces. A live slot that stops holding the static token classifies
     /// `Diverged`, and without the guard the adopt overwrites the usage chain
     /// with the live login. Same invariant
@@ -1890,7 +1890,7 @@ mod adopt_live_rotation {
         assert_eq!(
             stored_access(&handle, name),
             "at-old",
-            "the clauth-private usage pair must survive"
+            "the tollgate-private usage pair must survive"
         );
         let on_disk: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
             &crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
@@ -1940,7 +1940,7 @@ mod adopt_live_rotation {
                 .expect("live slot")
                 .file_type()
                 .is_symlink(),
-            "the adopt must restore the symlink, or clauth's next rotation never reaches CC"
+            "the adopt must restore the symlink, or tollgate's next rotation never reaches CC"
         );
         assert_eq!(
             crate::claude::classify_credentials_link(&crate::profile::ProfileName::from(name))
@@ -2096,7 +2096,7 @@ fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
 }
 
 /// A sidecar repair that failed on the bounded state-flock wait is CONTENTION
-/// — another clauth process is busy under ~/.clauth, on macOS possibly across
+/// — another tollgate process is busy under ~/.tollgate, on macOS possibly across
 /// a 20-second Keychain shell-out — and must never render as
 /// `SidecarWriteFailed`'s "check permissions", which sends the operator
 /// hunting a fault that does not exist. Any other error keeps the fault copy.
@@ -2106,7 +2106,7 @@ fn a_state_lock_timeout_reads_as_contention_not_permissions() {
         .context("quarantine session-token.json");
     let t = sidecar_repair_transient(&crate::profile::ProfileName::from("busy"), &busy);
     assert!(
-        t.text().contains("another clauth process holds"),
+        t.text().contains("another tollgate process holds"),
         "contention names the holder, got: {}",
         t.text()
     );
@@ -2119,7 +2119,7 @@ fn a_state_lock_timeout_reads_as_contention_not_permissions() {
     let fault = anyhow::anyhow!("read-only file system").context("write session-token.json");
     let t = sidecar_repair_transient(&crate::profile::ProfileName::from("busy"), &fault);
     assert!(
-        t.text().contains("check permissions on ~/.clauth"),
+        t.text().contains("check permissions on ~/.tollgate"),
         "a genuine filesystem fault keeps the fault copy, got: {}",
         t.text()
     );
@@ -2274,8 +2274,8 @@ fn gate_under_guard_refuses_when_the_adoption_flock_is_wedged() {
     )));
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
 
-    let lock_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let lock_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join(crate::lock::LOCK_FILENAME);
     let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
     holder.lock().expect("hold the flock");
@@ -2295,7 +2295,7 @@ fn gate_under_guard_refuses_when_the_adoption_flock_is_wedged() {
         panic!("a wedged adoption flock must refuse the gate");
     };
     assert!(
-        t.text().contains("another clauth process holds"),
+        t.text().contains("another tollgate process holds"),
         "the timeout reads as contention, got: {}",
         t.text()
     );
@@ -2321,7 +2321,7 @@ fn an_adoption_flock_failure_splits_contention_from_fault() {
         anyhow::Error::new(crate::lock::StateLockTimeout::stub()).context("adopt disk rotation");
     let t = adopt_lock_transient(&crate::profile::ProfileName::from("busy"), &busy);
     assert!(
-        t.text().contains("another clauth process holds"),
+        t.text().contains("another tollgate process holds"),
         "contention names the holder, got: {}",
         t.text()
     );
@@ -2334,7 +2334,7 @@ fn an_adoption_flock_failure_splits_contention_from_fault() {
     let fault = anyhow::anyhow!("read-only file system").context("open state lock");
     let t = adopt_lock_transient(&crate::profile::ProfileName::from("busy"), &fault);
     assert!(
-        t.text().contains("check permissions on ~/.clauth"),
+        t.text().contains("check permissions on ~/.tollgate"),
         "a genuine filesystem fault keeps the fault copy, got: {}",
         t.text()
     );
@@ -2822,7 +2822,7 @@ fn gate_session_token_ready_even_when_auth_broken() {
 /// refresh threshold = the backup-restore rule). Three minutes of life is
 /// inside CC's own refresh window — a refresh-less credential the client
 /// immediately tries to refresh, signing the session out — so the switch must
-/// refuse it exactly where `clauth static-token` calls the identical bytes
+/// refuse it exactly where `tollgate static-token` calls the identical bytes
 /// EXPIRED; ten minutes clears the window and installs. Zero grace here was
 /// the one arm that INSTALLS a mint while every other slot called it dead.
 #[test]
@@ -2938,7 +2938,7 @@ fn rotate_one_inner_rotates_under_a_live_session() {
 }
 
 /// On macOS it must NOT: spending the chain here strands the running session,
-/// whose Claude Code reads a Keychain item clauth cannot write. A skip is
+/// whose Claude Code reads a Keychain item tollgate cannot write. A skip is
 /// silent — `Persisted(false)`, activity Idle, no `OpResult`.
 #[cfg(target_os = "macos")]
 #[test]
@@ -3254,7 +3254,7 @@ fn guard_acquire_failure_names_the_filesystem_cause() {
     #[allow(clippy::expect_used, reason = "test")]
     let locks_dir = lock.parent().expect("lock parent");
     #[allow(clippy::expect_used, reason = "test")]
-    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    std::fs::create_dir_all(locks_dir.parent().expect("tollgate dir")).expect("tollgate dir");
     #[allow(clippy::expect_used, reason = "test")]
     std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
     #[allow(clippy::expect_used, reason = "test")]
@@ -3274,7 +3274,7 @@ fn guard_acquire_failure_names_the_filesystem_cause() {
     };
     assert_eq!(
         t.text(),
-        format!("could not lock '{name}' for a token refresh; check permissions on ~/.clauth"),
+        format!("could not lock '{name}' for a token refresh; check permissions on ~/.tollgate"),
         "the cause names its own next step; a second one contradicts it"
     );
     assert!(
@@ -3304,7 +3304,7 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
     #[allow(clippy::expect_used, reason = "test")]
     let locks_dir = lock.parent().expect("lock parent");
     #[allow(clippy::expect_used, reason = "test")]
-    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    std::fs::create_dir_all(locks_dir.parent().expect("tollgate dir")).expect("tollgate dir");
     #[allow(clippy::expect_used, reason = "test")]
     std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
     #[allow(clippy::expect_used, reason = "test")]
@@ -3384,7 +3384,7 @@ fn poisoned_config_refusal_offers_no_retry() {
     };
     assert_eq!(
         t.text(),
-        "clauth hit an internal lock error, restart clauth"
+        "tollgate hit an internal lock error, restart tollgate"
     );
 }
 
@@ -3481,7 +3481,7 @@ fn canary_bodies(i: usize) -> (u16, String) {
 /// emits its failure as an `OpResult` the TUI renders as a Danger toast, and
 /// that used to be `HTTP {status}: {body}` because the plain `refresh` wrapper
 /// collapsed the Invalid/Transient split into one opaque error. Both arms are
-/// asserted — a dead chain keeps the shared `clauth login` recovery step, a
+/// asserted — a dead chain keeps the shared `tollgate login` recovery step, a
 /// blip gets the canned transient line — and neither carries a wire byte.
 #[test]
 fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
@@ -3516,7 +3516,7 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
         "the endpoint's status reached the rotate toast: {msg}"
     );
     assert!(
-        msg.contains(&format!("clauth login {dead}")),
+        msg.contains(&format!("tollgate login {dead}")),
         "the dead-chain arm must keep the one recovery step it shares with the \
          switch gate and the daemon, got: {msg}"
     );
@@ -3556,7 +3556,7 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
 }
 
 /// The dead-chain toast on a keyless third-party profile: `login_expired`'s
-/// bare `clauth login <name>` runs the browser flow and leaves the missing key
+/// bare `tollgate login <name>` runs the browser flow and leaves the missing key
 /// missing, so the arm carries the pre-flight's keyless sentence instead — the
 /// command that clears the state the profile is actually in. The OAuth shape
 /// keeps the shared login hint, pinned one test up.
@@ -3608,7 +3608,7 @@ fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
     assert_eq!(
         msg,
         "profile has no api key: rotate-keyless-third-party (run \
-         `clauth login rotate-keyless-third-party --api-key <key>`)"
+         `tollgate login rotate-keyless-third-party --api-key <key>`)"
     );
 
     #[allow(clippy::expect_used, reason = "test")]
@@ -3669,7 +3669,7 @@ fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
     assert_eq!(
         msg,
         "stored OAuth chain is dead, its api key still works: rotate-keyed-third-party \
-         (run `clauth login rotate-keyed-third-party --api-key <key>` to clear the quarantine)"
+         (run `tollgate login rotate-keyed-third-party --api-key <key>` to clear the quarantine)"
     );
 
     #[allow(clippy::expect_used, reason = "test")]
@@ -3771,7 +3771,7 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
 }
 
 /// `oauth_config` with the rolling token enabled and a plan-capable chain
-/// (full scopes + subscriptionType) — the shape `clauth rolling-token <p>`
+/// (full scopes + subscriptionType) — the shape `tollgate rolling-token <p>`
 /// requires.
 fn rolling_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
     let mut config = oauth_config(name, refresh_token, expires_at);
@@ -3911,7 +3911,7 @@ fn a_live_session_on_a_rolling_chain_refuses_the_switch_with_the_live_session_co
     };
     assert_eq!(
         e.text(),
-        "'test-roll-refuse' has a live clauth start session still on its rotating login; retry in a moment"
+        "'test-roll-refuse' has a live tollgate start session still on its rotating login; retry in a moment"
     );
     assert_eq!(e.text_with_status(), e.text());
 }
@@ -4040,7 +4040,7 @@ fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
     );
     assert!(
         oauth.refresh_token.is_none(),
-        "the pair never leaves clauth custody"
+        "the pair never leaves tollgate custody"
     );
     assert_eq!(oauth.subscription_type.as_deref(), Some("max"));
     assert_eq!(oauth.expires_at, Some(future_expiry_of(&handle, name)));
@@ -4773,7 +4773,7 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
 
 /// The scheduler's re-stamp leg must never park behind a held rotation lock:
 /// it runs inline on the tick thread and this gate's waiting form carries no
-/// deadline, so a `clauth start` holding the lock across its recursive copy would
+/// deadline, so a `tollgate start` holding the lock across its recursive copy would
 /// stall every account's poll. With the lock held, the gate answers Transient
 /// promptly (the NoWait path) instead of blocking until release.
 #[test]
@@ -4848,7 +4848,7 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
 /// arm that widened last. The scenario that defeats it: a mis-filled sidecar,
 /// an EXPIRED preserved mint (so the heal has nothing live to restore), an
 /// expiring chain (so the vanilla gate would proceed to its blocking
-/// acquire), and a `clauth start` holding the rotation lock. The tick's leg
+/// acquire), and a `tollgate start` holding the rotation lock. The tick's leg
 /// must answer Transient with the mis-fill's own cause, promptly, touching
 /// neither the refresher nor the evidence on disk.
 #[test]
@@ -5110,13 +5110,13 @@ fn the_quarantine_logline_splits_the_recovery_like_every_other_surface() {
     assert_eq!(
         sink.snapshot(),
         vec![
-            "clauth: login for 'ql-oauth' has expired: refresh token revoked or invalid: \
-             run clauth login ql-oauth (flagged auth_broken)"
+            "tollgate: login for 'ql-oauth' has expired: refresh token revoked or invalid: \
+             run tollgate login ql-oauth (flagged auth_broken)"
                 .to_string(),
-            "clauth: stored OAuth chain is dead, its api key still works: ql-keyed (run \
-             `clauth login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken)"
+            "tollgate: stored OAuth chain is dead, its api key still works: ql-keyed (run \
+             `tollgate login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken)"
                 .to_string(),
-            "clauth: profile has no api key: ql-keyless (run `clauth login ql-keyless \
+            "tollgate: profile has no api key: ql-keyless (run `tollgate login ql-keyless \
              --api-key <key>`) (flagged auth_broken)"
                 .to_string(),
         ],
@@ -5210,8 +5210,8 @@ fn quarantine_persist_fixture(name: &str, broken: bool) -> crate::profile::Confi
 /// injection `testutil::block_credentials_write` aims at a credentials write.
 /// The last-good file is gone until [`unblock_state_persist`] restores it.
 fn block_state_persist() {
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("profiles.toml");
     std::fs::remove_file(&path).expect("drop the last-good state file");
     std::fs::create_dir(&path).expect("block the state file with a directory");
@@ -5220,8 +5220,8 @@ fn block_state_persist() {
 /// Put `state` back as the on-disk `profiles.toml` — the file the failed
 /// write never touched, rewritten through the production saver.
 fn unblock_state_persist(state: &AppState) {
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("profiles.toml");
     std::fs::remove_dir(&path).expect("drop the blocking directory");
     crate::profile::save_app_state(state).expect("restore the last-good state");
@@ -5256,12 +5256,13 @@ fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
     );
     assert_eq!(
         lines[0],
-        "clauth: login for 'qp-set' has expired: refresh token revoked or \
-         invalid: run clauth login qp-set (flagged auth_broken)"
+        "tollgate: login for 'qp-set' has expired: refresh token revoked or \
+         invalid: run tollgate login qp-set (flagged auth_broken)"
     );
     assert!(
-        lines[1]
-            .starts_with("clauth: failed to persist auth_broken set for 'qp-set': failed to read "),
+        lines[1].starts_with(
+            "tollgate: failed to persist auth_broken set for 'qp-set': failed to read "
+        ),
         "the failure line names the profile and the direction: {lines:?}"
     );
 
@@ -5317,11 +5318,11 @@ fn a_failed_clear_persist_is_logged_and_retried_by_the_next_call() {
     );
     assert_eq!(
         lines[0],
-        "clauth: 'qp-clear' re-authenticated: auth_broken cleared"
+        "tollgate: 'qp-clear' re-authenticated: auth_broken cleared"
     );
     assert!(
         lines[1].starts_with(
-            "clauth: failed to persist auth_broken clear for 'qp-clear': failed to read "
+            "tollgate: failed to persist auth_broken clear for 'qp-clear': failed to read "
         ),
         "the failure line names the profile and the direction: {lines:?}"
     );

@@ -55,8 +55,8 @@ fn the_callback_takes_the_code_only_under_the_expected_state() {
 /// carries, and the form `query_param` decodes it to. Neither is a string any
 /// page copy or terminal line of this module can contain, so their absence is
 /// the echo check, whichever form an echo would carry.
-const CALLBACK_CANARY: &str = "CANARY%0Aclauth:%20forged%20line%20%60rm%20-rf%60";
-const CALLBACK_CANARY_DECODED: &str = "CANARY\nclauth: forged line `rm -rf`";
+const CALLBACK_CANARY: &str = "CANARY%0Atollgate:%20forged%20line%20%60rm%20-rf%60";
+const CALLBACK_CANARY_DECODED: &str = "CANARY\ntollgate: forged line `rm -rf`";
 
 /// An OAuth `error` param is fatal, and its bytes reach nothing: the code is
 /// parsed into RFC 6749's closed set and the description is never read, so
@@ -79,7 +79,7 @@ fn the_callback_parses_an_error_into_the_closed_set_and_echoes_nothing() {
         );
     }
     assert!(
-        response.ends_with("close this tab; you can retry from clauth any time."),
+        response.ends_with("close this tab; you can retry from tollgate any time."),
         "the declined arm's own page: {response}"
     );
 
@@ -139,7 +139,7 @@ fn the_login_binds_the_registered_ports_in_order_and_refuses_with_both_held() {
     assert_eq!(
         err,
         "codex's login ports (1455 and 1457) are both in use — close whatever holds them \
-         (another codex or clauth login?) and retry"
+         (another codex or tollgate login?) and retry"
     );
     drop(primary);
     drop(fallback);

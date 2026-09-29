@@ -1137,7 +1137,7 @@ fn no_tier_type_cell_does_not_pulse() {
     // The wave is Full-tier only; an unpinned tier renders every row flat and
     // makes the equality below vacuous. Same guard the disabled-row pin carries.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
-    // `something_new` is a claim clauth cannot classify, so the row has no tier
+    // `something_new` is a claim tollgate cannot classify, so the row has no tier
     // at all; `max` is the same row WITH one.
     let config = config_with(
         vec![
@@ -1715,7 +1715,7 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
     line_text(row).chars().skip(col).collect()
 }
 
-/// The column answers "how many `clauth start` sessions are on this account",
+/// The column answers "how many `tollgate start` sessions are on this account",
 /// with `⇄` marking that at least one of them can be moved by the chain. It is
 /// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
 /// authenticates as — an account can carry either, both, or neither. That split
@@ -1802,7 +1802,7 @@ fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
 }
 
 /// The column is budgeted on WIDTH alone. Were it budgeted on whether anything
-/// is live, the whole table would reflow the moment someone ran `clauth start`
+/// is live, the whole table would reflow the moment someone ran `tollgate start`
 /// and reflow back when that session exited — so an empty fleet must lay the
 /// table out exactly as a busy one does.
 #[test]
@@ -1990,7 +1990,7 @@ fn deepseek_row_shows_total_balance_in_5h_column() {
     );
 }
 
-/// The cache on disk outlives the label clauth writes into it. Every DeepSeek
+/// The cache on disk outlives the label tollgate writes into it. Every DeepSeek
 /// account carries a `third_party_cache.json` an older binary wrote, `profile.rs`
 /// seeds it into `third_party_usage` on every start, and two populations never
 /// get a rewrite at all: a disabled profile is dropped by
@@ -2767,8 +2767,8 @@ fn the_accounts_meta_slot_sheds_before_the_title_loses_its_rule() {
 #[test]
 fn codex_rows_read_the_roster_and_its_own_cache() {
     let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    let dir = home.home().join(".tollgate");
+    crate::profile::mkdir_700(&dir).expect("mkdir .tollgate");
     std::fs::write(
         dir.join("codex-profiles.toml"),
         "active_profile = \"cx2\"\nprofiles = [\"cx1\", \"cx2\"]\n",
@@ -2918,7 +2918,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 }
 
 /// The banked-reset chip renders only while a reset is available, trailing the
-/// usage cells: `↺ N` names what `clauth limit-reset` would spend.
+/// usage cells: `↺ N` names what `tollgate limit-reset` would spend.
 #[test]
 fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2953,8 +2953,8 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
 #[test]
 fn a_quarantined_codex_row_renders_the_broken_marker() {
     let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    let dir = home.home().join(".tollgate");
+    crate::profile::mkdir_700(&dir).expect("mkdir .tollgate");
     std::fs::write(
         dir.join("codex-profiles.toml"),
         "active_profile = \"cx2\"\nprofiles = [\"cx1\", \"cx2\"]\n",

@@ -1,12 +1,12 @@
-//! `clauth daemon` — headless scheduler owner.
+//! `tollgate daemon` — headless scheduler owner.
 //!
 //! Runs the exact same background refresher the TUI runs (`spawn_refresher`),
 //! but with no ratatui loop. Its jobs each tick:
 //!   1. execute any auto-switch the scheduler queued (`pending_switch` /
 //!      `pending_switch_off`) — this is what makes unattended auto-switch work
 //!      with the TUI closed, the operator's core requirement;
-//!   2. rewrite `~/.clauth/status.json` atomically (the external read feed);
-//!   3. pick up external config changes (a new `clauth login`, a TUI edit).
+//!   2. rewrite `~/.tollgate/status.json` atomically (the external read feed);
+//!   3. pick up external config changes (a new `tollgate login`, a TUI edit).
 //!
 //! The scheduler already persists `usage_cache.json` inside `apply_outcome`, so
 //! the daemon and the TUI share one cache. A single-instance advisory lock keeps
@@ -46,8 +46,8 @@ use crate::lockorder::RankedMutex;
 use crate::logline::logline;
 use crate::out::outln;
 use crate::profile::{
-    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600, clauth_dir,
-    load_config, mkdir_700, reload_fingerprint,
+    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600, load_config,
+    mkdir_700, reload_fingerprint, tollgate_dir,
 };
 use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
@@ -58,7 +58,7 @@ use crate::usage::{
     spawn_refresher,
 };
 use status_json::LiveSignals;
-// `clauth list` (src/list.rs) renders a human table over the same body, so the
+// `tollgate list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
 pub(crate) use status_json::{
     ProfileEntry, build_codex_entries, build_profile_entries, build_status,
@@ -75,17 +75,17 @@ const TICK: Duration = Duration::from_secs(1);
 /// bound a busy log.
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
-const LOCK_FILE: &str = "clauthd.lock";
+const LOCK_FILE: &str = "tollgated.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
 /// lock file itself because Windows locks are mandatory (`LockFileEx`): a
 /// `--status` reader in another process cannot read bytes inside the daemon's
 /// held exclusive lock, so the pid has to live somewhere unlocked. Informational
 /// only — presence is the flock, never this file. See [`probe::holder_pid`].
-const PID_FILE: &str = "clauthd.pid";
+const PID_FILE: &str = "tollgated.pid";
 /// The standby slot's flock (#57). A peer of [`LOCK_FILE`]; held by the single
 /// instance allowed to park on the singleton lock. See [`probe::Claim`].
-const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
-/// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.clauth`,
+const STANDBY_LOCK_FILE: &str = "tollgated-standby.lock";
+/// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.tollgate`,
 /// held for life by whichever instance (daemon or a TUI) is the current usage
 /// fetcher. See [`FetchLease`](probe::FetchLease).
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
@@ -202,20 +202,20 @@ fn drains_exhausted(remaining: Option<Duration>, now: Instant, deadline: Instant
     remaining.is_some_and(|r| r.is_zero()) || now >= deadline
 }
 
-/// Tighten an existing `~/.clauth` tree on boot, before `load_config` runs its
+/// Tighten an existing `~/.tollgate` tree on boot, before `load_config` runs its
 /// own walk. `mkdir_700` only sets the mode on dirs it CREATES; a tree from an
 /// older build or created under a permissive umask can be 0o755
 /// (world-traversable → world-readable `daemon.log`, enumerable account names).
-/// Delegates to [`crate::profile::enforce_clauth_perms`] for the whole tree
+/// Delegates to [`crate::profile::enforce_tollgate_perms`] for the whole tree
 /// (dirs → 0o700, files → 0o600, symlinks skipped), which also covers the
 /// launchd-created `daemon.log`: launchd opens it (`StandardErrorPath`) at the
 /// umask (~0o644) before `exec`, and the already-open fd keeps appending to the
 /// now-0o600 inode. Best-effort — a chmod failure never stops the daemon.
-fn migrate_clauth_perms_700(dir: &std::path::Path) {
-    crate::profile::enforce_clauth_perms(dir);
+fn migrate_tollgate_perms_700(dir: &std::path::Path) {
+    crate::profile::enforce_tollgate_perms(dir);
 }
 
-/// What a starting `clauth daemon` does when another instance already holds the
+/// What a starting `tollgate daemon` does when another instance already holds the
 /// singleton lock (#57).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum StartMode {
@@ -235,17 +235,17 @@ pub(crate) enum StartMode {
     Replace,
 }
 
-/// Opt-out for the REST API, matching `CLAUTH_NO_UPDATE` / `CLAUTH_NO_COMPLETIONS`
+/// Opt-out for the REST API, matching `TOLLGATE_NO_COMPLETIONS`
 /// (only `"1"` opts out). A listening socket is the one daemon behavior an
 /// operator might need to kill without editing the unit that passes `--listen`.
-const NO_API_ENV: &str = "CLAUTH_NO_API";
+const NO_API_ENV: &str = "TOLLGATE_NO_API";
 
 fn api_enabled() -> bool {
     std::env::var(NO_API_ENV).as_deref() != Ok("1")
 }
 
 /// `serve`'s listener decision, extracted because it is the REST kill switch's
-/// call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield `no_api`, never a
+/// call site: `Some(addr)` under `TOLLGATE_NO_API=1` must yield `no_api`, never a
 /// prepared listener. The prepare arm reads the certificate; the legacy import and
 /// the bind itself run later, below the claim, in `api::serve_prepared`.
 fn listener_setup(
@@ -261,7 +261,7 @@ fn listener_setup(
 
 /// The TUI's `start daemon`: `<exe> daemon` detached from the caller, its
 /// output appended to [`LOG_FILE`] (append mode, which the size cap's
-/// in-place trim needs), its cwd `~/.clauth` so it pins no directory the
+/// in-place trim needs), its cwd `~/.tollgate` so it pins no directory the
 /// caller ran in. On unix it leads its own process group, so the caller's
 /// Ctrl-C and the terminal's hangup, which reach only the foreground group,
 /// never reach it; on Windows it runs on a hidden console of its own, so
@@ -269,12 +269,12 @@ fn listener_setup(
 /// it starts (the gateway, its PowerShell probes) share that hidden console
 /// instead of each opening a window, and it leaves the caller's job object
 /// where that job allows it, so a host closing the job (sshd ending a
-/// session) does not end it either. A clauth session home the caller inherited
-/// is scrubbed ([`crate::runtime::scrub_clauth_homes`]): the daemon outlives
+/// session) does not end it either. A tollgate session home the caller inherited
+/// is scrubbed ([`crate::runtime::scrub_tollgate_homes`]): the daemon outlives
 /// that session and its tree.
 pub(crate) fn spawn_detached(exe: &std::path::Path) -> Result<std::process::Child> {
-    let dir = clauth_dir()?;
-    mkdir_700(&dir).context("failed to create ~/.clauth")?;
+    let dir = tollgate_dir()?;
+    mkdir_700(&dir).context("failed to create ~/.tollgate")?;
     let log_path = dir.join(LOG_FILE);
     let log = crate::profile::open_append_600(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
@@ -285,7 +285,7 @@ pub(crate) fn spawn_detached(exe: &std::path::Path) -> Result<std::process::Chil
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().context("failed to share the daemon log")?)
         .stderr(log);
-    crate::runtime::scrub_clauth_homes(&mut command);
+    crate::runtime::scrub_tollgate_homes(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -357,7 +357,7 @@ pub(crate) fn await_start(
     }
 }
 
-/// `clauth daemon` — build the shared stores, run the scheduler headless, and
+/// `tollgate daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
 /// `listen` is the REST API's bind address (`--listen`), or `None` for the
@@ -374,11 +374,11 @@ pub(crate) fn serve(
     crate::logline::enable_timestamps();
     crate::platform::init();
 
-    let dir = clauth_dir()?;
-    // Create ~/.clauth at 0o700 (was create_dir_all → umask 0o755). Above the
+    let dir = tollgate_dir()?;
+    // Create ~/.tollgate at 0o700 (was create_dir_all → umask 0o755). Above the
     // singleton claim because the lock files live in the dir; it no-ops for
     // every instance after the first.
-    mkdir_700(&dir).context("failed to create ~/.clauth")?;
+    mkdir_700(&dir).context("failed to create ~/.tollgate")?;
 
     // The listener's unreadable certificate is settled BEFORE the claim below,
     // because the claim is what terminates the incumbent under `--replace`.
@@ -407,7 +407,7 @@ pub(crate) fn serve(
         Claim::Active(lock) => (lock, false),
         Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
         Claim::Redundant => {
-            logline!("clauth daemon: {}; exiting", redundant_reason(mode));
+            logline!("tollgate daemon: {}; exiting", redundant_reason(mode));
             return Ok(());
         }
     };
@@ -421,14 +421,14 @@ pub(crate) fn serve(
     // and skips this.
     if promoted && let Some(prepared) = prepared.as_mut() {
         prepared.reload_certificate(certs)?;
-        logline!("clauth daemon: standby promoted; TLS certificate reloaded");
+        logline!("tollgate daemon: standby promoted; TLS certificate reloaded");
     }
 
     log_rotate::warn_if_log_cap_defeated();
     // Tighten an existing looser tree (older builds / CLI umask left it 0o755)
     // before `load_config` runs its own walk. Idempotent, so the standby path
     // running it twice costs one stat walk.
-    migrate_clauth_perms_700(&dir);
+    migrate_tollgate_perms_700(&dir);
     crate::runtime::gc_stale_runtimes();
 
     let config = load_config()?;
@@ -447,7 +447,7 @@ pub(crate) fn serve(
         // Said here rather than above the claim so a redundant instance cannot
         // print it and then "already running": two lines from a process that
         // did nothing.
-        logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
+        logline!("tollgate daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
     }
     if let Some(prepared) = prepared {
         api::serve_prepared(
@@ -466,13 +466,13 @@ pub(crate) fn serve(
     let _supervisor = match gateway::start(Arc::clone(&daemon.gateway), &lock) {
         Ok(supervisor) => gateway::stop_on_signal(supervisor),
         Err(e) => {
-            logline!("clauth daemon: {e:#}; the shunt gateway is not supervised");
+            logline!("tollgate daemon: {e:#}; the shunt gateway is not supervised");
             None
         }
     };
 
     logline!(
-        "clauth daemon: running (status → {})",
+        "tollgate daemon: running (status → {})",
         daemon.status_path.display()
     );
     daemon.run();
@@ -489,8 +489,8 @@ pub(crate) fn serve(
 /// standing-by line would otherwise sit in a world-readable `daemon.log` naming
 /// accounts for the whole wait.
 fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
-    migrate_clauth_perms_700(dir);
-    logline!("clauth daemon: another instance holds the lock: standing by until it exits");
+    migrate_tollgate_perms_700(dir);
+    logline!("tollgate daemon: another instance holds the lock: standing by until it exits");
     slot.promote()
 }
 
@@ -539,7 +539,7 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
     let uncapped = uncapped_spenders(config);
     if !uncapped.is_empty() {
         logline!(
-            "clauth daemon: {} can spend with no cap. {}. without one, max spend only gates when \
+            "tollgate daemon: {} can spend with no cap. {}. without one, max spend only gates when \
              billing starts, not when it stops",
             uncapped.join(", "),
             crate::fallback::uncapped_spend_fix(),
@@ -563,7 +563,7 @@ fn redundant_reason(mode: StartMode) -> String {
     }
 }
 
-/// `clauth daemon --status` — presence probe for a supervisor or a menu-bar app,
+/// `tollgate daemon --status` — presence probe for a supervisor or a menu-bar app,
 /// so "is one already up?" costs a try-lock instead of a spawn. One line on
 /// stdout while a daemon is up (exit 0); exit 1 with nothing on stdout when
 /// none is, matching the sessions surface's convention.
@@ -575,7 +575,7 @@ pub(crate) fn status_probe() -> Result<()> {
     // filesystem without working locks. Here the same condition is an error the
     // caller sees. `daemon_health` still owns the freshness word below.
     if !probe::singleton_held()? {
-        anyhow::bail!("no clauth daemon is running");
+        anyhow::bail!("no tollgate daemon is running");
     }
     let pid = probe::holder_pid().map_or_else(|| "unknown".to_string(), |p| p.to_string());
     let feed = if daemon_health() == DaemonHealth::Fresh {
@@ -592,7 +592,7 @@ pub(crate) fn status_probe() -> Result<()> {
     Ok(())
 }
 
-/// `clauth status --json [--all|--disabled]` — single-shot serializer. Reads
+/// `tollgate status --json [--all|--disabled]` — single-shot serializer. Reads
 /// the on-disk caches and prints the same shape the daemon writes, then
 /// exits. No scheduler; freshness and next-refresh are derived from cache
 /// mtimes. `include_disabled` mirrors `build_status`'s flag of the same name
@@ -605,15 +605,15 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Republish `~/.clauth/status.json` from a process that is not the daemon, so a
-/// switch landing in the TUI, in `clauth <name>`, or through the MCP tool reaches
+/// Republish `~/.tollgate/status.json` from a process that is not the daemon, so a
+/// switch landing in the TUI, in `tollgate <name>`, or through the MCP tool reaches
 /// the feed's readers at once.
 ///
 /// Without this the feed is only ever written by a running daemon, which learns
 /// of such a switch from the `profiles.toml` mtime on its next tick — and never
 /// learns of it at all when no daemon is running, leaving the published file
 /// naming an account the operator switched away from however long ago. That is
-/// the one field an external reader (`clauth-tray`, a status bar) most needs to
+/// the one field an external reader (`tollgate-tray`, a status bar) most needs to
 /// be right, so a switch publishes it itself.
 ///
 /// A live daemon OWNS the file: it republishes every tick with the scheduler's
@@ -630,7 +630,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// be written.
 ///
 /// The stamp is the daemon's, never this publish's: `generated_at` is how every
-/// reader (`clauth-tray`, the TUI's daemon chip) decides a daemon is alive, so
+/// reader (`tollgate-tray`, the TUI's daemon chip) decides a daemon is alive, so
 /// the republish carries the daemon's last stamp forward, or the epoch when no
 /// daemon has ever published — see [`prior_generated_at`].
 ///
@@ -643,7 +643,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// Call it OUTSIDE the switch's `with_state_lock`, the way every caller in
 /// `actions` does: [`build_status`] stats and reads each profile's caches and
 /// sweeps the session flocks, and that disk work has no business extending the
-/// critical section every other clauth process is queued behind.
+/// critical section every other tollgate process is queued behind.
 ///
 /// Takes the shared [`ConfigHandle`] and snapshots the config the same way the
 /// daemon's own writer and the API's switch do — the guard acquired for the
@@ -687,7 +687,7 @@ pub(crate) fn publish_status_with(
 /// answers that with the epoch, which every staleness rule reads as "no
 /// daemon".
 fn prior_generated_at() -> Option<String> {
-    let Ok(dir) = clauth_dir() else { return None };
+    let Ok(dir) = tollgate_dir() else { return None };
     let body = std::fs::read(dir.join(STATUS_FILE)).ok()?;
     serde_json::from_slice::<serde_json::Value>(&body)
         .ok()?
@@ -750,11 +750,11 @@ fn publish_status_json_if_current(
 ) {
     debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Config>());
     let active = snapshot.state.active_profile.as_ref();
-    let feed = clauth_dir().ok().map(|dir| dir.join(STATUS_FILE));
+    let feed = tollgate_dir().ok().map(|dir| dir.join(STATUS_FILE));
     if let Err(e) = crate::lock::with_state_lock(|_held| {
         if crate::profile::load_app_state()?.active_profile.as_ref() != active {
             logline!(
-                "clauth: skipped the daemonless status.json republish: the active profile moved while this body was built"
+                "tollgate: skipped the daemonless status.json republish: the active profile moved while this body was built"
             );
             return Ok(());
         }
@@ -763,14 +763,14 @@ fn publish_status_json_if_current(
             && mtime >= built_after
         {
             logline!(
-                "clauth: skipped the daemonless status.json republish: a newer publication landed while this body was built"
+                "tollgate: skipped the daemonless status.json republish: a newer publication landed while this body was built"
             );
             return Ok(());
         }
         write_status_json(json);
         Ok(())
     }) {
-        logline!("clauth: failed to publish status.json after a switch: {e:#}");
+        logline!("tollgate: failed to publish status.json after a switch: {e:#}");
     }
 }
 
@@ -793,23 +793,23 @@ fn status_feed_json(
     match serde_json::to_vec_pretty(&body) {
         Ok(json) => Some(json),
         Err(e) => {
-            logline!("clauth: failed to serialize status.json after a switch: {e}");
+            logline!("tollgate: failed to serialize status.json after a switch: {e}");
             None
         }
     }
 }
 
 fn write_status_json(json: &[u8]) {
-    let Ok(dir) = clauth_dir() else { return };
+    let Ok(dir) = tollgate_dir() else { return };
     if let Err(e) = mkdir_700(&dir) {
         logline!(
-            "clauth: failed to prepare {} for status.json: {e}",
+            "tollgate: failed to prepare {} for status.json: {e}",
             dir.display()
         );
         return;
     }
     if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), json) {
-        logline!("clauth: failed to publish status.json after a switch: {e}");
+        logline!("tollgate: failed to publish status.json after a switch: {e}");
     }
 }
 
@@ -822,7 +822,7 @@ fn write_status_json(json: &[u8]) {
 /// wedges every headless switch behind a TUI decision about nothing while
 /// running sessions sit at "Login expired" (observed 2026-07-15). An
 /// unreadable/torn live file still defers — it may be a CC write in progress.
-/// The shell / first-login / clauth-symlink exemptions all live in
+/// The shell / first-login / tollgate-symlink exemptions all live in
 /// [`crate::claude::live_diverged_and_unsaved`]; a read that errors outright
 /// maps to `false` (proceed) here.
 fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
@@ -1205,7 +1205,7 @@ impl Daemon {
     fn spawn_watchdog(&self) {
         let heartbeat = Arc::clone(&self.heartbeat);
         let spawned = std::thread::Builder::new()
-            .name("clauth-daemon-watchdog".into())
+            .name("tollgate-daemon-watchdog".into())
             .spawn(move || {
                 let mut unaccounted_ms: u64 = 0;
                 loop {
@@ -1228,7 +1228,7 @@ impl Daemon {
                         WATCHDOG_DEADLINE.as_millis() as u64,
                         || {
                             logline!(
-                                "clauth daemon: watchdog: no tick within {}s; aborting for a \
+                                "tollgate daemon: watchdog: no tick within {}s; aborting for a \
                                  clean launchd restart",
                                 WATCHDOG_DEADLINE.as_secs()
                             );
@@ -1241,7 +1241,7 @@ impl Daemon {
             // No watchdog = a wedged loop hangs forever with launchd seeing a
             // live process. Say so loudly; the daemon still runs.
             logline!(
-                "clauth daemon: failed to spawn the anti-wedge watchdog: {e}. \
+                "tollgate daemon: failed to spawn the anti-wedge watchdog: {e}. \
                  A stalled tick will NOT auto-restart this process"
             );
         }
@@ -1289,10 +1289,10 @@ impl Daemon {
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
                 if let Err(e) = atomic_write_600(&self.status_path, &json) {
-                    logline!("clauth daemon: failed to write status.json: {e}");
+                    logline!("tollgate daemon: failed to write status.json: {e}");
                 }
             }
-            Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
+            Err(e) => logline!("tollgate daemon: failed to serialize status.json: {e}"),
         }
     }
 }

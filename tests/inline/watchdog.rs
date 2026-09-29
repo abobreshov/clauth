@@ -1,5 +1,5 @@
 //! Inline tests for `crate::watchdog` — the event filter, the watch's survival
-//! of the rename every clauth write publishes through, the two loop properties
+//! of the rename every tollgate write publishes through, the two loop properties
 //! (cooldown measured from the reconcile's END, a cooled-down wake deferred
 //! rather than dropped), and the filter-health signal that keeps a watcher
 //! matching nothing from reading as a healthy one.
@@ -136,7 +136,7 @@ fn publish(dst: &Path, bytes: &[u8]) {
 
 /// The defect that made the event path permanently self-disabling: a watch on
 /// the FILE arms `IN_DELETE_SELF`/`IN_MOVE_SELF`, and the rename that publishes
-/// every clauth-written file unlinks that inode, so notify drops the watch with
+/// every tollgate-written file unlinks that inode, so notify drops the watch with
 /// nothing re-arming it. One write per path and the watcher is dead — silently,
 /// because the channel stays connected. A directory inode outlives its
 /// children's renames.
@@ -342,12 +342,12 @@ fn a_store_publish_reconciles_with_every_ticker_disabled() {
 }
 
 /// The filter is what keeps a directory watch from costing a reconcile per
-/// unrelated write in a hot directory — and what keeps clauth's own staging
+/// unrelated write in a hot directory — and what keeps tollgate's own staging
 /// halves from waking the loop on every publish it makes.
 #[test]
 fn the_filter_takes_named_children_and_drops_staging_siblings() {
-    let store = Path::new("/clauth/profiles/acct");
-    let tree = Path::new("/clauth/profiles/acct/runtime-1-0");
+    let store = Path::new("/tollgate/profiles/acct");
+    let tree = Path::new("/tollgate/profiles/acct/runtime-1-0");
     let specs = vec![
         WatchSpec::new(store, Interest::Names(vec!["credentials.json".into()])),
         WatchSpec::new(tree, Interest::AnyChild),
@@ -685,7 +685,7 @@ fn the_callback_counts_events_it_was_handed_apart_from_the_ones_it_took() {
 /// An event about a watched directory ITSELF is accounted for by definition:
 /// it came from a watch we armed. inotify leaves `name` empty for those and
 /// notify then reports the watch root, with `WatchMask::OPEN` armed — so every
-/// `opendir` of a watched directory produces one, and clauth's own config leg
+/// `opendir` of a watched directory produces one, and tollgate's own config leg
 /// does two per reconcile (`runtime::shared_runtime_dirs` reads the profile
 /// store directory). Reading them as unaccountable crosses the orphan floor in
 /// under two minutes on a healthy install, which trains the operator to ignore
@@ -731,7 +731,7 @@ fn an_event_about_the_watched_directory_itself_is_never_an_orphan() {
         );
         assert_eq!(
             counts.orphans, 0,
-            "clauth's own reconcile reads this directory twice per pass: \
+            "tollgate's own reconcile reads this directory twice per pass: \
              counting that as unaccountable accuses every healthy session"
         );
     }
@@ -813,7 +813,7 @@ fn a_stream_of_unaccountable_events_is_reported_even_while_another_spec_matches(
 }
 
 /// Both spellings, because the difference between them IS the bug this detects.
-/// A line naming only the directory clauth armed tells the operator nothing
+/// A line naming only the directory tollgate armed tells the operator nothing
 /// they did not already configure.
 #[test]
 fn the_watched_list_names_both_spellings_when_they_differ() {
@@ -996,7 +996,7 @@ fn the_loop_raises_the_unaccountable_line_once() {
     assert_eq!(
         lines,
         vec![
-            "clauth: fs watcher is being handed events under a directory it cannot \
+            "tollgate: fs watcher is being handed events under a directory it cannot \
              account for (16 of 17 seen, e.g. /private/var/u/.claude/settings.json), \
              so that surface reconciles on the 10ms fallback rather than on its own \
              events. Watched: /home/u/.claude"
@@ -1021,7 +1021,7 @@ fn the_loop_raises_the_nothing_matched_line_once() {
     assert_eq!(
         lines,
         vec![
-            "clauth: fs watcher armed every directory but matched none of its 16 \
+            "tollgate: fs watcher armed every directory but matched none of its 16 \
              events, so every change reconciles on the 10ms fallback rather than on \
              its own event. Watched: /home/u/.claude"
                 .to_string()
@@ -1055,8 +1055,8 @@ fn the_loop_says_nothing_about_a_watcher_that_matched() {
 /// their PARENT so no entry is armed on an inode a rename will unlink.
 #[test]
 fn watch_specs_cover_each_reconciled_file_through_its_directory() {
-    let runtime = Path::new("/clauth/profiles/acct/runtime-1-0");
-    let store = Path::new("/clauth/profiles/acct/credentials.json");
+    let runtime = Path::new("/tollgate/profiles/acct/runtime-1-0");
+    let store = Path::new("/tollgate/profiles/acct/credentials.json");
     let claude_home = Path::new("/home/u/.claude");
     let specs = watch_specs(runtime, store, claude_home);
 
@@ -1079,7 +1079,7 @@ fn watch_specs_cover_each_reconciled_file_through_its_directory() {
     assert!(
         !wants(
             &specs,
-            &Path::new("/clauth/profiles/acct").join("kick_block.json")
+            &Path::new("/tollgate/profiles/acct").join("kick_block.json")
         ),
         "the profile store directory holds caches a scheduler rewrites on its own cadence"
     );

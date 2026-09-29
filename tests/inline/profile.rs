@@ -1,4 +1,4 @@
-//! Regression tests pinning the serde alias that lets clauth 0.2.0 users
+//! Regression tests pinning the serde alias that lets tollgate 0.2.0 users
 //! upgrade without losing their persisted settings: `kick_timer` (per-profile
 //! config.toml) was renamed to `auto_start` after 0.2.0. Drop the alias and the
 //! test below fails.
@@ -680,7 +680,7 @@ fn a_profiles_toml_carrying_the_removed_auto_rescue_key_still_loads() {
 }
 
 // `save_app_state` rewrites profiles.toml over itself, and the file is shared
-// with writers this binary does not model: a newer clauth (the
+// with writers this binary does not model: a newer tollgate (the
 // `auto_start_queue` erasure, issue #75) or an operator's hand-edit. The key
 // belongs to whoever put it in the file; a save that only changes a modelled
 // field must keep it.
@@ -777,7 +777,7 @@ fn save_app_state_keeps_unknown_nested_keys_inside_a_modelled_table() {
     let path = app_state_path().expect("app_state_path");
     let disk = std::fs::read_to_string(&path).expect("read state file");
     // Append future nested keys under the modelled tables, the shape a newer
-    // clauth (or a hand-edit) would write.
+    // tollgate (or a hand-edit) would write.
     std::fs::write(
         &path,
         format!(
@@ -968,7 +968,7 @@ fn save_profile_keeps_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() 
     let config_path =
         profile_config_path(&crate::profile::ProfileName::from("cfgnested")).expect("config path");
     // Overwrite the disk file so [models] holds ONLY the unmodelled key: the
-    // shape a hand-edit or a newer clauth leaves when the model's own fields
+    // shape a hand-edit or a newer tollgate leaves when the model's own fields
     // are unset in the file.
     std::fs::write(
         &config_path,
@@ -1470,7 +1470,7 @@ fn switch_off_when_spent_keeps_its_wrap_off_key_on_disk() {
     .expect("serialize");
     assert!(
         rendered.contains("wrap_off = true"),
-        "writes must keep the published key, else an older clauth reads the file \
+        "writes must keep the published key, else an older tollgate reads the file \
          and silently loses the setting: {rendered}"
     );
     assert!(
@@ -1530,7 +1530,7 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
 /// NaN threshold reads false, so a hand-edited one silently disables the gate
 /// it was meant to set. Worse, `render_config_toml` writes it back out as
 /// `NaN`, which TOML rejects, so the next `load_profile` fails on the file
-/// clauth itself just rewrote. Non-finite reads as unset on both percent
+/// tollgate itself just rewrote. Non-finite reads as unset on both percent
 /// fields, matching `max_auto_spend`'s guard above.
 #[test]
 fn non_finite_percent_fields_read_as_unset_at_load() {
@@ -2422,7 +2422,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
     );
 
     // The swap executor's touch receipt: it holds no secret, but it is a writer
-    // under `~/.clauth` and the invariant is the whole tree, so a future writer
+    // under `~/.tollgate` and the invariant is the whole tree, so a future writer
     // swapped off the per-profile cache path has to fail here.
     // Registered AFTER the empty `save_app_state` above, which rewrote the
     // record the cache-write gate reads.
@@ -2585,16 +2585,19 @@ fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
     use std::os::unix::fs::PermissionsExt;
 
     let _home = HomeSandbox::new();
-    let clauth = clauth_dir().expect("clauth_dir");
+    let tollgate = tollgate_dir().expect("tollgate_dir");
 
-    let codex_home = clauth.join("profiles").join("cx").join("codex-home-4242-0");
+    let codex_home = tollgate
+        .join("profiles")
+        .join("cx")
+        .join("codex-home-4242-0");
     std::fs::create_dir_all(&codex_home).expect("mkdir codex home");
     let helper = codex_home.join("codex-alias");
     std::fs::write(&helper, b"#!/bin/sh\n").expect("write helper");
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    let impostor = clauth.join("profiles").join("codex-home");
+    let impostor = tollgate.join("profiles").join("codex-home");
     std::fs::create_dir_all(&impostor).expect("mkdir impostor profile");
     std::fs::write(impostor.join("config.toml"), b"").expect("write config");
     std::fs::set_permissions(
@@ -2603,7 +2606,7 @@ fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
     )
     .expect("chmod");
 
-    enforce_clauth_perms(&clauth);
+    enforce_tollgate_perms(&tollgate);
 
     let mode =
         |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
@@ -2629,7 +2632,7 @@ fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
 /// entry point loads the config, so that is where the tree gets retightened.
 #[cfg(unix)]
 #[test]
-fn load_config_repairs_a_loose_clauth_tree() {
+fn load_config_repairs_a_loose_tollgate_tree() {
     use crate::testutil::owner_only_violations;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2645,7 +2648,7 @@ fn load_config_repairs_a_loose_clauth_tree() {
     })
     .expect("save_app_state");
 
-    let clauth = clauth_dir().expect("clauth_dir");
+    let tollgate = tollgate_dir().expect("tollgate_dir");
     let profile = profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir");
     let runtime = profile.join("runtime");
     let sessions = profile.join("sessions");
@@ -2655,7 +2658,7 @@ fn load_config_repairs_a_loose_clauth_tree() {
     std::fs::write(profile.join("usage_history.jsonl"), b"").expect("write history");
 
     // What an older build left behind: umask modes top to bottom.
-    for dir in [&clauth, &clauth.join("profiles"), &profile, &runtime] {
+    for dir in [&tollgate, &tollgate.join("profiles"), &profile, &runtime] {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
     }
     for file in [
@@ -2668,7 +2671,7 @@ fn load_config_repairs_a_loose_clauth_tree() {
     }
 
     // A runtime links into the operator's ~/.claude, and `set_permissions`
-    // resolves links — walking one would chmod a file clauth does not own.
+    // resolves links — walking one would chmod a file tollgate does not own.
     let outside = home.home().join("outside.json");
     std::fs::write(&outside, b"{}").expect("write outside");
     std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).expect("chmod");
@@ -2676,10 +2679,10 @@ fn load_config_repairs_a_loose_clauth_tree() {
 
     load_config().expect("load_config");
 
-    let left = owner_only_violations(&clauth);
+    let left = owner_only_violations(&tollgate);
     assert!(
         left.is_empty(),
-        "load_config must leave the whole ~/.clauth tree owner-only; still loose: {left:#?}"
+        "load_config must leave the whole ~/.tollgate tree owner-only; still loose: {left:#?}"
     );
     let outside_mode = std::fs::metadata(&outside)
         .expect("outside metadata")
@@ -2688,7 +2691,7 @@ fn load_config_repairs_a_loose_clauth_tree() {
     assert_eq!(
         outside_mode & 0o777,
         0o644,
-        "the repair followed a symlink out of the tree and chmodded {:#o} onto a file clauth does not own",
+        "the repair followed a symlink out of the tree and chmodded {:#o} onto a file tollgate does not own",
         outside_mode & 0o777,
     );
 }
@@ -2729,7 +2732,7 @@ fn model_settings_round_trip_through_config_toml() {
 /// real load boundary — the point of these tests is where normalization
 /// happens, so nothing may bypass `load_app_state`.
 fn load_state_from_toml(toml: &str) -> AppState {
-    std::fs::create_dir_all(clauth_dir().expect("clauth dir")).expect("create clauth dir");
+    std::fs::create_dir_all(tollgate_dir().expect("tollgate dir")).expect("create tollgate dir");
     std::fs::write(app_state_path().expect("state path"), toml).expect("write profiles.toml");
     load_app_state().expect("load state")
 }
@@ -2824,8 +2827,8 @@ fn reload_fingerprint_changes_when_profiles_toml_mtime_bumps() {
 #[test]
 fn reload_fingerprint_covers_the_codex_state_file() {
     let _home = crate::testutil::HomeSandbox::new();
-    let dir = clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let dir = tollgate_dir().expect("tollgate dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .tollgate");
     let before = reload_fingerprint();
     let path = dir.join("codex-profiles.toml");
     crate::testutil::write_codex_roster(&[]);
@@ -3346,7 +3349,7 @@ check_scoped = false
 
 /// The Alibaba console session survives a save/load round trip through
 /// `config.toml`'s `[console]` table, and its file keeps the 0600 posture every
-/// credential under `~/.clauth` carries.
+/// credential under `~/.tollgate` carries.
 #[test]
 fn a_console_session_round_trips_through_config_toml() {
     let _home = HomeSandbox::new();
@@ -3427,7 +3430,7 @@ fn a_console_table_without_a_token_reads_as_no_session() {
 /// The `[console]` block ships into every `config.toml`, so its copy is the one
 /// place this claim reaches users unprompted — and "the session lasts 48 hours"
 /// is false. The 48h runs from the operator's aliyun BROWSER sign-in, not from
-/// the `clauth login`: two tokens minted ~4h apart report the same
+/// the `tollgate login`: two tokens minted ~4h apart report the same
 /// `sessionCreateTimeStamp`/`sessionExpireTimeStamp`, so a fresh login inherits
 /// whatever is left and can be worth minutes.
 #[test]
@@ -3443,7 +3446,7 @@ fn the_console_template_does_not_promise_a_fresh_48_hours() {
     );
 }
 
-/// The dead-credential record is a new writer under `~/.clauth`, so the
+/// The dead-credential record is a new writer under `~/.tollgate`, so the
 /// tree-wide 0600/0700 invariant covers it — the rule is the TREE, not the
 /// secrets in it, and this file holds a hash of a live credential.
 #[cfg(unix)]
@@ -3529,7 +3532,7 @@ fn save_profile_preserves_mcp_oauth_across_a_login_refresh() {
 /// An OAuth block holding keys `OAuthToken` does not model (`rateLimitTier`,
 /// `refreshTokenExpiresAt`, `clientId` — all written by Claude Code through the
 /// symlinked store) keeps them through a plain load → mutate → save, the exact
-/// shape of every config mutation (`clauth disable`, a TUI toggle): the parse
+/// shape of every config mutation (`tollgate disable`, a TUI toggle): the parse
 /// must carry the subkeys into memory and the save must write them back
 /// (issue #75).
 #[test]
@@ -3670,7 +3673,7 @@ fn the_rate_limit_tier_stamp_uses_claude_codes_key() {
     );
 }
 
-/// A login minted by clauth's own browser flow carries no extras, and the
+/// A login minted by tollgate's own browser flow carries no extras, and the
 /// serialized store must not grow an empty catch-all key for it.
 #[test]
 fn a_fresh_login_serializes_with_no_catch_all_key() {
@@ -3740,7 +3743,7 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
 
 // ── #80 backfill: the usage poll stamps a missing tier into pre-#80 chains ──
 //
-// `clauth login` stamps `rateLimitTier` since #80; a chain minted earlier
+// `tollgate login` stamps `rateLimitTier` since #80; a chain minted earlier
 // carries none. The poll's hourly `/profile` leg backfills it (decision 1 of
 // the #80 review), write-if-missing onto the stored chain, under
 // the state flock.
@@ -3975,7 +3978,7 @@ fn rolling_token_round_trips_through_config_toml() {
 }
 
 /// `save_profile` rewrites `config.toml` over itself, and the file is shared
-/// with writers this binary does not model (a newer clauth, a hand-edit).
+/// with writers this binary does not model (a newer tollgate, a hand-edit).
 /// A save that changes one modelled field must keep the keys it does not know
 /// (issue #75, the config.toml sibling of the profiles.toml erasure).
 #[test]
@@ -4021,7 +4024,7 @@ fn a_carried_scalar_stays_top_level_beside_a_trailing_table() {
     let config_path = profile_config_path(&name).expect("config path");
     std::fs::create_dir_all(config_path.parent().expect("parent")).expect("create profile dir");
     // The knob sits top-level ABOVE [env] — the placement a hand-edit or an
-    // older clauth's file has. The test's point is where the SAVE puts it, not
+    // older tollgate's file has. The test's point is where the SAVE puts it, not
     // where a corrupted file left it.
     std::fs::write(
         &config_path,
@@ -4069,7 +4072,7 @@ fn a_carried_profiles_toml_scalar_stays_top_level_beside_herdr() {
     // The unknown key must be planted TOP-LEVEL, above the rendered [herdr]
     // block — appending after it would nest the key inside [herdr] in the
     // fixture itself, which is the corrupted-file shape, not a valid carry
-    // input. A hand-edit or an older clauth writes it top-level.
+    // input. A hand-edit or an older tollgate writes it top-level.
     let path = app_state_path().expect("app_state_path");
     let raw = std::fs::read_to_string(&path).expect("read");
     let herdr_at = raw.find("[herdr]").expect("herdr block present");
@@ -4277,7 +4280,7 @@ fn loading_a_config_toml_with_unknown_keys_does_not_rewrite_it() {
 }
 
 /// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
-/// released clauth ever wrote it, and a permanent alias for something that
+/// released tollgate ever wrote it, and a permanent alias for something that
 /// never shipped is pure legacy surface. An unknown key parses as OFF.
 #[test]
 fn the_pre_rename_session_feed_key_is_not_carried() {
@@ -4285,13 +4288,13 @@ fn the_pre_rename_session_feed_key_is_not_carried() {
         toml::from_str("session_feed = true\n").expect("parse legacy config");
     assert!(
         !legacy.rolling_token,
-        "installs that ran the feature branch re-run `clauth rolling-token <p>` once"
+        "installs that ran the feature branch re-run `tollgate rolling-token <p>` once"
     );
 }
 
 /// A test that forgets its sandbox must fail rather than reach the operator's
-/// tree: `~/.clauth` is live state a running clauth writes and flocks, so a
-/// stray write lands in their accounts and a stray `~/.clauth/.lock` wait times
+/// tree: `~/.tollgate` is live state a running tollgate writes and flocks, so a
+/// stray write lands in their accounts and a stray `~/.tollgate/.lock` wait times
 /// the test out on contention it never staged.
 #[test]
 fn resolving_a_home_with_no_sandbox_held_panics() {

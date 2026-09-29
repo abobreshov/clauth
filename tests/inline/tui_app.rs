@@ -145,7 +145,7 @@ fn bare_app() -> App {
     })
 }
 
-/// Seed CC's plugin registry with one clauth install record at `scope`.
+/// Seed CC's plugin registry with one tollgate install record at `scope`.
 fn write_plugin_install(scope: &str) {
     let path = crate::profile::claude_dir()
         .expect("claude dir")
@@ -153,7 +153,7 @@ fn write_plugin_install(scope: &str) {
         .join("installed_plugins.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     let body = serde_json::json!({
-        "plugins": { "clauth@clauth": [{ "scope": scope, "version": "0.1.0" }] }
+        "plugins": { "tollgate@tollgate": [{ "scope": scope, "version": "0.1.0" }] }
     });
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 }
@@ -169,7 +169,7 @@ fn plugin_check(app: &App) -> &super::Check {
 /// The delegates pane's rows arrive BANDED, from the store.
 ///
 /// `recompute_plugin_checks` is the pane's only reader, and it must call
-/// `jobs::list_banded` — the same function `clauth jobs` and `monitor`'s listing
+/// `jobs::list_banded` — the same function `tollgate jobs` and `monitor`'s listing
 /// call — rather than `jobs::list`. The renderer sorts nothing any more, so this
 /// read is the whole of the pane's ordering: reverting it to the raw retention
 /// order silently drops a long-running delegate below a burst of completions,
@@ -348,7 +348,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
         .join("installed_plugins.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     let body = serde_json::json!({
-        "plugins": { "clauth@clauth": [
+        "plugins": { "tollgate@tollgate": [
             { "scope": "local", "version": "0.14.1" },
             { "scope": "user", "version": "0.15.0" }
         ] }
@@ -474,13 +474,13 @@ fn the_install_fix_runs_agentgear_user_scope_install() {
         data_dir.display()
     );
     assert!(
-        std::path::Path::new(tree_arg).starts_with(data_dir.join("clauth")),
+        std::path::Path::new(tree_arg).starts_with(data_dir.join("tollgate")),
         "the marketplace source must be the materialized tree under the \
          hermetic data dir, got: {tree_arg}"
     );
     let installs = log
         .lines()
-        .filter(|l| *l == "plugin install clauth@clauth --scope user")
+        .filter(|l| *l == "plugin install tollgate@tollgate --scope user")
         .count();
     assert_eq!(
         installs, 1,
@@ -1321,7 +1321,7 @@ fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
     // `reload_if_state_changed` takes the reload branch instead of early-out.
     let config_toml = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("acct")
         .join("config.toml");
@@ -1412,7 +1412,7 @@ fn the_durable_auth_verdict_seeds_the_key_rejected_set_on_reload() {
 
     let config_toml = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("zai")
         .join("config.toml");
@@ -2750,7 +2750,7 @@ fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
     );
     let on_disk = std::fs::read_to_string(
         home.home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("acct")
             .join("config.toml"),
@@ -2812,7 +2812,7 @@ fn disabled_row_toggle_is_inert_for_the_active_account() {
     );
 }
 
-/// Same gate, the other half: a live `clauth start` session also blocks it.
+/// Same gate, the other half: a live `tollgate start` session also blocks it.
 #[test]
 fn disabled_row_toggle_is_inert_with_a_live_session() {
     use super::{ConfigRow, build_draft_existing, run_config_row};
@@ -3275,7 +3275,7 @@ fn clear_session_token_on_an_idle_account_leaves_the_live_link_alone() {
     );
 }
 
-/// The TUI clear is the same FULL exit as `clauth static-token --clear`, or the
+/// The TUI clear is the same FULL exit as `tollgate static-token --clear`, or the
 /// two surfaces fight the daemon differently: on a rolling profile the
 /// `rolling_token` flag goes FIRST (a set flag has the daemon re-stamp a fresh
 /// bearer over the removal on its next scan) and the preserved mint goes too
@@ -3846,12 +3846,12 @@ fn daemon_control_outcomes_toast_and_rearm_the_verb() {
         (
             R::Start(Ok(StartOutcome::Exited)),
             ToastKind::Danger,
-            "daemon exited at start\nsee ~/.clauth/daemon.log",
+            "daemon exited at start\nsee ~/.tollgate/daemon.log",
         ),
         (
             R::Start(Ok(StartOutcome::NotYet)),
             ToastKind::Warning,
-            "daemon not up after 5s\nsee ~/.clauth/daemon.log",
+            "daemon not up after 5s\nsee ~/.tollgate/daemon.log",
         ),
         (
             R::Start(Err("no such file".to_string())),
@@ -4027,7 +4027,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 }
 
-/// The console link is offered for exactly the accounts clauth knows a page
+/// The console link is offered for exactly the accounts tollgate knows a page
 /// for. An OAuth account has none, so the entry is absent above rather than
 /// present-and-inert — the assertions there are the other direction of this one.
 #[test]
@@ -4237,8 +4237,8 @@ fn overview_switch_request_never_opens_a_confirm_for_a_disabled_account() {
     );
 }
 
-/// Off macOS a live `clauth start` session no longer blocks the rotate: it reads
-/// the same credential file clauth writes, so it picks the rotated pair up on
+/// Off macOS a live `tollgate start` session no longer blocks the rotate: it reads
+/// the same credential file tollgate writes, so it picks the rotated pair up on
 /// its next request. The action arms the ordinary rotate confirm, exactly as an
 /// idle profile does — no acknowledge notice, no pre-refusal.
 #[cfg(not(target_os = "macos"))]
@@ -4297,7 +4297,7 @@ fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
         matches!(confirm.on_confirm, ConfirmAction::Acknowledge),
         "macOS arms an acknowledge notice, not a rotate that cannot run"
     );
-    assert_eq!(confirm.message, "'busy' has a live clauth start session");
+    assert_eq!(confirm.message, "'busy' has a live tollgate start session");
     assert_eq!(
         confirm.detail.as_deref(),
         Some(super::ROTATE_LIVE_SESSION_DETAIL)
@@ -4365,7 +4365,7 @@ fn confirming_a_rotate_under_a_live_session_is_refused_on_macos() {
 ///
 /// `join_test_workers` is load-bearing, not hygiene: `spawn_worker` detaches, and
 /// a worker still running when `HomeSandbox` drops resolves the operator's REAL
-/// `$HOME` and takes real locks under `~/.clauth`.
+/// `$HOME` and takes real locks under `~/.tollgate`.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
@@ -4409,14 +4409,14 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
 #[test]
 fn rotate_all_detail_promises_what_the_host_actually_does() {
     let want = if cfg!(target_os = "macos") {
-        "accounts with a live clauth start session are skipped."
+        "accounts with a live tollgate start session are skipped."
     } else {
         "running sessions pick up the new tokens on their next request."
     };
     assert_eq!(super::ROTATE_ALL_DETAIL, want);
 }
 
-/// The single-rotate refusal copy. These strings assert a MECHANISM (clauth
+/// The single-rotate refusal copy. These strings assert a MECHANISM (tollgate
 /// cannot write the keychain entry that session's Claude Code reads), not the
 /// old and now-false "the session manages its own tokens" theory, so a drift
 /// back toward the old wording is a drift back to a wrong explanation. Pinned
@@ -4425,16 +4425,16 @@ fn rotate_all_detail_promises_what_the_host_actually_does() {
 fn the_live_session_rotate_refusal_names_the_keychain_mechanism() {
     assert_eq!(
         super::ROTATE_LIVE_SESSION_MSG,
-        "has a live clauth start session"
+        "has a live tollgate start session"
     );
     assert_eq!(
         super::ROTATE_LIVE_SESSION_DETAIL,
-        "macos keeps its login in a keychain entry clauth can't write, so rotating would sign \
+        "macos keeps its login in a keychain entry tollgate can't write, so rotating would sign \
          the session out."
     );
     assert_eq!(
         super::ROTATE_LIVE_SESSION_TOAST,
-        "macos keeps its login where clauth can't rotate it"
+        "macos keeps its login where tollgate can't rotate it"
     );
 }
 
@@ -5604,13 +5604,13 @@ fn divergence_poll_ignores_a_logged_out_shell() {
     );
 }
 
-/// A clauth-owned symlink in the live slot is never "unsaved credentials": a
+/// A tollgate-owned symlink in the live slot is never "unsaved credentials": a
 /// long-lived `session-token.json` for the active profile flips its install
 /// source, so the live symlink classifies Diverged though re-pointing it loses
 /// no login. The 1Hz poll must NOT flag the banner — it repainted it every second.
 #[cfg(unix)]
 #[test]
-fn divergence_poll_ignores_a_stale_clauth_symlink() {
+fn divergence_poll_ignores_a_stale_tollgate_symlink() {
     use crate::profile::{
         AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile,
     };
@@ -5619,7 +5619,7 @@ fn divergence_poll_ignores_a_stale_clauth_symlink() {
     let mut work = Profile::new("work".to_string(), None, None);
     work.credentials = Some(login_creds("rt-work"));
     save_profile(&work).expect("save work");
-    // The live slot is clauth's own symlink into work's rotating store.
+    // The live slot is tollgate's own symlink into work's rotating store.
     crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("work"))
         .expect("link work");
     // A long-lived session token (no refresh token) flips work's install source;
@@ -5655,7 +5655,7 @@ fn divergence_poll_ignores_a_stale_clauth_symlink() {
     force_poll(&mut app);
     assert!(
         app.divergence_pending.is_none(),
-        "a clauth-owned symlink is nothing to resolve — no 1Hz banner"
+        "a tollgate-owned symlink is nothing to resolve — no 1Hz banner"
     );
     assert!(app.modals.is_empty(), "and certainly no modal");
 }
@@ -6197,8 +6197,12 @@ fn walk_order_space_cycles_and_persists() {
     // Persisted to profiles.toml, not just the in-memory config — reload it
     // fresh, the way a relaunch would pick up the value.
     let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
     assert_eq!(
@@ -6334,8 +6338,12 @@ fn burn_aware_space_toggles_and_persists() {
     // Persisted to profiles.toml, not just the in-memory config — reload it
     // fresh, the way a relaunch would pick up the flag.
     let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
     assert!(reloaded.burn_aware_switching, "toggle persists to disk");
@@ -6367,8 +6375,12 @@ fn spend_budget_space_toggles_and_persists() {
     assert!(app.config().state.spend_budget_switching, "space arms it");
 
     let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
     assert!(reloaded.spend_budget_switching, "toggle persists to disk");
@@ -6418,8 +6430,12 @@ fn auto_start_queue_space_noops_until_an_account_opts_in() {
         "with an opted-in account space arms the queue"
     );
     let reloaded: AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
     assert!(reloaded.auto_start_queue, "the toggle persists to disk");
@@ -6427,11 +6443,10 @@ fn auto_start_queue_space_noops_until_an_account_opts_in() {
 
 // ── auto-update (the [update] toggle) ────────────────────────────────────────
 
-/// The row flips the persisted `[update]` table through the real Config
-/// router: space off writes `auto_update = false` explicitly, ⏎ back on
-/// omits the whole table again (on is the default, so nothing renders).
+/// Self-update is compiled out of this build: space and ⏎ on the row toast
+/// the disabled message and never flip or persist the saved `[update]` value.
 #[test]
-fn auto_update_row_toggles_and_persists() {
+fn auto_update_row_reports_self_update_disabled() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
@@ -6439,34 +6454,29 @@ fn auto_update_row_toggles_and_persists() {
         .iter()
         .position(|r| *r == GlobalConfigRow::AutoUpdate)
         .unwrap();
-    assert!(app.config().state.update.auto_update, "on by default");
+    assert!(app.config().state.update.auto_update, "saved default");
 
-    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    for code in [KeyCode::Char(' '), KeyCode::Enter] {
+        app.toasts.clear();
+        super::handle_global_config_key(&mut app, key(code));
+        assert!(
+            app.config().state.update.auto_update,
+            "{code:?} leaves the saved value alone"
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.body == crate::update::DISABLED_MESSAGE),
+            "{code:?} says why: {:?}",
+            app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+        );
+    }
+    let path = crate::profile::tollgate_dir()
+        .unwrap()
+        .join("profiles.toml");
     assert!(
-        !app.config().state.update.auto_update,
-        "space toggles it off"
-    );
-
-    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
-    let reloaded: crate::profile::AppState =
-        toml::from_str(&std::fs::read_to_string(&path).expect("read profiles.toml"))
-            .expect("parse profiles.toml");
-    assert!(!reloaded.update.auto_update, "off persists to disk");
-    let on_disk = std::fs::read_to_string(&path).expect("read");
-    assert!(
-        on_disk.contains("auto_update = false"),
-        "an explicit off must render or the next load reverts it to on:\n{on_disk}"
-    );
-
-    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
-    assert!(
-        app.config().state.update.auto_update,
-        "⏎ mirrors space and toggles it back on"
-    );
-    let on_disk = std::fs::read_to_string(&path).expect("read");
-    assert!(
-        !on_disk.contains("update"),
-        "on (default) omits the whole [update] table:\n{on_disk}"
+        std::fs::read_to_string(&path).map_or(true, |s| !s.contains("auto_update")),
+        "nothing is persisted"
     );
 }
 
@@ -6527,8 +6537,12 @@ fn budget_wrap_off_space_toggles_and_persists() {
     );
 
     let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
     assert!(
@@ -6632,8 +6646,12 @@ fn preemptive_rotation_space_toggles_on_every_platform() {
     // config, but a relaunch must pick it up from disk too. An explicit off is
     // the direction that regresses if the key is skipped on serialize.
     let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
     assert!(
@@ -7303,7 +7321,7 @@ mod env_editor {
         super::super::commit_env_new_key(&mut app);
         assert!(
             matches!(app.modals.last(), Some(Modal::EnvCollision(_))),
-            "a clauth-managed key clash raises the collision prompt"
+            "a tollgate-managed key clash raises the collision prompt"
         );
     }
 
@@ -7939,15 +7957,15 @@ fn reorder_chain_member_keeps_the_cursor_when_the_save_fails() {
     app.chain_cursor = 0;
 
     // Fail the whole-state save the reorder leg performs; `set_chain_order`
-    // re-reads fresh state and saves into ~/.clauth, which 0o500 refuses.
-    let restore = crate::profile::clauth_dir().expect("clauth dir");
+    // re-reads fresh state and saves into ~/.tollgate, which 0o500 refuses.
+    let restore = crate::profile::tollgate_dir().expect("tollgate dir");
     std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o500))
-        .expect("chmod clauth dir read-only");
+        .expect("chmod tollgate dir read-only");
 
     super::reorder_chain_member(&mut app, 1);
 
     std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
-        .expect("restore clauth dir perms");
+        .expect("restore tollgate dir perms");
 
     assert_eq!(
         app.chain_cursor, 0,
@@ -8099,17 +8117,17 @@ fn toggle_preferred_rolls_back_both_flags_when_the_save_fails() {
     app.chain_cursor = 0;
 
     // Block the very first write: `save_profile` does `mkdir_700` under
-    // `~/.clauth/profiles`, which fails once `~/.clauth` (created by the
+    // `~/.tollgate/profiles`, which fails once `~/.tollgate` (created by the
     // fixture's roster save) refuses new children.
-    let restore = crate::profile::clauth_dir().expect("clauth dir");
+    let restore = crate::profile::tollgate_dir().expect("tollgate dir");
     std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o500))
-        .expect("chmod clauth dir read-only");
+        .expect("chmod tollgate dir read-only");
 
     super::toggle_preferred(&mut app);
 
     // Restore before any assertion so a failure still lets the sandbox clean up.
     std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
-        .expect("restore clauth dir perms");
+        .expect("restore tollgate dir perms");
 
     let cfg = app.config();
     let a = cfg
@@ -8867,7 +8885,9 @@ fn capture_overwrite_cancel_changes_nothing() {
     let config_toml = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
         .unwrap()
         .join("config.toml");
-    let profiles_toml = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let profiles_toml = crate::profile::tollgate_dir()
+        .unwrap()
+        .join("profiles.toml");
     let before_config = std::fs::read(&config_toml).expect("read config.toml");
     let before_state = std::fs::read(&profiles_toml).expect("read profiles.toml");
 
@@ -9146,7 +9166,7 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
     assert!(
         app.toasts
             .iter()
-            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login dead")),
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("tollgate login dead")),
         "the refusal names the recovery"
     );
 }
@@ -9326,7 +9346,7 @@ fn tui_switch_refuses_a_quarantined_target_with_login_hint() {
     assert!(
         app.toasts
             .iter()
-            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login broken")),
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("tollgate login broken")),
         "the refusal names the recovery"
     );
 }
@@ -10407,7 +10427,7 @@ fn startup_overwrite_default_routes_a_shell_through_the_guarded_sink() {
     crate::profile::save_profile(&profile).expect("save profile");
 
     // CC's logged-out shell in the live slot: blank tokens, a foreign key kept,
-    // written as a plain file (not clauth's symlink).
+    // written as a plain file (not tollgate's symlink).
     let live = crate::profile::claude_dir()
         .expect("claude dir")
         .join(".credentials.json");
@@ -10536,7 +10556,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
     }
 }
 
-/// Two `clauth start` children on one account plus a third on another — the only
+/// Two `tollgate start` children on one account plus a third on another — the only
 /// shape that reaches BOTH the summary line's plural and the per-account
 /// sub-line's `·` count. Every other `runtime_check_*` fixture is single-session,
 /// so `instances > 1` never executed and the `{name} · {instances}` sub-line
@@ -11450,7 +11470,7 @@ fn console_outcome(token: &str) -> crate::alibaba_login::ConsoleLoginOutcome {
 
 /// `log in` means a different flow per account, and the row cannot show which.
 /// An Alibaba account's usage rides a console session its api key cannot stand
-/// in for, so that row captures the session — matching a bare `clauth login`.
+/// in for, so that row captures the session — matching a bare `tollgate login`.
 /// Every other account keeps the flow it had.
 #[test]
 fn the_login_row_targets_a_console_only_for_a_model_studio_account() {
@@ -11862,7 +11882,7 @@ fn herdr_check_warns_without_fix_when_not_installed() {
     );
     assert_eq!(check.health, super::Health::Warn);
     assert!(check.detail.iter().any(|l| l == "plugin: not installed"));
-    assert!(check.detail.iter().any(|l| l == "  clauth herdr install"));
+    assert!(check.detail.iter().any(|l| l == "  tollgate herdr install"));
     assert!(check.fix.is_none());
 }
 
@@ -12033,7 +12053,7 @@ fn a_real_linked_payload_reads_as_a_local_link() {
     );
 }
 
-/// herdr's warnings and clauth's own probe errors are prose that happens to carry a colon, and `detail_line` turns the first `": "` of an un-indented line into a key column. Left flush, "manifest unavailable: No such file or directory" renders as a field called `manifest unavailable` and widens the key column for every real field in the row, which is what a live run against a stale link showed.
+/// herdr's warnings and tollgate's own probe errors are prose that happens to carry a colon, and `detail_line` turns the first `": "` of an un-indented line into a key column. Left flush, "manifest unavailable: No such file or directory" renders as a field called `manifest unavailable` and widens the key column for every real field in the row, which is what a live run against a stale link showed.
 #[test]
 fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
     use crate::herdr::{STALE, plugin_list_json, registry_entry_from};
@@ -12415,7 +12435,7 @@ fn delegate_row_text_confirm_copy_and_cancel_leave_everything_alone() {
                     .detail
                     .as_deref()
                     .unwrap_or("")
-                    .contains("$clauth_delegate"),
+                    .contains("$tollgate_delegate"),
                 "the detail names the delegate token: {:?}",
                 state.detail
             );
@@ -12552,7 +12572,7 @@ fn delegate_row_text_confirm_persists_the_knob_then_heals() {
         "the user's own content survives the heal: {text}"
     );
     assert!(
-        text.contains("$clauth_delegate"),
+        text.contains("$tollgate_delegate"),
         "heal wrote the row the new knob asks for: {text}"
     );
     assert_eq!(
@@ -12569,7 +12589,7 @@ fn delegate_row_text_confirm_persists_the_knob_then_heals() {
 }
 
 /// The same flow back: with the knob on, confirming drops the delegate token
-/// from the row clauth wrote — the direction-aware copy names the write.
+/// from the row tollgate wrote — the direction-aware copy names the write.
 #[cfg(unix)]
 #[test]
 fn delegate_row_text_confirm_turns_the_knob_back_off() {
@@ -12610,11 +12630,11 @@ fn delegate_row_text_confirm_turns_the_knob_back_off() {
     assert!(!herdr_knobs().delegate_row_text, "the knob turns back off");
     let text = std::fs::read_to_string(&config_path).expect("read config");
     assert!(
-        !text.contains("$clauth_delegate"),
+        !text.contains("$tollgate_delegate"),
         "heal rewrote the row without the token: {text}"
     );
     assert!(
-        text.contains("$clauth"),
+        text.contains("$tollgate"),
         "the row itself stays, minus the delegate token: {text}"
     );
 }
@@ -12708,8 +12728,8 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     // The landing is a one-time door: the marker it persists makes the next
     // launch open the home tab (pinned in the sibling test).
     let saved = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .unwrap_or_default();
@@ -12743,8 +12763,8 @@ fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
         "no construction recompute outside the first herdr landing"
     );
     let saved = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .unwrap_or_default();
@@ -12768,8 +12788,8 @@ fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
         "the first herdr launch lands on Plugin"
     );
     let saved = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .unwrap_or_default();
@@ -12796,7 +12816,7 @@ fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
 #[test]
 fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
     let _home = crate::testutil::HomeSandbox::new();
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(
         dir.join("profiles.toml"),
@@ -12817,8 +12837,8 @@ fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
         "a plain launch runs no eager probe, whatever the home tab"
     );
     let saved = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .unwrap_or_default();
@@ -12849,8 +12869,8 @@ fn home_tab_cycles_from_the_config_appearance_row() {
     );
     super::run_global_config_row(&mut app, home_row.expect("found"));
     let saved = std::fs::read_to_string(
-        crate::profile::clauth_dir()
-            .expect("clauth dir")
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
             .join("profiles.toml"),
     )
     .expect("read");
@@ -13851,8 +13871,8 @@ fn a_reload_that_moves_the_card_off_its_member_forgets_the_custom_stop() {
     let mut state = crate::profile::load_app_state().expect("load the state");
     state.fallback_chain = vec!["a".into(), "b".into()];
     crate::profile::save_app_state(&state).expect("rewrite the state");
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("profiles.toml");
     crate::testutil::set_mtime(
         &path,
@@ -14287,8 +14307,8 @@ fn reload_with_state(app: &mut App, edit: impl FnOnce(&mut AppState)) {
     edit(&mut state);
     crate::profile::save_app_state(&state).expect("rewrite the state");
     // A distinct mtime, so the fingerprint moves however fast the write lands.
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("profiles.toml");
     crate::testutil::set_mtime(
         &path,

@@ -5,7 +5,7 @@
 //!
 //! - **daemon** ([`enable_timestamps`] flipped once at `serve()`): stderr, which
 //!   the supervisor redirects to `daemon.log`. ISO-8601-UTC stamped.
-//! - **interactive TUI / CLI on a terminal**: `~/.clauth/clauth.log`. Here stderr
+//! - **interactive TUI / CLI on a terminal**: `~/.tollgate/tollgate.log`. Here stderr
 //!   IS the ratatui alternate screen, so a bare line from a background scheduler
 //!   thread paints straight over the accounts pane (the 2026-07-14 corruption
 //!   report). The line is stamped and diverted to the log file instead.
@@ -51,7 +51,7 @@ pub(crate) fn render(stamped: bool, now_secs: i64, msg: &str) -> String {
 /// **A diagnostic reached once per CALL from a hook or an MCP process must take
 /// [`to_logfile`], never [`line`].** [`route`] sends a process whose stderr is
 /// not a terminal and which has not enabled stamping — exactly a hook, exactly
-/// `clauth mcp` — to [`Sink::Stderr`], where nothing bounds the total. A
+/// `tollgate mcp` — to [`Sink::Stderr`], where nothing bounds the total. A
 /// per-EVENT line there is fine and every current caller is one; a per-CALL one
 /// floods the channel Claude Code surfaces to the user, which took a review to
 /// catch once already. [`Sink::LogFile`] is size-rotated.
@@ -121,13 +121,13 @@ fn write_stderr_line(rendered: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{rendered}");
 }
 
-/// `~/.clauth/clauth.log`, resolved and size-capped once per process. `None`
-/// when the clauth dir can't be resolved — the line is then dropped, since a
+/// `~/.tollgate/tollgate.log`, resolved and size-capped once per process. `None`
+/// when the tollgate dir can't be resolved — the line is then dropped, since a
 /// diagnostic log must never take down its caller.
 fn log_path() -> Option<&'static Path> {
     LOG_PATH
         .get_or_init(|| {
-            let path = crate::profile::clauth_dir().ok()?.join("clauth.log");
+            let path = crate::profile::tollgate_dir().ok()?.join("tollgate.log");
             // Trim once at first use. Event lines are sparse, so within-session
             // growth is negligible; add a per-write trim if a hot logger lands here.
             let _ = log_rotate::rotate_log_if_large(
@@ -151,7 +151,7 @@ fn append_logfile(rendered: &str) {
 /// event source.
 fn write_log_line(path: &Path, rendered: &str) {
     // 0o600 on create: an event line names profiles, endpoints, and failure
-    // bodies, and the log lives under `~/.clauth` — owner-only like the rest.
+    // bodies, and the log lives under `~/.tollgate` — owner-only like the rest.
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -165,7 +165,7 @@ fn write_log_line(path: &Path, rendered: &str) {
 }
 
 /// One event line: stderr for the daemon (ISO-8601-UTC prefixed once
-/// [`enable_timestamps`] is set), else `~/.clauth/clauth.log` on an interactive
+/// [`enable_timestamps`] is set), else `~/.tollgate/tollgate.log` on an interactive
 /// terminal so it never paints over the TUI.
 macro_rules! logline {
     ($($arg:tt)*) => {

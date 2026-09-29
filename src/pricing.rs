@@ -1,6 +1,6 @@
 //! Model price table — fetches per-token USD rates so the Tokens tab can show
 //! API-equivalent cost (what the recorded usage *would* cost at pay-as-you-go
-//! API rates; clauth users are on subscription plans, so this reads as "value
+//! API rates; tollgate users are on subscription plans, so this reads as "value
 //! extracted", not a bill).
 //!
 //! # Source
@@ -8,7 +8,7 @@
 //! The ai-pricelog index (`index.json` on the `dist` branch of
 //! uwuclxdy/ai-pricelog, version 4): a `sources` object mapping provider name
 //! → model id → a row whose `rates` object maps a price axis to USD per
-//! million tokens. clauth models four axes (`input`, `output`, `cache_read`,
+//! million tokens. tollgate models four axes (`input`, `output`, `cache_read`,
 //! `cache_write`); every other axis the store carries (`cache_write_1h`,
 //! `image`, `audio`, `internal_reasoning`, …) has no bucket to charge to and
 //! is ignored, as are `limits`, `fees` and `provenance`. A row may carry
@@ -100,7 +100,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::logline::logline;
 use crate::poll::{first_delay, run_polling_loop};
-use crate::profile::{atomic_write_600, clauth_dir};
+use crate::profile::{atomic_write_600, tollgate_dir};
 use crate::tokens::{ModelTokens, today_date};
 use crate::usage::now_ms;
 
@@ -731,8 +731,8 @@ impl PriceTable {
     /// The peak indicator for a whole profile: its provider's own store rows,
     /// nothing else. Peak/off-peak is a property of the PROVIDER (owner ruling
     /// 2026-09-15): a recognized provider charges its windows whatever the
-    /// profile pins, and an endpoint clauth does not recognize has no schedule
-    /// clauth can name — pinned models matching another provider's rows would
+    /// profile pins, and an endpoint tollgate does not recognize has no schedule
+    /// tollgate can name — pinned models matching another provider's rows would
     /// price a schedule that endpoint never charges (a reseller fronting
     /// deepseek ids is not on deepseek's clock), so pins never feed the
     /// indicator. `None` for every profile without a store-backed provider:
@@ -1296,7 +1296,7 @@ fn fetch_body(url: &str) -> anyhow::Result<String> {
 
     let reader = agent
         .get(url)
-        .header("User-Agent", "clauth-pricing")
+        .header("User-Agent", "tollgate-pricing")
         .call()
         .map_err(anyhow::Error::from)?
         .into_body()
@@ -1445,7 +1445,7 @@ fn distill_catalog(
 /// A row carrying `removed_at` is delisted and skipped the same way — it
 /// prices nothing at any date. The index's removal convention keeps the row
 /// in place with its last prices and stamps it, so the skip is what makes a
-/// delisting effective in clauth.
+/// delisting effective in tollgate.
 ///
 /// Sources iterate in the file's own key order (serde_json's `preserve_order`
 /// feature) — deterministic, and carrying no precedence contract: a resold or
@@ -1590,10 +1590,10 @@ fn distill_aliases(json: &str) -> anyhow::Result<Vec<AliasKey>> {
     Ok(keys)
 }
 
-/// The rate axes clauth charges tokens to, in USD per million; a missing axis
+/// The rate axes tollgate charges tokens to, in USD per million; a missing axis
 /// is `None` (→ 0.0 per token). Every other axis the store's `rates` object
 /// carries (`cache_write_1h`, `image`, `audio`, `internal_reasoning`, …) is
-/// deliberately NOT declared: clauth counts no such tokens, so there is no
+/// deliberately NOT declared: tollgate counts no such tokens, so there is no
 /// bucket to charge them to. `cache_write` is the 5-minute-TTL creation rate;
 /// the 1-hour axis has no TTL data to select it by.
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -1634,7 +1634,7 @@ struct RawWhen {
     #[serde(default)]
     window: Option<[u32; 2]>,
     /// A token-VOLUME threshold: the entry's rates apply to a request above
-    /// it. clauth prices per hour and has no volume dimension, so
+    /// it. tollgate prices per hour and has no volume dimension, so
     /// [`RawOverride::to_entry`] drops such an entry rather than letting a
     /// tier rate price every request.
     #[serde(default)]
@@ -1655,7 +1655,7 @@ struct RawOverride {
 }
 
 impl RawOverride {
-    /// `None` for an entry clauth cannot use: one whose `when` names a
+    /// `None` for an entry tollgate cannot use: one whose `when` names a
     /// `min_tokens` volume tier, or a RATES-LESS entry without a window (a
     /// windowless quota weight marks no hours). Both are dropped, never widened
     /// into an always-active entry that would price every hour and every
@@ -1709,9 +1709,9 @@ impl RawOverride {
 }
 
 /// One index or history row: the base [`RawRates`], the override entries, and
-/// the two date stamps clauth reads. A v4 row's remaining keys (`schema`,
+/// the two date stamps tollgate reads. A v4 row's remaining keys (`schema`,
 /// `source`, `model_id`, `observed_at`, `first_seen`, `provenance`, `fees`,
-/// `limits`, `currency`) are not declared and are ignored — clauth models no
+/// `limits`, `currency`) are not declared and are ignored — tollgate models no
 /// context limit and no per-request fee. `currency` names what the SOURCE
 /// quoted, never what the row holds: ai-pricelog multiplies every rate and
 /// every override rate by the fx factor at build time and records it as
@@ -1818,12 +1818,12 @@ struct CacheFile {
     history: Vec<RateSnapshot>,
 }
 
-/// `~/.clauth/ai_pricelog_v4_price_cache.json`. Resolved ONCE at spawn time
+/// `~/.tollgate/ai_pricelog_v4_price_cache.json`. Resolved ONCE at spawn time
 /// and passed into the worker so the detached thread never re-resolves
 /// `home_dir()` later.
 ///
 /// The name carries the feed generation on purpose. A v3-era cache parses into
-/// these types unchanged — they are clauth's own distilled shapes — but its
+/// these types unchanged — they are tollgate's own distilled shapes — but its
 /// `store` was filtered by the retired provider allowlist, so reading it would
 /// serve the very rows this build exists to drop (and dash the ones it adds)
 /// until the next fetch. [`first_delay`] does not force that fetch: it returns
@@ -1833,7 +1833,7 @@ struct CacheFile {
 /// [`delete_stale_cache_once`] sweeps the old file the way the two
 /// pre-ai-pricelog names were swept.
 fn cache_path() -> Option<PathBuf> {
-    clauth_dir()
+    tollgate_dir()
         .ok()
         .map(|d| d.join("ai_pricelog_v4_price_cache.json"))
 }

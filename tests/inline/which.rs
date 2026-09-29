@@ -348,7 +348,7 @@ fn token_match_still_works_inside_session() {
 
 #[test]
 fn resolves_started_profile_in_runtime_session() {
-    // `clauth start <blank>`: credential-less started profile owns the runtime session
+    // `tollgate start <blank>`: credential-less started profile owns the runtime session
     let config = config_with(
         vec![
             oauth_profile("work", "rt-work"),
@@ -449,7 +449,7 @@ fn session_token_install_is_attributed_to_its_profile() {
     // The regression: a switch installs `session-token.json` for a CLA-SPLIT
     // profile, and that mint carries no refresh token, so tier 1 cannot see it.
     // Before the sidecar tier the whole resolution fell through to `unknown`
-    // and every statusline reading `clauth which` lost its account.
+    // and every statusline reading `tollgate which` lost its account.
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_session_token("oat-work");
     assert_eq!(
@@ -868,20 +868,20 @@ fn source_maps_to_wire_strings() {
 }
 
 /// Tier 2 keys on the config dir's NAME, so per-session runtime dirs have to
-/// resolve too — otherwise `clauth which` and `session_auth` stop recognizing
-/// every `clauth start` session, with nothing failing loudly. The legacy
+/// resolve too — otherwise `tollgate which` and `session_auth` stop recognizing
+/// every `tollgate start` session, with nothing failing loudly. The legacy
 /// unsuffixed path must keep resolving alongside it.
 #[test]
 fn session_profile_extracted_from_runtime_path() {
     assert_eq!(
         session_profile_from_config_dir(std::path::Path::new(
-            "/home/u/.clauth/profiles/work/runtime"
+            "/home/u/.tollgate/profiles/work/runtime"
         )),
         Some("work".to_string())
     );
     assert_eq!(
         session_profile_from_config_dir(std::path::Path::new(
-            "/home/u/.clauth/profiles/work/runtime-4242-0"
+            "/home/u/.tollgate/profiles/work/runtime-4242-0"
         )),
         Some("work".to_string())
     );
@@ -894,14 +894,14 @@ fn session_profile_none_for_non_runtime_path() {
         None
     );
     assert_eq!(
-        session_profile_from_config_dir(std::path::Path::new("/home/u/.clauth/profiles/work")),
+        session_profile_from_config_dir(std::path::Path::new("/home/u/.tollgate/profiles/work")),
         None
     );
     // The isolated flavor was never attributable through this tier; widening the
     // name check must not start attributing it.
     for isolated in [
-        "/home/u/.clauth/profiles/work/runtime-isolated",
-        "/home/u/.clauth/profiles/work/runtime-isolated-4242-0",
+        "/home/u/.tollgate/profiles/work/runtime-isolated",
+        "/home/u/.tollgate/profiles/work/runtime-isolated-4242-0",
     ] {
         assert_eq!(
             session_profile_from_config_dir(std::path::Path::new(isolated)),
@@ -1016,7 +1016,7 @@ fn default_dir_verdicts_follow_the_macos_gate_and_the_canonical_compare() {
 }
 
 /// `CLAUDE_CONFIG_DIR` describes the process ASKING, so it is the wrong input for
-/// attributing another process's credentials. A TUI running inside a `clauth
+/// attributing another process's credentials. A TUI running inside a `tollgate
 /// start` session would otherwise claim every bare `claude` on the box for its
 /// own runtime profile.
 #[test]
@@ -1031,7 +1031,7 @@ fn resolve_global_ignores_claude_config_dir_in_the_readers_env() {
     );
     let runtime_dir = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("started")
         .join("runtime-4242-0");
@@ -1075,11 +1075,11 @@ fn json_view_doc_names_the_managed_half_and_points_at_the_routing_answer() {
 /// the profile; anything else — the operator's real `~/.codex`, a claude
 /// runtime, a codex-home dir parked outside a profiles tree — names nothing.
 #[test]
-fn codex_home_parse_accepts_the_clauth_shape_only() {
+fn codex_home_parse_accepts_the_tollgate_shape_only() {
     use std::path::Path;
     for good in [
-        "/home/u/.clauth/profiles/cx/codex-home-4242-0",
-        "/home/u/.clauth/profiles/cx/codex-home",
+        "/home/u/.tollgate/profiles/cx/codex-home-4242-0",
+        "/home/u/.tollgate/profiles/cx/codex-home",
     ] {
         assert_eq!(
             session_profile_from_codex_home(Path::new(good)).as_deref(),
@@ -1089,9 +1089,9 @@ fn codex_home_parse_accepts_the_clauth_shape_only() {
     }
     for bad in [
         "/home/u/.codex",
-        "/home/u/.clauth/profiles/cx/runtime-4242-0",
+        "/home/u/.tollgate/profiles/cx/runtime-4242-0",
         "/home/u/codex-home-4242-0",
-        "/home/u/.clauth/cx/codex-home-4242-0",
+        "/home/u/.tollgate/cx/codex-home-4242-0",
     ] {
         assert_eq!(
             session_profile_from_codex_home(Path::new(bad)),
@@ -1108,18 +1108,18 @@ fn codex_home_parse_accepts_the_clauth_shape_only() {
 #[test]
 fn codex_home_attribution_is_roster_gated() {
     let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
+    let dir = home.home().join(".tollgate");
     crate::testutil::write_codex_roster(&["cx"]);
 
     let member = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("cx")
         .join("codex-home-4242-0");
     let stranger = home
         .home()
-        .join(".clauth")
+        .join(".tollgate")
         .join("profiles")
         .join("ghost")
         .join("codex-home-4242-0");
@@ -1187,8 +1187,8 @@ fn codex_json_view_tracks_the_claude_key_set() {
 #[test]
 fn codex_json_view_keeps_the_key_set_and_reads_the_codex_slot() {
     let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    let dir = home.home().join(".tollgate");
+    crate::profile::mkdir_700(&dir).expect("mkdir .tollgate");
     std::fs::write(
         dir.join("codex-profiles.toml"),
         "active_profile = \"cx\"\nprofiles = [\"cx\", \"other\"]\n",
@@ -1208,14 +1208,17 @@ fn codex_json_view_keeps_the_key_set_and_reads_the_codex_slot() {
 
 /// Env vars inherit: a claude session started from inside a codex session
 /// carries the ancestor's CODEX_HOME, and its own CLAUDE_CONFIG_DIR names the
-/// clauth runtime that IS this process's identity. The runtime claim wins;
+/// tollgate runtime that IS this process's identity. The runtime claim wins;
 /// with no such claim, the inherited codex home answers.
 #[test]
 fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
     let home = crate::testutil::HomeSandbox::new();
-    let clauth = home.home().join(".clauth");
+    let tollgate = home.home().join(".tollgate");
     crate::testutil::write_codex_roster(&["cx"]);
-    let codex_home = clauth.join("profiles").join("cx").join("codex-home-4242-0");
+    let codex_home = tollgate
+        .join("profiles")
+        .join("cx")
+        .join("codex-home-4242-0");
     let _codex_env = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
 
     assert!(
@@ -1227,13 +1230,13 @@ fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
         "with no claude claim, the inherited codex home answers"
     );
 
-    let runtime = clauth
+    let runtime = tollgate
         .join("profiles")
         .join("started")
         .join("runtime-4242-0");
     let _config_dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
     assert!(
         claude_session_dir_claims_this_process(),
-        "a clauth runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
+        "a tollgate runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
     );
 }

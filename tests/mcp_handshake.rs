@@ -1,4 +1,4 @@
-//! What a modern MCP client sees when it opens `clauth mcp`, driven against the
+//! What a modern MCP client sees when it opens `tollgate mcp`, driven against the
 //! real binary.
 //!
 //! A green build says nothing about the wire. The failures this pins are all
@@ -11,7 +11,7 @@
 //! Unix only, and not for lack of a Windows story: the child resolves its home
 //! through `dirs`, which on Windows reads `FOLDERID_Profile` from the shell API
 //! and no environment variable at all, so the run could not be pointed away
-//! from the operator's real `~/.clauth`.
+//! from the operator's real `~/.tollgate`.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -40,15 +40,15 @@ const HERDR_VARS: [&str; 5] = [
 
 /// A path no herdr binary can resolve to, so the reporter's second gate fails
 /// as well: cleared vars alone would still leave a `PATH` herdr reachable.
-const NO_HERDR_BIN: &str = "/nonexistent/clauth-mcp-handshake-no-herdr";
+const NO_HERDR_BIN: &str = "/nonexistent/tollgate-mcp-handshake-no-herdr";
 
 /// The spawn every case in this file uses.
 fn server_command(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_clauth"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tollgate"));
     command
         .arg("mcp")
         .env("HOME", home)
-        .env("CLAUTH_MCP_PROBE", "1")
+        .env("TOLLGATE_MCP_PROBE", "1")
         .env_remove("CLAUDE_CONFIG_DIR")
         .env("HERDR_BIN_PATH", NO_HERDR_BIN);
     for var in HERDR_VARS {
@@ -67,9 +67,9 @@ fn client_meta(version: &str) -> Value {
     })
 }
 
-/// Pipe `requests` into a fresh `clauth mcp` and return its replies keyed by id.
+/// Pipe `requests` into a fresh `tollgate mcp` and return its replies keyed by id.
 /// `HOME` is a sandbox: the server runs its startup GC and reads config from
-/// there, and `CLAUTH_MCP_PROBE` keeps it off the live-session tally.
+/// there, and `TOLLGATE_MCP_PROBE` keeps it off the live-session tally.
 fn handshake(requests: &[Value]) -> HashMap<i64, Value> {
     let home = TempDir::new().unwrap();
     let mut child = server_command(home.path())
@@ -77,7 +77,7 @@ fn handshake(requests: &[Value]) -> HashMap<i64, Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn clauth mcp");
+        .expect("spawn tollgate mcp");
 
     let mut stdin = child.stdin.take().expect("piped stdin");
     for request in requests {
@@ -188,7 +188,7 @@ fn discover_advertises_the_stateless_revision_and_the_tools_capability() {
 /// rmcp's default `Implementation` reads its own build env, so a server that
 /// never sets one introduces itself to every client as "rmcp".
 #[test]
-fn discover_names_clauth_as_the_server() {
+fn discover_names_tollgate_as_the_server() {
     let replies = discover_and_list();
     let info = &replies[&1]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"];
 
@@ -299,7 +299,7 @@ fn a_malformed_request_is_refused_with_the_spec_codes() {
 }
 
 /// The other half of the dual-era posture: a legacy opener still yields a usable
-/// session, carrying clauth's identity and the old result shape.
+/// session, carrying tollgate's identity and the old result shape.
 #[test]
 fn a_legacy_initialize_still_negotiates() {
     let replies = handshake(&[

@@ -74,7 +74,7 @@ pub(crate) trait HarnessEngine {
     // ── runtime-spawn ──
     /// The resolved CLI command (Windows shim resolution included).
     fn command(&self) -> std::process::Command;
-    /// The env var that pins a spawned session to its clauth-built home.
+    /// The env var that pins a spawned session to its tollgate-built home.
     fn home_env_key(&self) -> &'static str;
     /// Drop from `command`'s inherited env every key that must reach the
     /// session only through its own home — this harness's managed set plus
@@ -106,7 +106,7 @@ impl HarnessEngine for ClaudeEngine {
         crate::runtime::scrub_profile_env(command, active_env_keys);
         // The CODEX_HOME half is the cross-harness one; the caller pins
         // CLAUDE_CONFIG_DIR itself right after.
-        crate::runtime::scrub_clauth_homes(command);
+        crate::runtime::scrub_tollgate_homes(command);
     }
 }
 
@@ -132,13 +132,13 @@ pub(crate) struct CodexEngine;
 ///   auth method"): `CODEX_API_KEY` first, then `CODEX_ACCESS_TOKEN`, and only
 ///   then the persistent store this session was built around. `OPENAI_API_KEY`
 ///   is the same hazard one layer down, since `resolved_mode()` reads a bare
-///   key as an auth mode of its own. Left inherited, `clauth start <p>` spends
-///   a DIFFERENT account than the one it names — the exact confusion clauth
+///   key as an auth mode of its own. Left inherited, `tollgate start <p>` spends
+///   a DIFFERENT account than the one it names — the exact confusion tollgate
 ///   exists to prevent.
 /// - the ENDPOINT OVERRIDES codex ships for its own tests. They decide where a
 ///   refresh POSTs, where a revoke goes, and which client id is claimed. A
 ///   codex refresh token is single-use, so an inherited override spends the
-///   profile's one live chain against a host clauth did not choose.
+///   profile's one live chain against a host tollgate did not choose.
 const CODEX_MANAGED_ENV_KEYS: &[&str] = &[
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
@@ -176,10 +176,10 @@ impl HarnessEngine for CodexEngine {
         for key in active_env_keys {
             command.env_remove(key);
         }
-        // The CLAUDE_CONFIG_DIR half matters here: `clauth which` in the codex
+        // The CLAUDE_CONFIG_DIR half matters here: `tollgate which` in the codex
         // session would answer as the ancestor claude session (the runtime
         // claim deliberately outranks the codex arm).
-        crate::runtime::scrub_clauth_homes(command);
+        crate::runtime::scrub_tollgate_homes(command);
     }
 }
 

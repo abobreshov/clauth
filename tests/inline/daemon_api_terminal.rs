@@ -49,8 +49,8 @@ fn config() -> crate::profile::ConfigHandle {
 }
 
 fn status_path() -> std::path::PathBuf {
-    crate::profile::clauth_dir()
-        .expect("clauth dir")
+    crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json")
 }
 
@@ -743,8 +743,12 @@ fn a_forged_device_name_cannot_write_audit_lines() {
     // Seeded straight into the store, the way a hand edit or a newer build
     // would land one: the CLI's name parser is a UI gate, not a store
     // invariant, so the audit lines must hold for any bytes the store holds.
-    devices::seed_for_tests("forge\nclauth api: paired device 'x'", Tier::Control, TOKEN)
-        .expect("seed the forged device");
+    devices::seed_for_tests(
+        "forge\ntollgate api: paired device 'x'",
+        Tier::Control,
+        TOKEN,
+    )
+    .expect("seed the forged device");
     let ctx = ApiContext::new(
         config(),
         status_path(),
@@ -772,7 +776,7 @@ fn a_forged_device_name_cannot_write_audit_lines() {
     // SECOND line that reads as its own audit entry.
     for line in captured_lines(&served) {
         assert!(
-            !line.starts_with("clauth api: paired device"),
+            !line.starts_with("tollgate api: paired device"),
             "a forged standalone audit line escaped: {line:?}"
         );
     }

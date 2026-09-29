@@ -693,7 +693,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
 fn header_lines_plan_dashes_when_no_tier_is_known() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // Credentialed, so the row is a live OAuth account rather than an empty
-    // shell — but the token claims nothing clauth can classify.
+    // shell — but the token claims nothing tollgate can classify.
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -1409,7 +1409,7 @@ fn status_lines_stacks_the_health_rungs_under_disabled() {
         "status    [ disabled ]\n\
          ├ enable it on the setup tab\n\
          │         [ auth broken ]\n\
-         └ re-login with clauth login gamma",
+         └ re-login with tollgate login gamma",
         "both facts stack on one rail"
     );
 
@@ -1748,7 +1748,7 @@ fn status_lines_single_hint_has_no_rail() {
         .collect();
     assert_eq!(hint_lines.len(), 1, "a single hint, got {lines:?}");
     assert!(
-        hint_lines[0].starts_with("└ re-login with clauth login a"),
+        hint_lines[0].starts_with("└ re-login with tollgate login a"),
         "col-0 anchored, no rail glyph needed for a lone hint: {:?}",
         hint_lines[0]
     );
@@ -2165,7 +2165,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
 // a switch-grade block reads differently under `auto_start` on vs off.
 
 /// The flagship (state, config) → hint divergence: a switch-grade kick block on
-/// an `auto_start` account is reassurance (clauth re-tests each poll and it
+/// an `auto_start` account is reassurance (tollgate re-tests each poll and it
 /// clears itself), on a manual one it names the fix (enable auto-start). The two
 /// copies MUST differ — collapsing them to one string is the mutation this guards.
 #[test]
@@ -2173,7 +2173,7 @@ fn kick_hint_diverges_on_auto_start() {
     let on = diag_fix(UsageDiag::KickSwitchGrade { auto_start: true }, "a");
     let off = diag_fix(UsageDiag::KickSwitchGrade { auto_start: false }, "a");
     assert_ne!(on, off, "the auto_start split must change the copy");
-    assert_eq!(on, "clauth is re-testing periodically");
+    assert_eq!(on, "tollgate is re-testing periodically");
     assert_eq!(off, "won't recover with auto-start off, enable it");
     // A non-switch-grade burst is neither — low-urgency backoff, no chain switch.
     assert_eq!(
@@ -2188,7 +2188,7 @@ fn kick_hint_diverges_on_auto_start() {
 fn auth_broken_hint_names_the_profile() {
     assert_eq!(
         diag_fix(UsageDiag::AuthBroken, "kerry"),
-        "re-login with clauth login kerry"
+        "re-login with tollgate login kerry"
     );
 }
 
@@ -2232,7 +2232,7 @@ fn status_lines_renders_the_auto_start_divergence() {
             120,
         ))
     };
-    assert!(render(true).contains("clauth is re-testing periodically"));
+    assert!(render(true).contains("tollgate is re-testing periodically"));
     assert!(render(false).contains("won't recover with auto-start off"));
 }
 
@@ -2318,7 +2318,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
         120,
     ));
     assert!(
-        out.contains("[ auth broken ]") && out.contains("re-login with clauth login a"),
+        out.contains("[ auth broken ]") && out.contains("re-login with tollgate login a"),
         "the dead login leads: {out}"
     );
     assert!(
@@ -2369,7 +2369,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
         120,
     ));
     assert!(
-        out.contains("[ auth broken ]") && out.contains("re-login with clauth login OmniRoute"),
+        out.contains("[ auth broken ]") && out.contains("re-login with tollgate login OmniRoute"),
         "the dead login still leads with the pill + its re-login hint: {out}"
     );
     assert!(
@@ -2925,12 +2925,12 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
 }
 
 /// R7: the best-effort report footer survives a 45-column pane. The 56-cell
-/// `looks wrong? report at github.com/uwuclxdy/clauth/issues` line used to
+/// `looks wrong? report at github.com/abobreshov/clauth/issues` line used to
 /// render as one unwrapped `Line` and clip mid-`uwuclxdy` at the 41-cell
 /// interior (45 cols − 2 border − 2 block padding), dropping the tail of the
 /// only in-app report pointer; it now wraps through the shared
 /// `panes::wrap_words` path like the terminal arms (greedy wrap at 41:
-/// `looks wrong? report at` / `github.com/uwuclxdy/clauth/issues`), the URL
+/// `looks wrong? report at` / `github.com/abobreshov/clauth/issues`), the URL
 /// surviving whole on its own segment.
 #[test]
 fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
@@ -2980,7 +2980,7 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
 
     assert!(
         rows.iter()
-            .any(|r| r.starts_with("│ github.com/uwuclxdy/clauth/issues")),
+            .any(|r| r.starts_with("│ github.com/abobreshov/clauth/issues")),
         "the 33-cell report URL must wrap whole onto its own line, never clip mid-url: {rows:?}"
     );
     assert!(

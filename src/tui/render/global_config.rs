@@ -61,7 +61,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
-            auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
             any_auto_start: cfg.profiles.iter().any(|p| p.auto_start),
@@ -215,7 +214,6 @@ struct RowState {
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
-    auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
     /// Whether ANY account has opted into `auto_start` — the queue toggle is
@@ -265,7 +263,7 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             ClockFormat::H12 => "write reset times as 9:20pm, in your local timezone",
         }),
         GlobalConfigRow::HomeTab => String::from(
-            "the tab clauth opens on; the first herdr launch opens the plugin tab with the herdr row selected",
+            "the tab tollgate opens on; the first herdr launch opens the plugin tab with the herdr row selected",
         ),
         GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",
@@ -337,14 +335,8 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         } else {
             "rotate the login only when a request rejects it"
         }),
-        // The on-state hint names the env override plus the timing: the check
-        // runs at launch (and the daemon's herdr leg at its next reload), so
-        // toggling never cancels a live process.
-        GlobalConfigRow::AutoUpdate => String::from(if rows.auto_update {
-            "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
-        } else {
-            "no update checks"
-        }),
+        // Self-update is compiled out of this build: the hint says so.
+        GlobalConfigRow::AutoUpdate => String::from(crate::update::DISABLED_MESSAGE),
         GlobalConfigRow::RefreshSpentAccounts => String::from(if rows.refresh_spent {
             "keep checking accounts that are already at 100%"
         } else {
@@ -519,10 +511,9 @@ fn detail_row(
             let options = [("lazy", !rows.preemptive), ("preemptive", rows.preemptive)];
             cycle_row(arrow, "rotation", &options, selected)
         }
-        // Never dimmed, never gated: the row edits the persisted value even
-        // while `CLAUTH_NO_UPDATE=1` overrides it (the env var stays
-        // authoritative until it goes, and the row renders what is saved).
-        GlobalConfigRow::AutoUpdate => toggle_row(arrow, "auto-update", rows.auto_update, selected),
+        // Self-update is compiled out of this build, so the row renders off
+        // and dimmed, whatever the saved value; its key only explains why.
+        GlobalConfigRow::AutoUpdate => dimmed_toggle_row("auto-update", false, selected),
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
         }

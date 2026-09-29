@@ -1,6 +1,6 @@
 //! One-time pairing codes: how a device earns a token without holding one.
 //!
-//! `clauth devices pair <name>` parks a code in `~/.clauth/pairing.json` (its
+//! `tollgate devices pair <name>` parks a code in `~/.tollgate/pairing.json` (its
 //! SHA-256, never the code) with the name and tier the device will get, an
 //! expiry, and an attempt budget, then waits for the outcome. `POST
 //! /api/v1/pair` redeems it. The whole redemption runs inside one state-flock
@@ -23,7 +23,7 @@ use super::http::sanitize_for_log;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::out::{Wrote, errln, write_chunk_result};
-use crate::profile::{atomic_write_600, clauth_dir};
+use crate::profile::{atomic_write_600, tollgate_dir};
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 const PAIRING_FILE: &str = "pairing.json";
@@ -106,7 +106,7 @@ impl std::fmt::Debug for Code {
     }
 }
 
-/// `~/.clauth/pairing.json`: the one live code.
+/// `~/.tollgate/pairing.json`: the one live code.
 #[derive(Serialize, Deserialize)]
 struct PairingFile {
     schema: u64,
@@ -139,7 +139,7 @@ impl PairingFile {
 }
 
 fn pairing_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join(PAIRING_FILE))
+    Ok(tollgate_dir()?.join(PAIRING_FILE))
 }
 
 /// The live code's record, or `None` when there is none. A file that does not
@@ -274,7 +274,7 @@ pub(crate) fn redeem_at(code: &Code, now: i64) -> Result<Redeemed> {
             if live.attempts_left == 0 {
                 discard(&path)?;
                 logline!(
-                    "clauth api: the pairing code for '{}' was dropped after {CODE_ATTEMPTS} \
+                    "tollgate api: the pairing code for '{}' was dropped after {CODE_ATTEMPTS} \
                      wrong tries",
                     sanitize_for_log(&live.name)
                 );
@@ -293,7 +293,7 @@ pub(crate) fn redeem_at(code: &Code, now: i64) -> Result<Redeemed> {
             }),
             None => {
                 logline!(
-                    "clauth api: the pairing code for '{}' was refused: a device took that name \
+                    "tollgate api: the pairing code for '{}' was refused: a device took that name \
                      first",
                     sanitize_for_log(&live.name)
                 );
@@ -399,7 +399,7 @@ pub(crate) fn wait_for(
     }
 }
 
-/// `clauth devices pair <name> [--control] [--sessions]`: the code alone on
+/// `tollgate devices pair <name> [--control] [--sessions]`: the code alone on
 /// stdout, the wait on stderr.
 pub(crate) fn run_pair(name: &str, control: bool, sessions: bool) -> Result<()> {
     let name = DeviceName::parse(name)?;
@@ -421,26 +421,26 @@ pub(crate) fn run_pair(name: &str, control: bool, sessions: bool) -> Result<()> 
         withdraw_lost(&pending, write_err)?;
     }
     errln!(
-        "clauth: enter the code on the device within {} minutes to pair '{name}' ({tier}); \
+        "tollgate: enter the code on the device within {} minutes to pair '{name}' ({tier}); \
          Ctrl-C withdraws it",
         CODE_TTL_SECS / 60
     );
     if tier == Tier::Control {
         errln!(
-            "clauth: until it is used the code is a control credential: whoever enters it first \
+            "tollgate: until it is used the code is a control credential: whoever enters it first \
              can switch this host's accounts"
         );
     }
     if sessions {
         errln!(
-            "clauth: until it is used the code also grants sessions: whoever enters it first \
+            "tollgate: until it is used the code also grants sessions: whoever enters it first \
              can mint them through the API"
         );
     }
     if matches!(crate::daemon::singleton_held(), Ok(false)) {
         errln!(
-            "clauth: no clauth daemon is running here, so nothing can redeem the code; start one \
-             with `clauth daemon --listen`"
+            "tollgate: no tollgate daemon is running here, so nothing can redeem the code; start one \
+             with `tollgate daemon --listen`"
         );
     }
     let waited = wait_for(&pending, || interrupt.caught(), POLL);
@@ -460,7 +460,7 @@ fn withdraw_lost(pending: &Pending, write_err: Option<std::io::Error>) -> Result
             bail!("the pairing code for '{name}' never reached its reader{cause}; it was withdrawn")
         }
         Ok(false) => bail!(
-            "the pairing code for '{name}' never reached its reader{cause}; a newer `clauth \
+            "the pairing code for '{name}' never reached its reader{cause}; a newer `tollgate \
              devices pair` had already replaced it"
         ),
         Err(e) => bail!(
@@ -481,19 +481,19 @@ fn finish(pending: &Pending, waited: Result<Waited>) -> Result<()> {
             Ok(())
         }
         Ok(Waited::Done(Outcome::Replaced)) => {
-            bail!("a newer `clauth devices pair` replaced this code before anyone entered it")
+            bail!("a newer `tollgate devices pair` replaced this code before anyone entered it")
         }
         Ok(Waited::Done(Outcome::Burned)) => bail!(
-            "the code was dropped after {CODE_ATTEMPTS} wrong tries; run `clauth devices pair \
+            "the code was dropped after {CODE_ATTEMPTS} wrong tries; run `tollgate devices pair \
              {name}` for a new one"
         ),
         Ok(Waited::Done(Outcome::Expired)) => {
             withdraw_or_say(pending);
-            bail!("the code expired unused; run `clauth devices pair {name}` for a new one")
+            bail!("the code expired unused; run `tollgate devices pair {name}` for a new one")
         }
         Ok(Waited::Interrupted(signal)) => match withdraw_or_say(pending) {
             Some(true) => {
-                errln!("clauth: pairing code withdrawn");
+                errln!("tollgate: pairing code withdrawn");
                 Err(crate::Interrupted(signal).into())
             }
             // Already gone when the signal was read: the code reached an
@@ -503,7 +503,7 @@ fn finish(pending: &Pending, waited: Result<Waited>) -> Result<()> {
                 Ok(None) => Err(crate::Interrupted(signal).into()),
                 Err(e) => {
                     errln!(
-                        "clauth: the pairing code was no longer waiting, and what became of it \
+                        "tollgate: the pairing code was no longer waiting, and what became of it \
                          could not be read: {e:#}"
                     );
                     Err(crate::Interrupted(signal).into())
@@ -526,7 +526,7 @@ fn withdraw_or_say(pending: &Pending) -> Option<bool> {
         Ok(removed) => Some(removed),
         Err(e) => {
             errln!(
-                "clauth: could not withdraw the pairing code, which stays redeemable until it \
+                "tollgate: could not withdraw the pairing code, which stays redeemable until it \
                  expires: {e:#}"
             );
             None

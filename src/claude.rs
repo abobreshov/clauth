@@ -24,10 +24,10 @@ fn claude_settings_path() -> Result<PathBuf> {
 /// (`session-token.json`, e.g. a `claude setup-token` mint). Such a profile
 /// splits its credentials: the STATIC session token is what switches install
 /// for Claude Code sessions to run on, while the rotating OAuth pair in
-/// `credentials.json` stays clauth-private for usage polling. Sessions then
-/// hold a token that never rotates, so they can never race clauth's refresher
+/// `credentials.json` stays tollgate-private for usage polling. Sessions then
+/// hold a token that never rotates, so they can never race tollgate's refresher
 /// on a single-use refresh chain (the root cause of the 2026-07-16..18
-/// serial `refresh token revoked` deaths: N live sessions + clauth all
+/// serial `refresh token revoked` deaths: N live sessions + tollgate all
 /// rotating the same chains through one live slot).
 pub(crate) fn has_session_token(name: &ProfileName) -> bool {
     matches!(
@@ -41,7 +41,7 @@ pub(crate) fn has_session_token(name: &ProfileName) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SessionTokenStatus {
     /// A genuine long-lived login — defined by carrying NO refresh token:
-    /// with nothing to rotate, sessions can never race clauth's refresher on
+    /// with nothing to rotate, sessions can never race tollgate's refresher on
     /// it, which is the whole point of the split. Carries the recorded
     /// epoch-ms expiry when stamped.
     LongLived(Option<i64>),
@@ -88,7 +88,7 @@ pub(crate) fn session_token_status(name: &ProfileName) -> Option<SessionTokenSta
 /// the same predicate as [`has_session_token`], so a profile can never be
 /// attributed by a token no switch would ever install — and that predicate is
 /// content-classified, so a ROLLING stamp (refresh-less by construction, like
-/// the mint) attributes here too: `clauth which` names a session running on a
+/// the mint) attributes here too: `tollgate which` names a session running on a
 /// rolling bearer the same way it names one on a static mint.
 pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
     if !has_session_token(name) {
@@ -263,7 +263,7 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
         anyhow::bail!(
             "that looks like an API key (sk-ant-api…), not a `claude setup-token` mint. \
              Installing it as the session bearer signs sessions out on first use; capture an \
-             API key with `clauth login <name> --base-url <url> --api-key <key>` instead"
+             API key with `tollgate login <name> --base-url <url> --api-key <key>` instead"
         );
     }
     if token.chars().any(char::is_whitespace) {
@@ -317,7 +317,7 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
 /// with the chain's REAL expiry, full scopes, and `subscriptionType`, and NO
 /// refresh token (the classifier stays [`SessionTokenStatus::LongLived`], so
 /// every split guard keeps working unmodified; sessions get nothing to rotate,
-/// the refresh chain stays clauth-private). The honest expiry is deliberate: a
+/// the refresh chain stays tollgate-private). The honest expiry is deliberate: a
 /// dead roll must LOOK dead on every surface, never a far-future stamp sitting
 /// over a token that died hours ago — a display that reads comfortable while
 /// the credential behind it is gone is how one of these goes unnoticed.
@@ -342,7 +342,7 @@ pub(crate) fn stamp_rolling_token(
             "'{name}' usage chain's recorded grant is indistinguishable from a setup-token \
              mint (no scope beyond the setup pair, no subscription type) · refusing to stamp \
              a rolling bearer that could later be preserved as the static mint. Re-run \
-             `clauth login {name}` to record the chain's real grant"
+             `tollgate login {name}` to record the chain's real grant"
         );
     }
     let sidecar = ClaudeCredentials {
@@ -368,7 +368,7 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
         expires_at: chain.expires_at,
         scopes: chain.scopes.clone(),
         subscription_type: chain.subscription_type.clone(),
-        // A fresh mint from clauth's own chain, not a rewrite over a prior
+        // A fresh mint from tollgate's own chain, not a rewrite over a prior
         // store, so it starts with no outside-written keys to keep. Claude
         // Code adds its own on its first save into the sidecar, and the
         // rolling re-stamp replaces them until that next save. The one key
@@ -401,7 +401,7 @@ fn preserve_static_mint(name: &ProfileName) -> Result<()> {
     // LOUD and aborts the caller's roll: this function's verdict decides
     // whether `stamp_rolling_token` may overwrite the sidecar, and a transient
     // `EIO`/`EACCES` swallowed here would destroy a genuine mint with no
-    // backup written and nothing left for `clauth static-token` to restore —
+    // backup written and nothing left for `tollgate static-token` to restore —
     // the one direction that is unrecoverable.
     let raw = match std::fs::read(&sidecar) {
         Ok(raw) => raw,
@@ -436,7 +436,7 @@ fn preserve_static_mint(name: &ProfileName) -> Result<()> {
     // being preserved (re-mint, re-arm, and the fresh mint was destroyed on
     // the next roll with only the dead backup left to restore) — and a live
     // but OLDER backup did the same thing one notch subtler: with the flag
-    // off, `clauth login --setup-token` writes the sidecar alone, so the
+    // off, `tollgate login --setup-token` writes the sidecar alone, so the
     // fresh year-scale mint sat only there, and "an existing backup is never
     // replaced" let the next roll destroy it while preserving the stale one.
     // Liveness comes from [`classify_backup_bytes`], the SAME rule every
@@ -555,7 +555,7 @@ pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> 
 }
 
 /// CLA-ROLL: quarantine a mis-filled sidecar and REMOVE it (leaving the
-/// sidecar absent) — the CLI `clauth rolling-token <p>` pre-clear, where overwriting
+/// sidecar absent) — the CLI `tollgate rolling-token <p>` pre-clear, where overwriting
 /// is explicit operator intent but the evidence still goes to quarantine
 /// first. `Ok(true)` when a mis-fill was cleared.
 pub(crate) fn quarantine_misfilled_sidecar(name: &ProfileName) -> Result<bool> {
@@ -580,9 +580,9 @@ pub(crate) fn quarantine_misfilled_sidecar(name: &ProfileName) -> Result<bool> {
 /// mis-filled it survives the repair. Callers hold the state flock.
 fn quarantine_file_locked(name: &ProfileName, path: &Path, suffix: &str) -> Result<()> {
     let bytes = std::fs::read(path).context("read credential file for quarantine")?;
-    // UNDER THE PROFILE, not a global `~/.clauth/quarantine/`. What lands here
+    // UNDER THE PROFILE, not a global `~/.tollgate/quarantine/`. What lands here
     // can be a rotating pair — that is what makes a sidecar a mis-fill — and
-    // a global dir means `clauth delete <name>` leaves that profile's refresh
+    // a global dir means `tollgate delete <name>` leaves that profile's refresh
     // tokens on disk after removing everything else it owns. Here
     // `delete_profile`'s existing `remove_dir_all` sweeps it with the rest, and
     // the profile name stops being part of a filename that has to be parsed
@@ -597,7 +597,7 @@ fn quarantine_file_locked(name: &ProfileName, path: &Path, suffix: &str) -> Resu
     atomic_write_600(&dest, bytes).context("write quarantined credential file")
 }
 
-/// CLA-ROLL: best-effort arming at session start (`clauth start` resolves its
+/// CLA-ROLL: best-effort arming at session start (`tollgate start` resolves its
 /// credentials through [`install_source_path`], never `ensure_installable`) —
 /// a rolling-token profile whose sidecar is absent or stale is stamped from the
 /// DISK-loaded chain when comfortably live, so a session launched inside an
@@ -622,10 +622,10 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
         Err(e) => {
             // Loud, not a bare return: never-fail-the-start is the contract,
             // but a session that silently runs on the rotating pair because
-            // ~/.clauth could not be read is the failure this leg exists to
+            // ~/.tollgate could not be read is the failure this leg exists to
             // prevent, and it deserves a trace.
             crate::logline::logline!(
-                "clauth: start-time rolling-token arming for '{name}' skipped (could not load the profile: {e:#}); the session runs on whatever the sidecar holds"
+                "tollgate: start-time rolling-token arming for '{name}' skipped (could not load the profile: {e:#}); the session runs on whatever the sidecar holds"
             );
             return;
         }
@@ -662,18 +662,18 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
     // only whether this is worth serializing for, never what gets written.
     pre_guard_done();
     // `RotationGuard::acquire` BLOCKS on the flock, so arriving at the `else`
-    // is a filesystem or permissions problem under `~/.clauth`, not contention:
+    // is a filesystem or permissions problem under `~/.tollgate`, not contention:
     // the ordinary interleaving is that we WAIT here while the daemon's
     // rotation lands, and only then proceed.
     let _guard = match crate::runtime::RotationGuard::acquire(name) {
         Ok(guard) => guard,
         Err(e) => {
             // `acquire` BLOCKS, so failing is a filesystem or permissions
-            // fault under ~/.clauth, never contention — the one situation an
+            // fault under ~/.tollgate, never contention — the one situation an
             // operator has to hear about, because every later arming attempt
             // fails the same way.
             crate::logline::logline!(
-                "clauth: start-time rolling-token arming for '{name}' skipped (rotation lock: {e:#})"
+                "tollgate: start-time rolling-token arming for '{name}' skipped (rotation lock: {e:#})"
             );
             return;
         }
@@ -688,7 +688,7 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
         Ok(fresh) => fresh,
         Err(e) => {
             crate::logline::logline!(
-                "clauth: start-time rolling-token arming for '{name}' skipped (post-guard profile re-read failed: {e:#})"
+                "tollgate: start-time rolling-token arming for '{name}' skipped (post-guard profile re-read failed: {e:#})"
             );
             return;
         }
@@ -735,7 +735,7 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
     }
     if let Err(e) = stamp_rolling_token(name, oauth) {
         crate::logline::logline!(
-            "clauth: start-time rolling-token arming for '{name}' failed: {e:#}"
+            "tollgate: start-time rolling-token arming for '{name}' failed: {e:#}"
         );
     }
 }
@@ -799,7 +799,7 @@ fn classify_backup_bytes(bytes: &[u8], now: i64) -> BackupVerdict {
 ///     also destroys whatever life the sidecar's current bearer has left);
 ///   * not a mint at all → QUARANTINED to the profile's `quarantine/` dir and
 ///     the slot cleared. A slot-holder that can never restore is worse than an
-///     empty slot: `clauth static-token` flips the flag off before it reads
+///     empty slot: `tollgate static-token` flips the flag off before it reads
 ///     the file, so a permanent error here left the operator's prescribed
 ///     re-mint running with the flag off — the no-backup write path — and the
 ///     file survived to fail the next attempt identically.
@@ -817,8 +817,8 @@ fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>
         BackupVerdict::LiveMint => Ok(Some(bytes)),
         BackupVerdict::Expired => {
             crate::logline::logline!(
-                "clauth: '{name}' preserved static mint has itself expired — not restoring it; \
-                 re-mint with `clauth login {name} --setup-token`"
+                "tollgate: '{name}' preserved static mint has itself expired — not restoring it; \
+                 re-mint with `tollgate login {name} --setup-token`"
             );
             Ok(None)
         }
@@ -826,9 +826,9 @@ fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>
             quarantine_file_locked(name, backup, "session-token.static.json")?;
             std::fs::remove_file(backup).context("remove quarantined static backup")?;
             crate::logline::logline!(
-                "clauth: '{name}' preserved static backup does not hold a mint — quarantined \
+                "tollgate: '{name}' preserved static backup does not hold a mint — quarantined \
                  under the profile's quarantine/ dir; re-mint with \
-                 `clauth login {name} --setup-token`"
+                 `tollgate login {name} --setup-token`"
             );
             Ok(None)
         }
@@ -902,7 +902,7 @@ pub(crate) fn install_source_path(name: &ProfileName) -> Result<PathBuf> {
 /// sidecar is gone: the `credentials.json` [`install_source_path`] falls back to.
 ///
 /// Read off the FILE rather than `Profile::credentials`, because the file is what
-/// the relink branches on. The clear paths (`clauth static-token --clear`, the
+/// the relink branches on. The clear paths (`tollgate static-token --clear`, the
 /// Setup tab's row) are refused only when clearing would strip a profile's last
 /// credential — a stored piece with neither a login nor an api key behind it —
 /// so an api-key profile clears fine and lands on an ABSENT install
@@ -985,7 +985,7 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 
 /// True when the profile has no stored credentials but the live path is a regular
 /// file with a completed OAuth login — first login after blank profile creation.
-/// clauth adopts this rather than treating it as divergence.
+/// tollgate adopts this rather than treating it as divergence.
 pub(crate) fn is_first_login(active: &ProfileName) -> Result<bool> {
     let link = claude_credentials_path()?;
     // CLA-SPLIT: a profile whose install source is its session token is never
@@ -1021,7 +1021,7 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
 /// not defer a switch (or raise the divergence prompt) on it. Two ways to be
 /// saved, one structural and one by content:
 ///
-/// * The live slot is clauth's own symlink. CC writes a regular file; only a
+/// * The live slot is tollgate's own symlink. CC writes a regular file; only a
 ///   switch symlinks the slot, so a symlink there points into a profile store
 ///   by construction — that login is saved whatever it resolves to, even if
 ///   the target is momentarily unreadable (a store file removed under a live
@@ -1050,7 +1050,7 @@ pub(crate) fn live_login_is_stored(active: &ProfileName) -> bool {
     let Ok(link) = claude_credentials_path() else {
         return false;
     };
-    // Structural half: a symlink at the live slot is clauth's own, pointing
+    // Structural half: a symlink at the live slot is tollgate's own, pointing
     // into a store by construction — saved even if the target is unreadable.
     if link
         .symlink_metadata()
@@ -1144,7 +1144,7 @@ enum AbsentSource {
     /// learned to sign out. The guarded relink alone, and it is not a
     /// conservatism: `rename_profile`, the first-ever `login` capture, and the
     /// daemon's and TUI's boot reconcile all reach that path with nothing
-    /// switching, so a sign-out there would destroy a bare `claude` login clauth
+    /// switching, so a sign-out there would destroy a bare `claude` login tollgate
     /// never captured and cannot put back. `switch_profile`'s uncaptured-relogin
     /// branch routes here too, deliberately: refusing beats dropping when a live
     /// login is unsaved.
@@ -1178,7 +1178,7 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
     // session-token.json vanishing between two stats can't split them. This
     // `exists` is a SECOND stat, though, and under `SignOut` its false branch is
     // destructive where it used to be inert. Both stats sit inside the state
-    // flock, so only a writer that is not clauth can win that race.
+    // flock, so only a writer that is not tollgate can win that race.
     if !path.exists() {
         return match absent {
             // Both outcomes complete the switch: an actually-signed-out item,
@@ -1225,7 +1225,7 @@ pub(crate) fn keychain_mirror_source_for_config_dir(
 /// it has migrated, so the swap's item write would otherwise destroy the
 /// outgoing member's only live pair.
 ///
-/// The item is not unconditionally fresher: the STORE moves too (a `clauth
+/// The item is not unconditionally fresher: the STORE moves too (a `tollgate
 /// login` recapture, a switch-away snapshot), so the winner is the side whose
 /// login expires later — CC's refresh and a recapture both advance expiry —
 /// and a tie keeps the store. The compare and the write share ONE state-flock
@@ -1237,7 +1237,7 @@ pub(crate) fn keychain_mirror_source_for_config_dir(
 ///
 /// The read (a `security` subprocess) runs OUTSIDE the state flock.
 ///
-/// Ownership of the item's login is never proven first: neither clauth-written
+/// Ownership of the item's login is never proven first: neither tollgate-written
 /// stores nor CC-written items carry a top-level account anchor on real blobs,
 /// and a skipped rescue overwrites the account's only live refresh token — so
 /// any item whose login expires later is adopted.
@@ -1248,7 +1248,7 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         Ok(None) => return Ok(()),
         Err(e) if crate::keychain::read_failed_unparseable(&e) => {
             logline!(
-                "clauth: the per-session Keychain item is not valid JSON; the swap's write \
+                "tollgate: the per-session Keychain item is not valid JSON; the swap's write \
                  replaces it rather than carrying its bytes"
             );
             return Ok(());
@@ -1272,7 +1272,7 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         }
         if store.file_name().is_some_and(|f| f == "session-token.json") {
             logline!(
-                "clauth: kept the static session token (a session-side re-login \
+                "tollgate: kept the static session token (a session-side re-login \
                  found in the per-session Keychain item is never adopted over it)"
             );
             return Ok(());
@@ -1329,7 +1329,7 @@ pub(crate) const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// The namespaced Keychain service Claude Code derives for a config dir it
 /// runs under (`CLAUDE_CONFIG_DIR`): [`CLAUDE_KEYCHAIN_SERVICE`], a `-`, then
 /// the first 8 hex chars of the SHA-256 of the dir's path — CC's own
-/// `sha256(configDir).toString('hex').slice(0, 8)`, which is why a `clauth
+/// `sha256(configDir).toString('hex').slice(0, 8)`, which is why a `tollgate
 /// start` session's CC reads this twin and never the bare item. The session
 /// seed, the swap executor and the stale-runtime GC all derive the same name
 /// for one runtime tree through this rule.
@@ -1379,7 +1379,7 @@ pub(crate) fn is_namespaced_keychain_service(service: &str) -> bool {
 }
 
 /// The census decision over one `security dump-keychain` text: the NAMESPACED
-/// services it lists that clauth's durable ownership ledger authorizes and no
+/// services it lists that tollgate's durable ownership ledger authorizes and no
 /// existing runtime dir explains. Shape is only a parser guard: a foreign
 /// `CLAUDE_CONFIG_DIR` item never enters the ledger or live set and is therefore
 /// left untouched. `owned` is loaded fail-closed by the caller; an unreadable or
@@ -1709,7 +1709,7 @@ pub(crate) fn publish_credential_link(link: &Path, target: &Path) -> Result<()> 
 /// Windows only. It keeps [`publish_credential_link`] from refusing a switch
 /// that the unlink-then-create before it would have completed: a read-only
 /// destination refuses `rename` there with os error 5, while `remove_file`
-/// clears the attribute on its way past. Nothing clauth writes is read-only, so
+/// clears the attribute on its way past. Nothing tollgate writes is read-only, so
 /// the operator or a backup tool is what sets it.
 #[cfg(windows)]
 #[expect(
@@ -1846,7 +1846,7 @@ pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut
 /// `mcpOAuth` object and deletes only the entry, so the live file carries the
 /// shrunken object forward. Pruning instead would wipe real logins the first
 /// time a freshly-logged-in account became live, which is the worse trade. The
-/// upgrade path is a clauth-owned canonical copy the per-store copies reconcile
+/// upgrade path is a tollgate-owned canonical copy the per-store copies reconcile
 /// against, which is only worth its moving parts once revocation is a surface.
 ///
 /// A no-op when either file is unreadable or `target` is the static-token
@@ -1914,7 +1914,7 @@ fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
 /// Park `name`'s MCP-server logins out of a credential store about to be
 /// removed. `save_profile` deletes that file whenever a profile stops storing a
 /// login (a recapture onto a third-party endpoint, a blanked OAuth login), and
-/// where the live slot is clauth's symlink that file IS what the slot resolves
+/// where the live slot is tollgate's symlink that file IS what the slot resolves
 /// to — so the logins are already unreachable by the time any relink runs, and
 /// the carry above never sees them. Reading the STORE rather than the live slot
 /// is what makes this behave the same on a host that copies the slot instead.
@@ -1966,7 +1966,7 @@ pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
 fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) {
     if let Err(e) = carry_live_extra_into(link, target, name) {
         logline!(
-            "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
+            "tollgate: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
              Re-authenticate any MCP server that reports a signed-out session"
         );
     }
@@ -2095,13 +2095,13 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
 
 /// Extract the profile name from a `apiKeyHelper` command string of the form
 /// `<exe> __api-key <profile>` (each token shell-quoted). The exe may itself
-/// be shell-quoted with internal spaces (`'/home/uwu clxdy/bin/clauth'`), so
+/// be shell-quoted with internal spaces (`'/home/uwu clxdy/bin/tollgate'`), so
 /// `split_whitespace` can yield more than three tokens — the parser locates
 /// the literal `__api-key` subcommand token and takes the NEXT token as the
 /// profile name, requiring it to be the LAST token (no trailing flags) and
 /// to pass `validate_profile_name`'s charset (`[A-Za-z0-9_.@+-]+`, no leading
 /// dot). A foreign helper that happens to contain `__api-key` followed by a
-/// profile-shaped token still parses — acceptable because clauth only writes
+/// profile-shaped token still parses — acceptable because tollgate only writes
 /// this string itself, and the subcommand name is unusual enough not to
 /// collide in practice. A hand-edited or corrupted helper that fails any of
 /// the above yields `None` rather than risk a phantom profile lookup that
@@ -2129,11 +2129,11 @@ fn profile_name_from_helper(helper: &str) -> Option<String> {
     None
 }
 
-/// The Setup-tab field that owns a clauth-managed env key, phrased for the
-/// collision prompt (`'X' is already set by …`). These are the keys clauth
+/// The Setup-tab field that owns a tollgate-managed env key, phrased for the
+/// collision prompt (`'X' is already set by …`). These are the keys tollgate
 /// derives from a profile's endpoint + model-tier fields; a custom env entry
 /// equal to one of them would override the field's value in `settings.json`.
-/// `None` when the key is not clauth-managed.
+/// `None` when the key is not tollgate-managed.
 pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
     Some(match key {
         "ANTHROPIC_BASE_URL" => "the base url field",
@@ -2222,7 +2222,7 @@ fn apply_profile_to_claude_settings_inner(
     atomic_write(&path, content).context("failed to write settings.json")
 }
 
-/// The hidden `clauth __api-key <profile>` subcommand name embedded in CC's
+/// The hidden `tollgate __api-key <profile>` subcommand name embedded in CC's
 /// `apiKeyHelper`. The helper string is rebuilt from `env::current_exe()` on
 /// every `build_claude_settings_json` run; a long-lived process (daemon/TUI)
 /// that rebuilds after an in-place self-update sees Linux's `<path> (deleted)`
@@ -2365,7 +2365,7 @@ pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
 /// refuse its `delegate` (`mcp::preflight_target`), because the chain it lost
 /// feeds usage polling and nothing else.
 ///
-/// Never keyed on a RECOGNISED provider: whether clauth has a usage integration
+/// Never keyed on a RECOGNISED provider: whether tollgate has a usage integration
 /// for a host says nothing about whether inference works against it, and most
 /// endpoints in use resolve to `provider: None`. The keyless refusal is a
 /// different question and keeps its own `is_third_party` scope — an
@@ -2426,7 +2426,7 @@ pub(crate) fn build_claude_settings_json(
     // previous profile's token.
     env.remove("ANTHROPIC_AUTH_TOKEN");
 
-    // Model-tier and subagent overrides — clauth-owned env keys, always set or
+    // Model-tier and subagent overrides — tollgate-owned env keys, always set or
     // cleared deterministically so a switch never inherits the prior profile's.
     let model_env = [
         ("ANTHROPIC_DEFAULT_OPUS_MODEL", &profile.models.opus),
@@ -2538,7 +2538,7 @@ fn snapshot_active_credentials_unchecked(
 ) -> Result<()> {
     // CLA-SPLIT: a profile whose live slot holds its static session token carries
     // nothing to snapshot, and capturing the live file into `profile.credentials`
-    // would clobber the clauth-private usage OAuth pair. The guard lives at this
+    // would clobber the tollgate-private usage OAuth pair. The guard lives at this
     // shared sink so every caller is covered: both the divergence-modal
     // "overwrite" and the CLI reconciled switch reach here via
     // `force_snapshot_active_credentials`. `adopt_first_login` never hits it for

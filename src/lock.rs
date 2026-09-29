@@ -1,9 +1,9 @@
 //! Cross-process serialization of state mutations.
 //!
-//! All disk writes that touch shared clauth state (profiles.toml, per-profile
+//! All disk writes that touch shared tollgate state (profiles.toml, per-profile
 //! config/credentials, ~/.claude/settings.json, .credentials.json symlink) run
-//! under an exclusive advisory file lock on ~/.clauth/.lock. This stops two
-//! concurrent clauth instances from interleaving read-modify-write cycles and
+//! under an exclusive advisory file lock on ~/.tollgate/.lock. This stops two
+//! concurrent tollgate instances from interleaving read-modify-write cycles and
 //! losing each other's changes, racing OAuth refresh-token rotations, or
 //! clobbering the active-profile symlink.
 //!
@@ -15,7 +15,7 @@
 //!
 //! Acquiring the cross-process flock is bounded by [`STATE_LOCK_TIMEOUT`]. A
 //! blocking flock has no deadline, so a lease-holding fetcher whose rotation path
-//! waits on a lock another clauth process holds forever would pin the usage-fetch
+//! waits on a lock another tollgate process holds forever would pin the usage-fetch
 //! lease and stand every TUI down permanently (no watchdog covers the scheduler
 //! thread). A bounded wait turns that silent wedge into a [`StateLockTimeout`] the
 //! caller retries instead of a hang.
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::logline::logline;
-use crate::profile::clauth_dir;
+use crate::profile::tollgate_dir;
 
 pub(crate) const LOCK_FILENAME: &str = ".lock";
 
@@ -122,8 +122,8 @@ pub(crate) const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 /// nothing over a multi-second deadline.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The state lock could not be taken within [`STATE_LOCK_TIMEOUT`]: another clauth
-/// process is holding `~/.clauth/.lock`. A recoverable, retry-later condition kept
+/// The state lock could not be taken within [`STATE_LOCK_TIMEOUT`]: another tollgate
+/// process is holding `~/.tollgate/.lock`. A recoverable, retry-later condition kept
 /// as a distinct type (surfaced through `anyhow`) so a caller can `downcast_ref`
 /// and retry rather than treat it as a hard error. The scheduler's fetch tick
 /// falls back to the disk cache and retries next tick without dropping its
@@ -149,7 +149,7 @@ impl std::fmt::Display for StateLockTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "timed out after {:.0}s acquiring the state lock; another clauth process holds ~/.clauth/.lock",
+            "timed out after {:.0}s acquiring the state lock; another tollgate process holds ~/.tollgate/.lock",
             self.waited.as_secs_f64()
         )
     }
@@ -322,7 +322,7 @@ impl StateLock {
             DEPTH.set(
                 depth
                     .checked_add(1)
-                    .expect("clauth state lock depth overflow"),
+                    .expect("tollgate state lock depth overflow"),
             );
             return Ok(Self {
                 _thread_guard: None,
@@ -345,10 +345,10 @@ impl StateLock {
         };
 
         if guard.is_none() {
-            let dir = clauth_dir()?;
-            crate::profile::mkdir_700(&dir).context("failed to create ~/.clauth")?;
+            let dir = tollgate_dir()?;
+            crate::profile::mkdir_700(&dir).context("failed to create ~/.tollgate")?;
             let file = crate::profile::open_state_file(&dir.join(LOCK_FILENAME))
-                .context("failed to open clauth state lock file")?;
+                .context("failed to open tollgate state lock file")?;
             // On timeout `guard` drops here, releasing THREAD_LOCK with the slot
             // still `None` and DEPTH still 0 — a clean unwind, no rank entered.
             lock_file_with_timeout(&file, timeout)?;
@@ -396,13 +396,13 @@ pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<(
                 let now = Instant::now();
                 if now >= deadline {
                     let timed_out = StateLockTimeout { waited: timeout };
-                    logline!("clauth: {timed_out}");
+                    logline!("tollgate: {timed_out}");
                     return Err(anyhow::Error::new(timed_out));
                 }
                 std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline - now));
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                return Err(e).context("failed to acquire clauth state lock");
+                return Err(e).context("failed to acquire tollgate state lock");
             }
         }
     }

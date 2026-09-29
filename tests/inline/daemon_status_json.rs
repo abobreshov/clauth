@@ -2,7 +2,7 @@
 //! `daemon::status_json::build_status` shape + field derivation.
 //!
 //! These exercise the single-shot path (`live = None`, freshness/next-refresh
-//! from cache mtime) against a `HomeSandbox` so no real `~/.clauth` is touched.
+//! from cache mtime) against a `HomeSandbox` so no real `~/.tollgate` is touched.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -69,7 +69,6 @@ fn build_status_top_level_shape_and_active() {
         [
             "active_codex_profile",
             "active_profile",
-            "clauth_version",
             "codex_fallback_chain",
             "codex_wrap_off",
             "gateway",
@@ -78,6 +77,7 @@ fn build_status_top_level_shape_and_active() {
             "profiles",
             "refresh_interval_ms",
             "schema",
+            "tollgate_version",
             "wrap_off",
         ],
     );
@@ -1165,7 +1165,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
 }
 
-/// The daemonless surfaces (`clauth status --json`, `clauth list`) derive
+/// The daemonless surfaces (`tollgate status --json`, `tollgate list`) derive
 /// freshness from the usage cache's mtime, so a warm cache behind a DEAD
 /// console session published `fetch_status: "Fresh"` — a live measurement over
 /// a credential that can never self-heal, which is the exact failure this
@@ -1367,7 +1367,7 @@ fn build_status_rolling_token_is_false_for_a_misfill() {
 }
 
 /// The published `profiles[]` entries deserialize into [`ProfileEntry`] — the
-/// typed spelling the reader (`clauth list`) derives its fields from. A field
+/// typed spelling the reader (`tollgate list`) derives its fields from. A field
 /// the writer drops or renames reds here instead of in a reader's typed access.
 #[test]
 fn published_entries_deserialize_into_the_typed_contract() {
@@ -1420,8 +1420,8 @@ fn published_entries_deserialize_into_the_typed_contract() {
 #[test]
 fn the_codex_surface_is_additive_and_appended() {
     let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    let dir = home.home().join(".tollgate");
+    crate::profile::mkdir_700(&dir).expect("mkdir .tollgate");
     std::fs::write(
         dir.join("codex-profiles.toml"),
         "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
@@ -1454,7 +1454,9 @@ fn the_codex_surface_is_additive_and_appended() {
         "the codex chain is published beside the claude one"
     );
     assert!(
-        v["clauth_version"].as_str().is_some_and(|s| !s.is_empty()),
+        v["tollgate_version"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
         "the writer names itself, so an old daemon is distinguishable from an empty roster"
     );
 
@@ -1728,7 +1730,7 @@ fn status_body_matches_legacy_json_bytes() {
         codex_fallback_chain: vec!["cx".into()],
         codex_wrap_off: true,
         refresh_interval_ms: 300_000,
-        clauth_version: "9.9.9".to_string(),
+        tollgate_version: "9.9.9".to_string(),
         gateway: None,
         profiles: vec![
             ProfileEntry {
@@ -1821,7 +1823,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"profiles":["#,
+        r#""tollgate_version":"9.9.9","gateway":null,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -1854,7 +1856,7 @@ fn status_body_matches_legacy_json_bytes() {
         codex_fallback_chain: vec![],
         codex_wrap_off: false,
         refresh_interval_ms: 60_000,
-        clauth_version: "9.9.9".to_string(),
+        tollgate_version: "9.9.9".to_string(),
         gateway: None,
         profiles: vec![],
     };
@@ -1862,7 +1864,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"profiles":[]}"#,
+        r#""tollgate_version":"9.9.9","gateway":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -1957,17 +1959,17 @@ fn status_body_never_leaks_a_credential() {
 
     // One marker per slot, so an assertion message names the slot a leak came
     // from instead of blaming a shared string.
-    let oauth_access = "clauth-canary-oauth-access-7f3a";
-    let oauth_refresh = "clauth-canary-oauth-refresh-7f3a";
-    let oauth_extra = "clauth-canary-oauth-extra-7f3a";
-    let api_key = "clauth-canary-api-key-7f3a";
-    let console = "clauth-canary-console-7f3a";
-    let env_auth = "clauth-canary-env-auth-7f3a";
-    let env_second = "clauth-canary-env-second-7f3a";
-    let session = "clauth-canary-session-7f3a";
-    let mcp = "clauth-canary-mcp-7f3a";
-    let kick_access = "clauth-canary-kick-access-7f3a";
-    let kick_refresh = "clauth-canary-kick-refresh-7f3a";
+    let oauth_access = "tollgate-canary-oauth-access-7f3a";
+    let oauth_refresh = "tollgate-canary-oauth-refresh-7f3a";
+    let oauth_extra = "tollgate-canary-oauth-extra-7f3a";
+    let api_key = "tollgate-canary-api-key-7f3a";
+    let console = "tollgate-canary-console-7f3a";
+    let env_auth = "tollgate-canary-env-auth-7f3a";
+    let env_second = "tollgate-canary-env-second-7f3a";
+    let session = "tollgate-canary-session-7f3a";
+    let mcp = "tollgate-canary-mcp-7f3a";
+    let kick_access = "tollgate-canary-kick-access-7f3a";
+    let kick_refresh = "tollgate-canary-kick-refresh-7f3a";
 
     let mut oauth = Profile::new("canary-oauth".to_string(), None, None);
     oauth.auto_start = true;
@@ -2000,7 +2002,7 @@ fn status_body_never_leaks_a_credential() {
     api.env
         .insert("ANTHROPIC_AUTH_TOKEN".to_string(), env_auth.to_string());
     api.env
-        .insert("CLAUTH_CANARY_ENV".to_string(), env_second.to_string());
+        .insert("TOLLGATE_CANARY_ENV".to_string(), env_second.to_string());
     save_profile(&api).unwrap();
 
     // A second queue member, so the kick block below excludes a planted name
@@ -2047,7 +2049,7 @@ fn status_body_never_leaks_a_credential() {
     let _api_live = crate::testutil::arm_live_session(home.home(), "canary-api");
 
     // The parked MCP logins slot, written through its real park writer.
-    let mcp_store = crate::profile::clauth_dir()
+    let mcp_store = crate::profile::tollgate_dir()
         .unwrap()
         .join("canary-mcp-store.json");
     std::fs::write(
@@ -2187,7 +2189,7 @@ fn status_body_never_leaks_a_credential() {
     // And the literal file that writer publishes.
     crate::daemon::write_status_json(&feed);
     let published =
-        std::fs::read(crate::profile::clauth_dir().unwrap().join("status.json")).unwrap();
+        std::fs::read(crate::profile::tollgate_dir().unwrap().join("status.json")).unwrap();
     let published_str = String::from_utf8_lossy(&published).into_owned();
 
     // Each cache must reach its branch, or its part of the canary proves nothing.
@@ -2353,7 +2355,7 @@ fn status_body_never_leaks_a_credential() {
     .unwrap();
     crate::daemon::write_status_json(&feed_api_active);
     let published_api_active =
-        std::fs::read(crate::profile::clauth_dir().unwrap().join("status.json")).unwrap();
+        std::fs::read(crate::profile::tollgate_dir().unwrap().join("status.json")).unwrap();
     let api_active_surfaces = [
         (
             "api-active single-shot body",

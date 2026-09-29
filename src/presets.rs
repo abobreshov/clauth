@@ -6,14 +6,14 @@
 //! carried them would silently move an api key between accounts.
 //!
 //! The built-ins ship in the binary; the rest live one JSON file per preset
-//! under `~/.clauth/presets/`. The file NAME is the preset name, so it goes
+//! under `~/.tollgate/presets/`. The file NAME is the preset name, so it goes
 //! through [`crate::actions::validate_profile_name`] (the same charset that
 //! bounds a profile directory) before it ever reaches a path.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{ModelSettings, atomic_write_600, clauth_dir, read_json_file};
+use crate::profile::{ModelSettings, atomic_write_600, read_json_file, tollgate_dir};
 
 /// A named `base_url` + [`ModelSettings`] template.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +25,7 @@ pub(crate) struct Preset {
     pub(crate) builtin: bool,
 }
 
-/// On-disk shape of `~/.clauth/presets/<name>.json`. The name is the file stem,
+/// On-disk shape of `~/.tollgate/presets/<name>.json`. The name is the file stem,
 /// so it is deliberately absent from the body — one spelling, no way for the two
 /// to disagree.
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,7 +150,7 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 }
 
 fn presets_dir() -> Result<std::path::PathBuf> {
-    Ok(clauth_dir()?.join("presets"))
+    Ok(tollgate_dir()?.join("presets"))
 }
 
 /// The name's own path, refusing anything that isn't a bare filename. Reuses the

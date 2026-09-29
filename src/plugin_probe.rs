@@ -1,7 +1,7 @@
 //! Local-read probes backing the Plugin tab: binary-on-`PATH` resolution, Claude
 //! Code's plugin registry (`installed_plugins.json` / `known_marketplaces.json`),
 //! the manual `mcpServers` wiring, the `claude --version` string, and the one
-//! safe write the tab performs (wire `mcpServers.clauth`).
+//! safe write the tab performs (wire `mcpServers.tollgate`).
 //!
 //! Everything here is a cheap filesystem/`PATH` read except [`cc_version`], which
 //! runs one short subprocess; the Plugin tab caches that result. Nothing spawns a
@@ -20,14 +20,14 @@ use serde_json::{Map, Value};
 use crate::profile::{atomic_write, claude_dir, home_dir};
 
 /// Plugin id in the registry (`<plugin>@<marketplace>`).
-pub(crate) const PLUGIN_ID: &str = "clauth@clauth";
+pub(crate) const PLUGIN_ID: &str = crate::identity::CC_PLUGIN;
 /// Marketplace key in `known_marketplaces.json`.
-pub(crate) const MARKETPLACE_KEY: &str = "clauth";
+pub(crate) const MARKETPLACE_KEY: &str = crate::identity::NAME;
 
 /// Resolve `binary` against `PATH`, returning the first hit. The OS does this
 /// implicitly when spawning, but a presence *check* needs it spelled out. On
 /// Windows the usual executable extensions are tried too; on Unix the exec bit is
-/// required so a non-executable file named `clauth` doesn't read as "resolved".
+/// required so a non-executable file named `tollgate` doesn't read as "resolved".
 pub(crate) fn on_path(binary: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
@@ -54,7 +54,7 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// One install record from `plugins["clauth@clauth"]`. Every field is optional —
+/// One install record from `plugins["tollgate@tollgate"]`. Every field is optional —
 /// CC's schema is treated leniently so a shape change degrades to "unknown"
 /// rather than a parse error.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -67,14 +67,14 @@ pub(crate) struct InstallRecord {
     pub(crate) project_path: Option<String>,
 }
 
-/// Marketplace source for `clauth`, from `known_marketplaces.json`.
+/// Marketplace source for `tollgate`, from `known_marketplaces.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MarketplaceInfo {
     pub(crate) repo: Option<String>,
     pub(crate) install_location: Option<String>,
 }
 
-/// Where a manual `mcpServers.clauth` entry lives, if any.
+/// Where a manual `mcpServers.tollgate` entry lives, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum McpWiring {
     /// `~/.claude.json` (user-global) carries it.
@@ -85,7 +85,7 @@ pub(crate) enum McpWiring {
     None,
 }
 
-/// Install records for the clauth plugin; empty when the registry is absent,
+/// Install records for the tollgate plugin; empty when the registry is absent,
 /// unreadable, or carries no entry (all read as "not installed").
 pub(crate) fn installed_records() -> Vec<InstallRecord> {
     let Some(root) = read_json(plugins_dir().map(|dir| dir.join("installed_plugins.json"))) else {
@@ -98,7 +98,7 @@ pub(crate) fn installed_records() -> Vec<InstallRecord> {
         .unwrap_or_default()
 }
 
-/// Marketplace record for clauth, when the marketplace is known to CC.
+/// Marketplace record for tollgate, when the marketplace is known to CC.
 pub(crate) fn marketplace_known() -> Option<MarketplaceInfo> {
     let root = read_json(plugins_dir().map(|d| d.join("known_marketplaces.json")))?;
     let entry = root.get(MARKETPLACE_KEY)?;
@@ -115,30 +115,30 @@ pub(crate) fn marketplace_known() -> Option<MarketplaceInfo> {
     })
 }
 
-/// Manual `mcpServers.clauth` wiring, preferring the user-global config over a
+/// Manual `mcpServers.tollgate` wiring, preferring the user-global config over a
 /// project file (the global is the one the fix writes).
 pub(crate) fn manual_mcp_wiring() -> McpWiring {
-    if global_claude_json_path().is_some_and(|path| json_has_clauth_mcp(&path)) {
+    if global_claude_json_path().is_some_and(|path| json_has_tollgate_mcp(&path)) {
         McpWiring::GlobalConfig
-    } else if json_has_clauth_mcp(Path::new(".mcp.json")) {
+    } else if json_has_tollgate_mcp(Path::new(".mcp.json")) {
         McpWiring::ProjectFile
     } else {
         McpWiring::None
     }
 }
 
-/// Whether the user-global `mcpServers.clauth` entry matches the canonical stdio
-/// entry clauth writes. `None` when no global manual entry exists (nothing to
+/// Whether the user-global `mcpServers.tollgate` entry matches the canonical stdio
+/// entry tollgate writes. `None` when no global manual entry exists (nothing to
 /// validate — a plugin install or a project file is judged elsewhere). `Some(false)`
 /// flags drift: a stale absolute `command` or `args` missing `mcp` reads as "wired"
 /// but won't launch the current server, so the tab re-offers the canonical write.
 pub(crate) fn global_entry_drifted() -> Option<bool> {
     let entry = read_json(global_claude_json_path()).and_then(|root| {
         root.get("mcpServers")
-            .and_then(|servers| servers.get("clauth"))
+            .and_then(|servers| servers.get(crate::identity::NAME))
             .cloned()
     })?;
-    let canon = clauth_mcp_entry();
+    let canon = tollgate_mcp_entry();
     // `type` is allowed to be absent (CC defaults stdio); only command + args are
     // load-bearing for the launch.
     let same =
@@ -146,7 +146,7 @@ pub(crate) fn global_entry_drifted() -> Option<bool> {
     Some(!same)
 }
 
-/// Verdict of a live `clauth mcp` discovery handshake.
+/// Verdict of a live `tollgate mcp` discovery handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpProbe {
     /// Server answered `server/discover` with a result advertising its tools.
@@ -155,14 +155,14 @@ pub(crate) enum McpProbe {
     Failed(String),
 }
 
-/// Spawn `clauth mcp`, send one JSON-RPC `server/discover`, and confirm the reply
-/// advertises tools. Client-faithful: catches a `clauth` that resolves on PATH but is
+/// Spawn `tollgate mcp`, send one JSON-RPC `server/discover`, and confirm the reply
+/// advertises tools. Client-faithful: catches a `tollgate` that resolves on PATH but is
 /// too old to serve (no `mcp` subcommand, or no stateless protocol) or boots then dies. Heavier than the
 /// other probes — the server runs `gc_stale_runtimes()` at startup — so the tab
 /// gates it behind `r` only. Drains stdout on a thread so a chatty server can't
 /// deadlock the pipe; 3s budget, then kill.
 fn probe_command() -> Command {
-    let mut cmd = Command::new("clauth");
+    let mut cmd = Command::new(crate::identity::NAME);
     cmd.arg("mcp")
         .env(crate::mcp::MCP_PROBE_ENV, "1")
         .stdin(Stdio::piped())
@@ -223,7 +223,7 @@ fn discover_frame() -> Value {
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                 "io.modelcontextprotocol/clientInfo": {
-                    "name": "clauth-probe", "version": env!("CARGO_PKG_VERSION")
+                    "name": "tollgate-probe", "version": env!("CARGO_PKG_VERSION")
                 },
                 "io.modelcontextprotocol/clientCapabilities": {}
             }
@@ -231,7 +231,7 @@ fn discover_frame() -> Value {
     })
 }
 
-/// JSON-RPC "method not found", which is what a `clauth` predating the stateless
+/// JSON-RPC "method not found", which is what a `tollgate` predating the stateless
 /// protocol answers `server/discover` with.
 const METHOD_NOT_FOUND: i64 = -32601;
 
@@ -246,7 +246,7 @@ fn parse_discover_reply(line: &str) -> McpProbe {
     if let Some(error) = value.get("error") {
         let code = error.get("code").and_then(Value::as_i64);
         return McpProbe::Failed(if code == Some(METHOD_NOT_FOUND) {
-            "no `server/discover`: the clauth on PATH predates the stateless protocol".to_string()
+            "no `server/discover`: the tollgate on PATH predates the stateless protocol".to_string()
         } else {
             let message = error
                 .get("message")
@@ -287,7 +287,7 @@ pub(crate) fn global_claude_json_path() -> Option<PathBuf> {
     Some(home_dir().ok()?.join(".claude.json"))
 }
 
-/// Write `mcpServers.clauth` into `~/.claude.json`, preserving every other field
+/// Write `mcpServers.tollgate` into `~/.claude.json`, preserving every other field
 /// (key order is kept via serde_json's `preserve_order`). The entry mirrors the
 /// plugin manifest so a manual wire matches a plugin install. Creates the file
 /// when absent.
@@ -300,24 +300,26 @@ pub(crate) fn wire_mcp_server() -> Result<()> {
         },
         Err(_) => Map::new(),
     };
-    let entry = clauth_mcp_entry();
+    let entry = tollgate_mcp_entry();
     match root
         .entry("mcpServers")
         .or_insert_with(|| Value::Object(Map::new()))
     {
         Value::Object(servers) => {
-            servers.insert("clauth".to_string(), entry);
+            servers.insert(crate::identity::NAME.to_string(), entry);
         }
         // `mcpServers` existed but wasn't an object — replace it with a fresh map.
-        other => *other = Value::Object(Map::from_iter([("clauth".to_string(), entry)])),
+        other => {
+            *other = Value::Object(Map::from_iter([(crate::identity::NAME.to_string(), entry)]))
+        }
     }
     atomic_write(&path, serde_json::to_vec_pretty(&Value::Object(root))?)?;
     Ok(())
 }
 
-/// The canonical stdio entry clauth registers (matches `plugin.json`).
-fn clauth_mcp_entry() -> Value {
-    serde_json::json!({ "type": "stdio", "command": "clauth", "args": ["mcp"] })
+/// The canonical stdio entry tollgate registers (matches `plugin.json`).
+fn tollgate_mcp_entry() -> Value {
+    serde_json::json!({ "type": "stdio", "command": crate::identity::NAME, "args": ["mcp"] })
 }
 
 /// CC's user-scope plugin registry. `claude` resolves its config dir as
@@ -342,11 +344,11 @@ fn read_json(path: Option<PathBuf>) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn json_has_clauth_mcp(path: &Path) -> bool {
+fn json_has_tollgate_mcp(path: &Path) -> bool {
     read_json(Some(path.to_path_buf()))
         .and_then(|root| {
             root.get("mcpServers")
-                .and_then(|servers| servers.get("clauth"))
+                .and_then(|servers| servers.get(crate::identity::NAME))
                 .cloned()
         })
         .is_some()

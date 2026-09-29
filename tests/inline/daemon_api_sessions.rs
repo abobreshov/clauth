@@ -76,7 +76,7 @@ fn live_isolated_session(
     mtime_secs: u64,
 ) -> fs::File {
     let path = sb.home().join(format!(
-        ".clauth/profiles/{profile}/runtime-isolated/projects/-w-iso/{id}.jsonl"
+        ".tollgate/profiles/{profile}/runtime-isolated/projects/-w-iso/{id}.jsonl"
     ));
     write_lines(&path, lines);
     set_mtime(
@@ -85,7 +85,7 @@ fn live_isolated_session(
     );
     let sessions_dir = sb
         .home()
-        .join(format!(".clauth/profiles/{profile}/sessions-isolated"));
+        .join(format!(".tollgate/profiles/{profile}/sessions-isolated"));
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap();
@@ -496,7 +496,7 @@ fn a_transcript_that_cannot_be_opened_is_404_and_logged() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: session 'lo cked' failed to read: {denied}"
+            "tollgate api: session 'lo cked' failed to read: {denied}"
         )]
     );
 }

@@ -6,18 +6,18 @@
 //! The gateway runs iff the record exists, its config exists and `disabled`
 //! is off, never inside this process, and only under the active daemon:
 //! [`start`] takes the singleton's [`DaemonLock`], which a parked standby does
-//! not hold. clauth signals only a process it spawned: its own [`Child`], or
+//! not hold. tollgate signals only a process it spawned: its own [`Child`], or
 //! the orphan of a daemon that died hard, matched by the pid AND the process
-//! start time recorded in `~/.clauth/gateway-child.json`.
+//! start time recorded in `~/.tollgate/gateway-child.json`.
 //!
-//! Threads: the supervisor's rounds run on the `clauth-gateway` thread, paced
+//! Threads: the supervisor's rounds run on the `tollgate-gateway` thread, paced
 //! to at most one probe per [`SUPERVISE_POLL`], so a `/health` probe (up to
 //! [`crate::gateway::HEALTH_PROBE_TIMEOUT`]) never stalls the daemon's tick;
 //! the tick and the REST API read only the slot a round publishes. Each probe
 //! runs on a short helper thread and its answer and a shutdown share one
 //! channel, so a shutdown preempts a probe instead of waiting it out.
 //!
-//! The gateway's stdout and stderr go to `~/.clauth/gateway.log`, never the
+//! The gateway's stdout and stderr go to `~/.tollgate/gateway.log`, never the
 //! daemon's own stderr: shunt logs every request at `info`, which would flood
 //! `daemon.log`'s size cap.
 
@@ -43,7 +43,7 @@ use crate::gateway::{
 };
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
-use crate::profile::{atomic_write_600, clauth_dir, open_append_600};
+use crate::profile::{atomic_write_600, open_append_600, tollgate_dir};
 use crate::usage::{epoch_secs_to_iso, now_ms};
 
 /// The run loop's round length: after a round it waits out the rest of this
@@ -117,14 +117,14 @@ pub(crate) enum GatewayState {
     Disabled,
     /// The adopted config is gone from disk.
     NoConfig,
-    /// The record names a YAML config, which clauth cannot edit in place.
+    /// The record names a YAML config, which tollgate cannot edit in place.
     YamlRefused,
     /// The record, its env file or its bind cannot be read into a spawn, or
     /// the gateway's log cannot be opened; `reason` says which.
     Misconfigured,
     /// The shunt binary is not there; `binary` names what was looked up.
     BinaryMissing,
-    /// Something clauth did not spawn answers on the bind port, so none is
+    /// Something tollgate did not spawn answers on the bind port, so none is
     /// started beside it; re-probed until it leaves.
     Foreign,
     /// Spawned, or about to be, with no `/health` answer yet.
@@ -132,14 +132,14 @@ pub(crate) enum GatewayState {
     Healthy,
     /// Running, but `/health` does not answer; never killed for it.
     Unhealthy,
-    /// It reported a version below the floor, so clauth stopped it and holds
+    /// It reported a version below the floor, so tollgate stopped it and holds
     /// off until the record or the binary changes.
     BelowFloor,
     /// It exited; the next spawn waits out the backoff.
     Restarting,
-    /// clauth asked a gateway it spawned to stop and waits for it to exit.
+    /// tollgate asked a gateway it spawned to stop and waits for it to exit.
     Stopping,
-    /// Built without the supervisor: the single-shot `clauth status --json`,
+    /// Built without the supervisor: the single-shot `tollgate status --json`,
     /// a feed republished while no daemon runs, or a live daemon whose
     /// supervisor thread failed to spawn (so it published the record-only
     /// slot once and never steps).
@@ -213,19 +213,19 @@ pub(crate) struct GatewaySlot {
     /// The port the gateway binds, or the port a foreign answerer holds.
     #[schema(required = true)]
     pub(crate) port: Option<u16>,
-    /// The pid of the gateway clauth spawned, while one runs.
+    /// The pid of the gateway tollgate spawned, while one runs.
     #[schema(required = true)]
     pub(crate) pid: Option<u32>,
-    /// The version `/health` reported: clauth's gateway's, or a shunt-shaped
+    /// The version `/health` reported: tollgate's gateway's, or a shunt-shaped
     /// foreign answerer's.
     #[schema(required = true)]
     pub(crate) version: Option<String>,
     /// What answered on the port of a `foreign` gateway.
     #[schema(required = true)]
     pub(crate) answerer: Option<Answerer>,
-    /// The oldest shunt clauth supervises.
+    /// The oldest shunt tollgate supervises.
     pub(crate) floor: String,
-    /// Restarts after an exit clauth did not ask for, since the daemon
+    /// Restarts after an exit tollgate did not ask for, since the daemon
     /// started.
     pub(crate) restarts: u32,
     /// How the last gateway process ended, `null` before any has.
@@ -394,7 +394,7 @@ impl Tick {
     }
 }
 
-/// The gateway clauth spawned.
+/// The gateway tollgate spawned.
 struct Running {
     child: Child,
     pid: u32,
@@ -462,7 +462,7 @@ enum Orphan {
     Done,
 }
 
-/// The supervision state machine, stepped by the `clauth-gateway` thread (or
+/// The supervision state machine, stepped by the `tollgate-gateway` thread (or
 /// by a test, with an injected [`Tick`]).
 pub(crate) struct Supervisor {
     handle: GatewayHandle,
@@ -597,7 +597,7 @@ impl Supervisor {
                 Ok(Some(status)) => {
                     let report = ExitReport::from(status);
                     logline!(
-                        "clauth daemon: the shunt gateway (pid {}) stopped ({report})",
+                        "tollgate daemon: the shunt gateway (pid {}) stopped ({report})",
                         running.pid
                     );
                     remove_marker();
@@ -607,7 +607,7 @@ impl Supervisor {
                 Ok(None) => {}
                 Err(e) => {
                     logline!(
-                        "clauth daemon: cannot wait on the shunt gateway (pid {}): {e}",
+                        "tollgate daemon: cannot wait on the shunt gateway (pid {}): {e}",
                         running.pid
                     );
                     return;
@@ -623,7 +623,7 @@ impl Supervisor {
             }
             if now >= deadline {
                 logline!(
-                    "clauth daemon: the shunt gateway (pid {}) is still stopping; the next daemon start finishes the stop",
+                    "tollgate daemon: the shunt gateway (pid {}) is still stopping; the next daemon start finishes the stop",
                     running.pid
                 );
                 return;
@@ -641,14 +641,14 @@ impl Supervisor {
             }
             Ok(None) => {}
             Err(e) => logline!(
-                "clauth daemon: cannot wait on the shunt gateway (pid {}): {e}",
+                "tollgate daemon: cannot wait on the shunt gateway (pid {}): {e}",
                 running.pid
             ),
         }
         if let Some(stop) = running.stop.as_mut() {
             if tick.at >= stop.deadline && !stop.killed {
                 logline!(
-                    "clauth daemon: the shunt gateway (pid {}) did not exit within {}s of SIGTERM; killing it",
+                    "tollgate daemon: the shunt gateway (pid {}) did not exit within {}s of SIGTERM; killing it",
                     running.pid,
                     running.stop_bound.as_secs()
                 );
@@ -669,7 +669,7 @@ impl Supervisor {
             }
             // An unreadable or YAML record keeps a running gateway: it was
             // started under a record that read, and that record's intent is
-            // the last one clauth knows.
+            // the last one tollgate knows.
             Intent::Idle(_) => {}
             Intent::Run(record)
                 if spawn_inputs(record) != spawn_inputs(&running.identity.record) =>
@@ -702,7 +702,7 @@ impl Supervisor {
             running.next_probe = tick.at + HEALTH_INTERVAL;
             if let Err(refusal) = check_version_floor(&version) {
                 logline!(
-                    "clauth daemon: {refusal}; stopping the gateway it started (pid {})",
+                    "tollgate daemon: {refusal}; stopping the gateway it started (pid {})",
                     running.pid
                 );
                 return self.begin_stop(AfterStop::BelowFloor(refusal.read), tick);
@@ -737,13 +737,13 @@ impl Supervisor {
             AfterStop::Shutdown => "the daemon is exiting".to_string(),
         };
         logline!(
-            "clauth daemon: stopping the shunt gateway (pid {}): {why}",
+            "tollgate daemon: stopping the shunt gateway (pid {}): {why}",
             running.pid
         );
         terminate_pid(running.pid, false);
         let deadline_ms = tick.wall_ms + running.stop_bound.as_millis() as u64;
         if let Err(e) = write_marker(&running.marker(Some(deadline_ms))) {
-            logline!("clauth daemon: failed to record the gateway's stop deadline: {e:#}");
+            logline!("tollgate daemon: failed to record the gateway's stop deadline: {e:#}");
         }
         running.stop = Some(Stop {
             deadline: tick.at + running.stop_bound,
@@ -765,7 +765,7 @@ impl Supervisor {
         match running.stop.map(|stop| stop.then) {
             Some(AfterStop::Idle(slot)) => {
                 logline!(
-                    "clauth daemon: the shunt gateway (pid {}) stopped ({report})",
+                    "tollgate daemon: the shunt gateway (pid {}) stopped ({report})",
                     running.pid
                 );
                 self.set(slot, tick);
@@ -781,7 +781,7 @@ impl Supervisor {
             }
             Some(AfterStop::Respawn) => {
                 logline!(
-                    "clauth daemon: the shunt gateway (pid {}) stopped ({report}); starting it on the changed record",
+                    "tollgate daemon: the shunt gateway (pid {}) stopped ({report}); starting it on the changed record",
                     running.pid
                 );
                 // The backoff paces crashes of one set of spawn inputs; the
@@ -800,7 +800,7 @@ impl Supervisor {
                 self.restarts = self.restarts.saturating_add(1);
                 self.restart_at = Some(tick.at + delay);
                 logline!(
-                    "clauth daemon: the shunt gateway (pid {}) exited ({report}); restarting in {}s",
+                    "tollgate daemon: the shunt gateway (pid {}) exited ({report}); restarting in {}s",
                     running.pid,
                     delay.as_secs()
                 );
@@ -846,7 +846,7 @@ impl Supervisor {
             Err(e) => {
                 let reason = format!("{e:#}");
                 if self.slot.reason.as_deref() != Some(reason.as_str()) {
-                    logline!("clauth daemon: cannot start the shunt gateway: {reason}");
+                    logline!("tollgate daemon: cannot start the shunt gateway: {reason}");
                 }
                 let slot = GatewaySlot {
                     reason: Some(reason),
@@ -886,7 +886,7 @@ impl Supervisor {
         if let Some((answerer, version)) = foreign {
             if self.slot.state != GatewayState::Foreign {
                 logline!(
-                    "clauth daemon: port {port} already answers /health ({}); not starting the managed gateway beside it",
+                    "tollgate daemon: port {port} already answers /health ({}); not starting the managed gateway beside it",
                     version.as_deref().map_or_else(
                         || format!("{answerer:?}"),
                         |version| format!("shunt {version:?}")
@@ -910,7 +910,7 @@ impl Supervisor {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if self.slot.state != GatewayState::BinaryMissing {
                     logline!(
-                        "clauth daemon: cannot start the shunt gateway: {} not found; install shunt or point the gateway at its binary",
+                        "tollgate daemon: cannot start the shunt gateway: {} not found; install shunt or point the gateway at its binary",
                         record.shunt_binary().display()
                     );
                 }
@@ -924,7 +924,7 @@ impl Supervisor {
             Err(e) => {
                 let reason = format!("cannot run {}: {e}", record.shunt_binary().display());
                 if self.slot.reason.as_deref() != Some(reason.as_str()) {
-                    logline!("clauth daemon: cannot start the shunt gateway: {reason}");
+                    logline!("tollgate daemon: cannot start the shunt gateway: {reason}");
                 }
                 let slot = GatewaySlot {
                     port: Some(port),
@@ -952,9 +952,9 @@ impl Supervisor {
             stop: None,
         };
         if let Err(e) = write_marker(&running.marker(None)) {
-            logline!("clauth daemon: failed to record the gateway's pid: {e:#}");
+            logline!("tollgate daemon: failed to record the gateway's pid: {e:#}");
         }
-        logline!("clauth daemon: started the shunt gateway (pid {pid}) on port {port}");
+        logline!("tollgate daemon: started the shunt gateway (pid {pid}) on port {port}");
         let slot = running.slot(GatewayState::Starting);
         self.child = Some(running);
         self.set(slot, tick);
@@ -985,7 +985,7 @@ impl Supervisor {
             .collect::<Vec<_>>()
             .join(", ");
         logline!(
-            "clauth daemon: the gateway's env file {} assigns nothing on line(s) {numbers} (systemd skips such lines too); the gateway runs without them",
+            "tollgate daemon: the gateway's env file {} assigns nothing on line(s) {numbers} (systemd skips such lines too); the gateway runs without them",
             env_file.display()
         );
         self.last_skipped = Some(memo);
@@ -1024,7 +1024,7 @@ impl Supervisor {
             } => {
                 if process_start_time(*pid).as_ref() != Some(start) {
                     logline!(
-                        "clauth daemon: the shunt gateway a previous daemon left running (pid {pid}) is gone"
+                        "tollgate daemon: the shunt gateway a previous daemon left running (pid {pid}) is gone"
                     );
                     remove_marker();
                     self.orphan = Orphan::Done;
@@ -1032,7 +1032,7 @@ impl Supervisor {
                 }
                 if tick.wall_ms >= *deadline_ms && !*killed {
                     logline!(
-                        "clauth daemon: the shunt gateway a previous daemon left running (pid {pid}) outlived its stop deadline; killing it"
+                        "tollgate daemon: the shunt gateway a previous daemon left running (pid {pid}) outlived its stop deadline; killing it"
                     );
                     terminate_pid(*pid, true);
                     *killed = true;
@@ -1060,7 +1060,7 @@ fn stop_left_behind(now_ms: u64) -> Option<LeftBehind> {
         Ok(Some(marker)) => marker,
         Ok(None) => return None,
         Err(e) => {
-            logline!("clauth daemon: ignoring an unreadable gateway child marker: {e:#}");
+            logline!("tollgate daemon: ignoring an unreadable gateway child marker: {e:#}");
             remove_marker();
             return None;
         }
@@ -1078,7 +1078,7 @@ fn stop_left_behind(now_ms: u64) -> Option<LeftBehind> {
         Some(deadline_ms) => deadline_ms,
         None => {
             logline!(
-                "clauth daemon: stopping the shunt gateway a previous daemon left running (pid {})",
+                "tollgate daemon: stopping the shunt gateway a previous daemon left running (pid {})",
                 marker.pid
             );
             terminate_pid(marker.pid, false);
@@ -1088,7 +1088,7 @@ fn stop_left_behind(now_ms: u64) -> Option<LeftBehind> {
                 ..marker.clone()
             };
             if let Err(e) = write_marker(&stopping) {
-                logline!("clauth daemon: failed to record the gateway's stop deadline: {e:#}");
+                logline!("tollgate daemon: failed to record the gateway's stop deadline: {e:#}");
             }
             deadline_ms
         }
@@ -1206,10 +1206,10 @@ fn spawn(record: &GatewayRecord, env: &GatewayEnv, log: File) -> std::io::Result
 // ── the gateway's log ───────────────────────────────────────────────────────
 
 fn log_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join(LOG_FILE))
+    Ok(tollgate_dir()?.join(LOG_FILE))
 }
 
-/// Hold `~/.clauth/gateway.log` under `daemon.log`'s size cap, once a step:
+/// Hold `~/.tollgate/gateway.log` under `daemon.log`'s size cap, once a step:
 /// the file takes shunt's per-request lines, so it passes the cap by at most
 /// one step's output. The trim rewrites the file in place, which the
 /// gateway's append-mode fds follow to the new end.
@@ -1221,7 +1221,7 @@ fn trim_log() {
 
 // ── the child marker ────────────────────────────────────────────────────────
 
-/// `~/.clauth/gateway-child.json`: the gateway a daemon spawned, so the next
+/// `~/.tollgate/gateway-child.json`: the gateway a daemon spawned, so the next
 /// daemon can tell its own orphan from a stranger on the same pid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChildMarker {
@@ -1236,7 +1236,7 @@ pub(crate) struct ChildMarker {
 }
 
 fn marker_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join(CHILD_MARKER_FILE))
+    Ok(tollgate_dir()?.join(CHILD_MARKER_FILE))
 }
 
 pub(crate) fn write_marker(marker: &ChildMarker) -> Result<()> {
@@ -1261,7 +1261,7 @@ fn remove_marker() {
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => logline!("clauth daemon: failed to remove {}: {e}", path.display()),
+        Err(e) => logline!("tollgate daemon: failed to remove {}: {e}", path.display()),
     }
 }
 
@@ -1327,7 +1327,7 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
 
 // ── the thread ──────────────────────────────────────────────────────────────
 
-/// The `clauth-gateway` thread and the way to end it.
+/// The `tollgate-gateway` thread and the way to end it.
 pub(crate) struct SupervisorThread {
     commands: Option<Sender<RunMessage>>,
     thread: Option<JoinHandle<()>>,
@@ -1366,7 +1366,7 @@ pub(crate) fn start(handle: GatewayHandle, _singleton: &DaemonLock) -> Result<Su
     let (commands, inbox) = mpsc::channel::<RunMessage>();
     let probe_sender = commands.clone();
     let thread = std::thread::Builder::new()
-        .name("clauth-gateway".into())
+        .name("tollgate-gateway".into())
         .spawn(move || run(supervisor, &inbox, probe_sender))
         .context("failed to spawn the gateway supervisor thread")?;
     Ok(SupervisorThread {
@@ -1404,7 +1404,7 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
         // finish and its answer is dropped with the channel.
         let addr = want.addr();
         if let Err(e) = std::thread::Builder::new()
-            .name("clauth-gateway-probe".into())
+            .name("tollgate-gateway-probe".into())
             .spawn({
                 let sender = probe.clone();
                 move || {
@@ -1413,7 +1413,9 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
             })
         {
             // No thread left: probe inline so the state machine still advances.
-            logline!("clauth daemon: cannot spawn the gateway probe thread ({e}); probing inline");
+            logline!(
+                "tollgate daemon: cannot spawn the gateway probe thread ({e}); probing inline"
+            );
             supervisor.apply(want, run_probe(addr));
             supervisor.publish();
             continue;
@@ -1534,13 +1536,13 @@ impl SupervisorThread {
             StopOutcome::Stopped => true,
             StopOutcome::Panicked => {
                 logline!(
-                    "clauth daemon: the shunt gateway supervisor panicked; the next daemon start finishes the stop"
+                    "tollgate daemon: the shunt gateway supervisor panicked; the next daemon start finishes the stop"
                 );
                 false
             }
             StopOutcome::MissedBudget => {
                 logline!(
-                    "clauth daemon: the shunt gateway did not stop within the {} s signal budget; the next daemon start finishes the stop",
+                    "tollgate daemon: the shunt gateway did not stop within the {} s signal budget; the next daemon start finishes the stop",
                     budget.as_secs()
                 );
                 false
@@ -1616,26 +1618,26 @@ pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorT
         Ok(signals) => signals,
         Err(e) => {
             logline!(
-                "clauth daemon: cannot catch the stop signals ({e}); the shunt gateway outlives this daemon, and the next start stops it"
+                "tollgate daemon: cannot catch the stop signals ({e}); the shunt gateway outlives this daemon, and the next start stops it"
             );
             return Some(supervisor);
         }
     };
     let spawned = std::thread::Builder::new()
-        .name("clauth-daemon-sig".into())
+        .name("tollgate-daemon-sig".into())
         .spawn(move || {
             let Some(signal) = signals.forever().next() else {
                 return;
             };
             supervisor.shutdown(DAEMON_STOP_BUDGET);
             if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
-                logline!("clauth daemon: cannot re-raise signal {signal}: {e}");
+                logline!("tollgate daemon: cannot re-raise signal {signal}: {e}");
             }
             std::process::exit(128 + signal);
         });
     if let Err(e) = spawned {
         logline!(
-            "clauth daemon: failed to spawn the signal watcher ({e}); the shunt gateway was stopped"
+            "tollgate daemon: failed to spawn the signal watcher ({e}); the shunt gateway was stopped"
         );
     }
     None

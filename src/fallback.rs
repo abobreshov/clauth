@@ -738,7 +738,7 @@ pub(crate) enum BlockedReason {
     /// a parseable `resets_at`.
     WeeklySpent { resets_in: Option<i64> },
     /// The messages limiter refused this member's 5h auto-start kick (switch-grade
-    /// — the same block the walk routes around): clauth can't bring it online
+    /// — the same block the walk routes around): tollgate can't bring it online
     /// regardless of its usage headroom. `lifts_in` is seconds to the limiter's
     /// advertised ceiling (an upper bound it usually undercuts).
     KickRejected { lifts_in: i64 },
@@ -834,7 +834,7 @@ pub(crate) fn health_blocked_reason(
             .and_then(|w| reset_secs(w, now));
         return Some(BlockedReason::WeeklySpent { resets_in });
     }
-    // Kick-rejected outranks the usage blocks: the limiter won't let clauth start
+    // Kick-rejected outranks the usage blocks: the limiter won't let tollgate start
     // this member at all, so its free/paid headroom is moot. Below weekly-hard
     // (days) because the kick block lifts within hours.
     if let Some(until) = kick_lift {

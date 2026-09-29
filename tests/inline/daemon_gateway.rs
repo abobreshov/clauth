@@ -130,13 +130,13 @@ fn fixture(state: GatewayState) -> (GatewaySlot, &'static str) {
                 config,
                 binary,
                 reason: Some(
-                    "in env file /etc/shunt/tokens.env: line 3 holds a NUL byte; systemd refuses such a file whole, and so does clauth: remove the byte"
+                    "in env file /etc/shunt/tokens.env: line 3 holds a NUL byte; systemd refuses such a file whole, and so does tollgate: remove the byte"
                         .to_string(),
                 ),
                 since,
                 ..blank(state)
             },
-            r#"{"state":"misconfigured","config":"/etc/shunt/shunt.toml","binary":"/usr/local/bin/shunt","port":null,"pid":null,"version":null,"answerer":null,"floor":"0.48.0","restarts":0,"last_exit":null,"reason":"in env file /etc/shunt/tokens.env: line 3 holds a NUL byte; systemd refuses such a file whole, and so does clauth: remove the byte","since":"2026-09-21T14:13:20+00:00"}"#,
+            r#"{"state":"misconfigured","config":"/etc/shunt/shunt.toml","binary":"/usr/local/bin/shunt","port":null,"pid":null,"version":null,"answerer":null,"floor":"0.48.0","restarts":0,"last_exit":null,"reason":"in env file /etc/shunt/tokens.env: line 3 holds a NUL byte; systemd refuses such a file whole, and so does tollgate: remove the byte","since":"2026-09-21T14:13:20+00:00"}"#,
         ),
         GatewayState::BinaryMissing => (
             GatewaySlot {
@@ -289,7 +289,12 @@ fn the_drain_bound_is_the_env_then_the_config_then_shunts_default() {
             "shunt's default",
         ),
         ("", None, 30, "an empty config"),
-        (with, Some("soon"), 3600, "an env value clauth cannot read"),
+        (
+            with,
+            Some("soon"),
+            3600,
+            "an env value tollgate cannot read",
+        ),
         (
             "[server]\nshutdown_timeout_seconds = \"soon\"\n",
             None,
@@ -399,7 +404,7 @@ fn without_a_supervisor_the_slot_reads_the_record_alone() {
 #[test]
 fn a_step_trims_an_oversized_gateway_log_to_its_tail() {
     let _home = HomeSandbox::new();
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     fs::create_dir_all(&dir).expect("dir");
     let log = dir.join("gateway.log");
     // 52,429 lines of 100 bytes: 5,242,900 bytes, 20 past the 5 MiB cap.
@@ -507,7 +512,7 @@ impl Rig {
             .lines
             .snapshot()
             .iter()
-            .filter(|line| line.starts_with("clauth daemon: started the shunt gateway (pid "))
+            .filter(|line| line.starts_with("tollgate daemon: started the shunt gateway (pid "))
             .count();
         let mut calls = Vec::new();
         stub::wait_until(
@@ -607,7 +612,7 @@ fn step_until(rig: &Rig, supervisor: &mut Supervised, tick: Tick, state: Gateway
 
 #[cfg(unix)]
 fn store_env(home: &std::path::Path) -> Vec<String> {
-    let root = home.join(".clauth").join("shunt");
+    let root = home.join(".tollgate").join("shunt");
     let accounts = root.join("accounts");
     vec![
         format!(
@@ -648,7 +653,7 @@ fn store_env(home: &std::path::Path) -> Vec<String> {
 
 #[cfg(unix)]
 #[test]
-fn a_first_step_spawns_one_gateway_with_every_store_under_clauth_and_reads_its_version() {
+fn a_first_step_spawns_one_gateway_with_every_store_under_tollgate_and_reads_its_version() {
     let rig = Rig::new("0.49.1");
     let mut supervisor = rig.supervisor();
     let t0 = t0();
@@ -687,7 +692,7 @@ fn a_first_step_spawns_one_gateway_with_every_store_under_clauth_and_reads_its_v
     );
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = fs::metadata(clauth_dir().expect("dir").join("gateway-child.json"))
+        let mode = fs::metadata(tollgate_dir().expect("dir").join("gateway-child.json"))
             .expect("marker")
             .permissions()
             .mode();
@@ -842,7 +847,7 @@ fn a_gateway_below_the_floor_is_stopped_and_held_until_its_binary_changes() {
     );
     assert!(
         rig.lines.snapshot().contains(&format!(
-            "clauth daemon: shunt 0.47.0 is older than 0.48.0, the oldest release clauth supervises; stopping the gateway it started (pid {pid})"
+            "tollgate daemon: shunt 0.47.0 is older than 0.48.0, the oldest release tollgate supervises; stopping the gateway it started (pid {pid})"
         )),
         "the refusal names both versions: {:?}",
         rig.lines.snapshot()
@@ -922,7 +927,11 @@ fn turning_disabled_on_stops_the_running_gateway_with_sigterm() {
             ..rig.described(GatewayState::Disabled)
         }
     );
-    assert_eq!(rig.calls().len(), 1, "a stop clauth asked for is no crash");
+    assert_eq!(
+        rig.calls().len(),
+        1,
+        "a stop tollgate asked for is no crash"
+    );
     assert_eq!(
         read_marker().expect("read"),
         None,
@@ -1002,7 +1011,7 @@ fn a_changed_binary_stops_the_running_gateway_once_and_spawns_the_new_one_once()
         "no backoff: the stop was asked for, and the kill is not a second SIGTERM"
     );
     let stop_line = format!(
-        "clauth daemon: stopping the shunt gateway (pid {}): its config, binary or env file changed",
+        "tollgate daemon: stopping the shunt gateway (pid {}): its config, binary or env file changed",
         first.pid
     );
     assert_eq!(
@@ -1068,7 +1077,7 @@ fn a_gateway_ignoring_sigterm_is_killed_at_its_drain_bound() {
     // Counted on the supervisor's own kill line: `kill -s 0` still answers
     // for a killed child nobody has reaped yet.
     let kill = format!(
-        "clauth daemon: the shunt gateway (pid {pid}) did not exit within 13s of SIGTERM; killing it"
+        "tollgate daemon: the shunt gateway (pid {pid}) did not exit within 13s of SIGTERM; killing it"
     );
     let kills = || rig.lines.snapshot().iter().filter(|l| **l == kill).count();
     supervisor.step(t0.after(Duration::from_millis(14_999)));
@@ -1309,7 +1318,7 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
 #[test]
 fn the_supervisor_thread_stops_its_gateway_on_shutdown_and_joins() {
     let rig = Rig::new("0.49.1");
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     let super::super::probe::Claim::Active(singleton) =
         super::super::probe::claim_singleton(&dir, false).expect("claim")
     else {
@@ -1332,8 +1341,8 @@ fn the_supervisor_thread_stops_its_gateway_on_shutdown_and_joins() {
 #[cfg(unix)]
 #[test]
 fn the_slot_never_carries_an_env_value_or_the_admin_token() {
-    let env_canary = "clauth-canary-gateway-env-7f3a";
-    let line_canary = "clauth-canary-gateway-line-7f3a";
+    let env_canary = "tollgate-canary-gateway-env-7f3a";
+    let line_canary = "tollgate-canary-gateway-line-7f3a";
     let rig = Rig::new("0.49.1");
     let token = crate::gateway::ensure_admin_token().expect("token");
     fs::write(&rig.env_file, format!("GATEWAY_TEST_SECRET={env_canary}\n")).expect("env file");
@@ -1383,7 +1392,7 @@ fn the_slot_never_carries_an_env_value_or_the_admin_token() {
     assert_eq!(
         slot.reason,
         Some(format!(
-            "in env file {}: line 2 holds a NUL byte; systemd refuses such a file whole, and so does clauth: remove the byte",
+            "in env file {}: line 2 holds a NUL byte; systemd refuses such a file whole, and so does tollgate: remove the byte",
             rig.env_file.display()
         ))
     );
@@ -1400,7 +1409,7 @@ fn the_slot_never_carries_an_env_value_or_the_admin_token() {
 #[test]
 fn a_shutdown_preempts_a_probe_and_stops_the_gateway_inside_the_budget() {
     let rig = Rig::new("0.49.1");
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     let super::super::probe::Claim::Active(singleton) =
         super::super::probe::claim_singleton(&dir, false).expect("claim")
     else {
@@ -1457,7 +1466,7 @@ fn a_shutdown_during_an_underway_stop_sends_no_second_sigterm() {
         rig.lines
             .snapshot()
             .iter()
-            .filter(|line| line.starts_with("clauth daemon: stopping the shunt gateway (pid "))
+            .filter(|line| line.starts_with("tollgate daemon: stopping the shunt gateway (pid "))
             .count(),
         1,
         "one stop line, not two"
@@ -1509,13 +1518,13 @@ fn a_foreign_version_with_a_newline_enters_the_log_through_debug() {
         }
     );
     let expected = format!(
-        "clauth daemon: port {} already answers /health (shunt {:?}); not starting the managed gateway beside it",
+        "tollgate daemon: port {} already answers /health (shunt {:?}); not starting the managed gateway beside it",
         rig.port, "0.49.1\nforged"
     );
     let snapshot = rig.lines.snapshot();
     let foreign_lines: Vec<&str> = snapshot
         .iter()
-        .filter(|line| line.starts_with("clauth daemon: port "))
+        .filter(|line| line.starts_with("tollgate daemon: port "))
         .map(|line| line.as_str())
         .collect();
     assert_eq!(
@@ -1542,7 +1551,7 @@ fn an_env_file_with_skipped_lines_says_which_once() {
     let call = rig.only_call();
     assert_eq!(call.secret, "from-env-file", "the good line still loads");
     let line = format!(
-        "clauth daemon: the gateway's env file {} assigns nothing on line(s) 2, 3 (systemd skips such lines too); the gateway runs without them",
+        "tollgate daemon: the gateway's env file {} assigns nothing on line(s) 2, 3 (systemd skips such lines too); the gateway runs without them",
         rig.env_file.display()
     );
     assert_eq!(
@@ -1655,7 +1664,7 @@ fn the_backoff_doubles_caps_at_a_minute_and_resets_after_a_healthy_minute() {
 }
 
 /// An unreadable or YAML record keeps a running gateway: it was started under
-/// a record that read, and that record's intent is the last one clauth knows.
+/// a record that read, and that record's intent is the last one tollgate knows.
 #[cfg(unix)]
 #[test]
 fn an_unreadable_record_keeps_a_healthy_gateway_running() {
@@ -1694,7 +1703,7 @@ fn an_unreadable_record_keeps_a_healthy_gateway_running() {
 fn the_run_loop_probes_a_starting_gateway_at_most_once_a_poll() {
     let rig = Rig::new("0.49.1");
     rig.touch("no-health");
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     let super::super::probe::Claim::Active(singleton) =
         super::super::probe::claim_singleton(&dir, false).expect("claim")
     else {
@@ -1740,7 +1749,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
     supervisor.step(t0);
     rig.only_call();
     let first_line = format!(
-        "clauth daemon: the gateway's env file {} assigns nothing on line(s) 2, 3 (systemd skips such lines too); the gateway runs without them",
+        "tollgate daemon: the gateway's env file {} assigns nothing on line(s) 2, 3 (systemd skips such lines too); the gateway runs without them",
         rig.env_file.display()
     );
     assert_eq!(
@@ -1771,7 +1780,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
     let calls = rig.calls();
     assert_eq!(calls.len(), 2, "respawned on the new env file: {calls:?}");
     let second_line = format!(
-        "clauth daemon: the gateway's env file {} assigns nothing on line(s) 2, 3 (systemd skips such lines too); the gateway runs without them",
+        "tollgate daemon: the gateway's env file {} assigns nothing on line(s) 2, 3 (systemd skips such lines too); the gateway runs without them",
         other.display()
     );
     assert_eq!(
@@ -1942,7 +1951,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
 fn a_shutdown_that_misses_its_budget_is_logged() {
     let rig = Rig::new("0.49.1");
     rig.save(|record| record.disabled = true);
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     let super::super::probe::Claim::Active(singleton) =
         super::super::probe::claim_singleton(&dir, false).expect("claim")
     else {
@@ -1960,7 +1969,7 @@ fn a_shutdown_that_misses_its_budget_is_logged() {
     );
     seam.release();
     let line = format!(
-        "clauth daemon: the shunt gateway did not stop within the {} s signal budget; the next daemon start finishes the stop",
+        "tollgate daemon: the shunt gateway did not stop within the {} s signal budget; the next daemon start finishes the stop",
         DAEMON_STOP_BUDGET.as_secs()
     );
     assert_eq!(
@@ -1978,7 +1987,7 @@ fn a_shutdown_that_misses_its_budget_is_logged() {
 fn a_supervisor_that_panics_is_logged_as_a_panic() {
     let rig = Rig::new("0.49.1");
     rig.save(|record| record.disabled = true);
-    let dir = clauth_dir().expect("dir");
+    let dir = tollgate_dir().expect("dir");
     let super::super::probe::Claim::Active(singleton) =
         super::super::probe::claim_singleton(&dir, false).expect("claim")
     else {
@@ -1997,7 +2006,7 @@ fn a_supervisor_that_panics_is_logged_as_a_panic() {
     assert_eq!(
         rig.lines.snapshot(),
         [
-            "clauth daemon: the shunt gateway supervisor panicked; the next daemon start finishes the stop"
+            "tollgate daemon: the shunt gateway supervisor panicked; the next daemon start finishes the stop"
         ],
         "the panic is logged as a panic, and nothing else is"
     );

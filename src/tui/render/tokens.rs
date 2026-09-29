@@ -8,7 +8,7 @@
 //! hour-of-day, and activity — so each metric reads on its own rather than as
 //! one long scroll. The **Models** master-detail (reached with `⏎`) drills into
 //! a single model. All figures are global across every model/provider Claude
-//! Code has run — the on-disk pool is shared across clauth profiles, not
+//! Code has run — the on-disk pool is shared across tollgate profiles, not
 //! per-account.
 //!
 //! Both views obey the [`TokenPeriod`] lens (`t` / action menu): `lifetime`

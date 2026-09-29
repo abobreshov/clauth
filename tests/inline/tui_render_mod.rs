@@ -328,13 +328,13 @@ fn all_tabs_render() {
     ] {
         app.tab = tab;
         app.config_focus = focus;
-        assert!(dump(&app, 90, 20).contains("clauth"));
+        assert!(dump(&app, 90, 20).contains("tollgate"));
     }
 
     app.tab = Tab::Status;
     app.status.focus = StatusFocus::Detail;
     let detail = dump(&app, 90, 20);
-    assert!(detail.contains("clauth"));
+    assert!(detail.contains("tollgate"));
     assert!(
         detail.contains("TIMELINE"),
         "detail timeline eyebrow renders"
@@ -1195,7 +1195,7 @@ fn empty_state_renders() {
     let mut app = App::new(config);
     for tab in Tab::ALL {
         app.tab = tab;
-        assert!(dump(&app, 90, 20).contains("clauth"));
+        assert!(dump(&app, 90, 20).contains("tollgate"));
     }
 }
 
@@ -1223,7 +1223,7 @@ fn banner_renders() {
     let screen = dump(&app, 90, 20);
     assert!(screen.contains("all accounts spent"), "banner text missing");
     assert!(
-        screen.contains("clauth"),
+        screen.contains("tollgate"),
         "header missing with banner active"
     );
 

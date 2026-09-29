@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(unsafe_code)]
 
-//! `delegate` recursion-guard coverage. With `CLAUTH_MCP_DEPTH >= 1` the delegate must
+//! `delegate` recursion-guard coverage. With `TOLLGATE_MCP_DEPTH >= 1` the delegate must
 //! short-circuit to an `is_error` envelope BEFORE any `claude` spawn (the
 //! fork-bomb cap). We assert the error envelope without faking a `claude` binary;
 //! the guard returns before `spawn_blocking`/`ProfileRuntime::acquire` runs.
@@ -9,7 +9,7 @@
 use super::*;
 use crate::testutil::HomeSandbox;
 
-/// Drive the async `delegate` tool with `CLAUTH_MCP_DEPTH = depth` on a current-thread
+/// Drive the async `delegate` tool with `TOLLGATE_MCP_DEPTH = depth` on a current-thread
 /// runtime, restoring the prior env value before returning.
 ///
 /// # Safety
@@ -47,7 +47,7 @@ fn run_with_depth_args(depth: &str, args: DelegateArgs) -> CallToolResult {
     // SAFETY: test-only, serialized by the lock above, restored unconditionally.
     unsafe { std::env::set_var(MCP_DEPTH_ENV, depth) };
 
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -157,12 +157,12 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         handoff: None,
     })
     .expect_err("a disabled target must be refused");
-    assert_eq!(err, "profile is disabled: off (run `clauth enable off`)");
+    assert_eq!(err, "profile is disabled: off (run `tollgate enable off`)");
 
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("off")
             .join("runtime")
@@ -173,7 +173,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
 
 /// The quarantine gate `switch` has always had, moved onto the spend path. A
 /// profile whose refresh token was rejected (AUTH-1) authenticates nothing, and
-/// clauth knows it from `AppState::auth_broken` without touching the network —
+/// tollgate knows it from `AppState::auth_broken` without touching the network —
 /// so the refusal is the SAME sentence `switch` refuses with, not a
 /// `claude exited with 1` after the window is already gone.
 ///
@@ -220,7 +220,7 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("quarantined")
             .join("runtime")
@@ -270,13 +270,13 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
     .expect_err("a keyless third-party target must be refused");
     assert_eq!(
         err,
-        "profile has no api key: ds-nokey (run `clauth login ds-nokey --api-key <key>`)"
+        "profile has no api key: ds-nokey (run `tollgate login ds-nokey --api-key <key>`)"
     );
 
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("ds-nokey")
             .join("runtime")
@@ -323,13 +323,13 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
     .expect_err("an empty-key third-party target must be refused");
     assert_eq!(
         err,
-        "profile has no api key: ds-empty (run `clauth login ds-empty --api-key <key>`)"
+        "profile has no api key: ds-empty (run `tollgate login ds-empty --api-key <key>`)"
     );
 
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("ds-empty")
             .join("runtime")
@@ -375,13 +375,13 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
     .expect_err("a whitespace-key third-party target must be refused");
     assert_eq!(
         err,
-        "profile has no api key: ds-space (run `clauth login ds-space --api-key <key>`)"
+        "profile has no api key: ds-space (run `tollgate login ds-space --api-key <key>`)"
     );
 
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("ds-space")
             .join("runtime")
@@ -428,13 +428,13 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
     .expect_err("a control-char key third-party target must be refused");
     assert_eq!(
         err,
-        "profile has no api key: ds-ctrl (run `clauth login ds-ctrl --api-key <key>`)"
+        "profile has no api key: ds-ctrl (run `tollgate login ds-ctrl --api-key <key>`)"
     );
 
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("ds-ctrl")
             .join("runtime")
@@ -554,13 +554,13 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
     .expect_err("a keyless Alibaba profile must be refused");
     assert_eq!(
         err,
-        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+        "profile has no api key: qwen (run `tollgate login qwen --api-key <key>`)"
     );
 
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("qwen")
             .join("runtime")
@@ -655,7 +655,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         resolve_fanout(&config, &raw).expect_err("a keyless member refuses the whole fan-out");
     assert_eq!(
         err,
-        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+        "profile has no api key: qwen (run `tollgate login qwen --api-key <key>`)"
     );
 }
 
@@ -707,7 +707,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         resolve_fanout(&config, &raw).expect_err("an empty-key member refuses the whole fan-out");
     assert_eq!(
         err,
-        "profile has no api key: ds-empty (run `clauth login ds-empty --api-key <key>`)"
+        "profile has no api key: ds-empty (run `tollgate login ds-empty --api-key <key>`)"
     );
 }
 
@@ -776,7 +776,10 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
 
     let raw = vec!["both".to_string()];
     let err = resolve_fanout(&config, &raw).expect_err("a disabled member refuses the fan-out");
-    assert_eq!(err, "profile is disabled: both (run `clauth enable both`)");
+    assert_eq!(
+        err,
+        "profile is disabled: both (run `tollgate enable both`)"
+    );
 }
 
 /// Gate ORDER, second pinned case: a target that is quarantined AND a keyless
@@ -810,7 +813,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
         .expect_err("a keyless third-party member refuses the whole fan-out");
     assert_eq!(
         err,
-        "profile has no api key: ds-both (run `clauth login ds-both --api-key <key>`)"
+        "profile has no api key: ds-both (run `tollgate login ds-both --api-key <key>`)"
     );
 }
 
@@ -823,7 +826,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
 ///
 /// The other two targets pin the ruling's SHAPE: the discriminator is whether
 /// inference runs on the account's own endpoint and credential, never whether
-/// clauth recognises the provider — so an unrecognised endpoint is admitted
+/// tollgate recognises the provider — so an unrecognised endpoint is admitted
 /// too, while an account holding nothing but the dead chain still refuses.
 /// Without both, a swap to `is_third_party` or `is_oauth` ships green while
 /// silently re-narrowing or widening what the gate admits.
@@ -867,7 +870,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         "and the pre-flight the blocking path and the backstop share admits it too",
     );
 
-    // The scope control: same state, endpoint clauth has no provider for.
+    // The scope control: same state, endpoint tollgate has no provider for.
     // Admitted for the same reason — the ruling is about whether inference
     // works, and provider recognition says nothing about that.
     crate::actions::create_blank_profile(
@@ -888,7 +891,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         .expect("profile");
     assert!(
         !generic.is_third_party(),
-        "fixture control: the endpoint must be one clauth has no provider for",
+        "fixture control: the endpoint must be one tollgate has no provider for",
     );
     assert_eq!(
         preflight_target(
@@ -987,14 +990,14 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
     .expect("create profile");
 
     // Pin the depth to 0: the host that runs this suite may itself be a
-    // delegate child (`CLAUTH_MCP_DEPTH=1`), which would refuse at the depth
+    // delegate child (`TOLLGATE_MCP_DEPTH=1`), which would refuse at the depth
     // guard before the fan-out guard this test pins.
     let saved = std::env::var(MCP_DEPTH_ENV).ok();
     // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
     // restored unconditionally below.
     unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
 
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -1046,7 +1049,7 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
     assert_eq!(
         text,
         "delegate failed: profile has no api key: vendor \
-         (run `clauth login vendor --api-key <key>`)",
+         (run `tollgate login vendor --api-key <key>`)",
         "the refusal names the keyless profile, what it lacks, and the fix",
     );
     let job_count = jobs::jobs_dir()
@@ -1067,9 +1070,9 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
 //      gets a fresh token chain only after the live watchdog reconciles.
 //   3. happy path: a valid prompt returns `{is_error:false, result, ...}` parsed
 //      from `claude -p --output-format stream-json --verbose
-//      --include-partial-messages`, and the child inherits `CLAUTH_MCP_DEPTH=1`
+//      --include-partial-messages`, and the child inherits `TOLLGATE_MCP_DEPTH=1`
 //      + `--strict-mcp-config`, and every stream line's `session_id` equals the
-//      `--session-id` the spawn passed and `CLAUTH_DELEGATE_SESSION_ID` names.
+//      `--session-id` the spawn passed and `TOLLGATE_DELEGATE_SESSION_ID` names.
 //   4. idle kill + salvage: the idle guard fires on stream SILENCE — no stdout
 //      line for `idle_secs`, counted per line by `read_stdout` — so a child stuck
 //      in a long tool call is NOT idle. Measured 2026-08-25: a foreground
@@ -1102,14 +1105,14 @@ fn delegate_env_strips_inherited_provider_routing() {
             "{key} must be stripped from the inherited env",
         );
     }
-    // clauth's own keys are always set.
+    // tollgate's own keys are always set.
     assert_eq!(
         envs.get("CLAUDE_CONFIG_DIR"),
         Some(&Some("/cfg".to_string()))
     );
-    assert_eq!(envs.get("CLAUTH_MCP_DEPTH"), Some(&Some("1".to_string())));
+    assert_eq!(envs.get("TOLLGATE_MCP_DEPTH"), Some(&Some("1".to_string())));
     assert_eq!(
-        envs.get("CLAUTH_DELEGATE_SESSION_ID"),
+        envs.get("TOLLGATE_DELEGATE_SESSION_ID"),
         Some(&Some("sid-1".to_string())),
         "the delegate's own session id is exported for hook exemptions",
     );
@@ -1143,7 +1146,7 @@ fn delegate_env_strips_active_profile_custom_env() {
 }
 
 #[test]
-fn delegate_env_caller_reauthority_and_clauth_keys_win() {
+fn delegate_env_caller_reauthority_and_tollgate_keys_win() {
     let mut caller = HashMap::new();
     // a caller may deliberately re-route by re-adding a stripped key,
     caller.insert(
@@ -1151,10 +1154,10 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         "https://example.test".to_string(),
     );
     // must NOT be able to defeat the depth guard,
-    caller.insert("CLAUTH_MCP_DEPTH".to_string(), "0".to_string());
+    caller.insert("TOLLGATE_MCP_DEPTH".to_string(), "0".to_string());
     // nor hijack the exemption marker onto another session,
     caller.insert(
-        "CLAUTH_DELEGATE_SESSION_ID".to_string(),
+        "TOLLGATE_DELEGATE_SESSION_ID".to_string(),
         "spoofed-session".to_string(),
     );
     // and a caller-set max-tokens is respected, not overwritten by the default.
@@ -1180,7 +1183,7 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         "a caller can re-add a stripped routing key deliberately",
     );
     assert_eq!(
-        envs.get("CLAUTH_MCP_DEPTH"),
+        envs.get("TOLLGATE_MCP_DEPTH"),
         Some(&Some("1".to_string())),
         "the depth guard always wins over a caller value",
     );
@@ -1190,7 +1193,7 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         "a caller-set max-tokens is not clobbered by the default",
     );
     assert_eq!(
-        envs.get("CLAUTH_DELEGATE_SESSION_ID"),
+        envs.get("TOLLGATE_DELEGATE_SESSION_ID"),
         Some(&Some("sid-9".to_string())),
         "the session-id marker always wins over a caller value",
     );
@@ -1376,7 +1379,7 @@ fn seed_running(job_id: &str, profile: &str, started_at: u64) {
 /// inner entry, because an in-process test cannot construct a
 /// `Peer<RoleServer>`.
 fn call_monitor_args(args: MonitorArgs) -> CallToolResult {
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -1503,7 +1506,7 @@ fn a_running_check_on_a_third_party_target_reports_that_accounts_own_figures() {
     );
     assert!(
         !text.contains("quota: usage unknown"),
-        "clauth holds this account's figures, so nothing here is unknown: {text}",
+        "tollgate holds this account's figures, so nothing here is unknown: {text}",
     );
 }
 
@@ -1513,7 +1516,7 @@ fn a_running_check_on_a_third_party_target_reports_that_accounts_own_figures() {
 /// figures are on disk and every MCP surface must read them — the check's quota
 /// and the folded live-usage clause both.
 #[test]
-fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
+fn a_generic_api_key_target_answers_with_the_figures_tollgate_holds() {
     let _home = HomeSandbox::new();
     crate::profile::save_profile(&crate::profile::Profile::new(
         "litellm".to_string(),
@@ -1599,7 +1602,7 @@ fn an_env_authored_endpoint_qualifies_the_cost_clause() {
 /// The fail-safe arm, driven through the real read rather than a hand-built
 /// payload: a name whose profile config cannot be read at all is `Unknown`,
 /// never `Anthropic`. It earns the qualifier — and its OWN qualifier, because
-/// `not this endpoint's` would assert an endpoint clauth never saw.
+/// `not this endpoint's` would assert an endpoint tollgate never saw.
 #[test]
 fn an_unreadable_profile_config_prices_as_endpoint_unknown() {
     let _home = HomeSandbox::new();
@@ -2107,14 +2110,14 @@ fn a_heartbeat_reaches_a_running_check() {
 /// Finding 4: `JobRecord` stored neither deadline, so a poll could not say how
 /// close the run sat to either kill. Both are recorded at reserve time now — and
 /// a run with the idle leg off must read as HAVING no idle deadline, never as
-/// clauth having lost the figure.
+/// tollgate having lost the figure.
 ///
 /// The first arm is the only CROSS-VERSION pin in this file, and it is not a
-/// hypothetical: `(3600, Some(300))` is exactly what every clauth before the
+/// hypothetical: `(3600, Some(300))` is exactly what every tollgate before the
 /// wall clock came out wrote for a default `delegate({background: true})` —
 /// `resolve_deadlines` defaulted a streaming run to 3600 and
 /// `reserve_background_job` stored it beside `idle_secs: Some(300)`. Those files
-/// sit in `~/.clauth/jobs/` on any box that ran one, and a post-update server
+/// sit in `~/.tollgate/jobs/` on any box that ran one, and a post-update server
 /// reads and renders them, so the pair has to keep rendering both countdowns.
 /// Today's reserve cannot emit it — that shape is
 /// `a_run_with_no_wall_clock_still_reports_its_idle_countdown_and_tail` — so do
@@ -2141,7 +2144,7 @@ fn both_deadlines_reach_a_running_check() {
         "with no output yet the idle clock has run since the start: {text}",
     );
 
-    // A caller-pinned `--output-format` turns the idle leg off, so clauth knows
+    // A caller-pinned `--output-format` turns the idle leg off, so tollgate knows
     // there IS no such deadline.
     jobs::write_running(&jobs::RunningSpec {
         started_at,
@@ -2955,7 +2958,7 @@ fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .expect("refusal text"),
-        "error: unknown job_id: d-pin-unknown-0 — clauth never minted it (a real id reads \
+        "error: unknown job_id: d-pin-unknown-0 — tollgate never minted it (a real id reads \
          `d-<base36-ms>-<counter>`); check the id `delegate` handed back"
     );
 
@@ -3136,7 +3139,7 @@ fn background_depth_guard_refuses_without_writing_job() {
     // restored unconditionally below.
     unsafe { std::env::set_var(MCP_DEPTH_ENV, "1") };
 
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -3244,7 +3247,7 @@ fn parse_envelope_errors_on_unparseable_output() {
 /// wording rewrite stays free.
 #[test]
 fn the_session_id_description_discloses_the_env_split() {
-    let tools = ClauthServer::new().tool_router.list_all();
+    let tools = TollgateServer::new().tool_router.list_all();
     let delegate = tools
         .iter()
         .find(|t| t.name == "delegate")
@@ -3912,7 +3915,7 @@ fn an_abandoned_blocking_fanout_hands_every_member_off() {
         );
         let job_file = home
             .home()
-            .join(".clauth/jobs")
+            .join(".tollgate/jobs")
             .join(format!("{}.json", member.job_id));
         assert!(
             job_file.exists(),
@@ -4222,7 +4225,7 @@ fn an_unknown_job_id_names_which_cause_it_was() {
     for reason in [&aged_word, &fresh_word] {
         assert!(
             reason.contains("never have minted it") && reason.contains("d-<base36-ms>-<counter>"),
-            "an id clauth may never have minted is never told it had one: {reason}",
+            "an id tollgate may never have minted is never told it had one: {reason}",
         );
     }
 
@@ -4253,7 +4256,7 @@ fn an_unknown_id_with_a_delivery_on_record_names_the_delivery() {
     jobs::write_delivery_ledger_for_test(&hooked, jobs::Claimant::Hook, now - 900);
     let reason = unknown_job_reason(&hooked, now);
     assert!(
-        reason.contains("delivered by clauth's auto-delivery hook"),
+        reason.contains("delivered by tollgate's auto-delivery hook"),
         "the hook delivery is named: {reason}"
     );
     assert!(
@@ -4783,9 +4786,9 @@ fn a_pinned_output_format_is_captured_as_one_document() {
 
 // ── bare-session marker gate ─────────────────────────────────────────────────
 
-/// A `clauth mcp` reading the GLOBAL credentials is the MCP half of a bare
+/// A `tollgate mcp` reading the GLOBAL credentials is the MCP half of a bare
 /// `claude`; every isolated tier reads its own `.credentials.json` — a supervised
-/// `clauth start` session (already registered) or a `delegate` child (which gets
+/// `tollgate start` session (already registered) or a `delegate` child (which gets
 /// `CLAUDE_CONFIG_DIR` in the same builder as its depth marker).
 #[test]
 fn only_a_globally_authenticated_server_registers_a_bare_marker() {
@@ -4799,7 +4802,7 @@ fn only_a_globally_authenticated_server_registers_a_bare_marker() {
     assert!(!bare_marker_wanted(&SessionAuth::IsolatedCustom, false));
 }
 
-/// The Plugin tab's `r` handshake boots a real `clauth mcp` child. Without the
+/// The Plugin tab's `r` handshake boots a real `tollgate mcp` child. Without the
 /// marker its 3s life would land on the tally as a session nobody is running —
 /// and the probe inherits no `CLAUDE_CONFIG_DIR` of its own to be caught by.
 #[test]
@@ -4827,7 +4830,7 @@ fn the_plugin_probes_own_child_registers_no_bare_marker() {
 /// description: a pinned phrase would otherwise red purely for spanning a line
 /// break. The pins built on this assert content, not layout.
 fn tool_entry_text(name: &str) -> String {
-    let tools = ClauthServer::new().tool_router.list_all();
+    let tools = TollgateServer::new().tool_router.list_all();
     let tool = tools
         .iter()
         .find(|t| t.name == name)
@@ -4975,7 +4978,7 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         //
         // The reply-shape facts. No parameter owns them, so the description is
         // the only half that can carry them, and without them the largest
-        // payload clauth puts in front of a model arrives unexplained.
+        // payload tollgate puts in front of a model arrives unexplained.
         //
         // These are the words `profile_line` RENDERS, not the JSON keys behind
         // them: `format` was deleted from every tool in slice 1, so every
@@ -5918,7 +5921,7 @@ fn a_mid_run_401_invalid_names_the_key_dead_and_the_fix() {
     assert!(
         reason.contains("naming the api key invalid")
             && reason.contains("dropped this account's cached balance")
-            && reason.contains("clauth login work --api-key"),
+            && reason.contains("tollgate login work --api-key"),
         "the failure names the key dead, the invalidation, and the fix: {reason}"
     );
     assert!(
@@ -6022,7 +6025,7 @@ fn record_dead_key_drops_the_balance_cache_and_records_the_fingerprint_verdict()
 }
 
 /// Finding 13, the non-zero-exit half. The account's window is spent whether or
-/// not clauth keeps the output, so a crash after six kilobytes of answer must
+/// not tollgate keeps the output, so a crash after six kilobytes of answer must
 /// not hand back a bare stderr string with the text and the resume handle
 /// sitting in locals two lines away.
 ///
@@ -6119,7 +6122,7 @@ fn an_unparseable_envelope_still_hands_back_what_the_run_produced() {
     );
 }
 
-/// Row 2's demanded shape: every completion arm carries the session id clauth
+/// Row 2's demanded shape: every completion arm carries the session id tollgate
 /// PINNED at the spawn — the child runs under it by `--session-id`/`--resume`,
 /// so it is the run's own id, never a guess — even when no streamed event ever
 /// named one (a pinned-format run, a run dead before its first event, an
@@ -6168,7 +6171,7 @@ fn every_completion_arm_stamps_the_pinned_session_id() {
         !envelope["result"]
             .as_str()
             .expect("reason")
-            .contains("no session id ever reached clauth"),
+            .contains("no session id ever reached tollgate"),
         "the reason never denies a handle the stamp just attached: {envelope}"
     );
 
@@ -6828,7 +6831,7 @@ fn a_refused_job_ids_list_cancels_nothing() {
 
 /// An id that could never name a job file is not an unheld job. It used to get
 /// the two-cause hedge prepended to its own structural refusal, which reads as
-/// though clauth went looking for it.
+/// though tollgate went looking for it.
 #[test]
 fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
     let _home = HomeSandbox::new();
@@ -6905,7 +6908,7 @@ fn a_reserved_job_is_cancellable_before_its_task_starts() {
 }
 
 /// A run with no id used to land in the isolated-transcript arm and be told its
-/// transcript was lost to auto-rescue — two things clauth did not observe. The
+/// transcript was lost to auto-rescue — two things tollgate did not observe. The
 /// id is the whole question now, and the answer to "no id" is still its own
 /// absence rather than a claim about a transcript nobody saw.
 #[test]
@@ -6919,7 +6922,7 @@ fn a_run_with_no_session_never_claims_a_lost_transcript() {
     let reason = envelope["result"].as_str().expect("reason");
     assert!(
         !reason.contains("auto-rescue") && !reason.contains("isolated runtime"),
-        "clauth saw no transcript and no session, so it asserts neither: {reason}"
+        "tollgate saw no transcript and no session, so it asserts neither: {reason}"
     );
     assert!(
         reason.contains("no resume handle"),
@@ -7206,7 +7209,7 @@ fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
     assert!(
         !home
             .home()
-            .join(".clauth")
+            .join(".tollgate")
             .join("profiles")
             .join("work")
             .join("runtime-isolated")
@@ -7567,7 +7570,7 @@ fn monitor_cannot_collect_a_blocking_run_under_either_spelling() {
     ] {
         assert!(
             !own.contains(false_clause),
-            "`{false_clause}` is false for an id clauth is holding a live run \
+            "`{false_clause}` is false for an id tollgate is holding a live run \
              under: {own}",
         );
     }
@@ -8371,7 +8374,7 @@ fn a_live_delegate_is_never_evicted_by_a_burst_of_finished_ones() {
     assert_eq!(
         &cli[..2],
         ["d-fresh-0".to_string(), "d-handedoff-0".to_string()],
-        "`clauth jobs` bands the same way: {cli:?}"
+        "`tollgate jobs` bands the same way: {cli:?}"
     );
     assert_eq!(cli.len(), 12, "and caps nothing: {cli:?}");
 }
@@ -8547,7 +8550,7 @@ fn the_state_mode_lists_a_handed_off_jobs_id() {
     let text = monitor_state_text();
 
     assert!(
-        text.contains("delegates clauth holds:"),
+        text.contains("delegates tollgate holds:"),
         "the listing labels itself: {text}"
     );
     assert_eq!(
@@ -8731,7 +8734,7 @@ fn an_id_keyed_monitor_call_cannot_reach_what_the_listing_shows() {
     }
 }
 
-/// `clauth jobs` and `monitor`'s listing report ONE store, in one order.
+/// `tollgate jobs` and `monitor`'s listing report ONE store, in one order.
 ///
 /// Both read it through `jobs::list_banded` and classify with
 /// `StoredJob::phase`, so the only way they can disagree about a record is if
@@ -8748,7 +8751,7 @@ fn an_id_keyed_monitor_call_cannot_reach_what_the_listing_shows() {
 ///
 /// What it does NOT claim is that the two always see the same SET of files.
 /// `serve()` sweeps orphaned `running` records at startup, so a long-dead one an
-/// operator still sees in `clauth jobs` — a fresh process that sweeps nothing —
+/// operator still sees in `tollgate jobs` — a fresh process that sweeps nothing —
 /// can already be gone by the time a model asks the server. That is the sweep's
 /// doing, not a second reader's, and this test drives `monitor_with` directly,
 /// which runs no sweep at all.
@@ -8811,14 +8814,14 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
 
     for phrase in [
         "Without `job_ids`",
-        // The object, not the verb. M12 rewrote `list the delegates clauth
+        // The object, not the verb. M12 rewrote `list the delegates tollgate
         // holds` as `lists ...` and this pin redded over the `s`; what the pin
         // exists for is WHICH set gets listed, so it holds the noun phrase and
         // leaves the sentence free. Same lesson as `ignored` -> `dropped` on
         // `delegate`. The leading `the ` went the same way 2026-08-20, over
-        // `lists at most 10 delegates clauth holds` — third reword, same pin,
+        // `lists at most 10 delegates tollgate holds` — third reword, same pin,
         // so the needle now holds only the words that name the set.
-        "delegates clauth holds",
+        "delegates tollgate holds",
         // What it puts FIRST, which is what a caller hunting an id needs and
         // what the rows actually do since they band.
         "live runs first",
@@ -8850,7 +8853,7 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
     // Lowercased first: a case-sensitive ban passed a mutant that appended
     // "Every delegate is listed." to the description, and sentence-initial is
     // exactly where this shape lands — `profiles`' own description opens "Every
-    // clauth account" one screen up.
+    // tollgate account" one screen up.
     //
     // The limit, recorded rather than papered over: a ban list transfers only
     // to the tokens it names, so `each delegate`, `the full set` and `nothing
@@ -8926,7 +8929,7 @@ fn the_refusal_tells_a_codex_name_apart_from_an_unknown_one() {
     let real = profile_not_found_cross_harness("cx", ProfileNotFoundFix::CallProfiles);
     assert!(real.contains("CODEX account"), "{real}");
     assert!(
-        real.contains("Switch it with `clauth <name>`"),
+        real.contains("Switch it with `tollgate <name>`"),
         "the fix names the surface that CAN: {real}"
     );
 
@@ -8966,7 +8969,7 @@ fn switch_profile_refuses_a_codex_name_as_a_codex_account() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx"]);
 
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
@@ -8988,13 +8991,13 @@ fn switch_profile_refuses_a_codex_name_as_a_codex_account() {
     assert_eq!(
         first_line("cx"),
         "switch failed: profile not found: cx; cx names a CODEX account, which these tools \
-         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         do not manage — they are Claude Code only. Switch it with `tollgate <name>`; \
          active profile none"
     );
     assert_eq!(
         first_line("CX"),
         "switch failed: profile not found: CX; cx names a CODEX account, which these tools \
-         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         do not manage — they are Claude Code only. Switch it with `tollgate <name>`; \
          active profile none"
     );
 }
@@ -9019,6 +9022,6 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
     assert_eq!(
         err,
         "profile not found: cx; cx names a CODEX account, which these tools do not manage — \
-         they are Claude Code only. Switch it with `clauth <name>`"
+         they are Claude Code only. Switch it with `tollgate <name>`"
     );
 }

@@ -365,7 +365,7 @@ impl PlanTier {
             Some("team") | Some("teams") => PlanTier::Team,
             Some("enterprise") => PlanTier::Enterprise,
             // `login_profile_from_raw` mints this token for a `Free` account, so
-            // without the arm clauth fails to read back its own write.
+            // without the arm tollgate fails to read back its own write.
             Some("free") => PlanTier::Free,
             _ => PlanTier::Unknown,
         }
@@ -474,12 +474,12 @@ pub(crate) struct UsageInfo {
     /// Banked reset credits (`rate_limit_reset_credits.available_count`): passes
     /// the account can spend to reopen a window early. Rides the same response,
     /// so it costs no extra request. The poll only reads the count; spending one
-    /// is `clauth limit-reset` ([`crate::usage::codex_reset`]), run by the operator.
+    /// is `tollgate limit-reset` ([`crate::usage::codex_reset`]), run by the operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_reset_credits: Option<i64>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only
     /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
-    /// `mark_window_open`): a history line carrying it is clauth's own durable
+    /// `mark_window_open`): a history line carrying it is tollgate's own durable
     /// record of that kick, and the auto-start queue confirms the window on it.
     /// Wire parses carry `None`; the one wire-written line that carries a stamp
     /// is a lagging-tick merge forwarding the kick's own, so the marker still
@@ -1201,10 +1201,10 @@ fn fetch_profile_plan(
     if let Some(tier) = raw_rate_limit_tier(&p) {
         match crate::profile::stamp_rate_limit_tier_if_missing(name, access_token, &tier) {
             Ok(true) => {
-                logline!("clauth: {name}: backfilled the rate-limit tier into the stored chain");
+                logline!("tollgate: {name}: backfilled the rate-limit tier into the stored chain");
             }
             Ok(false) => {}
-            Err(e) => logline!("clauth: {name}: rate-limit tier backfill failed: {e:#}"),
+            Err(e) => logline!("tollgate: {name}: rate-limit tier backfill failed: {e:#}"),
         }
     }
     Some(plan_from_profile(&p))
@@ -1283,7 +1283,7 @@ pub(crate) fn fetch_raw(
 /// `oauth::try_adopt_live_rotation` cannot prove a diverged live login is the
 /// same account once the stored pair is fully dead — the profile wedges in
 /// `auth_broken` even when the live session holds a healthy fresher pair
-/// (observed 2026-07-09). Write-if-missing only: `clauth login` remains the
+/// (observed 2026-07-09). Write-if-missing only: `tollgate login` remains the
 /// authoritative (re)seeder, and a blank uuid is shape drift, never an
 /// identity (same contract as [`fetch_account_uuid`]).
 ///
@@ -1393,7 +1393,7 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
     Ok(login_profile_from_raw(p))
 }
 
-/// Seed a profile's identity anchor from a completed `clauth login`. UNCONDITIONAL
+/// Seed a profile's identity anchor from a completed `tollgate login`. UNCONDITIONAL
 /// overwrite, unlike [`seed_identity_anchor`]'s write-if-missing ride-along: this
 /// is the authoritative (re)seeder, so a reauth that swaps a DIFFERENT account
 /// onto the name must replace the old anchor rather than keep proving the old

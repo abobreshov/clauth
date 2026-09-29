@@ -1,15 +1,15 @@
-//! `clauth which [--json]` — identify which stored profile owns the OAuth
+//! `tollgate which [--json]` — identify which stored profile owns the OAuth
 //! tokens in the credentials.json currently loaded by Claude Code.
 //!
 //! Resolution: (1) match the loaded file's `refreshToken` against each stored
-//! profile's `refreshToken` — the clauth symlink layout keeps the live file
+//! profile's `refreshToken` — the tollgate symlink layout keeps the live file
 //! and the matching profile's file byte-identical across rotations. (1b) When
 //! the loaded file carries NO refresh token, match its `accessToken` against
 //! each profile's long-lived session-token sidecar (CLA-SPLIT): that is what a
 //! switch installs for such a profile, and both things a sidecar can hold — a
 //! `claude setup-token` mint, or a rolling stamp (CLA-ROLL) — carry no refresh
 //! token by construction, so tier 1 can never see either. (2) Inside
-//! a `clauth start` runtime, fall back to the profile named by
+//! a `tollgate start` runtime, fall back to the profile named by
 //! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime-<sid>`, or a bare
 //! `profiles/<name>/runtime` where the tree is shared): a runtime tree belongs
 //! to exactly one profile, so that profile owns the session even before its
@@ -17,7 +17,7 @@
 //! (an API-key/endpoint profile, whose creds file is absent after a switch, or
 //! a fresh OAuth login not yet snapshotted).
 //!
-//! Path: honors `CLAUDE_CONFIG_DIR` (the same env var `clauth start` sets) so
+//! Path: honors `CLAUDE_CONFIG_DIR` (the same env var `tollgate start` sets) so
 //! a status line running inside an isolated session finds the right file.
 
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub(crate) enum Source {
     /// Exact `accessToken` match against a profile's long-lived session-token
     /// sidecar — the credential a switch installs for a CLA-SPLIT profile.
     SessionTokenMatch,
-    /// Profile named by a `clauth start` runtime `CLAUDE_CONFIG_DIR`.
+    /// Profile named by a `tollgate start` runtime `CLAUDE_CONFIG_DIR`.
     SessionDir,
     /// Fresh first-login attributed to the credential-less active profile.
     CredentialLessActive,
@@ -57,12 +57,12 @@ pub(crate) fn run(json: bool) -> Result<()> {
     // The codex arm, OUTRANKED by a claude session-dir claim: env vars
     // inherit, so a claude session started from inside a codex session
     // carries the ancestor's CODEX_HOME — but its own CLAUDE_CONFIG_DIR names
-    // a clauth runtime, which is this process's identity. Only when no clauth
-    // claude runtime claims the asker does a clauth-shaped CODEX_HOME answer.
-    // And a clauth-SHAPED home answers or answers unknown — never falls
+    // a tollgate runtime, which is this process's identity. Only when no tollgate
+    // claude runtime claims the asker does a tollgate-shaped CODEX_HOME answer.
+    // And a tollgate-SHAPED home answers or answers unknown — never falls
     // through: the claude tiers below would attribute a codex session to
     // whatever the GLOBAL ~/.claude credentials resolve to, a different
-    // harness's answer entirely. A CODEX_HOME that is not a clauth codex home
+    // harness's answer entirely. A CODEX_HOME that is not a tollgate codex home
     // (the operator's own ~/.codex) says nothing and falls through.
     if !claude_session_dir_claims_this_process() {
         match codex_session_profile() {
@@ -111,7 +111,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether this process's `CLAUDE_CONFIG_DIR` names a clauth claude runtime —
+/// Whether this process's `CLAUDE_CONFIG_DIR` names a tollgate claude runtime —
 /// the strongest identity claim there is, and the tie-break against an
 /// inherited `CODEX_HOME`.
 fn claude_session_dir_claims_this_process() -> bool {
@@ -124,12 +124,12 @@ fn claude_session_dir_claims_this_process() -> bool {
 /// deliberately distinct: only [`CodexClaim::NotACodexHome`] may fall through
 /// to the claude tiers.
 enum CodexClaim {
-    /// A clauth codex home whose profile the roster holds.
+    /// A tollgate codex home whose profile the roster holds.
     Member(String),
-    /// Shaped like a clauth codex home, but the roster misses the name or
+    /// Shaped like a tollgate codex home, but the roster misses the name or
     /// could not be read — fail closed, never attribute.
     UnknownHome,
-    /// Not a clauth codex home at all (unset, empty, or foreign).
+    /// Not a tollgate codex home at all (unset, empty, or foreign).
     NotACodexHome,
 }
 
@@ -157,8 +157,8 @@ fn codex_session_profile_at(home: &Path) -> CodexClaim {
     }
 }
 
-/// Extract the `<name>` from a clauth codex home path
-/// (`~/.clauth/profiles/<name>/codex-home[-<sid>]`). Returns `None` for any
+/// Extract the `<name>` from a tollgate codex home path
+/// (`~/.tollgate/profiles/<name>/codex-home[-<sid>]`). Returns `None` for any
 /// other shape — the structural twin of [`session_profile_from_config_dir`],
 /// answering off the same predicate the perms sweep asks
 /// ([`crate::runtime::is_codex_home_path`]) so the two can never disagree
@@ -192,7 +192,7 @@ fn codex_json_view(name: &str) -> serde_json::Value {
 
 /// Gather the session env + loaded credentials and resolve them to the owning
 /// profile, returning an owned name plus the branch that matched, or `None` when
-/// nothing matched. Shared by `clauth which` and the MCP `which` tool.
+/// nothing matched. Shared by `tollgate which` and the MCP `which` tool.
 pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
     resolve_at(config, session_config_dir().as_deref())
 }
@@ -227,7 +227,7 @@ pub(crate) fn active_credentials_path() -> Option<PathBuf> {
 ///
 /// That env var describes the process asking, so [`resolve_active`] is the wrong
 /// question for attributing a DIFFERENT process's credentials: a TUI running
-/// inside a `clauth start` session would claim every bare `claude` on the box for
+/// inside a `tollgate start` session would claim every bare `claude` on the box for
 /// its own runtime profile.
 pub(crate) fn resolve_global(config: &AppConfig) -> Option<(String, Source)> {
     resolve_at(config, None)
@@ -252,22 +252,22 @@ fn resolve_at(config: &AppConfig, config_dir: Option<&Path>) -> Option<(String, 
 }
 
 /// How this session reads its credentials, used to explain what `switch` does to
-/// *it*. The session's config dir is the discriminator: a `clauth start` runtime
+/// *it*. The session's config dir is the discriminator: a `tollgate start` runtime
 /// and a custom `CLAUDE_CONFIG_DIR` each read their own `.credentials.json`, which
 /// a global relink never touches; only a session on the global `~/.claude/` reads
 /// the very file `switch` repoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionAuth {
-    /// `clauth start <name>` runtime — pinned to its own creds; a global switch can't reach it.
+    /// `tollgate start <name>` runtime — pinned to its own creds; a global switch can't reach it.
     IsolatedRuntime(String),
-    /// A non-clauth `CLAUDE_CONFIG_DIR` — reads its own creds; a global switch can't reach it.
+    /// A non-tollgate `CLAUDE_CONFIG_DIR` — reads its own creds; a global switch can't reach it.
     IsolatedCustom,
     /// No `CLAUDE_CONFIG_DIR` — reads the global `~/.claude/` creds that `switch` repoints.
     Global,
 }
 
 /// Classify the current session's credential source from `CLAUDE_CONFIG_DIR` (the
-/// same env `clauth start` sets). An empty value is treated as unset.
+/// same env `tollgate start` sets). An empty value is treated as unset.
 pub(crate) fn session_auth() -> SessionAuth {
     let claude_dir = crate::profile::claude_dir().ok();
     session_auth_for(
@@ -318,8 +318,8 @@ fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Extract the `<name>` from a `clauth start` runtime path
-/// (`~/.clauth/profiles/<name>/runtime-<sid>`, or a legacy bare `runtime`).
+/// Extract the `<name>` from a `tollgate start` runtime path
+/// (`~/.tollgate/profiles/<name>/runtime-<sid>`, or a legacy bare `runtime`).
 /// Returns `None` for any other shape, an isolated runtime included: that tier
 /// has never covered the isolated flavor, and an isolated session's stored creds
 /// are already reached by the credential matches above (`refreshToken`, or the
@@ -348,7 +348,7 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
 /// attributed, no matter which tier matched it — including a stale token
 /// match against creds that predate the disable (a disabled profile's stored
 /// files are left untouched on disk, so its old refresh token can still sit
-/// there). Shared by `clauth which`, the MCP `which` tool, and the bare-session
+/// there). Shared by `tollgate which`, the MCP `which` tool, and the bare-session
 /// tally via [`resolve_at`], the only caller of this function.
 fn resolve_profile<'a>(
     config: &'a AppConfig,
@@ -373,12 +373,12 @@ fn resolve_profile<'a>(
 /// Resolve loaded credentials to a stored profile.
 ///
 /// Order: (1) exact refresh-token match; (1b) exact session-token match for a
-/// refresh-token-less login; (2) inside a `clauth start` runtime,
+/// refresh-token-less login; (2) inside a `tollgate start` runtime,
 /// the profile named by `CLAUDE_CONFIG_DIR` owns the session even before its
 /// first login is stored; (3) for a non-runtime caller, the credential-less
 /// active profile (API-key/endpoint, or a fresh login not yet snapshotted).
 ///
-/// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets steps 1/1b only — its
+/// A `CLAUDE_CONFIG_DIR` that isn't a tollgate runtime gets steps 1/1b only — its
 /// credentials don't belong to the global active profile.
 fn resolve_profile_candidate<'a>(
     config: &'a AppConfig,

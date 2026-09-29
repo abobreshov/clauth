@@ -117,7 +117,7 @@ impl super::Daemon {
             .iter()
             .filter(|m| !self.day_claim_notices.contains(m))
         {
-            logline!("clauth: {msg}");
+            logline!("tollgate: {msg}");
         }
         self.day_claim_notices = notices;
     }
@@ -139,7 +139,7 @@ impl super::Daemon {
         let switch_pending = self.pending_switch.lock().is_ok_and(|g| !g.is_empty());
         let off_pending = self.pending_switch_off.lock().is_ok_and(|g| *g);
         if switch_pending || off_pending {
-            logline!("clauth daemon: skipping queued switch work: tick budget or deadline spent");
+            logline!("tollgate daemon: skipping queued switch work: tick budget or deadline spent");
         }
         true
     }
@@ -161,7 +161,7 @@ impl super::Daemon {
         }
     }
 
-    /// Reload `profiles.toml` when it changed on disk (external `clauth login`,
+    /// Reload `profiles.toml` when it changed on disk (external `tollgate login`,
     /// TUI edit). Replaces the shared config and rebuilds token lists so the
     /// scheduler picks up added/removed profiles.
     pub(super) fn reload_if_changed(&mut self) {
@@ -178,9 +178,9 @@ impl super::Daemon {
                     *c = new_config;
                 }
                 self.rebuild_tokens();
-                logline!("clauth daemon: reloaded config after an external change");
+                logline!("tollgate daemon: reloaded config after an external change");
             }
-            Err(e) => logline!("clauth daemon: config reload failed: {e}"),
+            Err(e) => logline!("tollgate daemon: config reload failed: {e}"),
         }
     }
 
@@ -220,7 +220,7 @@ impl super::Daemon {
         let target_exists = crate::profile::is_configured(&target).unwrap_or(false);
         if !target_exists {
             logline!(
-                "clauth daemon: dropping queued switch to '{target}': profile no longer exists (deleted?)"
+                "tollgate daemon: dropping queued switch to '{target}': profile no longer exists (deleted?)"
             );
             if self
                 .switch_backoff
@@ -243,7 +243,7 @@ impl super::Daemon {
         {
             if now >= b.retry_until {
                 logline!(
-                    "clauth daemon: gave up switching to '{target}': {}",
+                    "tollgate daemon: gave up switching to '{target}': {}",
                     b.reason
                 );
                 self.switch_backoff = None;
@@ -286,7 +286,7 @@ impl super::Daemon {
 
         // AUTH-1 (Incident C): never install a stale/dead token. Refresh an expiring
         // target before install; a revoked token is quarantined (`auth_broken`) and
-        // dropped — retrying can't help until `clauth login`. The gate does its HTTP
+        // dropped — retrying can't help until `tollgate login`. The gate does its HTTP
         // refresh with no config lock held, so it cannot wedge the run loop mid-lock.
         match crate::oauth::ensure_installable(&self.config, &target, crate::oauth::refresh_result)
         {
@@ -297,7 +297,7 @@ impl super::Daemon {
                 // Terminal failure (drop, not retry) — clear any backoff.
                 self.last_reload_fp = reload_fingerprint();
                 logline!(
-                    "clauth daemon: {}",
+                    "tollgate daemon: {}",
                     crate::format::login_expired(&target).line()
                 );
                 self.switch_backoff = None;
@@ -345,7 +345,7 @@ impl super::Daemon {
             // an ambient stale mark.
             if queued_switch_away_is_stale(decision.key_rejected_cause.as_ref(), &cfg.profiles) {
                 logline!(
-                    "clauth daemon: dropping queued switch to '{target}': active '{}' was re-keyed",
+                    "tollgate daemon: dropping queued switch to '{target}': active '{}' was re-keyed",
                     decision
                         .key_rejected_cause
                         .as_ref()
@@ -375,9 +375,9 @@ impl super::Daemon {
                 self.last_reload_fp = fp;
                 self.switch_backoff = None;
                 if returning {
-                    logline!("clauth daemon: returned to preferred account '{target}'");
+                    logline!("tollgate daemon: returned to preferred account '{target}'");
                 } else {
-                    logline!("clauth daemon: switched to '{target}'");
+                    logline!("tollgate daemon: switched to '{target}'");
                 }
                 // The `cfg` guard is dropped at the block's end above, so this
                 // republish holds no config lock. A no-op switch (target already
@@ -410,7 +410,7 @@ impl super::Daemon {
             .as_ref()
             .is_none_or(|b| b.target != target || b.reason != reason);
         if changed {
-            logline!("clauth daemon: deferring switch to '{target}': {reason}");
+            logline!("tollgate daemon: deferring switch to '{target}': {reason}");
             self.switch_failure_logs += 1;
         }
         if now < retry_until {
@@ -424,7 +424,7 @@ impl super::Daemon {
             self.requeue_quiet(decision);
         } else {
             // Retry window closed — give up and stop tracking this target.
-            logline!("clauth daemon: gave up switching to '{target}': {reason}");
+            logline!("tollgate daemon: gave up switching to '{target}': {reason}");
             self.switch_backoff = None;
         }
     }
@@ -460,7 +460,7 @@ impl super::Daemon {
         };
         if active_diverged_unsaved(&active) {
             logline!(
-                "clauth daemon: skipping switch-off: active '{active}' has unsaved credentials"
+                "tollgate daemon: skipping switch-off: active '{active}' has unsaved credentials"
             );
             return;
         }
@@ -482,12 +482,12 @@ impl super::Daemon {
             Ok((fp, changed)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
-                logline!("clauth daemon: switched off: all accounts spent");
+                logline!("tollgate daemon: switched off: all accounts spent");
                 if changed {
                     crate::daemon::publish_status(&self.config);
                 }
             }
-            Err(e) => logline!("clauth daemon: switch-off failed: {e}"),
+            Err(e) => logline!("tollgate daemon: switch-off failed: {e}"),
         }
     }
 }

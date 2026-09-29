@@ -12,7 +12,7 @@
 //!
 //! This ledger closes that hole: the first time a finalized (past) day is seen in
 //! the transcripts, its per-model split is written to
-//! `~/.clauth/token_ledger.json`, so the day's tokens survive the transcripts
+//! `~/.tollgate/token_ledger.json`, so the day's tokens survive the transcripts
 //! being pruned. It doubles as a cold-start bound — the sweep's effective cutoff
 //! advances to [`Ledger::recorded_through`], so a fresh process re-reads only days
 //! after it instead of everything after a possibly-months-stale base date.
@@ -140,14 +140,14 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    fn path(clauth_dir: &Path) -> PathBuf {
-        clauth_dir.join(LEDGER_FILE)
+    fn path(tollgate_dir: &Path) -> PathBuf {
+        tollgate_dir.join(LEDGER_FILE)
     }
 
     /// Load the ledger, or an empty one when absent/unreadable/corrupt — the
     /// ledger is a durability + speed layer, never required for a correct base.
-    pub(crate) fn load(clauth_dir: &Path) -> Self {
-        std::fs::read(Self::path(clauth_dir))
+    pub(crate) fn load(tollgate_dir: &Path) -> Self {
+        std::fs::read(Self::path(tollgate_dir))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
@@ -155,9 +155,9 @@ impl Ledger {
 
     /// Persist atomically. Best-effort: a write failure only forfeits the
     /// optimization for one cycle.
-    pub(crate) fn save(&self, clauth_dir: &Path) {
+    pub(crate) fn save(&self, tollgate_dir: &Path) {
         if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = crate::profile::atomic_write_600(&Self::path(clauth_dir), &bytes);
+            let _ = crate::profile::atomic_write_600(&Self::path(tollgate_dir), &bytes);
         }
     }
 

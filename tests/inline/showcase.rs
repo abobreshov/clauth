@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 //! Showcase — a fake-data TUI for taking README screenshots. Compiled ONLY
 //! under `#[cfg(test)]` (included via `#[path]` into `crate::tui`), so none of
-//! this ships in the `clauth` binary and it lives outside `src/`.
+//! this ships in the `tollgate` binary and it lives outside `src/`.
 //!
 //! Launch it in a real terminal (it takes over the screen; press q twice to quit):
 //!
@@ -9,7 +9,7 @@
 //! cargo test showcase -- --ignored --nocapture
 //! ```
 //!
-//! All tests redirect `~/.clauth` and `~/.claude` into a tempdir via
+//! All tests redirect `~/.tollgate` and `~/.claude` into a tempdir via
 //! [`crate::profile::set_home_override`] so real files are never touched.
 
 use std::collections::BTreeMap;
@@ -635,7 +635,10 @@ fn headless_showcase_renders() {
         app.tab = tab;
         term.draw(|f| render::draw(f, &app)).unwrap();
         let frame = flatten(&term);
-        assert!(frame.contains("clauth"), "header brand renders on {tab:?}");
+        assert!(
+            frame.contains("tollgate"),
+            "header brand renders on {tab:?}"
+        );
     }
 
     // One tick exercises the drain/apply_usage/reload paths against the tempdir.
@@ -644,7 +647,10 @@ fn headless_showcase_renders() {
     term.draw(|f| render::draw(f, &app)).unwrap();
     let overview = flatten(&term);
 
-    assert!(overview.contains("clauth"), "header brand survives a tick");
+    assert!(
+        overview.contains("tollgate"),
+        "header brand survives a tick"
+    );
     assert!(
         overview.contains("personal"),
         "active demo profile populates the overview list"

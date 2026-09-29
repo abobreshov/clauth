@@ -1,4 +1,4 @@
-//! `clauth start <name>` — spawn `claude` against this session's own runtime
+//! `tollgate start <name>` — spawn `claude` against this session's own runtime
 //! directory. See [`crate::runtime`] for the per-session runtime design; this
 //! module is just the thin wrapper that owns the lifetime guard.
 
@@ -56,7 +56,7 @@ pub(crate) fn rescue_teardown(
     // `shell-snapshots/` out from under whatever is reading the tree, so an
     // unknown has to read the same way a live sibling does.
     if crate::runtime::live_sessions_at(sessions).is_none_or(|live| live > 1) {
-        logline!("clauth: skipping rescue, another isolated session is still live");
+        logline!("tollgate: skipping rescue, another isolated session is still live");
         return (0, 0);
     }
     crate::runtime::rescue_isolated_runtime(iso_root, claude_home)
@@ -132,7 +132,7 @@ fn refuse_unless_chain_eligible(
     if !held {
         anyhow::bail!(
             "'{name}': --with-fallback needs a running daemon to decide switches, \
-             run `clauth daemon`"
+             run `tollgate daemon`"
         );
     }
     // Last, because it is the only gate that touches disk.
@@ -244,7 +244,7 @@ pub(crate) fn run(
         errln!("{line}");
     }
 
-    // The plugin-migration pre-flight: heal a broken or divergent clauth
+    // The plugin-migration pre-flight: heal a broken or divergent tollgate
     // marketplace registration before the session launches, so the session loads
     // its hooks and MCP. A healthy registration costs this nothing — the gate is
     // two registry-file reads and spawns no `claude`. Best-effort: a failed heal
@@ -254,7 +254,7 @@ pub(crate) fn run(
     crate::plugin_host::preflight();
 
     // Strip the outgoing profile's custom env from the inherited base so a
-    // `clauth start <other>` session doesn't inherit it. The live
+    // `tollgate start <other>` session doesn't inherit it. The live
     // `settings.json` is owned by whoever is active; starting that same profile
     // passes its own keys, which the merge re-inserts (no-op). With no active
     // marker to read (`switch_off` clears it without touching the file) the
@@ -264,7 +264,7 @@ pub(crate) fn run(
     let stale_env_keys = crate::actions::outgoing_env_keys(config);
 
     let runtime = {
-        let _spinner = Spinner::start("clauth: preparing runtime");
+        let _spinner = Spinner::start("tollgate: preparing runtime");
         ProfileRuntime::acquire(profile, isolation, &stale_env_keys, follows_chain)?
     };
 
@@ -275,7 +275,7 @@ pub(crate) fn run(
     // engine plugs into the same three calls when its runtime lands.
     let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
     let mut command = engine.command();
-    // Scrub clauth-managed + outgoing custom env so a session started under
+    // Scrub tollgate-managed + outgoing custom env so a session started under
     // profile B doesn't inherit profile A's endpoint/auth/model overrides from
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
@@ -405,7 +405,7 @@ impl SignalWatcher {
         let (tx, rx) = channel();
         #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
         let thread = std::thread::Builder::new()
-            .name("clauth-sig".into())
+            .name("tollgate-sig".into())
             .spawn(move || {
                 for signal in signals.forever() {
                     if tx.send(signal).is_err() {
@@ -503,7 +503,7 @@ fn forward_signal_or_warn(child: &std::process::Child, signal: i32) {
     if let Err(e) = forward_signal(child, signal)
         && e.raw_os_error() != Some(libc::ESRCH)
     {
-        logline!("clauth: failed to forward signal to claude: {e}");
+        logline!("tollgate: failed to forward signal to claude: {e}");
     }
 }
 
@@ -540,13 +540,13 @@ fn toml_path_value(path: &Path) -> String {
 /// The store override (decision 6): the session's config.toml is a COPY of
 /// the operator's, and a keyring/auto setting in it would make codex ignore
 /// the linked auth.json — and delete it on the first refresh. Forced on every
-/// clauth spawn, never demanded of the operator's own config (the capture
+/// tollgate spawn, never demanded of the operator's own config (the capture
 /// path owns that refusal). The value carries its TOML quotes as literal arg
 /// bytes, so codex's `-c` override parser reads a well-formed TOML string
 /// rather than leaning on its bare-word fallback. Caller args come AFTER, so
 /// a later `-c` of the same key wins in codex's layering — overriding the
 /// store re-breaks the linked auth.json for that one run, the same class of
-/// self-inflicted foot-gun as `claude --settings` against a clauth runtime.
+/// self-inflicted foot-gun as `claude --settings` against a tollgate runtime.
 ///
 /// The state-DB override, the same reasoning one layer down: the store the
 /// sqlite DBs live in is a config KEY (`sqlite_home`) as well as an env var,
@@ -555,7 +555,7 @@ fn toml_path_value(path: &Path) -> String {
 /// directory the operator named — the home's durable links are never opened
 /// through, and two accounts share one conversation history. Scrubbing the env
 /// cannot reach it, since the key outranks the variable, so it is pinned to the
-/// home clauth just set: exactly what codex resolves when neither is spelled.
+/// home tollgate just set: exactly what codex resolves when neither is spelled.
 fn codex_spawn_command(
     home: &Path,
     codex_args: &[String],
@@ -573,15 +573,15 @@ fn codex_spawn_command(
     command
 }
 
-/// What codex's managed config does to a clauth-built home. Read before a
+/// What codex's managed config does to a tollgate-built home. Read before a
 /// codex spawn: the managed layer sits ABOVE the session's `-c` flags in
 /// codex's config stack (`config_layer_source.rs`: session flags 30, the
 /// managed file 40), so a key set there defeats the forced store and state-DB
-/// home that [`codex_spawn_command`] pins, and nothing clauth passes can
+/// home that [`codex_spawn_command`] pins, and nothing tollgate passes can
 /// outrank it.
 #[derive(Debug, PartialEq, Eq)]
 enum ManagedConfigVerdict {
-    /// Nothing there reaches the keys clauth forces or strips.
+    /// Nothing there reaches the keys tollgate forces or strips.
     Clear,
     /// The spawn proceeds; the line goes to stderr.
     Warn(String),
@@ -591,7 +591,7 @@ enum ManagedConfigVerdict {
 
 /// Where codex reads its managed config: the system path on unix. On windows
 /// codex defaults it to `<CODEX_HOME>/managed_config.toml`, and the session's
-/// `CODEX_HOME` is the home clauth just built, which holds none.
+/// `CODEX_HOME` is the home tollgate just built, which holds none.
 fn managed_config_path() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(path) = MANAGED_CONFIG_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
@@ -678,9 +678,9 @@ fn managed_config_verdict(path: &Path) -> ManagedConfigVerdict {
     {
         return ManagedConfigVerdict::Refuse(format!(
             "{file} sets cli_auth_credentials_store = {store}, and a managed config outranks \
-             the file store clauth forces at spawn, so codex would ignore this session's \
+             the file store tollgate forces at spawn, so codex would ignore this session's \
              linked auth.json. ask whoever manages this machine to remove the key or set it \
-             to \"file\"; clauth cannot override a managed config"
+             to \"file\"; tollgate cannot override a managed config"
         ));
     }
     if let Some(load_path) = table
@@ -692,34 +692,34 @@ fn managed_config_verdict(path: &Path) -> ManagedConfigVerdict {
     {
         return ManagedConfigVerdict::Refuse(format!(
             "{file} sets debug.config_lockfile.load_path = {load_path}, and a managed config \
-             outranks the flags clauth passes at spawn, so codex would replay that lockfile \
+             outranks the flags tollgate passes at spawn, so codex would replay that lockfile \
              as its whole config and drop the file store this session's linked auth.json \
-             depends on. ask whoever manages this machine to remove the key; clauth cannot \
+             depends on. ask whoever manages this machine to remove the key; tollgate cannot \
              override a managed config"
         ));
     }
     if let Some(sqlite_home) = table.get("sqlite_home") {
         return ManagedConfigVerdict::Warn(format!(
             "{file} sets sqlite_home = {sqlite_home}, which outranks the per-session home \
-             clauth pins at spawn, so every profile's state dbs land in that one directory"
+             tollgate pins at spawn, so every profile's state dbs land in that one directory"
         ));
     }
     ManagedConfigVerdict::Clear
 }
 
-/// `clauth start <codex-profile>` — spawn an interactive `codex` against this
-/// session's own clauth-built home. The claude start's extras have no codex
+/// `tollgate start <codex-profile>` — spawn an interactive `codex` against this
+/// session's own tollgate-built home. The claude start's extras have no codex
 /// counterpart and are absent on purpose: no usage priming (codex usage is
 /// passive), no run-window transcript stamping or rescue (codex owns its own
 /// `sessions/`, which the shared flavor links into the profile store), no
 /// fallback watchdog (a codex chain lands at the next start), no home-project
 /// settings guard (project-tier settings are a Claude Code concept).
 ///
-/// `codex_args` pass through verbatim, AFTER clauth's own `-c` store override
+/// `codex_args` pass through verbatim, AFTER tollgate's own `-c` store override
 /// — later `-c` occurrences win in codex's config layering, but overriding
 /// the store mode simply re-breaks the linked `auth.json` for that one run,
 /// the same class of self-inflicted foot-gun as `claude --settings` against a
-/// clauth runtime.
+/// tollgate runtime.
 pub(crate) fn run_codex(
     config: &AppConfig,
     name: &str,
@@ -730,7 +730,7 @@ pub(crate) fn run_codex(
     if let Some(path) = managed_config_path() {
         match managed_config_verdict(&path) {
             ManagedConfigVerdict::Clear => {}
-            ManagedConfigVerdict::Warn(line) => errln!("clauth: {line}"),
+            ManagedConfigVerdict::Warn(line) => errln!("tollgate: {line}"),
             ManagedConfigVerdict::Refuse(line) => anyhow::bail!(line),
         }
     }
@@ -748,14 +748,14 @@ pub(crate) fn run_codex(
         .unwrap_or_default();
 
     let runtime = {
-        let _spinner = Spinner::start("clauth: preparing codex home");
+        let _spinner = Spinner::start("tollgate: preparing codex home");
         crate::runtime::CodexRuntime::acquire(name, isolation)?
     };
 
     let mut command = codex_spawn_command(runtime.home(), codex_args, &active_env_keys);
 
     // The same signal discipline as the claude start: without it a SIGTERM to
-    // clauth skips the teardown — its carry-backs are lost, the flock releases
+    // tollgate skips the teardown — its carry-backs are lost, the flock releases
     // with the codex child still RUNNING, and a rotation then reads the
     // account as idle while a live session holds its chain, which is the
     // precise burn the marker exists to prevent.

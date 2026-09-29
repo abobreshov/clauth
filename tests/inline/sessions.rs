@@ -1,6 +1,6 @@
 //! Session-index core + redaction tests. Fixture stores live under a
 //! `HomeSandbox` so the global (`~/.claude/projects`) and isolated
-//! (`~/.clauth/profiles/<n>/runtime-isolated/projects`) walks stay off the real
+//! (`~/.tollgate/profiles/<n>/runtime-isolated/projects`) walks stay off the real
 //! tree. Every transcript file is named `<sessionId>.jsonl` because the session
 //! id is keyed off the filename stem, not the head line.
 
@@ -489,7 +489,7 @@ fn build_index_covers_global_and_isolated_and_indexes_corrupt() {
     // Live isolated session in its own throwaway store.
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
     write_jsonl(
         &iso,
         &[
@@ -497,7 +497,7 @@ fn build_index_covers_global_and_isolated_and_indexes_corrupt() {
             user_line("si", "/w/iso", "bye iso"),
         ],
     );
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap(); // held for the walk so the runtime reads as live
@@ -795,7 +795,7 @@ fn stamp_isolated_owns_all_sessions_ignoring_mtime() {
     // regardless of mtime, so no run window applies.
     let projects = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects");
     let a = projects.join("-w-a/isoA.jsonl");
     let b = projects.join("-w-b/isoB.jsonl");
     write_jsonl(&a, &[user_line("isoA", "/w/a", "hi")]);
@@ -874,10 +874,10 @@ fn contested_shared_session_reads_back_unknown() {
 }
 
 /// Stage the exact per-conversation record the hook writes:
-/// `~/.clauth/conversations/<id>.json`, carrying the account the hook resolved.
+/// `~/.tollgate/conversations/<id>.json`, carrying the account the hook resolved.
 /// `resolved: null` is the shape of a record that never attributed an account.
 fn stage_record(sb: &HomeSandbox, id: &str, resolved: Option<&str>) {
-    let dir = sb.home().join(".clauth/conversations");
+    let dir = sb.home().join(".tollgate/conversations");
     fs::create_dir_all(&dir).unwrap();
     crate::profile::atomic_write_600(
         &dir.join(format!("{id}.json")),
@@ -995,7 +995,7 @@ fn record_without_attribution_does_not_skip_the_sweep() {
 fn annotate_owners_sets_only_known_entries() {
     let _sb = HomeSandbox::new();
     // Build the store directly: one Known, one Contested; "absent" is never
-    // inserted. `atomic_write_600` creates the 0o700 `.clauth` dir as needed.
+    // inserted. `atomic_write_600` creates the 0o700 `.tollgate` dir as needed.
     let path = store_path().unwrap();
     let mut store = SessionProfiles::default();
     store
@@ -1095,7 +1095,7 @@ fn prune_keeps_a_grace_record_and_reaps_a_silent_one() {
     stage_record(&sb, "grace-fresh", Some("A"));
     stage_record(&sb, "grace-silent", Some("A"));
     set_mtime(
-        &sb.home().join(".clauth/conversations/grace-silent.json"),
+        &sb.home().join(".tollgate/conversations/grace-silent.json"),
         SystemTime::UNIX_EPOCH,
     );
 
@@ -1140,9 +1140,9 @@ fn prune_keeps_a_live_isolated_owner_and_reaps_it_once_dead() {
     // The id's only transcript is inside a live isolated store.
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/iso-hold.jsonl");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/iso-hold.jsonl");
     write_jsonl(&iso, &[user_line("iso-hold", "/w/iso", "iso work")]);
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap(); // held so the runtime reads as live
@@ -1450,7 +1450,7 @@ fn collect_jsonl_reports_a_depth_cap_truncation() {
 /// Isolated `<profile>/runtime-isolated/projects` root under the sandbox.
 fn iso_projects(sb: &HomeSandbox) -> PathBuf {
     sb.home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects")
+        .join(".tollgate/profiles/iso/runtime-isolated/projects")
 }
 
 /// The global `~/.claude/projects` root under the sandbox.
@@ -1598,7 +1598,7 @@ fn rescue_move_creates_parent_dir_owner_only() {
 
 /// The isolated runtime root under the sandbox — `projects/`'s parent.
 fn iso_root(sb: &HomeSandbox) -> PathBuf {
-    sb.home().join(".clauth/profiles/iso/runtime-isolated")
+    sb.home().join(".tollgate/profiles/iso/runtime-isolated")
 }
 
 /// The global CC config dir under the sandbox — `~/.claude/projects`'s parent.
@@ -1746,7 +1746,7 @@ fn sidecar_collision_lands_beside_without_clobbering() {
     assert!(!iso.join("tasks/same.json").exists(), "duplicate dropped");
 }
 
-/// The allowlist on disk: clauth-owned state, `projects/` (the transcript
+/// The allowlist on disk: tollgate-owned state, `projects/` (the transcript
 /// leg's), the secret- and cache-bearing CC trees and the top-level singleton
 /// files all stay in the isolated tree, to be discarded with it.
 #[test]
@@ -1963,7 +1963,7 @@ fn rescue_preserves_the_source_file_mode() {
     );
 }
 
-// ── targeted lookup (`clauth resume`/`info` and the `delegate` resume path) ──
+// ── targeted lookup (`tollgate resume`/`info` and the `delegate` resume path) ──
 
 /// `--resume` only resolves a session under its own workspace, so the delegate
 /// path needs one transcript's recorded `cwd` and nothing else. This lookup is
@@ -2007,7 +2007,7 @@ fn workspace_of_treats_a_cwd_less_transcript_as_unresolvable() {
 }
 
 /// A duplicated id must resolve to the same file the index would pick, or
-/// `clauth info` prints one path while `clauth sessions` lists another.
+/// `tollgate info` prints one path while `tollgate sessions` lists another.
 #[test]
 fn find_session_picks_the_same_duplicate_the_index_does() {
     let sb = HomeSandbox::new();
@@ -2124,19 +2124,19 @@ fn newest_session_skips_the_nested_transcripts_a_resume_cannot_open() {
 
 /// A live isolated store is invisible to the lookups, so its transcripts have to
 /// be reachable some other way — otherwise a resume can only report a session
-/// `clauth sessions` just listed as "not found".
+/// `tollgate sessions` just listed as "not found".
 #[test]
 fn live_isolated_holds_reports_what_the_lookup_excludes() {
     let sb = HomeSandbox::new();
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl");
     write_jsonl(&iso, &[user_line("siso", "/w/iso", "hi iso")]);
     set_mtime(&iso, SystemTime::UNIX_EPOCH + Duration::from_secs(5_000));
     let global = sb.home().join(".claude/projects/-w-g/sglobal.jsonl");
     write_jsonl(&global, &[user_line("sglobal", "/w/g", "hi global")]);
 
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap(); // held so the runtime reads as live
@@ -2162,16 +2162,16 @@ fn live_isolated_holds_ignores_a_runtime_with_no_live_session() {
     let sb = HomeSandbox::new();
     write_jsonl(
         &sb.home()
-            .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/sdead.jsonl"),
+            .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/sdead.jsonl"),
         &[user_line("sdead", "/w/iso", "over")],
     );
-    fs::create_dir_all(sb.home().join(".clauth/profiles/iso/sessions-isolated")).unwrap();
+    fs::create_dir_all(sb.home().join(".tollgate/profiles/iso/sessions-isolated")).unwrap();
 
     assert!(live_isolated_holds().is_empty());
 }
 
 /// The targeted lookup reads the GLOBAL store only, unlike `build_index`.
-/// `clauth resume` spawns against the shared store, so an id that lives only in
+/// `tollgate resume` spawns against the shared store, so an id that lives only in
 /// a live isolated runtime is one Claude Code would answer `No conversation
 /// found` for — refusing it by name beats spawning a session that can't work.
 #[test]
@@ -2179,9 +2179,9 @@ fn the_targeted_lookup_never_reaches_a_live_isolated_store() {
     let sb = HomeSandbox::new();
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl");
     write_jsonl(&iso, &[user_line("siso", "/w/iso", "hi iso")]);
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap(); // held so the runtime reads as live
@@ -2493,9 +2493,9 @@ fn walk_lists_both_stores_and_preview_fills_the_row() {
     write_jsonl(&dup, &[user_line("sg", "/w/other", "older copy")]);
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
     write_jsonl(&iso, &[user_line("si", "/w/iso", "hi iso")]);
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap();
@@ -2549,9 +2549,9 @@ fn locate_answers_from_both_stores_by_stem_alone() {
     write_jsonl(&g, &[user_line("sg", "/w/global", "hi")]);
     let iso = sb
         .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
+        .join(".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
     write_jsonl(&iso, &[user_line("si", "/w/iso", "hi iso")]);
-    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
     fs::create_dir_all(&sessions_dir).unwrap();
     let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
     lock_file.lock().unwrap();

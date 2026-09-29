@@ -1,12 +1,12 @@
-//! `clauth`'s command grammar as clap derive types. The doc comments here ARE
+//! `tollgate`'s command grammar as clap derive types. The doc comments here ARE
 //! the help copy: clap maps a comment's first paragraph to `-h` and the whole
 //! comment to `--help`, so each command's prose lives beside the variant it
 //! documents and the root stays a two-column table.
 //!
 //! Three shapes are not plain subcommands and are load-bearing: a bare
-//! `clauth` launches the TUI ([`Cli::command`] is `None`), a bare unrecognized
+//! `tollgate` launches the TUI ([`Cli::command`] is `None`), a bare unrecognized
 //! word switches to the profile of that name ([`Command::External`]), and
-//! `clauth start <profile> <claude args…>` forwards every token `start` does
+//! `tollgate start <profile> <claude args…>` forwards every token `start` does
 //! not declare to `claude` untouched, leading hyphens included.
 
 use std::net::SocketAddr;
@@ -19,16 +19,16 @@ use crate::runtime::Isolation;
 /// Where a value-less `--listen` binds. Every interface, because the flag's
 /// whole purpose is a client on a different machine; a loopback default would
 /// parse fine and then serve nobody.
-pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
+pub(crate) const DEFAULT_LISTEN: &str = crate::identity::DEFAULT_LISTEN;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "clauth",
+    name = "tollgate",
     version,
     about = "launcher and account manager for claude code",
-    after_help = "With no command, clauth launches the TUI; `clauth <profile>` switches to that account and exits \
-                  (deprecated, use `clauth switch <name>`). \
-                  The color depth can also be pinned in ~/.clauth/profiles.toml with `theme = \"full\"`."
+    after_help = "With no command, tollgate launches the TUI; `tollgate <profile>` switches to that account and exits \
+                  (deprecated, use `tollgate switch <name>`). \
+                  The color depth can also be pinned in ~/.tollgate/profiles.toml with `theme = \"full\"`."
 )]
 pub(crate) struct Cli {
     /// Force a color depth instead of auto-detecting one (TUI only).
@@ -57,10 +57,10 @@ pub(crate) enum ThemeArg {
 pub(crate) enum Command {
     /// Launch claude under a profile, in a per-profile CLAUDE_CONFIG_DIR
     ///
-    /// Args clauth does not recognize go to `claude` untouched, leading hyphens
-    /// included, so `clauth start acme -p "hi"` reaches claude with its own
-    /// `-p`. Put clauth's own flags before the profile name; to send `claude` a
-    /// spelling clauth shares (`--help`), separate it with `--`.
+    /// Args tollgate does not recognize go to `claude` untouched, leading hyphens
+    /// included, so `tollgate start acme -p "hi"` reaches claude with its own
+    /// `-p`. Put tollgate's own flags before the profile name; to send `claude` a
+    /// spelling tollgate shares (`--help`), separate it with `--`.
     Start(StartArgs),
 
     /// Add a new account, or re-authenticate an existing one in place
@@ -95,8 +95,8 @@ pub(crate) enum Command {
     /// browser flow. This is the way to adopt a login `claude` already minted,
     /// including the one a first account is refused over when the live file
     /// holds a login no profile owns. The first profile becomes the active
-    /// account; a later one needs `clauth <name>` to switch to. An existing
-    /// name is refused — re-authenticating one is `clauth login <name>`.
+    /// account; a later one needs `tollgate <name>` to switch to. An existing
+    /// name is refused — re-authenticating one is `tollgate login <name>`.
     Capture {
         /// Profile to save the current login under.
         profile: String,
@@ -110,7 +110,7 @@ pub(crate) enum Command {
         /// implicit yes for an irreversible delete.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Delete even while a live `clauth start` session holds the profile.
+        /// Delete even while a live `tollgate start` session holds the profile.
         /// Independent of --yes, which does not override this guard.
         #[arg(long)]
         force: bool,
@@ -186,9 +186,9 @@ pub(crate) enum Command {
     /// The daemon re-stamps `session-token.json` with the usage chain's current
     /// access token: full scopes and the account's `subscriptionType`, but NO
     /// refresh token. Sessions run bearers that unlock plan-gated models while
-    /// the rotating chain stays clauth-private.
+    /// the rotating chain stays tollgate-private.
     ///
-    /// Needs the clauth daemon running: the bearer dies in hours, and the
+    /// Needs the tollgate daemon running: the bearer dies in hours, and the
     /// daemon's scan is what re-stamps it before then.
     #[command(name = "rolling-token")]
     RollingToken {
@@ -221,9 +221,9 @@ pub(crate) enum Command {
         disabled: bool,
     },
 
-    /// List the delegate jobs clauth is holding
+    /// List the delegate jobs tollgate is holding
     ///
-    /// One row per record in ~/.clauth/jobs/: background runs still going,
+    /// One row per record in ~/.tollgate/jobs/: background runs still going,
     /// blocking runs whose caller is still waiting, finished results nothing
     /// has collected yet, and runs whose server died. Read-only — stopping one
     /// is the `monitor` tool's job. An empty store exits 0.
@@ -250,10 +250,10 @@ pub(crate) enum Command {
 
     /// Switch the global account, or move a live session to another profile
     ///
-    /// One name switches the global account: `clauth switch <name>` is the
-    /// bare `clauth <name>` act under its own verb, repointing the credentials
+    /// One name switches the global account: `tollgate switch <name>` is the
+    /// bare `tollgate <name>` act under its own verb, repointing the credentials
     /// the global `claude` reads (a codex name moves the codex active marker
-    /// instead). Two names address a live session: `clauth switch <sid>
+    /// instead). Two names address a live session: `tollgate switch <sid>
     /// <profile>` records the profile as the session's intended member — the
     /// same registry write the fallback chain's decider makes — and installs
     /// nothing itself: the session's own executor performs the switch, or
@@ -263,8 +263,8 @@ pub(crate) enum Command {
     /// next request, never before it. For a session started with
     /// --with-fallback, the chain's decider can supersede a manual intent on
     /// its next tick. The sid is the `<pid>-<seq>` of a live
-    /// `clauth start` session, one row per session under
-    /// ~/.clauth/live_sessions/.
+    /// `tollgate start` session, one row per session under
+    /// ~/.tollgate/live_sessions/.
     Switch {
         /// Profile to switch the global account to, or a live session id.
         name: String,
@@ -296,8 +296,8 @@ pub(crate) enum Command {
     /// Run the headless scheduler with no TUI
     ///
     /// Refreshes usage, auto-switches on exhaustion, and writes
-    /// ~/.clauth/status.json. Exits at once when a daemon is already running.
-    /// `--listen` also serves the REST API to the devices `clauth devices`
+    /// ~/.tollgate/status.json. Exits at once when a daemon is already running.
+    /// `--listen` also serves the REST API to the devices `tollgate devices`
     /// pairs (see the Daemon wiki page); `--status` prints and exits without
     /// running a scheduler.
     Daemon {
@@ -315,14 +315,14 @@ pub(crate) enum Command {
         /// Print the running daemon, or exit 1 with no output when none is.
         #[arg(long, conflicts_with = "listen")]
         status: bool,
-        /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8443
+        /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8453
         ///
-        /// For running the daemon on one machine and a client (clauth-tray) on
+        /// For running the daemon on one machine and a client (tollgate-tray) on
         /// another. TLS comes from this host's lego certificate — from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
-        /// ~/.clauth/tls.json. Every request but a pairing needs a paired
-        /// device's token; see `clauth devices`.
+        /// ~/.tollgate/tls.json. Every request but a pairing needs a paired
+        /// device's token; see `tollgate devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
         /// flag is for — a client on another machine. It is the same exposure
@@ -343,7 +343,7 @@ pub(crate) enum Command {
         /// `<name>.key` with no issuer file and none of lego's naming.
         ///
         /// Both files are read as PEM. Given these, nothing else is consulted —
-        /// not `hostname -f`, not the directory in ~/.clauth/tls.json, and no
+        /// not `hostname -f`, not the directory in ~/.tollgate/tls.json, and no
         /// issuer file beside the certificate. Requires --key and --listen.
         #[arg(long, value_name = "PATH", requires = "key", requires = "listen")]
         cert: Option<PathBuf>,
@@ -369,12 +369,12 @@ pub(crate) enum Command {
     /// Pair, list, grant sessions to, and revoke the devices that may call the
     /// REST API
     ///
-    /// Every `clauth daemon --listen` request but a pairing authenticates as
+    /// Every `tollgate daemon --listen` request but a pairing authenticates as
     /// one named device, and each device holds a tier fixed here, on this
     /// machine: `view` reads the status feed, `control` may also switch
     /// accounts and, with the `sessions` grant, create sessions through the API
     /// while `[serve] session_creation` is on.
-    /// Bare, it lists the devices. No token is ever printed back: clauth keeps
+    /// Bare, it lists the devices. No token is ever printed back: tollgate keeps
     /// only a SHA-256 of each.
     #[command(args_conflicts_with_subcommands = true)]
     Devices {
@@ -387,7 +387,7 @@ pub(crate) enum Command {
 
     /// Print the usage / auto-switch snapshot as JSON
     ///
-    /// The same shape the daemon writes to ~/.clauth/status.json.
+    /// The same shape the daemon writes to ~/.tollgate/status.json.
     Status {
         /// Required — status has no other output mode.
         #[arg(long, required = true)]
@@ -405,12 +405,12 @@ pub(crate) enum Command {
 
     /// Set the herdr plugin up, or take it back out
     ///
-    /// `clauth herdr install` runs herdr's own installer, then adds the two
+    /// `tollgate herdr install` runs herdr's own installer, then adds the two
     /// things a herdr plugin cannot declare for itself: the keybinding that
     /// opens the dashboard, and the sidebar row that renders which account
     /// each Claude Code pane burns. Both land in the user's herdr
     /// `config.toml`, and herdr validates the result before it is written.
-    /// `clauth herdr uninstall` reverses both halves together.
+    /// `tollgate herdr uninstall` reverses both halves together.
     Herdr {
         #[command(subcommand)]
         cmd: HerdrCommand,
@@ -418,8 +418,8 @@ pub(crate) enum Command {
 
     /// Print a shell completion script, or install one
     ///
-    /// `clauth completions <bash|zsh|fish>` prints the script to stdout.
-    /// `clauth completions install [shell]` writes it and wires it into the
+    /// `tollgate completions <bash|zsh|fish>` prints the script to stdout.
+    /// `tollgate completions install [shell]` writes it and wires it into the
     /// user's shell rc, detecting the shell from $SHELL when omitted.
     Completions {
         /// `bash`, `zsh`, `fish`, or `install`.
@@ -431,13 +431,13 @@ pub(crate) enum Command {
 
     /// Print one profile name per line, for the shell completion scripts;
     /// `--live-sessions` prints the live-session registry's id stems instead,
-    /// for `clauth switch`'s first position.
+    /// for `tollgate switch`'s first position.
     #[command(name = "__complete", hide = true)]
     Complete {
         /// The codex roster instead of the claude one (for `limit-reset`).
         #[arg(long)]
         codex: bool,
-        /// Print `~/.clauth/live_sessions/`'s file stems instead of profile
+        /// Print `~/.tollgate/live_sessions/`'s file stems instead of profile
         /// names.
         #[arg(long = "live-sessions", hide = true)]
         live_sessions: bool,
@@ -480,20 +480,20 @@ pub(crate) enum Command {
     },
 
     /// A bare word is a profile name: switch to it and exit (deprecated, use
-    /// `clauth switch <name>`). Declared last so every real subcommand above
+    /// `tollgate switch <name>`). Declared last so every real subcommand above
     /// shadows a same-named profile, which is the precedence the hand-rolled
     /// dispatcher had.
     #[command(external_subcommand)]
     External(Vec<String>),
 }
 
-/// `clauth start`'s flags, the profile, and the `claude` passthrough.
+/// `tollgate start`'s flags, the profile, and the `claude` passthrough.
 #[derive(Args, Debug)]
 pub(crate) struct StartArgs {
     /// Uses a clean throwaway runtime, without your CLAUDE.md, plugins, hooks,
     /// skills, MCP servers or tools. Run it in a clean cwd for a blind session.
     /// Useful for testing or benchmarking. Transcripts and session state are
-    /// lifted into the global store as clauth start shuts down, so the session
+    /// lifted into the global store as tollgate start shuts down, so the session
     /// stays resumable and its tokens counted. A hard kill skips that.
     #[arg(long)]
     pub(crate) isolated: bool,
@@ -504,7 +504,7 @@ pub(crate) struct StartArgs {
     /// a chain member is today's home account — the `preferred` flag, or a
     /// `preferred_days` list naming today — the session also returns to it once
     /// it reads clear and fresh again. Needs a running
-    /// `clauth daemon` to decide the switches, and a profile that is already a
+    /// `tollgate daemon` to decide the switches, and a profile that is already a
     /// chain member. Not available with --isolated, on a non-OAuth account,
     /// or on a Windows host without symlink privilege — each of those is refused
     /// by name at launch.
@@ -516,8 +516,8 @@ pub(crate) struct StartArgs {
     ///
     /// It takes the place of the profile name, so separate `claude`'s own args
     /// with `--` whenever the first of them starts with a hyphen:
-    /// `clauth start --auto -- -p "hi"`. Without a name in that slot there is
-    /// nothing to tell a passthrough `-p` from a misspelled clauth flag, and
+    /// `tollgate start --auto -- -p "hi"`. Without a name in that slot there is
+    /// nothing to tell a passthrough `-p` from a misspelled tollgate flag, and
     /// guessing would silently eat one of them.
     #[arg(long)]
     pub(crate) auto: bool,
@@ -536,7 +536,7 @@ pub(crate) struct StartArgs {
     pub(crate) claude_args: Vec<String>,
 }
 
-/// Which account a `clauth start` runs under: the name the operator typed, or
+/// Which account a `tollgate start` runs under: the name the operator typed, or
 /// the one the fallback-chain walk picks for the models the session may run.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StartTarget {
@@ -570,7 +570,7 @@ impl StartArgs {
     ///
     /// `--auto` leaves no profile to fill, but clap fills positionals in
     /// declaration order and binds the first trailing value to that slot
-    /// anyway — so `clauth start --auto -- -p "hi"` parks `-p` in `profile` and
+    /// anyway — so `tollgate start --auto -- -p "hi"` parks `-p` in `profile` and
     /// leaves `claude` a bare `hi`. Folding it back is what makes the `--`
     /// spelling come out whole on the other side.
     pub(crate) fn passthrough(&self) -> Vec<String> {
@@ -583,10 +583,10 @@ impl StartArgs {
     }
 }
 
-/// `clauth login`'s profile plus its auth-method flags.
+/// `tollgate login`'s profile plus its auth-method flags.
 ///
 /// Capturing a long-lived token lives here as `--setup-token` because it IS a
-/// login; removing one is `clauth static-token <profile> --clear`, a verb rather
+/// login; removing one is `tollgate static-token <profile> --clear`, a verb rather
 /// than a flag, matching how `enable`/`disable` toggle per-profile state.
 #[derive(Args, Debug)]
 pub(crate) struct LoginArgs {
@@ -611,7 +611,7 @@ pub(crate) struct LoginArgs {
     #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token", "model"])]
     pub(crate) codex: bool,
     /// With --codex: mint a FRESH codex chain via the browser instead of
-    /// adopting ~/.codex — a login clauth alone holds, leaving your own codex
+    /// adopting ~/.codex — a login tollgate alone holds, leaving your own codex
     /// untouched. Requires --codex.
     #[arg(long, requires = "codex")]
     pub(crate) browser: bool,
@@ -645,7 +645,7 @@ impl LoginArgs {
     }
 }
 
-/// `clauth herdr <cmd>`: install and uninstall the plugin and its config wiring.
+/// `tollgate herdr <cmd>`: install and uninstall the plugin and its config wiring.
 #[derive(Subcommand, Debug)]
 pub(crate) enum HerdrCommand {
     /// Install the plugin into herdr and wire it into herdr's own config
@@ -668,7 +668,7 @@ pub(crate) enum HerdrCommand {
         yes: bool,
     },
 
-    /// Uninstall the plugin from herdr and drop the config clauth added
+    /// Uninstall the plugin from herdr and drop the config tollgate added
     ///
     /// Takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone, then runs herdr's uninstall.
     Uninstall {
@@ -682,7 +682,7 @@ pub(crate) enum HerdrCommand {
 
     /// Print one herdr knob for the plugin scripts
     ///
-    /// `clauth herdr config get <key>` prints the knob's value on its own
+    /// `tollgate herdr config get <key>` prints the knob's value on its own
     /// line, shell-shaped (`fit|half|split-right|split-top`, `on|off`, or the
     /// bare number).
     /// Hidden from help: this is the scripts' read path, not a human surface.
@@ -693,7 +693,7 @@ pub(crate) enum HerdrCommand {
     },
 }
 
-/// `clauth herdr config <cmd>`: the plugin scripts' read path for the knobs
+/// `tollgate herdr config <cmd>`: the plugin scripts' read path for the knobs
 /// persisted under `[herdr]` in profiles.toml.
 #[derive(Subcommand, Debug)]
 pub(crate) enum HerdrConfigCommand {
@@ -705,7 +705,7 @@ pub(crate) enum HerdrConfigCommand {
     },
 }
 
-/// `clauth devices <cmd>`: the ways a device joins, leaves, or gains the
+/// `tollgate devices <cmd>`: the ways a device joins, leaves, or gains the
 /// sessions grant.
 #[derive(Subcommand, Debug)]
 pub(crate) enum DevicesCommand {
@@ -714,7 +714,7 @@ pub(crate) enum DevicesCommand {
     /// The code is 8 characters, valid for 5 minutes, used once, and dropped
     /// after 5 wrong tries; a new `pair` replaces a code still waiting. The
     /// device posts it to `POST /api/v1/pair` on this host's
-    /// `clauth daemon --listen` and gets its token in the answer. The code
+    /// `tollgate daemon --listen` and gets its token in the answer. The code
     /// prints alone on stdout and the wait reports on stderr; Ctrl-C withdraws
     /// the code if it is still waiting.
     Pair {
@@ -733,7 +733,7 @@ pub(crate) enum DevicesCommand {
     /// Mint a token for a device on this machine and print it once
     ///
     /// For a client configured by hand. The token prints alone on stdout;
-    /// clauth keeps only its SHA-256 and cannot show it again.
+    /// tollgate keeps only its SHA-256 and cannot show it again.
     Add {
         /// Name for the device: letters, digits and - _ . @ +.
         name: String,

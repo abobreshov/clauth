@@ -5050,7 +5050,7 @@ fn blocked_reason_kick_rejected_when_switch_grade_with_headroom() {
 
 #[test]
 fn blocked_reason_kick_rejected_outranks_a_5h_block() {
-    // 5h over threshold AND kick-rejected: the limiter won't let clauth start the
+    // 5h over threshold AND kick-rejected: the limiter won't let tollgate start the
     // member at all, so the kick block outranks the usage exhaustion. Reds if the
     // arm is placed below the 5h block.
     let p = profile_with_util("a", Some(95.0), Some(97.0));
@@ -6853,7 +6853,7 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     assert_eq!(
         pick,
         Some(0),
-        "a stale reading outranks a member clauth knows nothing about"
+        "a stale reading outranks a member tollgate knows nothing about"
     );
     assert!(rows[0].stale && !rows[0].fresh && !rows[1].fresh);
 
@@ -7127,7 +7127,7 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
 
 /// Ruling 2: a third-party member whose api KEY the provider rejected reads
 /// `StartBlock::AuthBroken` off the durable per-credential verdict — the same
-/// rung an OAuth auth-broken member lands on, so `clauth start --auto` refuses
+/// rung an OAuth auth-broken member lands on, so `tollgate start --auto` refuses
 /// it. A lapsed Alibaba console session is NOT this (its api key still serves).
 #[test]
 fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
@@ -7226,7 +7226,7 @@ fn next_target_never_picks_a_key_rejected_member() {
 }
 
 /// F-B negative: a console-lapsed Alibaba member (usage-only credential) is NOT
-/// excluded by `start_block` — its api key still serves, so `clauth start
+/// excluded by `start_block` — its api key still serves, so `tollgate start
 /// --auto` keeps it pickable.
 #[test]
 fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {

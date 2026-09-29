@@ -215,7 +215,7 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
     };
     if profile.is_disabled() {
         bail!(DeepRefusal(format!(
-            "'{name}': account is disabled, run `clauth enable {name}`"
+            "'{name}': account is disabled, run `tollgate enable {name}`"
         )));
     }
     Ok(())
@@ -281,7 +281,7 @@ pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) 
         // guard's live-vs-target byte check would wrongly reject. The SAME
         // predicate the defer/banner gates use — `live_diverged_and_unsaved` —
         // decides here, so a login already saved in the store (the mirror, a
-        // clauth symlink) forces the relink even once a sidecar capture flips the
+        // tollgate symlink) forces the relink even once a sidecar capture flips the
         // install source and makes classify read Diverged over it; without that
         // exemption the guarded link byte-rejects the macOS mirror and the switch
         // fails "unsaved credentials" though nothing is unsaved. (Interactive
@@ -384,7 +384,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 
     // AUTH-1 (Incident C): gate the target before its credentials land in the
     // Keychain (which re-authenticates every running `claude` on this machine).
-    // Refusal + `clauth login` hint pinned by
+    // Refusal + `tollgate login` hint pinned by
     // `switch_cli_refuses_dead_target_with_login_hint`.
     // The already-active profile is exempt: there is nothing new to install
     // (`switch_profile` no-ops on `is_active`), and its chain is the one a
@@ -417,7 +417,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
                 .to_string()
         };
         out!(
-            "clauth: '{active}' has a newer login in ~/.claude. save it into '{active}' \
+            "tollgate: '{active}' has a newer login in ~/.claude. save it into '{active}' \
              and switch to '{canonical}'? [Y/n] "
         );
         let mut answer = String::new();
@@ -426,7 +426,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
         if answer.is_empty() || answer == "y" || answer == "yes" {
             switch_profile_reconciled(&config, canonical)?;
         } else {
-            outln!("clauth: aborted, no changes made");
+            outln!("tollgate: aborted, no changes made");
             return Ok(());
         }
     } else {
@@ -437,10 +437,10 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
     // rotates once on a 401/429. One-shot — the CLI has no scheduler tick to
     // re-arm against, so no side channels.
     {
-        let _spinner = Spinner::start("clauth: priming usage window");
+        let _spinner = Spinner::start("tollgate: priming usage window");
         let _ = oauth::prime_window(&config, canonical);
     }
-    outln!("clauth: switched to '{canonical}'");
+    outln!("tollgate: switched to '{canonical}'");
     Ok(())
 }
 
@@ -471,7 +471,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 ///
 /// [`SwitchError::Refused`] carries an authored sentence — the `bail!` arms
 /// and the `format::Message` renders below, the closed diagnostic set every
-/// clauth surface already spells the same way. A reflectable refusal: it
+/// tollgate surface already spells the same way. A reflectable refusal: it
 /// names the condition and the fix, never a path.
 ///
 /// [`SwitchError::Failed`] carries the open anyhow chain (the IO arms and
@@ -567,7 +567,7 @@ pub(crate) fn switch_profile_noninteractive(
     // stays the backstop, this only prevents the spurious rotation.
     if target_disabled {
         return Err(SwitchError::Refused(format!(
-            "'{target}': account is disabled, run `clauth enable {target}`"
+            "'{target}': account is disabled, run `tollgate enable {target}`"
         )));
     }
 
@@ -612,7 +612,7 @@ pub(crate) fn switch_profile_noninteractive(
             Some(DivergenceChoice::NewProfile) | None => {
                 let active = previous.as_deref().unwrap_or_default();
                 return Err(SwitchError::Refused(format!(
-                    "'{active}' has a login clauth hasn't saved, {}",
+                    "'{active}' has a login tollgate hasn't saved, {}",
                     crate::format::RESOLVE_IN_TUI
                 )));
             }
@@ -672,7 +672,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
 /// writes the incoming profile's: the OUTGOING profile's, or — with no active
 /// marker to read — every configured profile's.
 ///
-/// The fallback is the point. A cleared `active_profile` is clauth's record,
+/// The fallback is the point. A cleared `active_profile` is tollgate's record,
 /// never a statement about `settings.json`: `switch_off` clears the marker
 /// without touching the file, so a departed account's `[env]` entries are
 /// still sitting there while the next activation repoints `ANTHROPIC_BASE_URL`
@@ -948,7 +948,7 @@ pub(crate) fn edit_profile_env(
 /// Which source a candidate custom env key collides with, in priority order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EnvKeyCollision {
-    /// A clauth-managed key derived from a profile field; carries the field's
+    /// A tollgate-managed key derived from a profile field; carries the field's
     /// human label (`the base url field`, …).
     Managed(&'static str),
     /// Already a custom env entry on this account; carries the sorted index.
@@ -958,10 +958,10 @@ pub(crate) enum EnvKeyCollision {
 }
 
 /// Classify a candidate custom env key against the three sources, highest
-/// priority first: a clauth-managed field key, then this account's existing
+/// priority first: a tollgate-managed field key, then this account's existing
 /// custom entries, then the inherited base `settings.json`. The managed and
 /// own-field checks return before the base check, so a base hit means a key set
-/// outside clauth. `base_env_keys` is read from the live settings by the caller.
+/// outside tollgate. `base_env_keys` is read from the live settings by the caller.
 pub(crate) fn classify_env_key(
     profile: &Profile,
     base_env_keys: &[String],
@@ -990,7 +990,7 @@ pub(crate) fn classify_env_key(
 /// (`runtime::ROTATION_LOCK_TIMEOUT`) is no substitute — it waits tens of seconds,
 /// and a mutation the operator typed should answer now.
 ///
-/// Creates `~/.clauth/rotation-locks/` and this profile's lock file when they
+/// Creates `~/.tollgate/rotation-locks/` and this profile's lock file when they
 /// are absent (`RotationGuard::try_acquire` does), so it is a write rather than
 /// a pure read and the name does not say so. It creates no profile directory —
 /// which is what lets `delete_profile` and `rename_profile` below keep their
@@ -1113,7 +1113,7 @@ pub(crate) fn delete_profile(
     _rotation: &RotationGuard,
 ) -> Result<()> {
     with_state_lock(|held| {
-        // Refuse to pull an account out from under a running `clauth start`
+        // Refuse to pull an account out from under a running `tollgate start`
         // session (either flavor), checked before any removal so a refused
         // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
         // override this; only `force` does.
@@ -1166,7 +1166,7 @@ pub(crate) fn delete_profile(
 }
 
 /// Move the codex active slot to `name` — and, when the operator's own
-/// `~/.codex/auth.json` is a link clauth installed, move that link with it.
+/// `~/.codex/auth.json` is a link tollgate installed, move that link with it.
 ///
 /// Returns the operator slot it repointed, if any.
 ///
@@ -1174,7 +1174,7 @@ pub(crate) fn delete_profile(
 /// reads the operator slot, which the capture linked onto ONE profile's store
 /// and nothing ever moved again. So a switch changed the panel and the feed
 /// while every codex the operator started kept spending the old account. The
-/// slot follows only when it is clauth's own link (the ownership rule
+/// slot follows only when it is tollgate's own link (the ownership rule
 /// [`detach_operator_auth_slot`] already uses); a regular file is the
 /// operator's own login and an absent slot is a login they never gave us —
 /// both are left exactly as found.
@@ -1211,18 +1211,18 @@ pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathB
 }
 
 /// Repoint the operator's `auth.json` at `name`'s store when it is a link into
-/// a DIFFERENT clauth profile's store; `None` when there is nothing of ours to
+/// a DIFFERENT tollgate profile's store; `None` when there is nothing of ours to
 /// move (a regular file, no slot, a foreign link, or already pointing here).
 fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     // Resolved the way the capture and the delete resolve it: inside a
-    // `clauth start` session CODEX_HOME names the session home, and the
+    // `tollgate start` session CODEX_HOME names the session home, and the
     // operator's real slot is still the default one.
     let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
     let slot = operator.join("auth.json");
     let Ok(target) = std::fs::read_link(&slot) else {
         return Ok(None);
     };
-    let Some(holder) = clauth_auth_store_owner(&target) else {
+    let Some(holder) = tollgate_auth_store_owner(&target) else {
         return Ok(None);
     };
     if holder.eq_ignore_ascii_case(name) {
@@ -1232,7 +1232,7 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     if !store.exists() {
         bail!(
             "'{name}' has no stored codex login, so {} cannot follow it — log it in \
-             with `clauth login {name} --codex --browser`",
+             with `tollgate login {name} --codex --browser`",
             slot.display()
         );
     }
@@ -1245,7 +1245,7 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     Ok(Some(slot))
 }
 
-/// `clauth delete <name>` for a codex profile. Same shape as the claude
+/// `tollgate delete <name>` for a codex profile. Same shape as the claude
 /// [`delete_profile`]: the live gate, an unwire of what the profile installed
 /// globally BEFORE the irreversible removal, then dir before state — a refused
 /// or failed delete leaves the record intact and retryable. What codex
@@ -1309,8 +1309,8 @@ pub(crate) fn delete_codex_profile(
 /// alone, never its target — returning the slot's path. A link naming another
 /// profile, a regular file (the operator re-logged in on their own), or an
 /// absent slot is left exactly as found. The operator home resolves as the
-/// capture resolves it; where that refuses (`CODEX_HOME` inside a clauth
-/// session home: a delete typed from a shell codex spawned by `clauth start`)
+/// capture resolves it; where that refuses (`CODEX_HOME` inside a tollgate
+/// session home: a delete typed from a shell codex spawned by `tollgate start`)
 /// the operator's real slot is still the default home's, which the capture
 /// linked exactly as it would have from any other shell, so that is the one
 /// checked — the ownership predicate is what makes the fallback safe.
@@ -1320,7 +1320,7 @@ fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     let Ok(target) = std::fs::read_link(&slot) else {
         return Ok(None);
     };
-    if !clauth_auth_store_owner(&target).is_some_and(|holder| holder.eq_ignore_ascii_case(name)) {
+    if !tollgate_auth_store_owner(&target).is_some_and(|holder| holder.eq_ignore_ascii_case(name)) {
         return Ok(None);
     }
     std::fs::remove_file(&slot)
@@ -1328,13 +1328,13 @@ fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     Ok(Some(slot))
 }
 
-/// `clauth login <name> --codex` — create (or re-authenticate) a codex
+/// `tollgate login <name> --codex` — create (or re-authenticate) a codex
 /// profile by ADOPTING the operator's own `codex login`: the chain moves into
 /// `profiles/<name>/auth.json` (atomic, 0600 — this writer owns that mode)
 /// with every key codex wrote and `last_refresh` re-stamped to the capture
 /// time, and the operator's `auth.json` becomes a symlink to it. One
 /// physical file is the design's own safety mechanism (decision 8): the
-/// operator's bare `codex`, every clauth session, and clauth's rotation all
+/// operator's bare `codex`, every tollgate session, and tollgate's rotation all
 /// hold the same chain. A snapshot-copy here would be the forbidden
 /// configuration decisions 7/8 exist to prevent — two carriers of a
 /// single-use rotating chain, where the first refresh on either side strands
@@ -1343,8 +1343,8 @@ fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// said out loud instead of implied away.
 ///
 /// The operator home is the one the operator's codex actually uses: a set
-/// `CODEX_HOME` is honored — unless it names a home clauth built, which means
-/// this shell is INSIDE a clauth codex session and "the operator's login" is
+/// `CODEX_HOME` is honored — unless it names a home tollgate built, which means
+/// this shell is INSIDE a tollgate codex session and "the operator's login" is
 /// some profile's store; that refuses rather than snapshotting a sibling.
 ///
 /// Refusals, each naming its fix:
@@ -1379,13 +1379,13 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
     }
     let auth_path = operator.join("auth.json");
 
-    // A slot clauth already adopted: the chain belongs to exactly one profile.
+    // A slot tollgate already adopted: the chain belongs to exactly one profile.
     if let Ok(target) = std::fs::read_link(&auth_path)
-        && let Some(holder) = clauth_auth_store_owner(&target)
+        && let Some(holder) = tollgate_auth_store_owner(&target)
     {
         if holder.eq_ignore_ascii_case(&trimmed) {
             outln!(
-                "clauth: {} already follows codex profile '{holder}' — nothing to capture",
+                "tollgate: {} already follows codex profile '{holder}' — nothing to capture",
                 auth_path.display()
             );
             return Ok(());
@@ -1483,26 +1483,26 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
     })?;
 
     if reauth {
-        outln!("clauth: re-captured the operator codex login into '{canonical}'");
+        outln!("tollgate: re-captured the operator codex login into '{canonical}'");
     } else {
-        outln!("clauth: captured the operator codex login into codex profile '{canonical}'");
+        outln!("tollgate: captured the operator codex login into codex profile '{canonical}'");
     }
     if adopted {
         outln!(
-            "clauth: {} now follows the profile store — your own codex and clauth \
+            "tollgate: {} now follows the profile store — your own codex and tollgate \
              sessions share one chain",
             auth_path.display()
         );
         outln!(
-            "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s \
+            "tollgate: while it does, `codex login` and `codex logout` reach '{canonical}'s \
              chain through that link and revoke it server-side — remove the link first \
              if you mean to mint a chain for a different account"
         );
     } else {
         outln!(
-            "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE \
+            "tollgate: could not repoint {} (no symlink support?) — it is now a SEPARATE \
              copy of a single-use rotating chain, and the first refresh on either side \
-             strands the other. Run codex only through `clauth start {canonical}` from \
+             strands the other. Run codex only through `tollgate start {canonical}` from \
              here on, or `codex login` again for your own use",
             auth_path.display()
         );
@@ -1583,16 +1583,16 @@ fn codex_browser_preflight(name: &str) -> Result<String> {
     Ok(trimmed)
 }
 
-/// `clauth login <name> --codex --browser` — mint a FRESH codex chain via
+/// `tollgate login <name> --codex --browser` — mint a FRESH codex chain via
 /// codex's own PKCE flow and land it as a new profile, without touching
 /// `~/.codex`. Unlike the adopt-capture this is not a second carrier of an
-/// existing chain — it is a brand-new login clauth alone holds.
+/// existing chain — it is a brand-new login tollgate alone holds.
 pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
     let trimmed = codex_browser_preflight(name)?;
 
     let outcome = crate::codex_login::login_with(|url| {
-        outln!("clauth: opening {url}");
-        outln!("clauth: if the browser did not open, paste that URL into it");
+        outln!("tollgate: opening {url}");
+        outln!("tollgate: if the browser did not open, paste that URL into it");
     })?;
 
     let guess = crate::codex_profiles::CodexState::load()?
@@ -1624,17 +1624,17 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
         Ok(canonical)
     })?;
 
-    outln!("clauth: logged a fresh codex chain into codex profile '{canonical}'");
+    outln!("tollgate: logged a fresh codex chain into codex profile '{canonical}'");
     if let Some(acc) = outcome.account_id {
-        outln!("clauth: ChatGPT account {acc}");
+        outln!("tollgate: ChatGPT account {acc}");
     }
-    outln!("clauth: run it with `clauth start {canonical}` — your own ~/.codex is untouched");
+    outln!("tollgate: run it with `tollgate start {canonical}` — your own ~/.codex is untouched");
     Ok(())
 }
 
 /// The home the OPERATOR's codex reads: an explicit non-empty `CODEX_HOME`,
-/// else `~/.codex`. A `CODEX_HOME` naming a clauth-built session home refuses
-/// — inside a `clauth start` codex session "the operator's login" resolves to
+/// else `~/.codex`. A `CODEX_HOME` naming a tollgate-built session home refuses
+/// — inside a `tollgate start` codex session "the operator's login" resolves to
 /// some profile's store, and capturing a sibling profile's chain is never
 /// what this verb means.
 fn codex_operator_home() -> Result<std::path::PathBuf> {
@@ -1642,8 +1642,8 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
         let dir = std::path::PathBuf::from(dir);
         if crate::runtime::is_codex_home_path(&dir) {
             bail!(
-                "CODEX_HOME points into a clauth codex session home — run the capture \
-                 from a shell outside `clauth start`, where ~/.codex (or your own \
+                "CODEX_HOME points into a tollgate codex session home — run the capture \
+                 from a shell outside `tollgate start`, where ~/.codex (or your own \
                  CODEX_HOME) holds the operator's login"
             );
         }
@@ -1657,9 +1657,9 @@ fn default_codex_operator_home() -> Result<std::path::PathBuf> {
     Ok(crate::profile::home_dir()?.join(".codex"))
 }
 
-/// The codex profile owning a clauth auth store path
+/// The codex profile owning a tollgate auth store path
 /// (`…/profiles/<name>/auth.json`), or `None` for any other shape.
-fn clauth_auth_store_owner(target: &std::path::Path) -> Option<String> {
+fn tollgate_auth_store_owner(target: &std::path::Path) -> Option<String> {
     if target.file_name()? != "auth.json" {
         return None;
     }
@@ -1711,11 +1711,11 @@ fn codex_operator_store_mode(operator: &std::path::Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `clauth disable <name>` — mark `name` as user-disabled (see
+/// `tollgate disable <name>` — mark `name` as user-disabled (see
 /// [`Profile::disabled`]): invisible to the fallback-chain walk, the
 /// usage/rotation scheduler, and the daemon status feed by default, while its
 /// profile directory and stored credentials stay on disk untouched. Refuses
-/// when `name` is the global active profile or holds a live `clauth start`
+/// when `name` is the global active profile or holds a live `tollgate start`
 /// session, naming the blocker — a disabled account must never be reachable
 /// as an active target, so both gates run before any write.
 ///
@@ -1745,7 +1745,7 @@ pub(crate) fn disable_profile(config: &mut AppConfig, name: &ProfileName) -> Res
     })
 }
 
-/// `clauth enable <name>` — clear [`Profile::disabled`], restoring `name` to
+/// `tollgate enable <name>` — clear [`Profile::disabled`], restoring `name` to
 /// every operational surface. No other side effects: chain slot, env, model
 /// settings, and stored credentials are untouched.
 ///
@@ -1829,10 +1829,10 @@ pub(crate) fn duplicate_profile(
 }
 
 /// Set a profile's default `model` (the Setup tab's base model row / the
-/// `clauth login --model` flag), preserving any alias overrides already on it.
+/// `tollgate login --model` flag), preserving any alias overrides already on it.
 /// An empty (post-trim) value clears the default, matching the Setup tab's ⏎
 /// commit on the model row. Persists via [`edit_profile_model`], so a caller
-/// that runs this before starting a session (`clauth login`) has the model
+/// that runs this before starting a session (`tollgate login`) has the model
 /// routed into that session's runtime settings from the first launch.
 pub(crate) fn set_profile_default_model(
     config: &mut AppConfig,
@@ -1871,7 +1871,7 @@ pub(crate) fn set_profile_default_model(
 /// genuinely foreign account, which is a human decision.
 ///
 /// Staleness caveat: CC trusts the cached `oauthAccount` block and does not
-/// re-derive it from a swapped credentials file (exactly why clauth strips it on
+/// re-derive it from a swapped credentials file (exactly why tollgate strips it on
 /// switch — [`crate::claude_json::strip_home_oauth_account`]). So a tier-2 hit is "CC's
 /// last booted identity", not fresh proof of the live token's account. That can
 /// only bias the verdict conservatively: pointing at a SIBLING routes the
@@ -1982,7 +1982,7 @@ pub(crate) fn snapshot_is_empty(snapshot: &CaptureSnapshot) -> bool {
     !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none()
 }
 
-/// `clauth capture <name>`: save the login Claude Code is using now as a new
+/// `tollgate capture <name>`: save the login Claude Code is using now as a new
 /// profile. That is the way out when the live credentials file holds a login no
 /// profile owns (#72) — every other create path refuses over it. Returns
 /// whether the new profile became the active account: the first one
@@ -1991,7 +1991,7 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     let name = name.trim();
     if let Some(existing) = config.canonical_name(name) {
         bail!(
-            "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
+            "a profile named '{existing}' already exists; re-authenticate it with:  tollgate login {existing}"
         );
     }
     validate_profile_name(name, Harness::Claude, None)?;
@@ -2002,7 +2002,9 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     // The TUI's capture asks before duplicating a login another profile already
     // owns; the CLI has no confirm flow, so it refuses with the owner named.
     if let Some(owner) = find_matching_oauth_profile(config, snapshot.credentials.as_ref()) {
-        bail!("these credentials already belong to '{owner}'; switch to it with:  clauth {owner}");
+        bail!(
+            "these credentials already belong to '{owner}'; switch to it with:  tollgate {owner}"
+        );
     }
     let becomes_active = config.state.active_profile.is_none();
     capture_into_profile(config, name.to_string(), None, snapshot)?;
@@ -2114,7 +2116,7 @@ pub(crate) fn create_profile_from_login(
 }
 
 /// The zero-account create arm's `link_profile_credentials` refusal (#72): the
-/// live credentials file holds a login clauth never saved, and the resolve step
+/// live credentials file holds a login tollgate never saved, and the resolve step
 /// the guard's own message points at is unreachable with no active profile. Roll
 /// the half-created profile back — dir off disk, in-memory records dropped, so
 /// config matches disk again — and name the two actions that CAN save the login.
@@ -2143,7 +2145,7 @@ fn rollback_first_account_create(
     let outer = format!(
         "profile '{name}' not created, the attempt was rolled back: the live \
          ~/.claude/.credentials.json holds a login no profile owns. Save it first with \
-         'clauth capture {name}', or with the '+ capture current login' row on the \
+         'tollgate capture {name}', or with the '+ capture current login' row on the \
          '+ new' form{rollback_note}"
     );
     // The CLI error printer (`exit_code`) shows the whole anyhow chain in
@@ -2257,7 +2259,7 @@ pub(crate) fn overwrite_captured_profile(
         // A disabled profile's creds are still captured above (the operator
         // asked for that), but it must never become the active account this
         // way — reachable via login → switch away → disable → delete the
-        // active (clears `active_profile` to None) → `clauth login
+        // active (clears `active_profile` to None) → `tollgate login
         // <disabled>` (the documented revoked-token recovery) auto-activating
         // it. `is_disabled` is re-read fresh rather than reusing a stale bool
         // from before `save_profile` — nothing above this line touches the
@@ -2313,7 +2315,7 @@ pub(crate) fn overwrite_captured_profile(
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
-        // AUTH-1: re-authenticating an existing profile (`clauth login <name>`) is
+        // AUTH-1: re-authenticating an existing profile (`tollgate login <name>`) is
         // the documented recovery for a revoked login — clear its quarantine.
         // Pinned by `reauth_overwrite_clears_broken_flag`.
         config.set_auth_broken(name, false);

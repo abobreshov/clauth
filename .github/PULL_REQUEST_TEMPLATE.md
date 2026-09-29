@@ -10,7 +10,7 @@ This PR
 
 ## Checklist
 
-- [ ] Secrets redacted from any pasted output (no `sk-ant-*`, no `~/.claude`/`~/.clauth` contents)
+- [ ] Secrets redacted from any pasted output (no `sk-ant-*`, no `~/.claude`/`~/.tollgate` contents)
 - [ ] `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings` and `cargo test --locked --all-features` pass locally
 
 ## AI

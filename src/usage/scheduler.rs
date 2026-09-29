@@ -415,7 +415,7 @@ impl NamedEntry for TokenEntry {
         }
         // A run of transient refresh failures climbs the same curve a 429 run
         // does, clamped to the same floor. Without it the one failure mode that
-        // can hit EVERY profile at once — clauth's own request shape drifting,
+        // can hit EVERY profile at once — tollgate's own request shape drifting,
         // which never quarantines because the endpoint never confirmed a dead
         // token — re-hits the token endpoint at full cadence indefinitely.
         if streaks.refresh_fail == 0 {
@@ -853,19 +853,19 @@ const ROTATE_LEAD_FLOOR_MS: i64 = 900_000;
 /// Claude Code refreshes its own OAuth token once it is within **5 minutes**
 /// of expiry — one predicate gates its whole demand path, measured against its
 /// shipped bundle. Rotating outside that window
-/// means CC never has a reason to refresh, so clauth's stored pair stays the
+/// means CC never has a reason to refresh, so tollgate's stored pair stays the
 /// live one instead of lagging a chain CC advanced. Three poll intervals give
 /// multiple rotation opportunities before expiry whatever the cadence, and the
 /// floor is what clears CC's threshold at the shipped 90 s rate.
 ///
 /// Correctness still does not depend on winning that race: when CC refreshes
-/// first — clauth downtime, a lost race — the poller ADOPTS CC's fresher pair
+/// first — tollgate downtime, a lost race — the poller ADOPTS CC's fresher pair
 /// rather than fighting for the chain (`oauth::try_adopt_live_rotation`).
 /// Losing is not free, though. Anthropic does not punish the double-spend — the
 /// pair the winner minted keeps working — but
-/// clauth answers the `invalid_grant` its own loser gets with a LOCAL
+/// tollgate answers the `invalid_grant` its own loser gets with a LOCAL
 /// quarantine (`mark_auth_broken`), and only an adopt, a carry, or a
-/// `clauth login` lifts that. Rotating early is what keeps the chain off that
+/// `tollgate login` lifts that. Rotating early is what keeps the chain off that
 /// path, not what makes the path harmless.
 fn rotate_lead_ms(interval_ms: u64) -> i64 {
     ((interval_ms as i64).saturating_mul(3)).max(ROTATE_LEAD_FLOOR_MS)
@@ -1024,7 +1024,7 @@ fn classify_pre_rotation(
 ///
 /// A second exception to "rotate only on a rejected token": with the
 /// `preemptive_rotation` toggle on (the default), a profile rotates ahead of
-/// expiry (see [`rotate_lead_ms`]) so the running `claude` reads a pair clauth
+/// expiry (see [`rotate_lead_ms`]) so the running `claude` reads a pair tollgate
 /// already refreshed rather than refreshing it itself.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
@@ -1170,7 +1170,7 @@ fn fetch_with_rotation(
     if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
         return outcome;
     }
-    // macOS only: clauth can't write the Keychain item this session's CC reads,
+    // macOS only: tollgate can't write the Keychain item this session's CC reads,
     // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
     if crate::runtime::rotation_blocked_for(name) {
         return bail_unrotated();
@@ -1227,7 +1227,7 @@ fn fetch_with_rotation(
                 // profile's live mirror, on every platform since the
                 // `keychain_live()` term went; this re-read catches every
                 // other racer (CC writing THROUGH an intact symlink, a
-                // sibling clauth process). See `carry_external_rotation`.
+                // sibling tollgate process). See `carry_external_rotation`.
                 if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
                     return outcome;
                 }
@@ -1859,7 +1859,7 @@ fn sync_kick_blocks_from_cache(blocks: &KickBlocks, names: &[String]) {
 ///
 /// Exists for the auto-start queue's membership rule
 /// ([`crate::usage::auto_start_queue_members`]), which every surface must answer
-/// identically or publish a queue the election is not running. `clauth status
+/// identically or publish a queue the election is not running. `tollgate status
 /// --json` has no scheduler to ask, and a blocked member left in would take a
 /// position and inflate `N` for as long as the limiter's advertised ceiling
 /// stands — hours — shortening every OTHER member's published `next_open_at`
@@ -2217,7 +2217,7 @@ fn rate_limit_backoff_ms(streak: u32) -> u64 {
 /// the user is watching mostly buys staleness (observed 2026-07-12: the
 /// endpoint recovered while the active account sat out a 14-minute slot as
 /// `RateLimited`). The cap must NOT be unconditional: the `/usage` window is
-/// filled only by clauth's own polls — the running claude's `/v1/messages`
+/// filled only by tollgate's own polls — the running claude's `/v1/messages`
 /// traffic never touches it — so on a SUSTAINED storm capped ~2×-cadence
 /// re-polls would keep the window pinned (the exact #30 failure); past the
 /// bound the active row climbs the same drain ladder as everyone else. A REAL
@@ -2686,7 +2686,7 @@ fn try_seed_cache(
 /// declines anything it cannot vouch for, so nothing here branches on provider.
 ///
 /// `None` REMOVES rather than leaves the previous entry. A provider that
-/// stopped publishing windows — a plan change, a response shape clauth no
+/// stopped publishing windows — a plan change, a response shape tollgate no
 /// longer recognises, a best-effort scan that used to guess one — has no
 /// current reading, and a frozen entry would keep answering the walk with a
 /// figure nothing refreshes: exactly the stale-cache trap the OAuth leg's
@@ -3200,7 +3200,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     sup.insert(name.to_string(), fingerprint);
                 }
                 // Durable twin of that suppression, for the surfaces with no
-                // scheduler in the process (`clauth list`, `clauth status
+                // scheduler in the process (`tollgate list`, `tollgate status
                 // --json`): without it they derive freshness from the usage
                 // cache's mtime and publish a warm cache behind a dead session
                 // as `Fresh`. Keyed by the same fingerprint, so a re-login
@@ -3502,7 +3502,7 @@ fn tick(state: &SchedulerState) {
     if !state.fetch_lease.acquire() {
         if !state.standdown_active.swap(true, Ordering::Relaxed) {
             standdown_transition_log(
-                "clauth: another instance holds the usage-fetch lease: standing \
+                "tollgate: another instance holds the usage-fetch lease: standing \
                  down (rendering from the shared cache)",
             );
         }
@@ -3510,7 +3510,7 @@ fn tick(state: &SchedulerState) {
         return;
     }
     if state.standdown_active.swap(false, Ordering::Relaxed) {
-        standdown_transition_log("clauth: acquired the usage-fetch lease: fetching");
+        standdown_transition_log("tollgate: acquired the usage-fetch lease: fetching");
     }
 
     // Retention trim for the logs this process appends to. Under the lease, so
@@ -3529,7 +3529,7 @@ fn tick(state: &SchedulerState) {
     // (one slow account stalling every other account's poll, every tick) has
     // no analogue here. What makes inline SAFE is `LockWait::NoWait`: the
     // gate's rotation-lock acquisition is a try-lock on this leg, because its
-    // waiting form carries no deadline and a `clauth start`
+    // waiting form carries no deadline and a `tollgate start`
     // holding the lock across its recursive `~/.claude` copy would otherwise park
     // this thread — and with it every account's poll — while the heartbeat
     // (stamped in the main loop, not here) kept reading fresh. The session
@@ -3546,12 +3546,12 @@ fn tick(state: &SchedulerState) {
     // watchdog-bounded reconcile loop: its refreshes are blocking token round
     // trips, exactly the kind of work the claude rotations already do here,
     // and putting them under the 30s daemon watchdog would let a slow OpenAI
-    // endpoint trip the abort that wipes clauth's own state. Lease-holder only
+    // endpoint trip the abort that wipes tollgate's own state. Lease-holder only
     // (like every leg here), so it is also the single cross-process writer the
     // no-replay rule needs — and self-contained over the codex roster, so the
     // claude scheduler's snapshots stay untouched (decision 4). Each pass hits
     // the wire only when a chain is actually due or kicked, so the steady
-    // state is zero HTTP; the NoWait guard inside keeps a `clauth start`
+    // state is zero HTTP; the NoWait guard inside keeps a `tollgate start`
     // holding rotation.lock from parking this thread.
     crate::codex_auth::standby_tick(now_ms() as i64, &chrono::Utc::now().to_rfc3339());
 
@@ -3764,7 +3764,7 @@ static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
 /// [`crate::codex_auth::kick_codex`], whose only production caller this is.
 ///
 /// One poll per profile per refresh interval, and only for profiles that
-/// actually hold a chain: an account clauth is not rotating between is not one
+/// actually hold a chain: an account tollgate is not rotating between is not one
 /// it needs a window reading for.
 ///
 /// Readings land in the SHARED [`UsageStore`], keyed by profile name. That is
@@ -3887,10 +3887,10 @@ fn apply_codex_switch(
     match action {
         crate::fallback::SwitchAction::To(target) => {
             if let Err(e) = crate::actions::switch_codex_profile(target.as_str()) {
-                logline!("clauth: codex auto-switch to '{target}' failed: {e:#}");
+                logline!("tollgate: codex auto-switch to '{target}' failed: {e:#}");
             } else {
                 logline!(
-                    "clauth: codex auto-switched to '{target}' — live at the next codex session"
+                    "tollgate: codex auto-switched to '{target}' — live at the next codex session"
                 );
             }
         }
@@ -3899,9 +3899,9 @@ fn apply_codex_switch(
                 st.set_active(None);
                 Ok(())
             }) {
-                logline!("clauth: codex switch-off failed: {e:#}");
+                logline!("tollgate: codex switch-off failed: {e:#}");
             } else {
-                logline!("clauth: every codex account is spent — codex active slot cleared");
+                logline!("tollgate: every codex account is spent — codex active slot cleared");
             }
         }
     }
@@ -3910,7 +3910,7 @@ fn apply_codex_switch(
 /// Log a stand-down / lease-acquired transition. Either the TUI or the daemon
 /// can stand down now (whichever didn't win the lease). `logline!` routes the
 /// daemon's line to `daemon.log` and an interactive TUI's to
-/// `~/.clauth/clauth.log`, so it is recorded without ever painting over the
+/// `~/.tollgate/tollgate.log`, so it is recorded without ever painting over the
 /// accounts pane.
 fn standdown_transition_log(msg: &str) {
     logline!("{msg}");
@@ -4160,7 +4160,7 @@ pub(crate) fn spawn_refresher(
     }
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
     std::thread::Builder::new()
-        .name("clauth-tick".into())
+        .name("tollgate-tick".into())
         .spawn(move || {
             loop {
                 if state.shutting_down.load(Ordering::SeqCst) {
@@ -4573,7 +4573,7 @@ struct SessionDecision {
 /// batch — `with_state_lock` is reentrant, so the `update_as_daemon` calls nested
 /// inside it take no second flock, where per-session acquisition would expose one
 /// tick to N × `STATE_LOCK_TIMEOUT`. Holding `config` across that flock would
-/// lengthen contention for every other clauth process (the same reason
+/// lengthen contention for every other tollgate process (the same reason
 /// `ProfileTtl` ranks outside `State`), and no pending-switch lock is held
 /// anywhere here: those rank OUTSIDE the flock (1500/1700 vs 500), so holding one
 /// across the write inverts the order.
@@ -4734,13 +4734,13 @@ fn scan_session_switches(
                 fields.set_intended_member(target.as_str());
                 fields.set_chain_cursor(*cursor);
             }) {
-                logline!("clauth: session {session_id} could not be pointed at {target}: {e:#}");
+                logline!("tollgate: session {session_id} could not be pointed at {target}: {e:#}");
             }
         }
         Ok::<_, anyhow::Error>(())
     });
     if let Err(e) = batch {
-        logline!("clauth: per-session fallback decisions deferred to the next tick: {e:#}");
+        logline!("tollgate: per-session fallback decisions deferred to the next tick: {e:#}");
     }
 }
 
@@ -5147,7 +5147,7 @@ const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
 /// so a hold only the clock releases would sit on the operator's fix for up to
 /// six hours. Every hold this long therefore records a
 /// [`crate::claude::credential_fingerprint`] of the profile, and a change to
-/// any of the three files — the operator's fix, or clauth's own successful
+/// any of the three files — the operator's fix, or tollgate's own successful
 /// rotation of the chain, either of which is exactly a reason to re-judge —
 /// releases the hold on the next scan: the gate runs right after the write,
 /// not six hours later. A self-release re-runs one gate and, if the verdict
@@ -5156,7 +5156,7 @@ const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// One paced re-stamp hold. `watched` is `Some` exactly on the
 /// [`ROLLING_BROKEN_RETRY_MS`]-length holds — the re-login-shaped ones, whose
-/// real exit is a credential file changing (the operator's fix, or clauth's
+/// real exit is a credential file changing (the operator's fix, or tollgate's
 /// own successful rotation — either one is reason to re-judge), not the
 /// clock. The short transient cadence stays purely time-based, and the
 /// backwards-clock clamp reads the kind off `watched`, so the coupling holds
@@ -5275,7 +5275,7 @@ pub(super) fn claude_rolling_tick(
                 p.retry_after_ms.remove(name.as_str());
             }
             logline!(
-                "clauth: '{name}' credentials changed under a re-stamp hold — re-checking now"
+                "tollgate: '{name}' credentials changed under a re-stamp hold — re-checking now"
             );
         }
         if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
@@ -5322,7 +5322,7 @@ pub(super) fn claude_rolling_tick(
             }
             crate::oauth::AuthGate::Transient(e) => {
                 logline!(
-                    "clauth: re-stamp for '{name}' failed (will retry): {}",
+                    "tollgate: re-stamp for '{name}' failed (will retry): {}",
                     e.text_with_status()
                 );
                 // A transient whose cause only a re-login clears is not

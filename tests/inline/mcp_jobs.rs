@@ -2,7 +2,7 @@
 
 //! Disk job-store coverage: atomic write/read roundtrip, id safety, and GC of
 //! expired / orphaned state. Home-sandboxed so files land in a tempdir, never
-//! the real `~/.clauth/jobs`.
+//! the real `~/.tollgate/jobs`.
 
 use super::*;
 use crate::testutil::HomeSandbox;
@@ -583,7 +583,7 @@ fn the_conversion_never_overwrites_a_finished_result() {
 }
 
 /// A tombstone is an orphan, never a done record: `phase()` reads the `crashed`
-/// flag before the generic `Done` arm, or `clauth jobs`, `monitor`'s listing and
+/// flag before the generic `Done` arm, or `tollgate jobs`, `monitor`'s listing and
 /// the TUI all read a crashed run as a collectable `done`.
 #[test]
 fn a_tombstone_reads_orphaned_not_done() {
@@ -1377,7 +1377,7 @@ fn the_listing_orders_on_the_retention_anchor_across_both_spellings() {
 /// arbitrary and not stable across calls on an unchanged store: a fan-out whose
 /// members land inside the same millisecond enumerated differently each time, so
 /// a model diffing two `monitor` replies saw changes that had not happened and
-/// an operator watching `clauth jobs` saw rows swap under a still store.
+/// an operator watching `tollgate jobs` saw rows swap under a still store.
 ///
 /// Six records at ONE anchor, written in an order that is neither the expected
 /// output nor its reverse: at six, an accidental `read_dir` agreement is 1 in
@@ -1444,7 +1444,7 @@ fn the_id_tiebreak_never_outranks_the_anchor() {
 
 /// A job file carries the delegate's prompt and the account's full response, and
 /// the dir naming every background job is as readable as the files in it. Both
-/// ride clauth's owner-only rule for `~/.clauth`.
+/// ride tollgate's owner-only rule for `~/.tollgate`.
 #[cfg(unix)]
 #[test]
 fn job_files_and_dir_are_owner_only() {

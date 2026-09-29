@@ -6,7 +6,7 @@
 //! reason as `tests/closed_reader.rs`: the child resolves its home through
 //! `dirs`, which on Windows reads `FOLDERID_Profile` and no environment
 //! variable, so the run could not be pointed away from the operator's real
-//! `~/.clauth`.
+//! `~/.tollgate`.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 #[test]
 fn the_hook_delivers_the_folded_envelopes_prose_with_its_account() {
     let home = tempfile::tempdir().unwrap();
-    let jobs = home.path().join(".clauth").join("jobs");
+    let jobs = home.path().join(".tollgate").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
     std::fs::write(
         jobs.join("d-hook-0.json"),
@@ -44,7 +44,7 @@ fn the_hook_delivers_the_folded_envelopes_prose_with_its_account() {
     // The host's documented mcp_result shape: the response envelope is
     // JSON-encoded as the content block's text.
     let payload = serde_json::json!({
-        "tool_name": "mcp__plugin_clauth_clauth__delegate",
+        "tool_name": "mcp__plugin_tollgate_tollgate__delegate",
         "tool_response": {
             "type": "mcp_result",
             "content": [{
@@ -58,7 +58,7 @@ fn the_hook_delivers_the_folded_envelopes_prose_with_its_account() {
             }],
         }
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_clauth"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tollgate"))
         .args(["mcp-await-job"])
         .env("HOME", home.path())
         .stdin(Stdio::piped())

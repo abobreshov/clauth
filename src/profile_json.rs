@@ -1,5 +1,5 @@
 //! Profile → JSON view helpers shared by the `mcp` server, the `daemon`
-//! status writer, and `clauth status --json`. Every reader sources usage from
+//! status writer, and `tollgate status --json`. Every reader sources usage from
 //! the on-disk cache the scheduler writes — `usage_cache.json` for an OAuth
 //! account and `third_party_cache.json` for an api-key one, picked by
 //! [`usage_cache_file`] — so these functions are process-independent: they
@@ -86,7 +86,7 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
 /// is what a second copy of the rule buys. It asks
 /// [`Profile::usage_cache_is_third_party`] — the question about where figures
 /// live — never `is_third_party`, which answers whether the provider is one
-/// clauth has a typed integration for and leaves every generic api-key endpoint
+/// tollgate has a typed integration for and leaves every generic api-key endpoint
 /// reading its empty OAuth cache.
 pub(crate) fn usage_cache_file(p: &Profile) -> &'static str {
     cache_file_of(p.usage_cache_is_third_party())
@@ -147,14 +147,14 @@ pub(crate) fn stale_after_ms(interval_ms: u64) -> u64 {
     2 * floored + interval_ms
 }
 
-/// What clauth can say about one account's headroom, discriminated so a reader
+/// What tollgate can say about one account's headroom, discriminated so a reader
 /// can tell a window that does not EXIST from a window with no cached figure.
 ///
 /// Each arm carries the age of the cache its own figures came from, because the
 /// file that answers is the file that dates the answer: reading figures out of
 /// one cache and their freshness out of the other is the defect this type makes
 /// unspellable. A stale figure is DATED, never dropped — a known-old number a
-/// reader can discount beats no number, which reads as clauth having lost track
+/// reader can discount beats no number, which reads as tollgate having lost track
 /// of the account.
 pub(crate) enum ProfileWindows {
     /// An OAuth account's own `/usage` read. `None` when nothing has been
@@ -339,7 +339,7 @@ fn windows_of(name: &ProfileName, third_party: bool, provider: Option<Provider>)
 /// and `None` again when its stamp is in the FUTURE. A saturating subtraction
 /// would render that as `cached just now` with `stale` false — maximum
 /// confidence for the one stamp that proves the clock is wrong — where an
-/// undated figure says exactly what clauth knows: it cannot date this one.
+/// undated figure says exactly what tollgate knows: it cannot date this one.
 pub(crate) fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
     let mtime = profile_cache_mtime_ms(name, file)?;
     now_ms().checked_sub(mtime).map(|age| age / 1000)
@@ -348,7 +348,7 @@ pub(crate) fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
 /// One published window row — the `{label, utilization_pct, resets_at}`
 /// spelling of a 5h, 7d, or per-model weekly window. Both writers
 /// ([`usage_windows`] → the daemon's `status.json` feed and the MCP payloads)
-/// and the reader (`clauth list`'s 5h/7d columns) derive from this one struct,
+/// and the reader (`tollgate list`'s 5h/7d columns) derive from this one struct,
 /// so a reader's key spelling cannot drift from what a writer emits.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct Window {
@@ -421,7 +421,7 @@ pub(crate) fn usage_windows(usage: &UsageInfo) -> Vec<Window> {
 }
 
 /// The headroom a THIRD-PARTY account's own cache holds, as the two figure
-/// strings `clauth list`'s 5h/7d columns render: the provider's own usage bars
+/// strings `tollgate list`'s 5h/7d columns render: the provider's own usage bars
 /// under those exact labels first (a LIVE bar's figures; a lapsed one is the
 /// previous window's last reading and drops, the same call [`usage_windows`]
 /// makes), falling back to the first FUNDED wallet's balance — the same

@@ -209,7 +209,7 @@ fn fmt_count(n: f64) -> String {
 }
 
 /// Epoch-secs → z.ai's `yyyy-MM-dd HH:mm:ss` UTC date param (space-separated, no
-/// timezone), derived from the ISO form clauth already emits.
+/// timezone), derived from the ISO form tollgate already emits.
 fn secs_to_zai_date(secs: i64) -> String {
     let iso = epoch_secs_to_iso(secs); // YYYY-MM-DDTHH:MM:SS+00:00
     let date = iso.get(..19).unwrap_or(&iso);

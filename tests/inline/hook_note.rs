@@ -68,20 +68,20 @@ fn cld() -> Option<Reading> {
     reading(Some("cld"))
 }
 
-/// clauth cannot attribute the loaded credentials.
+/// tollgate cannot attribute the loaded credentials.
 fn unknown() -> Option<Reading> {
     reading(None)
 }
 
 const SWITCHED: &str =
-    "clauth note: the active profile for this session switched from `kerry` to `cld`.";
+    "tollgate note: the active profile for this session switched from `kerry` to `cld`.";
 
 /// The shipped copy, byte for byte. All three spellings counted against
 /// opus-4-8 on their placeholder spellings —
 /// `old`/`new`/`100` standing in for the names and figure, the `%` literal:
-/// ``clauth note: session resumed under `new`; earlier turns ran under `old`.``
-/// counts 25, ``clauth note: the active profile for this session switched from
-/// `old` to `new`.`` counts 22, and ``clauth note: the active profile for this
+/// ``tollgate note: session resumed under `new`; earlier turns ran under `old`.``
+/// counts 25, ``tollgate note: the active profile for this session switched from
+/// `old` to `new`.`` counts 22, and ``tollgate note: the active profile for this
 /// session switched from `old` to `new`; its 5h window is 100% used.`` counts
 /// 33. A reworded one is a re-count.
 #[test]
@@ -92,7 +92,7 @@ fn both_note_spellings_render_the_shipped_copy() {
             before: "z.ai",
         }
         .render(),
-        "clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`.",
+        "tollgate note: session resumed under `DS4`; earlier turns ran under `z.ai`.",
     );
     assert_eq!(
         Note::Switched {
@@ -112,7 +112,7 @@ fn both_note_spellings_render_the_shipped_copy() {
             used: Some(62.0),
         }
         .render(),
-        "clauth note: the active profile for this session switched from `kerry` \
+        "tollgate note: the active profile for this session switched from `kerry` \
          to `cld`; its 5h window is 62% used.",
     );
 }
@@ -192,7 +192,7 @@ fn a_resume_under_another_account_names_the_earlier_turns() {
 
     assert_eq!(
         note_for(&resumed, &watch(2, 0), &|| reading(Some("DS4"))).as_deref(),
-        Some("clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
+        Some("tollgate note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
     );
 }
 
@@ -600,8 +600,8 @@ fn the_hook_fold_overwrites_a_contested_store_entry() {
     // Pre-state: the two differing sweeps must have left a CONTESTED entry, the
     // shape this test's name claims. `owner_of` collapses Contested to None, so
     // read the store file directly rather than through the reader.
-    let store_file = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let store_file = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("session_profiles.json");
     let raw: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&store_file).expect("store")).expect("json");
@@ -778,7 +778,7 @@ fn an_account_change_names_the_new_accounts_headroom() {
     assert_eq!(
         note_for(&fire, &watch(2, 0), &cld).as_deref(),
         Some(
-            "clauth note: the active profile for this session switched from \
+            "tollgate note: the active profile for this session switched from \
              `kerry` to `cld`; its 5h window is 62% used.",
         ),
     );
@@ -790,7 +790,7 @@ fn an_account_change_names_the_new_accounts_headroom() {
     assert_eq!(
         note_for(&compacted, &watch(3, 0), &kerry).as_deref(),
         Some(
-            "clauth note: the active profile for this session switched from \
+            "tollgate note: the active profile for this session switched from \
              `cld` to `kerry`; its 5h window is 33% used.",
         ),
     );
@@ -813,7 +813,7 @@ fn a_subagent_that_predates_the_move_hears_the_clause() {
     assert_eq!(
         note_for(&sub, &watch(2, 0), &cld).as_deref(),
         Some(
-            "clauth note: the active profile for this session switched from \
+            "tollgate note: the active profile for this session switched from \
              `kerry` to `cld`; its 5h window is 62% used.",
         ),
     );
@@ -877,7 +877,7 @@ fn a_resume_never_carries_the_headroom_clause() {
     resumed.source = Some("resume".to_string());
     assert_eq!(
         note_for(&resumed, &watch(2, 0), &|| reading(Some("DS4"))).as_deref(),
-        Some("clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
+        Some("tollgate note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
     );
 }
 
@@ -1130,7 +1130,7 @@ fn the_bare_id_bounds_are_exactly_sixty_four_bytes_and_non_empty() {
 #[test]
 fn watch_now_sees_a_per_profile_config_edit() {
     let home = HomeSandbox::new();
-    let profile = home.home().join(".clauth/profiles/acme");
+    let profile = home.home().join(".tollgate/profiles/acme");
     std::fs::create_dir_all(&profile).expect("profile dir");
     let config = profile.join("config.toml");
     std::fs::write(&config, b"# one\n").expect("write config");
@@ -1397,7 +1397,7 @@ fn a_task_past_the_threshold_with_nowhere_to_go_emits_the_approved_copy() {
     assert_eq!(
         note,
         format!(
-            "clauth note: 5h window 97% used (5.0%/h). at this rate, it reaches \
+            "tollgate note: 5h window 97% used (5.0%/h). at this rate, it reaches \
              its cap {when}, resets {reset}. no fallback is set; further agent \
              spawns may fail with 429s.",
         ),
@@ -1545,7 +1545,7 @@ fn a_below_threshold_window_whose_rate_caps_before_the_reset_emits() {
     assert_eq!(
         note,
         format!(
-            "clauth note: 5h window 74% used (30.0%/h). at this rate, it reaches \
+            "tollgate note: 5h window 74% used (30.0%/h). at this rate, it reaches \
              its cap {when}, resets {reset}. no fallback is set; further agent \
              spawns may fail with 429s.",
         ),
@@ -1821,7 +1821,7 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     assert!(!read.chain_acts, "the walk has nowhere to point");
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(
-        note.starts_with("clauth note: 5h window 97% used ("),
+        note.starts_with("tollgate note: 5h window 97% used ("),
         "the used figure is the disk-cached one: {note}",
     );
     assert!(
@@ -1884,7 +1884,7 @@ fn the_replay_judges_a_third_party_members_windows_like_the_live_leg() {
     );
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(
-        note.starts_with("clauth note: 5h window 97% used ("),
+        note.starts_with("tollgate note: 5h window 97% used ("),
         "the uncovered session hears it: {note}",
     );
 }
@@ -2018,7 +2018,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
     // reader's row check stays silent — the fire is eligible.
     let _dir = crate::testutil::ConfigDirSandbox::new(
         &home,
-        &home.home().join(".clauth/profiles/a/runtime-456-7"),
+        &home.home().join(".tollgate/profiles/a/runtime-456-7"),
     );
     let fire = task_fire("conv-pinned");
 
@@ -2030,7 +2030,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
     );
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(
-        note.starts_with("clauth note: 5h window 97% used ("),
+        note.starts_with("tollgate note: 5h window 97% used ("),
         "the session's own window earns it: {note}",
     );
 }
@@ -2062,7 +2062,7 @@ fn an_armed_session_silences_the_reader_before_any_read() {
     // (the payload's session_id is Claude Code's conversation id).
     let _dir = crate::testutil::ConfigDirSandbox::new(
         &home,
-        &home.home().join(".clauth/profiles/a/runtime-123-1"),
+        &home.home().join(".tollgate/profiles/a/runtime-123-1"),
     );
     crate::live_sessions::register(&crate::live_sessions::LiveSession {
         session_id: "123-1".to_string(),

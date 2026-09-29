@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest a feature or improvement for clauth
+description: Suggest a feature or improvement for tollgate
 title: "Feature: "
 labels: ["feature"]
 body:
@@ -7,7 +7,7 @@ body:
     id: problem
     attributes:
       label: Problem / motivation
-      description: What are you trying to do? Where does clauth fall short today?
+      description: What are you trying to do? Where does tollgate fall short today?
       placeholder: "I'm trying to ... but currently ..."
     validations:
       required: true
@@ -30,8 +30,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: clauth version
-      description: Output of `clauth --version`, or commit hash if built from source.
+      label: tollgate version
+      description: Output of `tollgate --version`, or commit hash if built from source.
       placeholder: e.g. v0.7.3
     validations:
       required: true

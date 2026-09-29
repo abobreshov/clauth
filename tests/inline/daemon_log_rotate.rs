@@ -1,4 +1,4 @@
-//! In-place log-trim tests. No supervisor, no real ~/.clauth — a
+//! In-place log-trim tests. No supervisor, no real ~/.tollgate — a
 //! plain tempfile stands in for `daemon.log`.
 
 #![allow(clippy::unwrap_used)]
@@ -55,7 +55,7 @@ fn leaves_a_small_log_untouched() {
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "tiny\n");
 }
 
-/// Absent file → `Ok(false)`, no error (manual `clauth daemon` → stderr to tty).
+/// Absent file → `Ok(false)`, no error (manual `tollgate daemon` → stderr to tty).
 #[test]
 fn absent_log_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
@@ -64,7 +64,7 @@ fn absent_log_is_a_no_op() {
 }
 
 /// The boot warning fires for exactly one fd shape: a regular file that is not in
-/// append mode (`clauth daemon > daemon.log`), where the in-place trim cannot
+/// append mode (`tollgate daemon > daemon.log`), where the in-place trim cannot
 /// bound the file. An appending file is the supported setup, and a tty/pipe has
 /// no cap to defeat.
 #[cfg(unix)]

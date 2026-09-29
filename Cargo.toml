@@ -1,11 +1,11 @@
 [package]
-name = "clauth"
-version = "0.16.0"
+name = "tollgate"
+version = "0.1.0"
 edition = "2024"
-description = "Manage multiple Claude Code accounts, monitor 5h/7d usage with configurable auto-switch and delegation with an MCP plugin. CLI + TUI."
+description = "Monitor and manage AI subscriptions and spending across providers (Claude, Codex, Ollama Cloud, Nous/Hermes, OpenRouter, …); switch accounts; herdr and agent APIs. CLI + TUI."
 license = "MIT"
-repository = "https://github.com/uwuclxdy/clauth"
-homepage = "https://github.com/uwuclxdy/clauth"
+repository = "https://github.com/abobreshov/clauth"
+homepage = "https://github.com/abobreshov/clauth"
 readme = "README.md"
 keywords = ["claude-code", "account-switcher", "usage-monitor", "mcp", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
@@ -24,20 +24,18 @@ toml_edit = "0.25.15"
 anyhow = "1.0.104"
 dirs = "7.0.0"
 ureq = "3.4.2"
-self-replace = "1.5.0"
 signal-hook = "0.4.4"
 tempfile = "3.27.0"
 libc = "0.2.189"
 sha2 = "0.11.0"
-minisign-verify = "0.2.5"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
 # transitively; pinned here as a direct dep). No unsafe in our crate.
 getrandom = "0.4.3"
 # The OS half of the codex UA (`codex_cli_rs/<version> (<os> <os version>;
 # <arch>) <terminal>`): codex's own client builds it from this crate, so
-# clauth's parity UA reads the same OS fields the same way.
+# tollgate's parity UA reads the same OS fields the same way.
 os_info = "3.15"
-# Echo-off prompt for the API key in `clauth login --base-url/--api-key`, so the
+# Echo-off prompt for the API key in `tollgate login --base-url/--api-key`, so the
 # key never routes through argv / shell history / process listings. Cross-
 # platform; no transitive deps beyond libc (already in the tree).
 rpassword = "7.5.4"
@@ -63,7 +61,7 @@ tokio = { version = "1.53.1", features = ["rt", "io-std", "time"] }
 # a client sends `notifications/cancelled`. rmcp awaits the tool handler bare
 # rather than racing it against that token, so `monitor`'s wait loops have to
 # read it themselves or an abandoned call runs out its full hour. Already in the
-# tree via rmcp → tokio-util; named here because the type is now in clauth's own
+# tree via rmcp → tokio-util; named here because the type is now in tollgate's own
 # signatures. No default features: `sync` is unconditional.
 tokio-util = { version = "0.7.19", default-features = false }
 regex = "1.13.1"
@@ -75,10 +73,10 @@ clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 # agentgear `PluginHost` derive + lifecycle: the Plugin tab's one-key install and
 # the SessionStart self-heal hook drive `claude plugin` through it instead of a
 # copy-paste hint. Default features (derive + claude + embed) are exactly the
-# claude-only host clauth is; the embedded tree is the committed `plugins/` dir.
+# claude-only host tollgate is; the embedded tree is the committed `plugins/` dir.
 agentgear = "0.1.4"
 
-# `clauth daemon --listen` (the TLS REST API). Every crate below already sits
+# `tollgate daemon --listen` (the TLS REST API). Every crate below already sits
 # in the lock graph via ureq, and all but `hex` are already compiled in the
 # tree; these lines only promote them to direct deps, so the listener costs no
 # new download and nothing new for cargo-deny to vet.
@@ -95,8 +93,7 @@ rustls-pki-types = { version = "1.15.1", features = ["std"] }
 # Request-head parsing for that server. Hand-rolling this is where the bugs are;
 # httparse is in the tree via ureq-proto.
 httparse = "1"
-# Constant-time bearer-token comparison. Nothing in the crate compares secrets
-# today — `update.rs`'s hex compare is explicitly marked as unsafe to reuse here.
+# Constant-time bearer-token comparison.
 subtle = "2.6"
 # Hex for the token. Three ad-hoc `{b:02x}` loops already exist; don't add a fourth.
 hex = "0.4"

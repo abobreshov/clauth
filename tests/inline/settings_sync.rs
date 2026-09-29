@@ -28,7 +28,7 @@ fn base_path(home: &Path) -> PathBuf {
 }
 
 fn runtime_path(home: &Path, profile: &str) -> PathBuf {
-    home.join(".clauth/profiles")
+    home.join(".tollgate/profiles")
         .join(profile)
         .join("runtime")
         .join("settings.json")
@@ -36,21 +36,21 @@ fn runtime_path(home: &Path, profile: &str) -> PathBuf {
 
 /// A live session's own copy, `runtime-<sid>/settings.json`.
 fn session_runtime_path(home: &Path, profile: &str, sid: &str) -> PathBuf {
-    home.join(".clauth/profiles")
+    home.join(".tollgate/profiles")
         .join(profile)
         .join(format!("runtime-{sid}"))
         .join("settings.json")
 }
 
 fn isolated_path(home: &Path, profile: &str) -> PathBuf {
-    home.join(".clauth/profiles")
+    home.join(".tollgate/profiles")
         .join(profile)
         .join("runtime-isolated")
         .join("settings.json")
 }
 
 fn write_config(home: &Path, profile: &str, body: &str) {
-    let dir = home.join(".clauth/profiles").join(profile);
+    let dir = home.join(".tollgate/profiles").join(profile);
     fs::create_dir_all(&dir).expect("mkdir profile");
     fs::write(dir.join("config.toml"), body).expect("write config.toml");
 }
@@ -153,7 +153,7 @@ fn an_api_key_target_keeps_its_routing_when_the_winner_has_none() {
         &apikey,
         &json!({
             "theme": "light",
-            "apiKeyHelper": "clauth __api-key p2",
+            "apiKeyHelper": "tollgate __api-key p2",
             "model": "deepseek-chat",
             "env": {
                 "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
@@ -168,7 +168,7 @@ fn an_api_key_target_keeps_its_routing_when_the_winner_has_none() {
     let after = read_json(&apikey);
     assert_eq!(
         after["apiKeyHelper"],
-        json!("clauth __api-key p2"),
+        json!("tollgate __api-key p2"),
         "the winner has no apiKeyHelper; the target must not lose its own"
     );
     assert_eq!(after["model"], json!("deepseek-chat"));
@@ -205,13 +205,13 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     // `claude::apply_profile_to_claude_settings` on every switch.
     write_json(
         &base,
-        &json!({"apiKeyHelper": "clauth __api-key active", "model": "opus", "env": {}}),
+        &json!({"apiKeyHelper": "tollgate __api-key active", "model": "opus", "env": {}}),
         t(1),
     );
     write_json(
         &p1,
         &json!({
-            "apiKeyHelper": "clauth __api-key p1",
+            "apiKeyHelper": "tollgate __api-key p1",
             "model": "sonnet",
             "theme": "dark",
             "env": {}
@@ -220,14 +220,14 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     );
     write_json(
         &p2,
-        &json!({"apiKeyHelper": "clauth __api-key p2", "model": "haiku", "env": {}}),
+        &json!({"apiKeyHelper": "tollgate __api-key p2", "model": "haiku", "env": {}}),
         t(5),
     );
 
     let expected = [
-        (&base, "clauth __api-key active", "opus"),
-        (&p1, "clauth __api-key p1", "sonnet"),
-        (&p2, "clauth __api-key p2", "haiku"),
+        (&base, "tollgate __api-key active", "opus"),
+        (&p1, "tollgate __api-key p1", "sonnet"),
+        (&p2, "tollgate __api-key p2", "haiku"),
     ];
     for (path, helper, model) in expected {
         let before = read_json(path);
@@ -291,7 +291,7 @@ fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
     let sibling = session_runtime_path(home.home(), "p2", "4242-1");
     let isolated = home
         .home()
-        .join(".clauth/profiles/p1")
+        .join(".tollgate/profiles/p1")
         .join("runtime-isolated-4242-2")
         .join("settings.json");
     for path in [&base, &legacy, &session, &sibling, &isolated] {
@@ -400,7 +400,7 @@ fn shared_env_key_dropped_by_the_winner_is_removed_from_targets() {
 /// umask-moded mode (0o644 at the default umask), the posture
 /// `apply_profile_to_claude_settings` leaves it in. The
 /// rename swaps the inode either way, so neither branch preserves an existing
-/// mode — the point is which mode clauth imposes.
+/// mode — the point is which mode tollgate imposes.
 #[cfg(unix)]
 #[test]
 fn runtime_copies_are_owner_only_and_the_base_keeps_its_posture() {
@@ -553,9 +553,9 @@ fn a_codex_profiles_config_is_never_read_here() {
     let home = HomeSandbox::new();
     write_config(home.home(), "p1", "[env]\nA_KEY = \"1\"\n");
 
-    let clauth = home.home().join(".clauth");
+    let tollgate = home.home().join(".tollgate");
     crate::testutil::write_codex_roster(&["cx"]);
-    let cx = clauth.join("profiles").join("cx");
+    let cx = tollgate.join("profiles").join("cx");
     fs::create_dir_all(&cx).expect("mkdir codex profile");
     fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
 
@@ -581,8 +581,8 @@ fn a_dual_claimed_name_stays_claude_first_here() {
     let home = HomeSandbox::new();
     write_config(home.home(), "shared", "[env]\nSHARED_KEY = \"1\"\n");
 
-    let clauth = home.home().join(".clauth");
-    fs::write(clauth.join("profiles.toml"), "profiles = [\"shared\"]\n")
+    let tollgate = home.home().join(".tollgate");
+    fs::write(tollgate.join("profiles.toml"), "profiles = [\"shared\"]\n")
         .expect("write claude roster");
     crate::testutil::write_codex_roster(&["shared"]);
 
@@ -601,8 +601,8 @@ fn a_dual_claimed_name_stays_claude_first_here() {
 fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
     let home = HomeSandbox::new();
     write_config(home.home(), "p1", "[env]\nFOO = \"1\"\n");
-    let clauth = home.home().join(".clauth");
-    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\n").expect("write broken roster");
+    let tollgate = home.home().join(".tollgate");
+    fs::write(tollgate.join("codex-profiles.toml"), "profiles = [\n").expect("write broken roster");
     CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
 
     assert_eq!(
@@ -621,7 +621,7 @@ fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
     // A valid roster naming a codex dir whose own config.toml does not parse:
     // the dir is skipped by membership, the claude keys still arrive.
     crate::testutil::write_codex_roster(&["cx"]);
-    let cx = clauth.join("profiles").join("cx");
+    let cx = tollgate.join("profiles").join("cx");
     fs::create_dir_all(&cx).expect("mkdir codex profile");
     fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
     assert_eq!(

@@ -36,7 +36,7 @@ impl Write for FlushFails {
     }
 }
 
-/// The regression: `clauth sessions | head -3` exited 101 with a Rust panic on
+/// The regression: `tollgate sessions | head -3` exited 101 with a Rust panic on
 /// stderr because `println!` panics on `EPIPE`. The reader leaving has to come
 /// back as an outcome the caller can act on.
 #[test]

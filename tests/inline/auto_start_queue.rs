@@ -855,7 +855,7 @@ fn auto_start_queue_series_reader_drops_a_plan_drifted_bridge() {
 
 /// An open the queue did NOT fire still has to gate it. A real Claude Code
 /// session on a member account opens that account's 5h window; nothing in
-/// clauth kicked, so `note_queue_open` never runs, and the in-memory anchor is
+/// tollgate kicked, so `note_queue_open` never runs, and the in-memory anchor is
 /// the only thing the gate used to consult once seeded. The member behind that
 /// open could then be elected seconds after it — re-collapsing the two windows
 /// the queue exists to separate, on every cycle, because the anchor re-phases

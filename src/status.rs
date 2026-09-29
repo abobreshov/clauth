@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::poll::{first_delay, run_polling_loop};
-use crate::profile::clauth_dir;
+use crate::profile::tollgate_dir;
 use crate::usage::{iso_to_epoch_secs, now_ms};
 
 /// Live feed URL (Statuspage v2 JSON API).
@@ -226,11 +226,11 @@ struct CacheFile {
     incidents: Vec<Incident>,
 }
 
-/// `~/.clauth/status_cache.json`. Resolved ONCE at spawn time and passed into
+/// `~/.tollgate/status_cache.json`. Resolved ONCE at spawn time and passed into
 /// the worker so the detached thread never re-resolves `home_dir()` later — that
-/// would race a test's `HOME_OVERRIDE` scope and could touch the real `~/.clauth`.
+/// would race a test's `HOME_OVERRIDE` scope and could touch the real `~/.tollgate`.
 fn cache_path() -> Option<std::path::PathBuf> {
-    clauth_dir().ok().map(|d| d.join("status_cache.json"))
+    tollgate_dir().ok().map(|d| d.join("status_cache.json"))
 }
 
 /// Load the cache at `path` if it exists and parses; `None` on any miss/error.
@@ -584,7 +584,7 @@ fn fetch_feed() -> anyhow::Result<Vec<Incident>> {
     use std::io::Read as _;
     let reader = agent
         .get(FEED_URL)
-        .header("User-Agent", "clauth-status")
+        .header("User-Agent", "tollgate-status")
         .call()
         .map_err(anyhow::Error::from)?
         .into_body()

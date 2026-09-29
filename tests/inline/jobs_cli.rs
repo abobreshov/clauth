@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! `clauth jobs` coverage: the four phases a row can be in, what each time
+//! `tollgate jobs` coverage: the four phases a row can be in, what each time
 //! column means, and the `--json` field set. Home-sandboxed so every seeded
-//! record lands in a tempdir, never the operator's real `~/.clauth/jobs`.
+//! record lands in a tempdir, never the operator's real `~/.tollgate/jobs`.
 
 use super::*;
 use crate::mcp::jobs::{
@@ -184,7 +184,7 @@ fn a_silent_run_reads_never_and_a_finished_one_reads_nothing() {
     assert_eq!(last_output_cell(row_for(&rows, "d-fin-0")), "-");
 }
 
-/// Both deadlines render where both exist, and an absent one is clauth knowing
+/// Both deadlines render where both exist, and an absent one is tollgate knowing
 /// there is none rather than a zero countdown.
 #[test]
 fn the_kill_column_names_whichever_deadlines_the_run_has() {
@@ -231,7 +231,7 @@ fn an_empty_store_renders_a_named_empty_state_and_an_empty_json_array() {
 }
 
 /// A record OUTLIVES the server that wrote it, and this is what that buys: the
-/// row for a job a dead `clauth mcp` left behind still carries the session id
+/// row for a job a dead `tollgate mcp` left behind still carries the session id
 /// linking it to its transcript, which is the whole reason the heartbeat stamps
 /// one onto a running record.
 ///
@@ -406,7 +406,7 @@ fn the_json_row_carries_every_key_on_every_state() {
 /// character stripped.
 ///
 /// This is another account's model output arriving verbatim, and the table is
-/// the first clauth surface that prints it raw — the MCP replies are JSON and
+/// the first tollgate surface that prints it raw — the MCP replies are JSON and
 /// the TUI goes through ratatui. `tail_line` collapses whitespace runs, which
 /// leaves `\x1b`, `\x07` and `\x00` untouched: none of them is
 /// `char::is_whitespace`. An escape sequence would reach the terminal intact,

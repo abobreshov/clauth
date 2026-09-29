@@ -2,7 +2,7 @@
 //!
 //! Claude Code on macOS stores its OAuth login in the login Keychain (a generic
 //! password: service `Claude Code-credentials`, account = the OS login name), NOT
-//! in `~/.claude/.credentials.json`. So clauth's symlink swap is cosmetic on
+//! in `~/.claude/.credentials.json`. So tollgate's symlink swap is cosmetic on
 //! macOS unless the switched account is also written here — Claude Code keeps
 //! reading the Keychain.
 //!
@@ -20,7 +20,7 @@
 //! **The read costs ONE access prompt, ever.** macOS gates a read on the ITEM's
 //! own ACL and binds the grant to the CALLING binary, so an "Always Allow"
 //! against Apple's stable, code-signed `/usr/bin/security` sticks permanently,
-//! where a grant against clauth's own `cargo build` binary would die at the next
+//! where a grant against tollgate's own `cargo build` binary would die at the next
 //! rebuild under its changed ad-hoc signature. That is why this shells out
 //! instead of linking `security-framework` (CCSwitcher's approach), and it is now
 //! load-bearing for reads as well as writes. Measured at a console 2026-08-12: an
@@ -62,7 +62,7 @@
 //! turned one corruption into a lost login plus every MCP login in the item.
 //! The two sites that act on a failed read — the merge that overwrites the item
 //! and the sign-out that deletes it — park the raw bytes under
-//! `~/.clauth/keychain-quarantine/` first ([`quarantine_item_bytes`], the
+//! `~/.tollgate/keychain-quarantine/` first ([`quarantine_item_bytes`], the
 //! `atomic_write_600` posture the parked `mcp-logins.json` already holds) and
 //! name the file on the event line. The write or delete still lands: quarantine
 //! preserves the evidence, it does not refuse the switch.
@@ -447,8 +447,8 @@ pub(crate) fn enabled() -> bool {
 /// The Keychain `account` Claude Code stores its credential blob under: the OS
 /// login name. Every `*-generic-password` call site in CC passes this same
 /// `$USER`-derived value (its own fallback for an unusable `$USER` is the literal
-/// `claude-code-user`, which clauth does not reproduce), so pinning the account
-/// keeps clauth writing where CC reads.
+/// `claude-code-user`, which tollgate does not reproduce), so pinning the account
+/// keeps tollgate writing where CC reads.
 ///
 /// A previous note here claimed a *separate* item at `account = "unknown"` held
 /// `mcpOAuth`. That is wrong and was load-bearing for the wrong conclusion: CC
@@ -466,7 +466,7 @@ fn account() -> Result<String> {
 /// it, and the two arms are the file path's own two rules.
 #[derive(Clone, Copy)]
 enum Keep {
-    /// The incoming login belongs to THIS account, rotated by clauth
+    /// The incoming login belongs to THIS account, rotated by tollgate
     /// (`oauth.rs`'s mirror, which fires only for the active profile and only
     /// once the live login is known not to be foreign). Nothing in the item is
     /// another account's, so every block survives.
@@ -579,7 +579,7 @@ fn carried_raw(e: &anyhow::Error) -> Option<&str> {
     e.downcast_ref::<UnparseableItem>().map(|u| u.raw.as_str())
 }
 
-/// Where salvaged Keychain bytes land: `~/.clauth/keychain-quarantine/`, a
+/// Where salvaged Keychain bytes land: `~/.tollgate/keychain-quarantine/`, a
 /// sibling of `profiles/` in the owner-only tree (the parked
 /// `mcp-logins.json`'s placement is the precedent).
 const QUARANTINE_DIR: &str = "keychain-quarantine";
@@ -621,7 +621,7 @@ fn quarantine_path(base: &Path, service: &str, epoch_secs: i64, pid: u32) -> Pat
 /// rather than landing outside the tree.
 fn quarantine_item_bytes(service: &str, raw: &str) -> Result<PathBuf> {
     let path = quarantine_path(
-        &crate::profile::clauth_dir()?,
+        &crate::profile::tollgate_dir()?,
         service,
         crate::usage::now_epoch_secs(),
         std::process::id(),
@@ -667,13 +667,13 @@ fn blob_to_merge_with(service: &str, account: &str) -> Option<Value> {
         Err(e) => {
             match carried_raw(&e) {
                 Some(raw) => logline!(
-                    "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
+                    "tollgate: could not read the macOS Keychain login before replacing it ({e:#}). \
                      The MCP server logins it held are replaced by whatever this profile last \
                      stored, which on macOS is older than the item's own set — their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(
-                    "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
+                    "tollgate: could not read the macOS Keychain login before replacing it ({e:#}). \
                      The MCP server logins it held are replaced by whatever this profile last \
                      stored, which on macOS is older than the item's own set: re-authenticate \
                      any MCP server that reports a signed-out session, and any that starts failing"
@@ -950,14 +950,14 @@ fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
         WriteDisposition::CompleteSilently => {}
         WriteDisposition::QuarantineAndFail(raw) => match quarantine_item_bytes(service, raw) {
             Ok(path) => logline!(
-                "clauth: the macOS Keychain write reported success but the item read back with \
+                "tollgate: the macOS Keychain write reported success but the item read back with \
                      different bytes, so it is known corrupt and the switch was not completed. The \
                      corrupted item's raw bytes are preserved at {}; the profile store still holds \
                      the intended login, so retry the switch to re-run the write",
                 path.display()
             ),
             Err(e) => logline!(
-                "clauth: the macOS Keychain write reported success but the item read back with \
+                "tollgate: the macOS Keychain write reported success but the item read back with \
                      different bytes, so it is known corrupt and the switch was not completed. \
                      Preserving the corrupted item's raw bytes failed ({e}); the profile store \
                      still holds the intended login, so retry the switch to re-run the write"
@@ -965,14 +965,14 @@ fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
         },
         WriteDisposition::Fail => {
             logline!(
-                "clauth: the macOS Keychain write reported success but the item read back absent, \
+                "tollgate: the macOS Keychain write reported success but the item read back absent, \
                  so the write is known corrupt and the switch was not completed. The profile \
                  store still holds the intended login, so retry the switch to re-run the write"
             );
         }
         WriteDisposition::CompleteWithNote(cause) => {
             logline!(
-                "clauth: the macOS Keychain write landed but could not be read back to verify \
+                "tollgate: the macOS Keychain write landed but could not be read back to verify \
                  ({cause}); the switch stays complete. If Claude Code reports a signed-out or \
                  broken session, retrying the switch re-runs the write"
             );
@@ -1035,7 +1035,7 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
         }
         PutTransport::Argv => {
             logline!(
-                "clauth: Keychain item is {} bytes on the `{SECURITY_BIN} -i` line, over the \
+                "tollgate: Keychain item is {} bytes on the `{SECURITY_BIN} -i` line, over the \
                  {SECURITY_STDIN_LINE_MAX} cap; writing it through argv instead, where the token \
                  is visible to same-UID `ps` for the life of the call",
                 line.len()
@@ -1124,12 +1124,12 @@ pub(crate) fn salvage_delete_namespaced_item(
 /// rename and the post-closure delete, a stuck-keychain delete failure) leave
 /// items no walked dir explains. `security dump-keychain` lists everything,
 /// but the pure decision ([`crate::claude::census_orphan_keychain_services`])
-/// admits only services in clauth's durable ownership ledger and outside the
+/// admits only services in tollgate's durable ownership ledger and outside the
 /// `live` set [`crate::runtime::live_namespaced_keychain_services`] derives from
 /// runtime dirs. A foreign `CLAUDE_CONFIG_DIR` item enters neither source and is
 /// untouched; an unreadable ledger or live set deletes nothing.
 ///
-/// Runs on every `clauth mcp` boot (accepted with the ruling). Skipped whole
+/// Runs on every `tollgate mcp` boot (accepted with the ruling). Skipped whole
 /// under the Plugin tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
 /// kill budget pays no `security` subprocess — the same gate `gc_stale_runtimes`
 /// reads for the tree sweep. The delete subprocesses stay outside any state
@@ -1159,7 +1159,7 @@ pub(crate) fn census_namespaced_items() {
         Ok(dump) => dump,
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census failed ({e:#}); orphaned per-session items stay in \
+                "tollgate: the Keychain census failed ({e:#}); orphaned per-session items stay in \
                  the Keychain until a later census"
             );
             return;
@@ -1169,7 +1169,7 @@ pub(crate) fn census_namespaced_items() {
         Ok(owned) => owned,
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census cannot read its ownership ledger ({e:#}); deleting \
+                "tollgate: the Keychain census cannot read its ownership ledger ({e:#}); deleting \
                  nothing — unreadable ownership must never authorize a delete"
             );
             return;
@@ -1179,7 +1179,7 @@ pub(crate) fn census_namespaced_items() {
         Ok(live) => crate::claude::census_orphan_keychain_services(&dump, &live, &owned),
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census cannot derive the live set ({e:#}); deleting nothing \
+                "tollgate: the Keychain census cannot derive the live set ({e:#}); deleting nothing \
                  — an underivable set must never read as every item orphaned"
             );
             return;
@@ -1199,7 +1199,7 @@ pub(crate) fn census_namespaced_items() {
             Ok(Some(in_flight)) => in_flight,
             Err(e) => {
                 census_log!(
-                    "clauth: the Keychain census cannot gate the delete of {service} ({e:#}); \
+                    "tollgate: the Keychain census cannot gate the delete of {service} ({e:#}); \
                      stopping the census, the remaining items stay for a later one"
                 );
                 return;
@@ -1210,7 +1210,7 @@ pub(crate) fn census_namespaced_items() {
                 let retirement = crate::runtime::namespaced_keychain_ledger::retire(&service);
                 let cleared = in_flight.clear();
                 census_log!(
-                    "clauth: collected the orphaned per-session Keychain item {service} (no existing \
+                    "tollgate: collected the orphaned per-session Keychain item {service} (no existing \
                      config dir explains it); {}; {}; {}",
                     crate::claude::salvage_tail(&salvage),
                     crate::claude::retirement_tail(&retirement),
@@ -1220,7 +1220,7 @@ pub(crate) fn census_namespaced_items() {
             Err(e) => {
                 let cleared = in_flight.clear();
                 census_log!(
-                    "clauth: collecting the orphaned per-session Keychain item {service} failed: \
+                    "tollgate: collecting the orphaned per-session Keychain item {service} failed: \
                      {e:#}. It stays inert in the Keychain until a later census removes it; {}",
                     crate::claude::in_flight_tail(&cleared)
                 );
@@ -1358,7 +1358,7 @@ pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitC
 ///
 /// Refuses a non-object blob rather than writing it. A store file is external
 /// input to this layer, and CC parses the item's password as one JSON object, so
-/// anything else would leave CC with a credential it cannot read and clauth with
+/// anything else would leave CC with a credential it cannot read and tollgate with
 /// no signal that it happened.
 pub(crate) fn keychain_install(store: &Value) -> Result<()> {
     install_at(SERVICE, store)
@@ -1366,7 +1366,7 @@ pub(crate) fn keychain_install(store: &Value) -> Result<()> {
 
 /// Install `store` as the login for a SPECIFIC config dir's item: the
 /// namespaced `Claude Code-credentials-<sha256(dir)[0:8]>` service a
-/// `clauth start` session's Claude Code reads (it sets `CLAUDE_CONFIG_DIR`,
+/// `tollgate start` session's Claude Code reads (it sets `CLAUDE_CONFIG_DIR`,
 /// so CC namespaces its Keychain item per dir), rather than the bare item a
 /// global `claude` reads. The multi-session swap executor writes this item
 /// alongside the credential link it repoints — on macOS CC resolves the
@@ -1416,7 +1416,7 @@ fn install_at(service: &str, store: &Value) -> Result<()> {
     merge_and_put_at(service, &account()?, store, Keep::CarriedOnly)
 }
 
-/// Mirror `creds` after clauth rotated THIS account's own chain (`oauth.rs`).
+/// Mirror `creds` after tollgate rotated THIS account's own chain (`oauth.rs`).
 /// Same account by construction, so every block the item holds survives beside
 /// the fresh login ([`Keep::Everything`]): the Keychain twin of the store
 /// rewrite `profile::serialize_credentials_preserving_extra` performs on the
@@ -1431,24 +1431,24 @@ pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<()> 
 /// [`keychain_mirror_rotation`] — the vanilla rotation mirror, the rotation
 /// hook mirroring the freshly stamped sidecar, and the rolling re-stamp leg —
 /// writes `Keep::Everything` — every sibling block in the item survives — so
-/// they must establish the item's login is clauth's own FIRST: once CC
+/// they must establish the item's login is tollgate's own FIRST: once CC
 /// migrates into the Keychain and deletes the plaintext file, the file layer
 /// stops being evidence, and an out-of-band `/login` as another account
-/// leaves the item holding B while clauth still believes A is active — the
+/// leaves the item holding B while tollgate still believes A is active — the
 /// next mirror would preserve B's
 /// `organizationUuid`/`trustedDeviceToken`/`enterpriseGateway` beside A's
 /// bearer, a mixed identity that never self-corrects.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ItemLoginState {
-    /// The item's login is one clauth put there, or the item is absent, or it
+    /// The item's login is one tollgate put there, or the item is absent, or it
     /// holds a blank (logged-out) shell. Proceed with the mirror.
     Ours,
-    /// The item holds a non-empty login matching no bearer clauth knows it
+    /// The item holds a non-empty login matching no bearer tollgate knows it
     /// wrote or replaced. Skip: leave the item intact rather than layer this
     /// account's bearer under its blocks.
     NotOurs,
     /// The item answered with bytes that are not valid JSON — almost always a
-    /// TRUNCATED version of clauth's own write (#66/#76). PROCEED: the
+    /// TRUNCATED version of tollgate's own write (#66/#76). PROCEED: the
     /// mirror's own read leg quarantines the bytes and the write heals the
     /// item, exactly the behavior this gate must not lose.
     Corrupt,
@@ -1461,7 +1461,7 @@ pub(crate) enum ItemLoginState {
 
 /// Read the real item and classify its login for the rotation-mirror gate
 /// ([`ItemLoginState`]). "Ours" for a bearer that changes on every re-stamp
-/// is decided by RECOGNITION: the caller passes the bearers it knows clauth
+/// is decided by RECOGNITION: the caller passes the bearers it knows tollgate
 /// wrote or is replacing (the sidecar's pre-stamp bearer, the pre-rotation
 /// chain token, the bearer about to be written), and the item's login must
 /// match one of them.
@@ -1513,7 +1513,7 @@ fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
 /// otherwise leave no local trace of why Claude Code is logged out. Only
 /// `force_link_profile_credentials` and `clear_claude_credentials` reach it,
 /// never the guarded relink, so a path that never meant to change accounts
-/// cannot destroy a login clauth does not hold (`claude::keychain_mirror_source`).
+/// cannot destroy a login tollgate does not hold (`claude::keychain_mirror_source`).
 pub(crate) fn keychain_sign_out() -> Result<SignOutOutcome> {
     sign_out_at(SERVICE, &account()?)
 }
@@ -1592,20 +1592,20 @@ fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
         Err(e) => {
             if !crate::claude::failed_read_degrades_to_delete(classified_exit(&e)) {
                 logline!(
-                    "clauth: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
+                    "tollgate: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
                      item was left untouched; retry the operation once the keychain is unlocked"
                 );
                 return Ok(SignOutOutcome::SkippedLocked);
             }
             match carried_raw(&e) {
                 Some(raw) => logline!(
-                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
+                    "tollgate: signed Claude Code out of the macOS Keychain by deleting the item: \
                      it could not be read first ({e:#}), so the MCP server logins stored beside \
                      the login went with it — their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(
-                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
+                    "tollgate: signed Claude Code out of the macOS Keychain by deleting the item: it \
                      could not be read first ({e:#}), so the MCP server logins stored beside the \
                      login went with it. Re-authenticate any MCP server that reports a signed-out \
                      session"
@@ -1617,14 +1617,14 @@ fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
     match crate::claude::strip_account_credentials(&mut blob) {
         crate::claude::SignOut::Delete => {
             logline!(
-                "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
-                 stores no Claude login). Run `clauth <name>` to put one back"
+                "tollgate: signed Claude Code out of the macOS Keychain (the profile now active \
+                 stores no Claude login). Run `tollgate <name>` to put one back"
             );
             delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }
         crate::claude::SignOut::Write => {
             logline!(
-                "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
+                "tollgate: signed Claude Code out of the macOS Keychain (the profile now active \
                  stores no Claude login); its MCP server logins were kept"
             );
             put_blob_at(service, account, &blob).map(|_| SignOutOutcome::SignedOut)
@@ -1636,12 +1636,12 @@ fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
 /// Derive the Keychain service name for a given `CLAUDE_CONFIG_DIR`.
 ///
 /// Claude Code on macOS namespaces its Keychain item per config directory:
-/// `Claude Code-credentials-<sha256(dir)[0:8]>`. A bare (non-clauth) `claude`
+/// `Claude Code-credentials-<sha256(dir)[0:8]>`. A bare (non-tollgate) `claude`
 /// uses the unsuffixed `Claude Code-credentials` because its config dir IS
-/// `~/.claude`; a `clauth start` session sets `CLAUDE_CONFIG_DIR` to its
-/// per-session runtime tree, so CC there reads a namespaced item that clauth
+/// `~/.claude`; a `tollgate start` session sets `CLAUDE_CONFIG_DIR` to its
+/// per-session runtime tree, so CC there reads a namespaced item that tollgate
 /// never wrote — and on its first token write, CC migrates credentials INTO
-/// the namespaced item and DELETES the plaintext file, after which clauth's
+/// the namespaced item and DELETES the plaintext file, after which tollgate's
 /// stored refresh token goes stale.
 ///
 /// This function returns the namespaced service name exactly as CC computes it.

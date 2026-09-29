@@ -1,12 +1,12 @@
 //! Inline tests for `plugin_host`. No environment needed: these pin the
 //! compile-time wiring (derive metadata, the embedded tree), the committed
-//! SessionStart hook that points at `clauth self-heal`, and the `clauth start`
+//! SessionStart hook that points at `tollgate self-heal`, and the `tollgate start`
 //! pre-flight gate's registry shapes. The lifecycle itself (the real `claude`
 //! CLI as transaction boundary) is pinned hermetically by the fake-claude
 //! install test in `tui_app.rs` and exercised for real in the scratch-profile
 //! verifies.
 
-use super::ClauthPlugin;
+use super::TollgatePlugin;
 use agentgear::PluginHost;
 
 /// The derive and the one-line `build.rs` are the whole of the agentgear
@@ -15,16 +15,16 @@ use agentgear::PluginHost;
 /// spawning the binary.
 #[test]
 fn derive_metadata_is_wired() {
-    assert_eq!(ClauthPlugin::NAME, "clauth");
-    assert_eq!(ClauthPlugin::MARKETPLACE, "clauth");
-    assert_eq!(ClauthPlugin::AGENTS, &["claude"]);
+    assert_eq!(TollgatePlugin::NAME, "tollgate");
+    assert_eq!(TollgatePlugin::MARKETPLACE, "tollgate");
+    assert_eq!(TollgatePlugin::AGENTS, &["claude"]);
     // build.rs pins plugins/.claude-plugin/plugin.json `version` to this, so
     // the const equals the crate version.
-    assert_eq!(ClauthPlugin::VERSION, env!("CARGO_PKG_VERSION"));
+    assert_eq!(TollgatePlugin::VERSION, env!("CARGO_PKG_VERSION"));
 
-    let descriptor = ClauthPlugin::descriptor();
-    assert_eq!(descriptor.name, "clauth");
-    assert_eq!(descriptor.id(), "clauth@clauth");
+    let descriptor = TollgatePlugin::descriptor();
+    assert_eq!(descriptor.name, "tollgate");
+    assert_eq!(descriptor.id(), "tollgate@tollgate");
     assert_eq!(descriptor.version, env!("CARGO_PKG_VERSION"));
 }
 
@@ -34,7 +34,7 @@ fn embedded_tree_is_baked_in() {
     // would mean `install(Scope::User, Source::Embedded)` errors at
     // materialize instead of installing.
     assert!(
-        !ClauthPlugin::embedded_blob().is_empty(),
+        !TollgatePlugin::embedded_blob().is_empty(),
         "the plugin tree was not embedded"
     );
 }
@@ -59,14 +59,14 @@ fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
         .find_map(|group| {
             group["matcher"]
                 .as_str()
-                .is_some_and(|m| m == "mcp__plugin_clauth_clauth__delegate$")
+                .is_some_and(|m| m == "mcp__plugin_tollgate_tollgate__delegate$")
                 .then(|| group["hooks"].as_array())
                 .flatten()
         })
         .and_then(|hooks| hooks.first())
         .expect("the delegate matcher carries one hook entry");
     assert_eq!(
-        entry["rewakeSummary"], "clauth delegate results",
+        entry["rewakeSummary"], "tollgate delegate results",
         "the manifest names the wake notification instead of the host's placeholder"
     );
     assert_ne!(
@@ -77,7 +77,7 @@ fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
 
 /// The SessionStart wiring the self-heal rides on: the committed hooks.json
 /// must carry BOTH hooks — the profile-change note keeps working, and the new
-/// self-heal entry points at the hidden `clauth self-heal` subcommand. A drift
+/// self-heal entry points at the hidden `tollgate self-heal` subcommand. A drift
 /// here (someone edits hooks.json and drops one command) silently disables a
 /// session behavior, which is exactly what this test exists to catch.
 #[test]
@@ -97,11 +97,11 @@ fn session_start_hook_wires_self_heal_beside_the_note() {
     assert!(
         commands
             .iter()
-            .any(|c| c == "clauth hook-profile-changed-note"),
+            .any(|c| c == "tollgate hook-profile-changed-note"),
         "the profile-change note must keep its SessionStart slot: {commands:?}"
     );
     assert!(
-        commands.iter().any(|c| c == "clauth self-heal"),
+        commands.iter().any(|c| c == "tollgate self-heal"),
         "the self-heal hook is not wired into SessionStart: {commands:?}"
     );
 }
@@ -148,7 +148,7 @@ fn self_heal_says_nothing_when_healthy_and_reports_changes() {
         .expect("remove shim state");
     assert_eq!(
         super::self_heal_line().expect("heal"),
-        Some("clauth self-heal: cleared stale marker".to_string()),
+        Some("tollgate self-heal: cleared stale marker".to_string()),
         "a heal that changed something says so, in the hook's own wording"
     );
 
@@ -195,7 +195,7 @@ fn gate_verdict(
     super::preflight_gate()
 }
 
-/// The healthy pair: a directory-source `clauth` entry registered exactly at
+/// The healthy pair: a directory-source `tollgate` entry registered exactly at
 /// the materialized pointer (created on disk, manifest included) plus a
 /// user-scope plugin entry whose files resolve. Every shape test below breaks
 /// exactly one half of this and keeps the other.
@@ -213,7 +213,7 @@ fn healthy_registry(
     let path = expected.to_string_lossy().into_owned();
     (
         serde_json::json!({
-            "clauth": {
+            "tollgate": {
                 "source": {"source": "directory", "path": path},
                 "installLocation": path,
                 "lastUpdated": "2026-08-26T00:00:00.000Z"
@@ -221,7 +221,7 @@ fn healthy_registry(
         }),
         serde_json::json!({
             "version": 2,
-            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
+            "plugins": {"tollgate@tollgate": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
         }),
     )
 }
@@ -267,7 +267,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
             "marketplace entry github-sourced",
             Box::new(move |claude, expected| {
                 (
-                    serde_json::json!({"clauth": {"source": {"source": "github", "repo": "uwuclxdy/clauth"}}}),
+                    serde_json::json!({"tollgate": {"source": {"source": "github", "repo": "abobreshov/clauth"}}}),
                     healthy_plugins(claude, expected),
                 )
             }),
@@ -276,7 +276,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
             "marketplace path diverged from the pointer",
             Box::new(move |claude, expected| {
                 (
-                    serde_json::json!({"clauth": {"source": {"source": "directory", "path": "/old/checkout/plugins"}}}),
+                    serde_json::json!({"tollgate": {"source": {"source": "directory", "path": "/old/checkout/plugins"}}}),
                     healthy_plugins(claude, expected),
                 )
             }),
@@ -285,7 +285,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
             "marketplace path missing",
             Box::new(move |claude, expected| {
                 (
-                    serde_json::json!({"clauth": {"source": {"source": "directory"}}}),
+                    serde_json::json!({"tollgate": {"source": {"source": "directory"}}}),
                     healthy_plugins(claude, expected),
                 )
             }),
@@ -294,7 +294,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
             "marketplace manifest deleted",
             Box::new(move |claude, expected| {
                 (
-                    serde_json::json!({"clauth": {"source": {"source": "directory", "path": broken_path.clone()}}}),
+                    serde_json::json!({"tollgate": {"source": {"source": "directory", "path": broken_path.clone()}}}),
                     healthy_plugins(claude, expected),
                 )
             }),
@@ -304,7 +304,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
             Box::new(move |claude, expected| {
                 (
                     healthy_mkt(claude, expected),
-                    serde_json::json!({"version": 2, "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}}),
+                    serde_json::json!({"version": 2, "plugins": {"tollgate@tollgate": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}}),
                 )
             }),
         ),
@@ -312,7 +312,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
             "plugin entry carries load errors",
             Box::new(move |claude, expected| {
                 let healthy_mkt = healthy_mkt(claude, expected);
-                let healthy_path = healthy_mkt["clauth"]["source"]["path"]
+                let healthy_path = healthy_mkt["tollgate"]["source"]["path"]
                     .as_str()
                     .expect("path")
                     .to_string();
@@ -320,7 +320,7 @@ fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
                     healthy_mkt,
                     serde_json::json!({
                         "version": 2,
-                        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": healthy_path, "errors": ["Marketplace clauth failed to load: cache-miss"]}]}
+                        "plugins": {"tollgate@tollgate": [{"scope": "user", "installPath": healthy_path, "errors": ["Marketplace tollgate failed to load: cache-miss"]}]}
                     }),
                 )
             }),
@@ -340,7 +340,7 @@ fn preflight_gate_ignores_project_scope_entries() {
         let (marketplaces, _) = healthy_registry(claude, expected);
         let plugins = serde_json::json!({
             "version": 2,
-            "plugins": {"clauth@clauth": [{"scope": "project", "installPath": "/gone/runtime/plugins/cache"}]}
+            "plugins": {"tollgate@tollgate": [{"scope": "project", "installPath": "/gone/runtime/plugins/cache"}]}
         });
         (marketplaces, plugins)
     });
@@ -386,7 +386,7 @@ fn preflight_gate_heals_when_a_registry_file_is_unparseable() {
     let _fake = FakeClaude::new(&home);
     let dir = claude.join("plugins");
     std::fs::create_dir_all(&dir).expect("plugins dir");
-    std::fs::write(dir.join("known_marketplaces.json"), "{\"clauth\":").expect("truncated");
+    std::fs::write(dir.join("known_marketplaces.json"), "{\"tollgate\":").expect("truncated");
     std::fs::write(dir.join("installed_plugins.json"), "{}").expect("installed");
     assert!(
         super::preflight_gate(),
@@ -397,8 +397,8 @@ fn preflight_gate_heals_when_a_registry_file_is_unparseable() {
 // ── the detached heal ──────────────────────────────────────────────────────
 
 /// The migration's own first-run gate: a box that never installed the plugin
-/// (both registry files parse, neither names `clauth`) must read "nothing to
-/// heal", not "heal". A false positive here makes every `clauth mcp` boot and
+/// (both registry files parse, neither names `tollgate`) must read "nothing to
+/// heal", not "heal". A false positive here makes every `tollgate mcp` boot and
 /// daemon tick spawn `claude plugin list --json` for nothing.
 #[cfg(unix)]
 #[test]
@@ -411,13 +411,13 @@ fn preflight_gate_stays_shut_when_nothing_of_ours_is_registered() {
     });
     assert!(
         !verdict,
-        "no clauth marketplace + no clauth@clauth row must not heal"
+        "no tollgate marketplace + no tollgate@tollgate row must not heal"
     );
 }
 
 /// The detached heal's "only when the gate says heal" half: a healthy
 /// registration makes `heal_detached()` a no-op that spawns no `claude`. This is
-/// the shape `clauth mcp` and the daemon hit on a working box.
+/// the shape `tollgate mcp` and the daemon hit on a working box.
 #[cfg(unix)]
 #[test]
 fn heal_detached_skips_when_the_gate_says_healthy() {
@@ -489,7 +489,7 @@ fn heal_detached_throttles_to_one_heal_per_window() {
         serde_json::to_vec(
             &serde_json::json!({
                 "version": 2,
-                "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
+                "plugins": {"tollgate@tollgate": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
             }),
         )
         .expect("seed json"),
@@ -576,13 +576,13 @@ fn committed_root_marketplace_matches_agentgear_rules() {
     let marketplace: serde_json::Value =
         serde_json::from_str(include_str!("../../.claude-plugin/marketplace.json"))
             .expect("marketplace.json parses");
-    assert_eq!(marketplace["name"].as_str(), Some("clauth"));
+    assert_eq!(marketplace["name"].as_str(), Some("tollgate"));
     let plugins = marketplace["plugins"]
         .as_array()
         .expect("plugins is an array");
     assert_eq!(plugins.len(), 1, "exactly one marketplace entry");
     let entry = &plugins[0];
-    assert_eq!(entry["name"].as_str(), Some("clauth"));
+    assert_eq!(entry["name"].as_str(), Some("tollgate"));
     assert_eq!(entry["source"].as_str(), Some("./plugins"));
     assert!(
         entry.get("version").is_none(),
@@ -592,7 +592,7 @@ fn committed_root_marketplace_matches_agentgear_rules() {
     let plugin: serde_json::Value =
         serde_json::from_str(include_str!("../../plugins/.claude-plugin/plugin.json"))
             .expect("plugin.json parses");
-    assert_eq!(plugin["name"].as_str(), Some("clauth"));
+    assert_eq!(plugin["name"].as_str(), Some("tollgate"));
     assert_eq!(plugin["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
 }
 
@@ -608,7 +608,7 @@ fn repoint_registry_reroots_a_dead_path_and_names_a_missing_twin() {
 
     let home = HomeSandbox::new();
     let claude = home.home().join(".claude");
-    let clauth = home.home().join(".clauth");
+    let tollgate = home.home().join(".tollgate");
 
     // The twin of the first recorded path exists; the second's does not. The
     // joins are component-wise, matching the product's per-component twin
@@ -625,19 +625,19 @@ fn repoint_registry_reroots_a_dead_path_and_names_a_missing_twin() {
 
     let dead = format!(
         "{}/D0/runtime-700698-0/plugins/cache/agenticat/agents/a6261ea74c14",
-        clauth.join("profiles").display()
+        tollgate.join("profiles").display()
     );
     let missing = format!(
         "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
-        clauth.join("profiles").display()
+        tollgate.join("profiles").display()
     );
     // A live tree still resolves its recorded path: left alone today, it
     // converges the day the tree dies.
     let live = format!(
         "{}/D0/runtime-9-0/plugins/cache/live/1",
-        clauth.join("profiles").display()
+        tollgate.join("profiles").display()
     );
-    std::fs::create_dir_all(clauth.join("profiles/D0/runtime-9-0/plugins/cache/live/1"))
+    std::fs::create_dir_all(tollgate.join("profiles/D0/runtime-9-0/plugins/cache/live/1"))
         .expect("live tree");
 
     let original = format!(
@@ -681,11 +681,11 @@ fn repoint_registry_names_a_skip_only_pass() {
 
     let home = HomeSandbox::new();
     let claude = home.home().join(".claude");
-    let clauth = home.home().join(".clauth");
+    let tollgate = home.home().join(".tollgate");
 
     let missing = format!(
         "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
-        clauth.join("profiles").display()
+        tollgate.join("profiles").display()
     );
     let original = format!(
         "{{\n  \"version\": 2,\n  \"plugins\": {{\n    \"security-guidance@claude-plugins-official\": [\n      {{ \"scope\": \"user\", \"installPath\": \"{missing}\" }}\n    ]\n  }}\n}}\n"
@@ -728,8 +728,8 @@ fn registry_remap_matches_both_separator_spellings() {
 
     let home = HomeSandbox::new();
     let claude = home.home().join(".claude");
-    let clauth = home.home().join(".clauth");
-    let profiles = clauth.join("profiles");
+    let tollgate = home.home().join(".tollgate");
+    let profiles = tollgate.join("profiles");
     let prefix_fwd = format!("{}/", profiles.display());
     let prefix_back = format!("{}\\", profiles.display());
 
@@ -796,11 +796,11 @@ fn detached_repoint_reports_skips_once_per_process() {
 
     let home = HomeSandbox::new();
     let claude = home.home().join(".claude");
-    let clauth = home.home().join(".clauth");
+    let tollgate = home.home().join(".tollgate");
 
     let missing = format!(
         "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
-        clauth.join("profiles").display()
+        tollgate.join("profiles").display()
     );
     let registry = claude.join("plugins/installed_plugins.json");
     std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
@@ -828,10 +828,10 @@ fn install_sh_runs_self_heal_after_both_install_legs() {
     assert_eq!(
         script.matches("self-heal").count(),
         2,
-        "install.sh must run `clauth self-heal` after the cargo leg and after the download leg: {script}"
+        "install.sh must run `tollgate self-heal` after the cargo leg and after the download leg: {script}"
     );
     assert!(
-        script.contains("cargo install clauth")
+        script.contains("cargo install --locked --git \"https://github.com/${REPO}\" tollgate")
             && script.contains("\"${INSTALL_DIR}/${BINARY}\" self-heal"),
         "both legs carry the heal call"
     );

@@ -72,7 +72,7 @@ struct ThrowawayItem {
 impl Drop for ThrowawayItem {
     fn drop(&mut self) {
         if let Err(e) = delete_at(&self.service, self.account) {
-            eprintln!("clauth-test: cleaning up {} failed: {e:#}", self.service);
+            eprintln!("tollgate-test: cleaning up {} failed: {e:#}", self.service);
         }
     }
 }
@@ -80,11 +80,11 @@ impl Drop for ThrowawayItem {
 #[test]
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn keychain_round_trip_on_temp_service() {
-    let service = format!("clauth-test-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-{}", std::process::id());
+    let account = "tollgate-test-account";
     let _throwaway = ThrowawayItem {
         service: service.clone(),
-        account: "clauth-test-account",
+        account: "tollgate-test-account",
     };
 
     // Clean slate — delete is idempotent, read of an absent item is None.
@@ -141,11 +141,11 @@ fn keychain_round_trip_on_temp_service() {
 #[test]
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn keychain_write_keeps_the_siblings_its_keep_allows() {
-    let service = format!("clauth-test-merge-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-merge-{}", std::process::id());
+    let account = "tollgate-test-account";
     let _throwaway = ThrowawayItem {
         service: service.clone(),
-        account: "clauth-test-account",
+        account: "tollgate-test-account",
     };
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
@@ -284,7 +284,7 @@ fn merged_blob_under_a_rotation_keeps_the_accounts_own_blocks() {
 
 // The CLA-SPLIT foreign gate's recognition rule (the pure core of
 // `item_login_state`): `Keep::Everything` preserves the item's sibling
-// blocks, so the item's login must be one clauth put there BEFORE a split
+// blocks, so the item's login must be one tollgate put there BEFORE a split
 // mirror runs. A rolling bearer changes on every stamp, so "ours" is decided
 // by recognition against the bearers the caller wrote or is replacing — never
 // against the incoming login alone, which a re-stamp replaces by design.
@@ -307,7 +307,7 @@ fn login_blob_is_ours_recognizes_the_bearer_being_replaced() {
 }
 
 #[test]
-fn login_blob_is_ours_refuses_a_login_clauth_never_wrote() {
+fn login_blob_is_ours_refuses_a_login_tollgate_never_wrote() {
     assert!(
         !login_blob_is_ours(Some(&item("someone-elses")), &["previous", "incoming"]),
         "an out-of-band `/login` as another account must never have its blocks preserved \
@@ -359,7 +359,7 @@ fn merge_write_skips_a_relink_that_reproduces_the_item() {
 
 /// The skip is keyed on the MERGED result, not on the incoming blob, so a store
 /// that merely lacks the item's siblings still skips: the carry puts them back
-/// and the two compare equal. Nothing here is a write clauth would want, and the
+/// and the two compare equal. Nothing here is a write tollgate would want, and the
 /// naive `incoming != existing` spelling would perform one on every tick.
 #[test]
 fn merge_write_skips_when_only_the_carry_closes_the_difference() {
@@ -750,8 +750,8 @@ fn oversized_item(entries: usize) -> serde_json::Value {
 #[test]
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn a_blob_past_the_stdin_ceiling_round_trips_intact() {
-    let service = format!("clauth-ceiling-test-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-ceiling-test-{}", std::process::id());
+    let account = "tollgate-test-account";
     delete_at(&service, account).expect("pre-clean");
 
     // Sized by VALUE around the cap; every leg's composed LINE still lands
@@ -804,7 +804,7 @@ fn a_blob_past_the_stdin_ceiling_round_trips_intact() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth: Keychain item is {len} bytes on the `/usr/bin/security -i` line, over the \
+            "tollgate: Keychain item is {len} bytes on the `/usr/bin/security -i` line, over the \
              4096 cap; writing it through argv instead, where the token is visible to same-UID \
              `ps` for the life of the call",
             len = realistic_line.len()
@@ -829,8 +829,8 @@ fn a_blob_past_the_stdin_ceiling_round_trips_intact() {
 #[test]
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn keychain_rotation_over_an_oversized_item_keeps_the_siblings() {
-    let service = format!("clauth-test-rotate-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-rotate-{}", std::process::id());
+    let account = "tollgate-test-account";
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
     // Seed the item the rotation will read and merge onto.
@@ -863,7 +863,7 @@ fn keychain_rotation_over_an_oversized_item_keeps_the_siblings() {
 /// KC-5's throwaway service: pid zero-padded to a fixed width, so the composed
 /// line length is deterministic across runs (a bare pid's digit count varies).
 fn edge_service() -> String {
-    format!("clauth-ceiling-edge-{:0>10}", std::process::id())
+    format!("tollgate-ceiling-edge-{:0>10}", std::process::id())
 }
 
 /// KC-5's fixture: a login-shaped blob whose composed `security -i` line lands
@@ -883,8 +883,8 @@ fn near_ceiling_blob() -> serde_json::Value {
 #[test]
 fn the_near_ceiling_fixture_composes_just_under_the_measured_line_cap() {
     let json = serde_json::to_string(&near_ceiling_blob()).expect("serialize");
-    let line =
-        add_generic_password_line(&edge_service(), "clauth-test-account", &json).expect("compose");
+    let line = add_generic_password_line(&edge_service(), "tollgate-test-account", &json)
+        .expect("compose");
     let line_len = line.len();
     assert!(
         (4090..=4096).contains(&line_len),
@@ -902,7 +902,7 @@ fn the_near_ceiling_fixture_composes_just_under_the_measured_line_cap() {
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn a_line_just_under_the_stdin_ceiling_round_trips_intact() {
     let service = edge_service();
-    let account = "clauth-test-account";
+    let account = "tollgate-test-account";
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
     let blob = near_ceiling_blob();
@@ -1165,11 +1165,11 @@ fn an_unparseable_items_debug_never_prints_the_bytes() {
 /// panicking or colliding.
 #[test]
 fn quarantine_path_is_timestamped_pid_separated_and_service_identified() {
-    let base = Path::new("/home/op/.clauth");
+    let base = Path::new("/home/op/.tollgate");
     assert_eq!(
         quarantine_path(base, "Claude Code-credentials", 1_771_234_565, 4213),
         PathBuf::from(
-            "/home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json"
+            "/home/op/.tollgate/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json"
         ),
     );
     assert_eq!(
@@ -1180,13 +1180,13 @@ fn quarantine_path_is_timestamped_pid_separated_and_service_identified() {
             4213
         ),
         PathBuf::from(
-            "/home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials-0123abcd.json"
+            "/home/op/.tollgate/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials-0123abcd.json"
         ),
     );
     // A separator in the service cannot escape the dir.
     assert_eq!(
         quarantine_path(base, "../evil", 0, 1),
-        PathBuf::from("/home/op/.clauth/keychain-quarantine/19700101T000000Z-1-.._evil.json"),
+        PathBuf::from("/home/op/.tollgate/keychain-quarantine/19700101T000000Z-1-.._evil.json"),
         "`/` is sanitized, never a path separator",
     );
     assert_eq!(
@@ -1204,11 +1204,11 @@ fn quarantine_path_is_timestamped_pid_separated_and_service_identified() {
 #[test]
 fn quarantine_tail_names_the_file_and_the_recovery_or_the_loss() {
     let path = PathBuf::from(
-        "/home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json",
+        "/home/op/.tollgate/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json",
     );
     assert_eq!(
         quarantine_tail(&Ok(path)),
-        "raw bytes are preserved at /home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json: the `claudeAiOauth` login head usually survives this corruption, so re-authenticate any MCP server that reports a signed-out session, or slice the login out of the quarantined file",
+        "raw bytes are preserved at /home/op/.tollgate/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json: the `claudeAiOauth` login head usually survives this corruption, so re-authenticate any MCP server that reports a signed-out session, or slice the login out of the quarantined file",
     );
     assert_eq!(
         quarantine_tail(&Err(anyhow::anyhow!("permission denied"))),
@@ -1370,8 +1370,8 @@ fn a_locked_keychain_write_failure_names_the_cause_and_carries_its_code() {
 fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
     use std::process::Command;
 
-    let service = format!("clauth-test-quarantine-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-quarantine-{}", std::process::id());
+    let account = "tollgate-test-account";
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
     // Seed the defect: truncated JSON, an intact `claudeAiOauth` head with its
@@ -1388,7 +1388,7 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
         "seeding the garbage item: {seeded:?}"
     );
 
-    // The quarantine write lands under `~/.clauth`, which under `cfg(test)`
+    // The quarantine write lands under `~/.tollgate`, which under `cfg(test)`
     // must resolve to a sandbox — never the operator's real tree.
     let sandbox = HomeSandbox::new();
     let lines = LogLines::new();
@@ -1415,7 +1415,7 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
     let event = &snapshot[0];
     assert!(
         event.starts_with(
-            "clauth: could not read the macOS Keychain login before replacing it (Keychain item \
+            "tollgate: could not read the macOS Keychain login before replacing it (Keychain item \
              is not valid JSON"
         ),
         "the line keeps its current shape: {event}"
@@ -1481,8 +1481,8 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
 fn an_unverifiable_write_lands_and_completes_the_switch() {
     use std::process::Command;
 
-    let service = format!("clauth-test-acl-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-acl-{}", std::process::id());
+    let account = "tollgate-test-account";
     // Seed a FRESH item (no -U: -T belongs to the create) whose trust list
     // names only /usr/bin/false, so our own find cannot read it back quietly.
     let mut seed = Command::new(SECURITY_BIN);
@@ -1505,7 +1505,7 @@ fn an_unverifiable_write_lands_and_completes_the_switch() {
 
     // The staged arm completes with a note, but an unexpected Corrupt
     // read-back would quarantine — the sandbox keeps that off the operator's
-    // tree (and `clauth_dir` panics unsandboxed under cfg(test)).
+    // tree (and `tollgate_dir` panics unsandboxed under cfg(test)).
     let sandbox = HomeSandbox::new();
     let lines = LogLines::new();
     let _capture = lines.capture_here();
@@ -1528,7 +1528,7 @@ fn an_unverifiable_write_lands_and_completes_the_switch() {
     let event = &snapshot[0];
     assert!(
         event.starts_with(
-            "clauth: the macOS Keychain write landed but could not be read back to verify ("
+            "tollgate: the macOS Keychain write landed but could not be read back to verify ("
         ),
         "the line names the write as landed but unverified: {event}"
     );
@@ -1558,8 +1558,8 @@ fn an_unverifiable_write_lands_and_completes_the_switch() {
 fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
     use std::process::Command;
 
-    let service = format!("clauth-test-signout-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-signout-{}", std::process::id());
+    let account = "tollgate-test-account";
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
     // Seed the defect exactly like KC-9: truncated JSON, an intact
@@ -1575,7 +1575,7 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
         "seeding the garbage item: {seeded:?}"
     );
 
-    // The quarantine write lands under `~/.clauth`, which under `cfg(test)`
+    // The quarantine write lands under `~/.tollgate`, which under `cfg(test)`
     // must resolve to a sandbox — never the operator's real tree.
     let sandbox = HomeSandbox::new();
     let lines = LogLines::new();
@@ -1597,7 +1597,7 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
     let event = &snapshot[0];
     assert!(
         event.starts_with(
-            "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it could \
+            "tollgate: signed Claude Code out of the macOS Keychain by deleting the item: it could \
              not be read first (Keychain item is not valid JSON"
         ),
         "the line keeps its current shape: {event}"
@@ -1638,8 +1638,8 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
 #[test]
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn an_item_past_the_pipe_buffer_round_trips_and_verifies() {
-    let service = format!("clauth-test-drain-{}", std::process::id());
-    let account = "clauth-test-account";
+    let service = format!("tollgate-test-drain-{}", std::process::id());
+    let account = "tollgate-test-account";
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
     // ~100 KiB of value: past the pipe buffer, composed line far past the
@@ -1814,7 +1814,7 @@ impl Drop for CensusItems {
     fn drop(&mut self) {
         for (service, account) in &self.0 {
             if let Err(e) = delete_at(service, account) {
-                eprintln!("clauth-test: cleaning up {service} failed: {e:#}");
+                eprintln!("tollgate-test: cleaning up {service} failed: {e:#}");
             }
         }
     }

@@ -310,7 +310,7 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     assert!(out.contains("Profiles, most headroom first (session-start snapshot"));
     assert!(out.contains("call `profiles`"));
 
-    // the tool router survives, because it is the ONLY clauth text a session is
+    // the tool router survives, because it is the ONLY tollgate text a session is
     // guaranteed to hold: some harnesses defer tool schemas, so a description is
     // unloaded until something searches for it. Every tool by name, so a fifth
     // tool that forgets the router reds here.
@@ -391,7 +391,7 @@ fn roster_groups_identical_brackets_and_leads_with_most_headroom() {
         "grouped, host-only, most headroom first",
     );
 
-    // A profile clauth has no figure for must not outrank one it knows is nearly
+    // A profile tollgate has no figure for must not outrank one it knows is nearly
     // spent: `None` is "unranked", never "full".
     let free = out.find("fresh").unwrap();
     let spent = out.find("spent").unwrap();
@@ -405,7 +405,7 @@ fn roster_groups_identical_brackets_and_leads_with_most_headroom() {
 
 /// Wallet profiles rank by amount inside one currency and never across two. The
 /// fleet this serves holds both: ordering 1117 CNY against 31 USD would need an
-/// exchange rate clauth has no way to obtain, so currency groups fall back to
+/// exchange rate tollgate has no way to obtain, so currency groups fall back to
 /// the order config first names them in — here CNY, because `cny-rich` leads.
 #[test]
 fn roster_ranks_wallets_within_a_currency_and_never_across_two() {
@@ -483,7 +483,7 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     assert!(custom.contains("custom `CLAUDE_CONFIG_DIR`"));
     assert!(custom.contains("unaffected"));
 
-    // The runtime-path note is earned by the one tier whose tree clauth builds.
+    // The runtime-path note is earned by the one tier whose tree tollgate builds.
     // A `Global` session has no runtime dir at all, and a custom
     // `CLAUDE_CONFIG_DIR` is somebody else's layout, so claiming the runtime
     // layout for either would send a model editing a path that does not exist,
@@ -632,13 +632,13 @@ unaffected)"
         assert!(runtime_paths_note(&other, probe).is_none());
         assert!(
             !instructions_block(&profiles, &other, probe).contains("runtime paths:"),
-            "only an isolated `clauth start` runtime may claim the runtime layout",
+            "only an isolated `tollgate start` runtime may claim the runtime layout",
         );
     }
 
     // The combined marker arm: the runtime profile IS the globally active one,
     // so one name carries both markers. Unpinned, folding this arm into either
-    // single marker stays green, and the most common case (`clauth start
+    // single marker stays green, and the most common case (`tollgate start
     // <active profile>`) is exactly the one that would drift.
     let both = instructions_block(
         &[snapshot("work", true)],
@@ -668,11 +668,11 @@ unaffected)"
     );
     assert!(
         !custom.contains("(this session)"),
-        "a custom dir holds no clauth session profile: {custom}",
+        "a custom dir holds no tollgate session profile: {custom}",
     );
 
     // The bans that held the old two-mode note hold the new one too: the note
-    // never constructs a runtime path, never names a path clauth does not build,
+    // never constructs a runtime path, never names a path tollgate does not build,
     // and never spells a transport as universal.
     for block in [&runtime_block, &copy_block, &mixed_block] {
         assert!(
@@ -681,7 +681,7 @@ unaffected)"
         );
         assert!(
             !block.contains("~/.agents"),
-            "no path clauth never builds: {block}"
+            "no path tollgate never builds: {block}"
         );
         assert!(
             !block.contains("SYMLINKS"),
@@ -708,7 +708,7 @@ fn live_usage_prose_names_every_window_and_warns() {
     // `live_usage_prose_dates_an_all_lapsed_unknown` below.
     // ...and a null profile name reads `none` and names no window at all: with
     // no account configured there is nothing whose windows could be reported,
-    // which is a state clauth knows rather than a figure it lost.
+    // which is a state tollgate knows rather than a figure it lost.
     let nulls = live_usage_prose(&serde_json::json!({"profile": null}), "active profile");
     assert_eq!(nulls, "active profile none");
 
@@ -788,7 +788,7 @@ fn live_usage_prose_dates_an_all_lapsed_unknown() {
 /// the very figure it introduces; one answering with a wallet has none, and the
 /// reader needs telling before reading the amount as a window. A third-party
 /// account with no figure at all denies nothing: the provider's limits are
-/// exactly what clauth cannot answer for there.
+/// exactly what tollgate cannot answer for there.
 #[test]
 fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
     assert_eq!(
@@ -1029,7 +1029,7 @@ fn both_carriers_spell_a_local_endpoint_the_same_way() {
     );
 }
 
-/// The defect the marker closes: a loopback account and one clauth genuinely
+/// The defect the marker closes: a loopback account and one tollgate genuinely
 /// cannot read both render `usage unknown`, so the cheapest target on the roster
 /// read exactly like the most broken one. One call renders both rows, so the two
 /// readings cannot be pinned apart by accident. Deleting the predicate strips the
@@ -1223,7 +1223,7 @@ fn host_locality_places_local_hosts_and_leaves_the_rest_bare() {
         // query-bearing base url really does reach here with no `/` to cut on.
         "localhost:80a",
         "127.0.0.1:4000?x=1",
-        // Names clauth would have to resolve, and it resolves nothing.
+        // Names tollgate would have to resolve, and it resolves nothing.
         "ollama.com",
         "api.deepseek.com",
         "openrouter.ai",
@@ -1264,7 +1264,7 @@ fn host_locality_places_local_hosts_and_leaves_the_rest_bare() {
         "localhost@evil.tld",
         "192.168.1.1@evil.tld",
         // Unbracketed IPv6, every spelling. RFC 3986 has no authority syntax for
-        // one, so clauth refuses rather than guessing which host was meant.
+        // one, so tollgate refuses rather than guessing which host was meant.
         //
         // DO NOT DELETE THESE AS UNREACHABLE. They are reachable, and measured so:
         // `base_url_host` splits without validating, `Profile::base_url` is raw
@@ -1282,7 +1282,7 @@ fn host_locality_places_local_hosts_and_leaves_the_rest_bare() {
         assert_eq!(
             host_locality(host),
             None,
-            "`{host}` is not a host clauth can place",
+            "`{host}` is not a host tollgate can place",
         );
     }
 }
@@ -1366,7 +1366,7 @@ fn windows_prose_dates_its_figures_and_marks_a_stale_one() {
             "stale": true,
         })),
         "5h 12% used (cached 2h 5m ago, stale)",
-        "a stale figure keeps its number: dropping it reads as clauth losing the account",
+        "a stale figure keeps its number: dropping it reads as tollgate losing the account",
     );
     // The roster spends no tokens dating rows that are current, and still says
     // so when one is not.
@@ -1570,7 +1570,7 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
     assert_eq!(
         listed,
         [
-            "delegates clauth holds:",
+            "delegates tollgate holds:",
             "  job `d-a-0` running on `one`, elapsed 1m 5s",
             "  job `d-b-0` blocking on `two` (its own caller takes the result), elapsed 20s",
             "  job `d-c-0` done on `three`, finished 1m 30s ago",
@@ -1611,7 +1611,7 @@ fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
     assert_eq!(
         listed,
         [
-            "delegates clauth holds:",
+            "delegates tollgate holds:",
             "  job `d-a-0` running on `one`, elapsed 1m 5s",
             "  job `d-d-0` orphaned on `four`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1h 6m ago",
         ]
@@ -1625,7 +1625,7 @@ fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
 ///
 /// A job that finished under a second ago and a fan-out member that just
 /// launched are both routine, so this is not an edge case. The rule lives in
-/// `format::humanize_span`, shared with `clauth jobs`, rather than being guarded
+/// `format::humanize_span`, shared with `tollgate jobs`, rather than being guarded
 /// a third time here.
 #[test]
 fn a_listing_row_renders_a_zero_span_as_a_length_not_as_an_instant() {
@@ -1790,7 +1790,7 @@ fn throughput_prose_flags_appear_only_when_true_with_retry_delay() {
 }
 
 /// The documented usage fields read as English; a field claude added that
-/// clauth does not document keeps its name in backticks so no figure vanishes.
+/// tollgate does not document keeps its name in backticks so no figure vanishes.
 #[test]
 fn usage_prose_documented_fields_read_english_and_unknown_keys_survive() {
     let u = serde_json::json!({
@@ -1872,7 +1872,7 @@ fn usage_prose_empty_and_all_filtered_are_empty() {
 
 /// The two documented fields always produce a clause: a run that produced no
 /// output is real signal, and a non-number still reads English and says
-/// clauth has no figure rather than dropping the clause.
+/// tollgate has no figure rather than dropping the clause.
 #[test]
 fn usage_prose_renders_the_documented_fields_even_without_a_number() {
     let u = serde_json::json!({"input_tokens": null, "output_tokens": ""});
@@ -1890,7 +1890,7 @@ fn usage_prose_recurses_into_arrays_and_scalars() {
     assert_eq!(usage_prose(&u), "`samples.0` 5, `samples.2` 7");
 }
 
-/// A stringified number is a figure: clauth fronts third-party proxies that
+/// A stringified number is a figure: tollgate fronts third-party proxies that
 /// stringify numerics, so `"83930"` reads as the number, and a stringified
 /// zero is still the always-render zero on a documented key.
 #[test]
@@ -2150,7 +2150,7 @@ fn truncate_clause_walks_scalars_and_a_zero_budget_collapses_to_the_marker() {
 }
 
 /// `f64::from_str` accepts `"NaN"` and `"inf"`, but neither is a number
-/// clauth can show, so a non-finite string is not a figure: on a documented
+/// tollgate can show, so a non-finite string is not a figure: on a documented
 /// key it reads `unknown`, elsewhere it takes the string-leaf path.
 #[test]
 fn usage_prose_treats_a_non_finite_string_as_not_a_figure() {
@@ -2353,11 +2353,11 @@ fn the_cost_clause_is_bare_only_for_an_anthropic_target() {
 }
 
 /// The gate's direction, pinned on its own: only a POSITIVE `anthropic` earns
-/// the bare clause. An unfolded envelope, or one whose target clauth could not
+/// the bare clause. An unfolded envelope, or one whose target tollgate could not
 /// classify, must not read as Anthropic-priced.
 ///
 /// It gets its OWN qualifier, though. `not this endpoint's` asserts the
-/// endpoint was something else, which is a fact clauth does not hold here —
+/// endpoint was something else, which is a fact tollgate does not hold here —
 /// collapsing "no answer" into "known otherwise" is the same defect the
 /// none-vs-unknown ruling forbids in the other direction.
 #[test]
@@ -2489,7 +2489,7 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
 
     // The tail is ANOTHER account's model output landing verbatim in a
     // model-facing reply. A bare quote in it would close the span early and the
-    // rest would read as clauth's own prose, so the span is forgeable unless
+    // rest would read as tollgate's own prose, so the span is forgeable unless
     // both the delimiter and the escape character are escaped.
     let forged = serde_json::json!({
         "job_id": "d-10",

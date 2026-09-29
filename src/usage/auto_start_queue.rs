@@ -19,7 +19,7 @@
 //! window's whole 5h life, so an open proves itself by PERSISTING across
 //! readings — one snapshot proves nothing, whatever its value: it can be a
 //! torn reading, a window seen exactly once, or a stale line from a lapsed
-//! window. clauth already persists that series per profile
+//! window. tollgate already persists that series per profile
 //! (`usage_history.jsonl`, 2-day retention, [`crate::profile::load_usage_history`]),
 //! so the anchor needs no state of its own: [`history_anchor`] replays it and
 //! keeps the newest boundary CONFIRMED by persistence ([`series_open`]).

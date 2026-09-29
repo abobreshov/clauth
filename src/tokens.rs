@@ -28,7 +28,7 @@
 //! `lastComputedDate`, but CC prunes them past `cleanupPeriodDays`, so a day after
 //! a frozen base but before the retention horizon would be counted nowhere. The
 //! ledger closes that: each finalized day's split is written once to
-//! `~/.clauth/token_ledger.json` and folded back on load, and its watermark
+//! `~/.tollgate/token_ledger.json` and folded back on load, and its watermark
 //! becomes the sweep's effective cutoff — so a frozen base can't keep the
 //! cold-start read growing either. Days recorded before the hourly axis carry
 //! no per-hour buckets; on the first run after an upgrade, a one-shot backfill
@@ -1568,7 +1568,7 @@ struct BackfillSweep {
 /// memory at one transcript.
 ///
 /// `None` when `recorded_through` yields no instant — never in practice (the
-/// watermark is clauth-written); the caller then skips the pass without
+/// watermark is tollgate-written); the caller then skips the pass without
 /// marking it done, so a fixed file still gets its backfill.
 fn backfill_corpus(
     claude_dir: &Path,
@@ -1742,16 +1742,16 @@ pub(crate) enum TokensEvent {
 /// cache so each sweep re-reads only changed transcripts. Exits when `refresh_rx`
 /// disconnects (TUI shutdown).
 ///
-/// `claude_dir` and `clauth_dir` must already be resolved by the caller — the
+/// `claude_dir` and `tollgate_dir` must already be resolved by the caller — the
 /// worker never re-resolves `home_dir()`, matching the pattern in `status::spawn`.
-/// `clauth_dir` is where the durable per-day ledger lives; `None` disables it (the
+/// `tollgate_dir` is where the durable per-day ledger lives; `None` disables it (the
 /// tab still works off stats-cache + transcripts, just without the aged-day
 /// backfill / cold-start bound).
 pub(crate) fn spawn(
     tx: Sender<TokensEvent>,
     refresh_rx: Receiver<()>,
     claude_dir: PathBuf,
-    clauth_dir: Option<PathBuf>,
+    tollgate_dir: Option<PathBuf>,
 ) {
     std::thread::spawn(move || {
         let mut cache = TopUpCache::default();
@@ -1764,7 +1764,9 @@ pub(crate) fn spawn(
             let lcd = base.last_computed_date.clone();
             // Fold durably-recorded days (past the frozen base, before the
             // transcript horizon) into the base so they survive transcript pruning.
-            let mut ledger = clauth_dir.as_deref().map(crate::token_ledger::Ledger::load);
+            let mut ledger = tollgate_dir
+                .as_deref()
+                .map(crate::token_ledger::Ledger::load);
             if let Some(l) = &ledger {
                 l.apply_to_base(&mut base, lcd.as_deref());
             }
@@ -1794,7 +1796,7 @@ pub(crate) fn spawn(
             // legs run inside this one tick, so neither sweep overlaps the
             // other or the next 90s cycle's. The backfill's save is
             // independent of whether `record` had anything to write.
-            if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref()) {
+            if let (Some(l), Some(dir)) = (ledger.as_mut(), tollgate_dir.as_deref()) {
                 persist_ledger(&claude_dir, l, dir, &base, &today, |done, total| {
                     if done % 25 == 0 || done == total {
                         let _ = tx.send(TokensEvent::Progress { done, total });

@@ -57,7 +57,7 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
-use crate::update::{self, UpdateEvent};
+use crate::update;
 use crate::usage::{
     ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
     OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff,
@@ -274,7 +274,7 @@ pub(crate) enum ConfigRow {
     /// `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
     /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
-    /// Dimmed and inert while the account is active or holds a live `clauth
+    /// Dimmed and inert while the account is active or holds a live `tollgate
     /// start` session — the same gate the CLI enforces.
     Disabled,
     Delete,
@@ -444,12 +444,9 @@ pub(crate) enum GlobalConfigRow {
     /// spent account until its window resets — a fetch-leg optimization only,
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
-    /// Background self-update (`AppState.update.auto_update`) — ON by default.
-    /// The binary updater reads it at next launch, the daemon's herdr leg on
-    /// its next reload, a new MCP server at startup (`check on launch`; no
-    /// live process is cancelled). The row renders the persisted value and
-    /// stays editable even under `CLAUTH_NO_UPDATE=1`, which still disables
-    /// every leg until the env var goes. ENUMERATED on/off, ⏎ mirrors space.
+    /// Background self-update (`AppState.update.auto_update`). Compiled out
+    /// of this build (`update::DISABLED_MESSAGE`): the row renders off and
+    /// activating it toasts that message instead of flipping the saved value.
     AutoUpdate,
     /// Whether the `auto_start` auto-start kick is interleaved across accounts, so
     /// their 5h windows open `5h / N` apart instead of all at once
@@ -612,7 +609,7 @@ pub(crate) enum ConfirmAction {
     /// Disable one account (action-menu "disable account" off the Setup pane,
     /// standing in for the row's arm-then-confirm).
     DisableOne(String),
-    /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
+    /// Plugin tab: write the `mcpServers.tollgate` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
     WireMcpServers,
     /// Plugin tab: relink `~/.claude/.credentials.json` to the active profile's
@@ -628,7 +625,7 @@ pub(crate) enum ConfirmAction {
     /// Setup `+ new` draft: `+ capture current login` pressed while a browser
     /// mint is already stashed. Confirm, then stash the snapshot in its place.
     CaptureOverMintStash(Box<CaptureSnapshot>),
-    /// Delete row on a profile with a live `clauth start` session: the unforced
+    /// Delete row on a profile with a live `tollgate start` session: the unforced
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
@@ -647,7 +644,7 @@ pub(crate) enum ConfirmAction {
     DeletePreset(String),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
-    /// its login in a Keychain entry clauth cannot write). Confirming just
+    /// its login in a Keychain entry tollgate cannot write). Confirming just
     /// dismisses; `run_confirm_action` does nothing.
     Acknowledge,
     /// Plugin tab: run `crate::herdr::heal` on the named config file.
@@ -656,7 +653,7 @@ pub(crate) enum ConfirmAction {
     /// then heal herdr's config so the sidebar row matches the new knob. The
     /// heal is what the confirm gates — it rewrites herdr's own file.
     HerdrDelegateRowText(std::path::PathBuf),
-    /// Plugin tab: install the clauth plugin through agentgear at user scope.
+    /// Plugin tab: install the tollgate plugin through agentgear at user scope.
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
@@ -871,9 +868,9 @@ pub(crate) enum ActionMenuAction {
     EnableProfile,
     /// Open the focused account's provider console — where its api key is
     /// minted. Offered only for a recognised third-party endpoint, since that
-    /// is the only case clauth knows a page for.
+    /// is the only case tollgate knows a page for.
     OpenProviderConsole,
-    /// `clauth daemon`, detached from the TUI, offered while none runs.
+    /// `tollgate daemon`, detached from the TUI, offered while none runs.
     StartDaemon,
     /// `--replace`'s termination with no successor, offered while one runs.
     StopDaemon,
@@ -1081,7 +1078,7 @@ const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 /// macOS refuses to rotate an account with a running session (it can't reach the
 /// credential that session reads), so the two hosts promise different things.
 #[cfg(target_os = "macos")]
-const ROTATE_ALL_DETAIL: &str = "accounts with a live clauth start session are skipped.";
+const ROTATE_ALL_DETAIL: &str = "accounts with a live tollgate start session are skipped.";
 #[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 
@@ -1092,10 +1089,10 @@ const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on thei
 /// Defined on every platform though only macOS reads them (the branch is
 /// `cfg!`, so it still compiles here) — that keeps the strings reviewable and
 /// exact-match pinnable from a Linux run.
-const ROTATE_LIVE_SESSION_MSG: &str = "has a live clauth start session";
-const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
+const ROTATE_LIVE_SESSION_MSG: &str = "has a live tollgate start session";
+const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry tollgate can't write, so rotating would sign the \
      session out.";
-const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
+const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where tollgate can't rotate it";
 
 /// What disabling costs, for the action menu's confirm. The Setup row states the
 /// same thing in its own hint (`config::row_hint`) before arming.
@@ -1418,9 +1415,9 @@ pub(crate) enum PluginFix {
     /// Relink a `missing` active-profile credential link to its own stored creds.
     RelinkCredentials(String),
     /// Append the keybinding + sidebar row to herdr's config (the config half of
-    /// `clauth herdr install`). `PathBuf` = the resolved config file.
+    /// `tollgate herdr install`). `PathBuf` = the resolved config file.
     HealHerdrConfig(std::path::PathBuf),
-    /// Install the clauth plugin through agentgear (user scope, embedded tree).
+    /// Install the tollgate plugin through agentgear (user scope, embedded tree).
     /// Replaces the copy-paste `/plugin` hint the row used to show.
     InstallPlugin,
 }
@@ -1459,7 +1456,7 @@ pub(crate) struct PluginState {
     /// on an explicit `r` — construction and a tab switch never spawn the
     /// subprocess, so the first paint never blocks on it.
     pub(crate) cc_version: Option<Option<String>>,
-    /// Cached `clauth mcp` discovery handshake: `None` = unprobed. Re-probed only
+    /// Cached `tollgate mcp` discovery handshake: `None` = unprobed. Re-probed only
     /// on `r` (heavier than the others — it boots the real server), never on a tab
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
@@ -1469,7 +1466,7 @@ pub(crate) struct PluginState {
     /// it spawns three subprocesses, so a tab switch and the per-tick refresh
     /// reuse the cached value.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
-    /// The `clauth mcp` job store as of the last refresh, newest first: what the
+    /// The `tollgate mcp` job store as of the last refresh, newest first: what the
     /// delegates pane draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
     /// subscribe to and no event to wait for. Read-only: the TUI never writes
@@ -1478,7 +1475,7 @@ pub(crate) struct PluginState {
     /// The cost is one readdir plus a parse per file. No count cap bounds that
     /// from here: retention is the two TTLs (`jobs::DONE_TTL_MS` /
     /// `jobs::RUNNING_TTL_MS`), applied only by the startup sweep inside a
-    /// `clauth mcp` process, which the TUI neither runs nor depends on having
+    /// `tollgate mcp` process, which the TUI neither runs nor depends on having
     /// run, and the count spans both record spellings. What the directory
     /// really holds is whatever the last such startup expired, plus every job
     /// written since. Measured against the 1 s tick with 256 records over
@@ -1626,7 +1623,7 @@ pub(crate) enum MainItemKind {
 
 /// Which harness the Overview shows. A VIEW filter only: selection and every
 /// action stay bound to the claude list, because a codex account has no
-/// `Profile` record for them to act on and clauth switches it through its own
+/// `Profile` record for them to act on and tollgate switches it through its own
 /// CLI verb. So the codex section renders READ-ONLY, and while the claude rows
 /// are hidden every key bound to the selection is inert
 /// ([`claude_rows_hidden`]) rather than acting on a row the screen does not
@@ -1928,8 +1925,6 @@ pub(crate) struct App {
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
     /// Tracked across frames so the "too small" toast fires only on the transition in.
     pub(crate) compact: bool,
-    /// Startup update check result; drained in `on_tick`. Silent on errors.
-    pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
     pub(crate) update_handle: Option<JoinHandle<()>>,
 
@@ -2113,7 +2108,7 @@ pub(crate) struct App {
     /// ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
     pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
-    /// Live `clauth start` sessions per account, for the Overview `active`
+    /// Live `tollgate start` sessions per account, for the Overview `active`
     /// column and the Fallback tab's compact equivalent. Cached because
     /// collecting it is a readdir plus an `open` + `try_lock` per row per marker
     /// layout, and both surfaces read it every frame. Refreshed by
@@ -2316,15 +2311,14 @@ impl App {
             }
         }
 
-        // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
-        let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
-        let update_handle = update::spawn(update_sender, config.state.update.auto_update);
+        // The update check: a no-op in this build (`update::spawn` is compiled out).
+        let update_handle = update::spawn(config.state.update.auto_update);
 
         // Status feed worker: streams incidents over `status_events`; a `()` on
         // `status_refresh` triggers a manual refetch. The channels are always
         // created (so the drains stay inert), but the thread is skipped under
         // `cfg!(test)`: a detached worker could outlive a test's `HOME_OVERRIDE`
-        // scope and its cache write would then resolve the real `~/.clauth`.
+        // scope and its cache write would then resolve the real `~/.tollgate`.
         let (status_sender, status_events) = std::sync::mpsc::channel::<StatusEvent>();
         let (status_refresh, status_refresh_rx) = std::sync::mpsc::channel::<()>();
         if cfg!(test) {
@@ -2346,16 +2340,16 @@ impl App {
         if cfg!(test) {
             drop((tokens_sender, tokens_refresh_rx));
         } else if let Ok(claude_dir) = crate::profile::claude_dir() {
-            let clauth_dir = crate::profile::clauth_dir().ok();
-            crate::tokens::spawn(tokens_sender, tokens_refresh_rx, claude_dir, clauth_dir);
+            let tollgate_dir = crate::profile::tollgate_dir().ok();
+            crate::tokens::spawn(tokens_sender, tokens_refresh_rx, claude_dir, tollgate_dir);
         } else {
             drop((tokens_sender, tokens_refresh_rx));
         }
 
         // Pricing loader: fetches the ai-pricelog index rates for the Tokens
-        // tab's cost lens, disk-cached under `~/.clauth`. Same test-skip
+        // tab's cost lens, disk-cached under `~/.tollgate`. Same test-skip
         // rationale as the status/token workers — a detached thread could
-        // outlive a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
+        // outlive a test's `HOME_OVERRIDE` and write the real `~/.tollgate`.
         let (pricing_sender, pricing_events) =
             std::sync::mpsc::channel::<crate::pricing::PricingEvent>();
         let (pricing_refresh, pricing_refresh_rx) = std::sync::mpsc::channel::<()>();
@@ -2428,7 +2422,6 @@ impl App {
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
-            update_results,
             update_handle,
             login: None,
             clipboard: crate::platform::copy_to_clipboard_osc52,
@@ -3894,9 +3887,9 @@ fn apply_plugin_fix(app: &mut App) {
         PluginFix::WireMcpServers => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: "wire clauth into claude code's mcpServers?".to_string(),
+                message: "wire tollgate into claude code's mcpServers?".to_string(),
                 detail: Some(
-                    "writes the clauth entry into ~/.claude.json; other fields are preserved."
+                    "writes the tollgate entry into ~/.claude.json; other fields are preserved."
                         .to_string(),
                 ),
                 choice: false,
@@ -3932,7 +3925,7 @@ fn apply_plugin_fix(app: &mut App) {
         PluginFix::InstallPlugin => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: "install the clauth plugin into claude code?".to_string(),
+                message: "install the tollgate plugin into claude code?".to_string(),
                 detail: Some(
                     "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
                         .to_string(),
@@ -4039,7 +4032,7 @@ fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
 ///
 /// Gated on the plugin-pane environment (`HERDR_ENV=1` plus the injected
 /// binary and plugin-root paths): no herdr command exposes the plugin root,
-/// so this gate is the only channel, and a bare `clauth` TUI inside a herdr
+/// so this gate is the only channel, and a bare `tollgate` TUI inside a herdr
 /// pane silently skips the push too. Best-effort — a failure anywhere is
 /// silent, and the change still lands with the next report (a watcher tick,
 /// or the next agent-event hook for panes without one).
@@ -4160,7 +4153,7 @@ pub(crate) fn parse_herdr_tag_secs(raw: &str) -> Option<u64> {
 }
 
 /// Open the confirm before flipping `delegate row text`: the flip rewrites
-/// herdr's own config (the row `clauth herdr install` appended), so it carries
+/// herdr's own config (the row `tollgate herdr install` appended), so it carries
 /// the same confirm gate as the `[f]` heal. The copy names the delegate token
 /// so the confirm says what it will write; cancel is the default choice.
 fn open_herdr_row_text_confirm(app: &mut App) {
@@ -4182,10 +4175,10 @@ fn open_herdr_row_text_confirm(app: &mut App) {
             "drop the delegate token from herdr's sidebar row?".to_string()
         },
         detail: Some(if turning_on {
-            "writes $clauth_delegate into the row clauth added in herdr's config.toml, validated by `herdr config check`; a hand-owned row is left alone with a note."
+            "writes $tollgate_delegate into the row tollgate added in herdr's config.toml, validated by `herdr config check`; a hand-owned row is left alone with a note."
                 .to_string()
         } else {
-            "rewrites the row clauth added in herdr's config.toml without $clauth_delegate, validated by `herdr config check`; a hand-owned row is left alone with a note."
+            "rewrites the row tollgate added in herdr's config.toml without $tollgate_delegate, validated by `herdr config check`; a hand-owned row is left alone with a note."
                 .to_string()
         }),
         choice: false,
@@ -4217,8 +4210,8 @@ fn version_satisfies(probed: Option<&str>, min: Option<&str>) -> bool {
     }
 }
 
-/// The Plugin tab's `herdr` row: the installed herdr's clauth plugin plus the
-/// keybinding/sidebar config `clauth herdr install` adds. Pure so the verdict
+/// The Plugin tab's `herdr` row: the installed herdr's tollgate plugin plus the
+/// keybinding/sidebar config `tollgate herdr install` adds. Pure so the verdict
 /// logic unit-tests without an `App`; the caller supplies the probe and the
 /// config readout (`None` when the config file could not be read at all).
 pub(crate) fn herdr_check(
@@ -4307,7 +4300,7 @@ pub(crate) fn herdr_check(
         warn = true;
         detail.push("plugin: not installed".to_string());
         detail.push(String::new());
-        detail.push("  clauth herdr install".to_string());
+        detail.push("  tollgate herdr install".to_string());
     }
 
     let health = if danger {
@@ -4351,24 +4344,24 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
 
-    // about — clauth's data dir + PATH resolution (CC spawns `clauth mcp` by
+    // about — tollgate's data dir + PATH resolution (CC spawns `tollgate mcp` by
     // name, so resolution is load-bearing) and the Claude Code version. Combined
-    // health: clauth missing is danger (server can't start), CC missing is warn.
-    let clauth_path = probe::on_path("clauth");
+    // health: tollgate missing is danger (server can't start), CC missing is warn.
+    let tollgate_path = probe::on_path(crate::identity::NAME);
     let mut about_detail = vec![format!(
         "data: {}",
-        crate::profile::clauth_dir()
+        crate::profile::tollgate_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "\u{2014}".to_string())
     )];
-    match &clauth_path {
+    match &tollgate_path {
         Some(path) => about_detail.push(format!("path: {}", path.display())),
         None => {
             about_detail.push("path: not on PATH".to_string());
             about_detail.push(
-                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
+                "claude code spawns tollgate mcp by name, so the server won't start".to_string(),
             );
-            about_detail.push("install clauth so its bin directory is on PATH".to_string());
+            about_detail.push("install tollgate so its bin directory is on PATH".to_string());
         }
     }
     match &app.plugin.cc_version {
@@ -4385,7 +4378,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     }
     checks.push(Check {
         label: "about",
-        health: if clauth_path.is_none() {
+        health: if tollgate_path.is_none() {
             Health::Danger
         } else if matches!(app.plugin.cc_version, Some(None)) {
             // Probed and missing is the only version verdict that warns; an
@@ -4398,12 +4391,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         fix: None,
     });
 
-    // `clauth mcp` boot self-probe — `r`-gated only (heavier than the other reads:
-    // it spawns the real server). Cleared when clauth no longer resolves so a stale
+    // `tollgate mcp` boot self-probe — `r`-gated only (heavier than the other reads:
+    // it spawns the real server). Cleared when tollgate no longer resolves so a stale
     // "boots" can't linger. Skipped under test so the suite never boots the server.
     if refresh_version {
         app.plugin.fetching = true;
-        app.plugin.mcp_boot = if clauth_path.is_some() {
+        app.plugin.mcp_boot = if tollgate_path.is_some() {
             Some(if cfg!(test) {
                 probe::McpProbe::Ok
             } else {
@@ -4424,12 +4417,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     }
 
     // "global" == active in every project: a CC `user`-scope plugin install. A
-    // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
+    // `local`/`project` install (or a `./.mcp.json`) binds tollgate to one repo.
     let records = probe::installed_records();
     let installed = !records.is_empty();
     let plugin_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
 
-    // mcpServers wiring — a plugin install OR a manual `mcpServers.clauth` entry.
+    // mcpServers wiring — a plugin install OR a manual `mcpServers.tollgate` entry.
     // Globally wired = a `user`-scope plugin or the `~/.claude.json` entry; a
     // project-scope plugin or a `./.mcp.json` wires this repo only, so it warns and
     // offers the same global write fix as a missing wiring does.
@@ -4555,7 +4548,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         detail.push(String::new());
-        detail.push("[f] install the clauth plugin".to_string());
+        detail.push("[f] install the tollgate plugin".to_string());
         Check {
             label: "plugin",
             health: Health::Warn,
@@ -4565,7 +4558,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     };
     checks.push(plugin_check);
 
-    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
+    // herdr — the installed herdr's tollgate plugin + keybinding/sidebar config.
     // The probe is cached (`r`-gated, three subprocesses); the config read is a
     // cheap `fs::read_to_string` that rides the tick, using the path the probe
     // already resolved. No row when herdr does not resolve or was never probed.
@@ -4785,10 +4778,10 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     // The delegates pane's data. Read here rather than on its own timer so it
     // rides the cadence this tab already documents (tab focus, `r`, and the 1 s
-    // tick while focused) — a `clauth mcp` run is a different process, so a
+    // tick while focused) — a `tollgate mcp` run is a different process, so a
     // watcher would buy freshness this tab has never promised.
     //
-    // `list_banded`, the same call `clauth jobs` and `monitor`'s listing make,
+    // `list_banded`, the same call `tollgate jobs` and `monitor`'s listing make,
     // so the pane's row order is not a second derivation of one. It arrives
     // banded and the renderer sorts nothing.
     app.plugin.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
@@ -5022,7 +5015,7 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
     };
     if snapshot_is_empty(&snapshot) {
         // The Keychain caveat only makes sense on macOS, where a live login can
-        // hide in the Keychain clauth doesn't read; elsewhere it's noise.
+        // hide in the Keychain tollgate doesn't read; elsewhere it's noise.
         let msg = if cfg!(target_os = "macos") {
             "no live login found\nnothing to capture (macos keychain isn't supported yet)"
         } else {
@@ -5680,19 +5673,10 @@ fn toggle_preemptive_rotation(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
-/// Flip the background self-update (`[update].auto_update`, default on). Same
-/// persistence shape as `toggle_preemptive_rotation`; `check on launch` timing
-/// — the binary updater reads the flag at next launch, the daemon's herdr leg
-/// on its next reload, a new MCP server at startup. The row stays live under
-/// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
-/// env var keeps overriding it until it goes.
+/// The self-update row. Self-update is compiled out of this build, so the row
+/// never flips the saved `[update].auto_update` value: it says why instead.
 fn toggle_auto_update(app: &mut App) {
-    {
-        let mut cfg = app.config();
-        cfg.state.update.auto_update = !cfg.state.update.auto_update;
-        let _ = save_app_state(&cfg.state);
-    }
-    app.last_reload_fp = reload_fingerprint();
+    app.toast(ToastKind::Info, update::DISABLED_MESSAGE.to_string());
 }
 
 /// Flip whether the background fetch polls spent (100%-capped) accounts
@@ -7318,7 +7302,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
 }
 
 /// Where the daemon's start and stop toasts send the user when either fails.
-const DAEMON_LOG_HINT: &str = "see ~/.clauth/daemon.log";
+const DAEMON_LOG_HINT: &str = "see ~/.tollgate/daemon.log";
 
 /// The action menu's `start daemon`: spawn `<this binary> daemon` detached,
 /// then report, off the UI thread, whether a daemon came up. The worker stays
@@ -7843,7 +7827,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 app.toast(
                     ToastKind::Danger,
                     format!(
-                        "these credentials already belong to '{owner}'\nswitch to it with:  clauth {owner}"
+                        "these credentials already belong to '{owner}'\nswitch to it with:  tollgate {owner}"
                     ),
                 );
                 app.refresh_unsaved_live_login();
@@ -8197,7 +8181,7 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
             let _ = event_tx.send((generation, login_event(progress)));
         });
         // A toast, not stderr: the canned line without the HTTP status. The
-        // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
+        // status is in `~/.tollgate/tollgate.log` via the exchange's `logline!`.
         let _ = result_tx.send((
             generation,
             res.map(|o| LoginResult::Oauth(Box::new(o)))
@@ -9250,7 +9234,7 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
         app.modals.push(Modal::Confirm(ConfirmState {
             message: format!("delete '{name}' anyway?"),
             detail: Some(
-                "this account has a live clauth start session; deleting it may log that \
+                "this account has a live tollgate start session; deleting it may log that \
                  session out."
                     .to_string(),
             ),
@@ -9669,7 +9653,7 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
 }
 
 /// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
-/// `name` is the active profile or holds a live `clauth start` session — the
+/// `name` is the active profile or holds a live `tollgate start` session — the
 /// same gate `actions::disable_profile` itself enforces, checked here TOO so
 /// the row stays truly inert (silent no-op, matching the dimmed-row rule):
 /// `disable_profile`'s own refusal is a real `bail!`, and without this early
@@ -9811,7 +9795,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
             recompute_plugin_checks(app, false);
         }
         Ok(notes) => {
-            // Non-empty notes = pieces clauth refused to touch (a table it
+            // Non-empty notes = pieces tollgate refused to touch (a table it
             // cannot extend by appending). Reporting success over those is a
             // lie, so the notes surface verbatim.
             app.toast(
@@ -9984,7 +9968,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::WireMcpServers => {
             match crate::plugin_probe::wire_mcp_server() {
                 Ok(()) => {
-                    app.toast(ToastKind::Success, "wired clauth into ~/.claude.json");
+                    app.toast(ToastKind::Success, "wired tollgate into ~/.claude.json");
                     // Reflect the new wiring in the rows without a fresh version probe.
                     recompute_plugin_checks(app, false);
                 }
@@ -10037,7 +10021,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // earned. (`Outcome` is #[non_exhaustive], so the wildcard is the
             // contract, not a shortcut.)
             Ok(outcome) => {
-                app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
+                app.toast(ToastKind::Success, format!("tollgate plugin {outcome}"));
                 // Reflect the fresh install in the rows without a version probe.
                 recompute_plugin_checks(app, false);
             }
@@ -10773,23 +10757,6 @@ fn apply_console_login(
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
-    while let Ok(ev) = app.update_results.try_recv() {
-        match ev {
-            UpdateEvent::Installed(v) => {
-                app.toast(
-                    ToastKind::Success,
-                    format!("updated to v{v}\nrestart to apply"),
-                );
-            }
-            UpdateEvent::Available(v) => {
-                app.toast(
-                    ToastKind::Info,
-                    format!("update available: v{v}\nreinstall with cargo install clauth"),
-                );
-            }
-        }
-    }
-
     drain_op_results(app);
     drain_status_events(app);
     drain_tokens_events(app);
@@ -10888,7 +10855,7 @@ pub(crate) fn warn_day_claim_notices(app: &mut App) {
         .cloned()
         .collect();
     for msg in fresh {
-        crate::logline::logline!("clauth: {msg}");
+        crate::logline::logline!("tollgate: {msg}");
         app.toast(ToastKind::Warning, msg);
     }
     app.day_claim_notices = notices;
@@ -10896,7 +10863,7 @@ pub(crate) fn warn_day_claim_notices(app: &mut App) {
 
 /// Re-read the codex roster for the Overview's codex section and the header's
 /// account count, at most once a second: a roster TOML plus a few small files
-/// per account is cheap but not per-frame cheap, and both a `clauth login --codex`
+/// per account is cheap but not per-frame cheap, and both a `tollgate login --codex`
 /// in another terminal and a codex usage fetch land on a human timescale.
 /// Ungated by tab and by filter, so a `c` onto the codex view shows the current
 /// roster rather than the one from whenever the view last showed it.
@@ -11028,7 +10995,7 @@ fn sync_broken_verdicts(app: &mut App) {
 /// Plugin tab live refresh: re-run the cheap local checks (session counts + link
 /// state) at most once per interval while the tab is focused and no modal is open,
 /// so a session started elsewhere shows up without a manual `r`. Never re-probes
-/// `claude --version` or `clauth mcp` — both stay `r`-gated.
+/// `claude --version` or `tollgate mcp` — both stay `r`-gated.
 fn poll_plugin_refresh(app: &mut App) {
     const PLUGIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -11267,7 +11234,7 @@ fn poll_credentials_divergence(app: &mut App) {
     }
     // A login already saved in the active profile's store holds nothing unsaved —
     // the next switch re-installs it, losing no login — so it must not raise the
-    // banner. This clears clauth's own symlink AND the macOS regular-file mirror CC
+    // banner. This clears tollgate's own symlink AND the macOS regular-file mirror CC
     // writes over it. The switch/defer gates apply the same exemption through
     // `live_diverged_and_unsaved`; the poll must adopt a first login before this
     // point, so it checks the predicate directly here instead.
@@ -11360,7 +11327,7 @@ impl Drop for BootstrapDoneGuard {
 /// Handles of every [`spawn_worker`] thread, so a test can join them BEFORE its
 /// `HomeSandbox` drops. `HOME_OVERRIDE` is a process-global cleared on that drop,
 /// so a detached worker that outlives it resolves the operator's REAL `$HOME` and
-/// takes real locks under `~/.clauth` — `RotationGuard::acquire` alone does
+/// takes real locks under `~/.tollgate` — `RotationGuard::acquire` alone does
 /// `mkdir_700` + a blocking flock. Serialized by `profile::HOME_TEST_LOCK`, which
 /// every sandboxed test holds, so the registry is effectively exclusive.
 /// Never compiled into the binary.

@@ -951,7 +951,7 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
         "a degraded profile must render the mint it is actually on"
     );
 
-    // Flag OFF, sidecar holding a rolling bearer (`clauth static-token` flips
+    // Flag OFF, sidecar holding a rolling bearer (`tollgate static-token` flips
     // the flag before the restore lands): the row must say rolling.
     std::fs::write(
         dir.join("session-token.json"),
@@ -1032,7 +1032,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
         .join(" ");
     assert!(stalled_t.contains("rolling token stalled"), "{stalled_t}");
     assert!(
-        stalled_t.contains("clauth rolling-token acct"),
+        stalled_t.contains("tollgate rolling-token acct"),
         "the fix line interpolates the profile, never a <p> placeholder: {stalled_t}"
     );
 
@@ -1047,7 +1047,7 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
 
 /// The stalled-rolling fix line interpolates `snap.title`, never `snap.name`:
 /// `build_snap(app, draft.is_none())` blanks `name` whenever a draft is open,
-/// so a name-fed line renders `clauth rolling-token  re-arms` — a fix command
+/// so a name-fed line renders `tollgate rolling-token  re-arms` — a fix command
 /// with a hole where the profile belongs — exactly while the operator is
 /// editing the profile it names. Driven through `draw_settings_rows` with the
 /// draft-open Snap shape (`title` carries the profile, `name` blank), which is
@@ -1077,7 +1077,7 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        joined.contains("clauth rolling-token acct re-arms"),
+        joined.contains("tollgate rolling-token acct re-arms"),
         "the fix line reads the title, which a draft never blanks: {joined}"
     );
 }

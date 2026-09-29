@@ -100,7 +100,7 @@ fn a_ratio_above_one_clamps_to_a_full_bar() {
 fn a_weekly_only_body_yields_no_5h_bar() {
     // The 5h pair is documented and every tier publishes a `five_hour`
     // allowance, but a real Solo account never returned it — a synthesised bar
-    // would be a claim clauth cannot make.
+    // would be a claim tollgate cannot make.
     let s = stats(&usage(USAGE_WEEKLY_ONLY), None, None);
     assert_eq!(
         s.bars.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),

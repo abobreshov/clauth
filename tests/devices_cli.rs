@@ -1,4 +1,4 @@
-//! `clauth devices` against the real binary: which stream carries what, and
+//! `tollgate devices` against the real binary: which stream carries what, and
 //! what a signal or a newer code does to a waiting `pair`. Spawning is the only
 //! way to see the bytes a shell would capture and the exit code it would get.
 //!
@@ -14,24 +14,24 @@ use std::time::{Duration, Instant};
 
 use sha2::Digest as _;
 
-/// `clauth` with its home in `home` and nothing inherited that names another.
-fn clauth(home: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_clauth"));
+/// `tollgate` with its home in `home` and nothing inherited that names another.
+fn tollgate(home: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tollgate"));
     cmd.env("HOME", home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .stdin(Stdio::null());
     cmd
 }
 
-/// Start `clauth devices pair <name>` and read the code off its stdout, which
+/// Start `tollgate devices pair <name>` and read the code off its stdout, which
 /// is printed only once the code is live.
 fn start_pair(home: &Path, name: &str) -> (Child, BufReader<std::process::ChildStdout>, String) {
-    let mut child = clauth(home)
+    let mut child = tollgate(home)
         .args(["devices", "pair", name])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn clauth devices pair");
+        .expect("spawn tollgate devices pair");
     let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the code line");
@@ -52,7 +52,7 @@ fn wait_bounded(child: &mut Child, limit: Duration) -> std::process::ExitStatus 
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            panic!("clauth devices pair did not exit within {limit:?}");
+            panic!("tollgate devices pair did not exit within {limit:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -80,16 +80,16 @@ fn is_display_code(code: &str) -> bool {
             .all(|c| alphabet.contains(c))
 }
 
-/// `add` puts the token alone on stdout, so `$(clauth devices add tray)`
+/// `add` puts the token alone on stdout, so `$(tollgate devices add tray)`
 /// captures exactly it, and its one-time warning on stderr. The list keeps the
 /// token's digest, and a listing never prints either back.
 #[test]
 fn add_prints_the_token_alone_on_stdout() {
     let home = tempfile::tempdir().expect("home");
-    let out = clauth(home.path())
+    let out = tollgate(home.path())
         .args(["devices", "add", "tray", "--control"])
         .output()
-        .expect("run clauth devices add");
+        .expect("run tollgate devices add");
     assert_eq!(out.status.code(), Some(0));
 
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
@@ -103,21 +103,21 @@ fn add_prints_the_token_alone_on_stdout() {
     );
     assert_eq!(
         String::from_utf8(out.stderr).expect("utf8 stderr"),
-        "clauth: added device 'tray' (control). That token is its only copy: clauth keeps just \
+        "tollgate: added device 'tray' (control). That token is its only copy: tollgate keeps just \
          a SHA-256 of it and cannot show it again.\n"
     );
 
-    let list = std::fs::read_to_string(home.path().join(".clauth/devices.json")).expect("list");
+    let list = std::fs::read_to_string(home.path().join(".tollgate/devices.json")).expect("list");
     assert!(!list.contains(token), "the list must hold no token");
     assert!(
         list.contains(&hex::encode(sha2::Sha256::digest(token.as_bytes()))),
         "the list holds the token's digest"
     );
 
-    let listed = clauth(home.path())
+    let listed = tollgate(home.path())
         .args(["devices", "--json"])
         .output()
-        .expect("run clauth devices --json");
+        .expect("run tollgate devices --json");
     assert_eq!(listed.status.code(), Some(0));
     let listed = String::from_utf8(listed.stdout).expect("utf8");
     assert!(
@@ -142,7 +142,7 @@ fn ctrl_c_during_pair_withdraws_the_code_and_exits_130() {
     let home = tempfile::tempdir().expect("home");
     let (mut child, mut stdout, code) = start_pair(home.path(), "phone");
     assert!(is_display_code(&code), "stdout opens with the code alone");
-    let pairing = home.path().join(".clauth/pairing.json");
+    let pairing = home.path().join(".tollgate/pairing.json");
     assert!(pairing.exists(), "the code is live once it is printed");
 
     let sent = Command::new("kill")
@@ -159,7 +159,7 @@ fn ctrl_c_during_pair_withdraws_the_code_and_exits_130() {
     assert_eq!(rest, "", "stdout carried the code and nothing else");
     let stderr = read_stderr(&mut child);
     assert!(
-        stderr.ends_with("clauth: pairing code withdrawn\n"),
+        stderr.ends_with("tollgate: pairing code withdrawn\n"),
         "{stderr}"
     );
 }
@@ -178,12 +178,12 @@ fn a_replaced_pair_says_so_and_exits_1() {
     let stderr = read_stderr(&mut first);
     assert!(
         stderr.ends_with(
-            "Error: a newer `clauth devices pair` replaced this code before anyone entered it\n"
+            "Error: a newer `tollgate devices pair` replaced this code before anyone entered it\n"
         ),
         "{stderr}"
     );
     assert!(
-        home.path().join(".clauth/pairing.json").exists(),
+        home.path().join(".tollgate/pairing.json").exists(),
         "the replaced waiter leaves the newer code alone"
     );
 
@@ -197,26 +197,26 @@ fn a_replaced_pair_says_so_and_exits_1() {
     );
 }
 
-/// `clauth <args>` with stdout already closed: an OS pipe whose reader is
+/// `tollgate <args>` with stdout already closed: an OS pipe whose reader is
 /// dropped before spawn, so the child's first stdout write meets `EPIPE`
 /// instead of racing a reader that leaves later.
 fn closed_stdout(home: &Path, args: &[&str]) -> std::process::Output {
     let (reader, writer) = std::io::pipe().expect("pipe");
     drop(reader);
-    clauth(home)
+    tollgate(home)
         .args(args)
         .stdout(Stdio::from(writer))
         .output()
-        .expect("run clauth")
+        .expect("run tollgate")
 }
 
-/// `clauth <args>` with stdout pointed at a socket whose send buffer is
+/// `tollgate <args>` with stdout pointed at a socket whose send buffer is
 /// already full and whose peer never reads, so every write fails with `EAGAIN`
 /// instead of the `EPIPE` a closed pipe gives: the write-error arm the
 /// closed-pipe tests never exercise. A full buffer is the one write fault that
 /// fails the same way on every Unix runner — the Linux `/dev/full` has no
 /// macOS twin, and a read-only handle's `EBADF` is what stdio swallows, not
-/// what clauth sees.
+/// what tollgate sees.
 fn full_stdout(home: &Path, args: &[&str]) -> std::process::Output {
     let (peer, writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
     writer.set_nonblocking(true).expect("nonblocking write end");
@@ -232,11 +232,11 @@ fn full_stdout(home: &Path, args: &[&str]) -> std::process::Output {
         }
     }
     drop(filler);
-    let out = clauth(home)
+    let out = tollgate(home)
         .args(args)
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
         .output()
-        .expect("run clauth");
+        .expect("run tollgate");
     // `peer` stays open past the child's exit, so the child meets a full
     // buffer, not the `EPIPE` of a reader that left.
     drop(peer);
@@ -275,10 +275,10 @@ fn add_with_closed_stdout_rolls_back_and_exits_1() {
     );
     assert!(!has_token_shape(&stderr), "stderr holds no token: {stderr}");
 
-    let listed = clauth(home.path())
+    let listed = tollgate(home.path())
         .args(["devices", "--json"])
         .output()
-        .expect("run clauth devices --json");
+        .expect("run tollgate devices --json");
     assert_eq!(listed.status.code(), Some(0));
     let listed = String::from_utf8(listed.stdout).expect("utf8");
     let rows: serde_json::Value = serde_json::from_str(&listed).expect("json rows");
@@ -305,10 +305,10 @@ fn pair_with_closed_stdout_withdraws_and_exits_1() {
     );
     assert!(!has_code_shape(&stderr), "stderr holds no code: {stderr}");
 
-    let added = clauth(home.path())
+    let added = tollgate(home.path())
         .args(["devices", "add", "tray"])
         .output()
-        .expect("run clauth devices add");
+        .expect("run tollgate devices add");
     assert_eq!(
         added.status.code(),
         Some(0),
@@ -337,10 +337,10 @@ fn add_with_full_stdout_rolls_back_and_exits_1() {
     );
     assert!(!has_token_shape(&stderr), "stderr holds no token: {stderr}");
 
-    let listed = clauth(home.path())
+    let listed = tollgate(home.path())
         .args(["devices", "--json"])
         .output()
-        .expect("run clauth devices --json");
+        .expect("run tollgate devices --json");
     assert_eq!(listed.status.code(), Some(0));
     let listed = String::from_utf8(listed.stdout).expect("utf8");
     let rows: serde_json::Value = serde_json::from_str(&listed).expect("json rows");
@@ -370,10 +370,10 @@ fn pair_with_full_stdout_withdraws_and_exits_1() {
     );
     assert!(!has_code_shape(&stderr), "stderr holds no code: {stderr}");
 
-    let added = clauth(home.path())
+    let added = tollgate(home.path())
         .args(["devices", "add", "tray"])
         .output()
-        .expect("run clauth devices add");
+        .expect("run tollgate devices add");
     assert_eq!(
         added.status.code(),
         Some(0),
@@ -387,10 +387,10 @@ fn pair_with_full_stdout_withdraws_and_exits_1() {
 #[test]
 fn add_with_sessions_prints_the_token_and_names_the_grant() {
     let home = tempfile::tempdir().expect("home");
-    let out = clauth(home.path())
+    let out = tollgate(home.path())
         .args(["devices", "add", "tray", "--control", "--sessions"])
         .output()
-        .expect("run clauth devices add");
+        .expect("run tollgate devices add");
     assert_eq!(out.status.code(), Some(0));
 
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
@@ -404,17 +404,17 @@ fn add_with_sessions_prints_the_token_and_names_the_grant() {
     );
     assert_eq!(
         String::from_utf8(out.stderr).expect("utf8 stderr"),
-        "clauth: added device 'tray' (control). That token is its only copy: clauth keeps just \
-         a SHA-256 of it and cannot show it again.\nclauth: 'tray' may mint sessions\n"
+        "tollgate: added device 'tray' (control). That token is its only copy: tollgate keeps just \
+         a SHA-256 of it and cannot show it again.\ntollgate: 'tray' may mint sessions\n"
     );
 
-    let list = std::fs::read_to_string(home.path().join(".clauth/devices.json")).expect("list");
+    let list = std::fs::read_to_string(home.path().join(".tollgate/devices.json")).expect("list");
     assert!(!list.contains(token), "the list must hold no token");
 
-    let listed = clauth(home.path())
+    let listed = tollgate(home.path())
         .args(["devices", "--json"])
         .output()
-        .expect("run clauth devices --json");
+        .expect("run tollgate devices --json");
     assert_eq!(listed.status.code(), Some(0));
     let rows: serde_json::Value =
         serde_json::from_str(&String::from_utf8(listed.stdout).expect("utf8")).expect("json rows");
@@ -428,13 +428,13 @@ fn add_with_sessions_prints_the_token_and_names_the_grant() {
 fn allow_sessions_prints_its_fixed_lines() {
     let home = tempfile::tempdir().expect("home");
 
-    let view = clauth(home.path())
+    let view = tollgate(home.path())
         .args(["devices", "add", "viewer"])
         .output()
         .expect("add a view device");
     assert_eq!(view.status.code(), Some(0));
 
-    let refused = clauth(home.path())
+    let refused = tollgate(home.path())
         .args(["devices", "allow-sessions", "viewer"])
         .output()
         .expect("allow-sessions on a view device");
@@ -445,40 +445,40 @@ fn allow_sessions_prints_its_fixed_lines() {
          re-pair it with --control\n"
     );
 
-    let missing = clauth(home.path())
+    let missing = tollgate(home.path())
         .args(["devices", "allow-sessions", "ghost"])
         .output()
         .expect("allow-sessions on a missing name");
     assert_eq!(missing.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(missing.stderr).expect("utf8 stderr"),
-        "Error: no device named 'ghost'; `clauth devices` lists the paired ones\n"
+        "Error: no device named 'ghost'; `tollgate devices` lists the paired ones\n"
     );
 
-    let control = clauth(home.path())
+    let control = tollgate(home.path())
         .args(["devices", "add", "tray", "--control"])
         .output()
         .expect("add a control device");
     assert_eq!(control.status.code(), Some(0));
 
-    let granted = clauth(home.path())
+    let granted = tollgate(home.path())
         .args(["devices", "allow-sessions", "tray"])
         .output()
         .expect("allow-sessions on a control device");
     assert_eq!(granted.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(granted.stdout).expect("utf8 stdout"),
-        "clauth: 'tray' may now mint sessions\n"
+        "tollgate: 'tray' may now mint sessions\n"
     );
 
-    let again = clauth(home.path())
+    let again = tollgate(home.path())
         .args(["devices", "allow-sessions", "tray"])
         .output()
         .expect("allow-sessions again");
     assert_eq!(again.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(again.stdout).expect("utf8 stdout"),
-        "clauth: 'tray' already may mint sessions\n"
+        "tollgate: 'tray' already may mint sessions\n"
     );
 }
 
@@ -488,10 +488,10 @@ fn allow_sessions_prints_its_fixed_lines() {
 fn sessions_without_control_is_a_usage_error() {
     let home = tempfile::tempdir().expect("home");
     for verb in ["pair", "add"] {
-        let out = clauth(home.path())
+        let out = tollgate(home.path())
             .args(["devices", verb, "tray", "--sessions"])
             .output()
-            .expect("run clauth devices");
+            .expect("run tollgate devices");
         assert_eq!(out.status.code(), Some(2), "{verb}: {:?}", out.status);
         let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
         assert!(
@@ -505,21 +505,21 @@ fn sessions_without_control_is_a_usage_error() {
 #[test]
 fn devices_json_carries_sessions_on_every_row() {
     let home = tempfile::tempdir().expect("home");
-    let granted = clauth(home.path())
+    let granted = tollgate(home.path())
         .args(["devices", "add", "tray", "--control", "--sessions"])
         .output()
         .expect("add a granted device");
     assert_eq!(granted.status.code(), Some(0));
-    let plain = clauth(home.path())
+    let plain = tollgate(home.path())
         .args(["devices", "add", "phone"])
         .output()
         .expect("add a view device");
     assert_eq!(plain.status.code(), Some(0));
 
-    let listed = clauth(home.path())
+    let listed = tollgate(home.path())
         .args(["devices", "--json"])
         .output()
-        .expect("run clauth devices --json");
+        .expect("run tollgate devices --json");
     assert_eq!(listed.status.code(), Some(0));
     let rows: serde_json::Value =
         serde_json::from_str(&String::from_utf8(listed.stdout).expect("utf8")).expect("json rows");
@@ -541,12 +541,12 @@ fn devices_json_carries_sessions_on_every_row() {
 #[test]
 fn pair_with_sessions_names_the_grant_before_any_device_exists() {
     let home = tempfile::tempdir().expect("home");
-    let mut child = clauth(home.path())
+    let mut child = tollgate(home.path())
         .args(["devices", "pair", "phone", "--control", "--sessions"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn clauth devices pair");
+        .expect("spawn tollgate devices pair");
     let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read the code line");
@@ -567,7 +567,7 @@ fn pair_with_sessions_names_the_grant_before_any_device_exists() {
     let stderr = read_stderr(&mut child);
     assert!(
         stderr.contains(
-            "clauth: until it is used the code also grants sessions: whoever enters it first \
+            "tollgate: until it is used the code also grants sessions: whoever enters it first \
              can mint them through the API"
         ),
         "{stderr}"

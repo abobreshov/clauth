@@ -145,7 +145,7 @@ const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05
 /// match CC's. NOTE: this is a
 /// deliberately *partial* stainless set (lang/runtime/package-version only) — a
 /// real SDK client also sends `x-stainless-arch/os/runtime-version`, which are
-/// host-derived (and clauth has no honest node runtime-version), so they stay
+/// host-derived (and tollgate has no honest node runtime-version), so they stay
 /// off. Drifts with CC's bundle.
 const KICK_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
 
@@ -344,14 +344,14 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 });
 
 /// The shared HTTP agent — one connect/recv budget and one
-/// status-as-value policy for every clauth-side token call, the codex
+/// status-as-value policy for every tollgate-side token call, the codex
 /// refresh included.
 pub(crate) fn http_agent() -> &'static ureq::Agent {
     &AGENT
 }
 
 /// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
-/// revoked/invalid refresh token (quarantine the account — `clauth login` is the
+/// revoked/invalid refresh token (quarantine the account — `tollgate login` is the
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
 /// retry next tick — never quarantine a healthy account on a hiccup).
 ///
@@ -361,7 +361,7 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
 /// the variant it cares about.
 pub(crate) enum RefreshError {
     /// The endpoint confirmed the refresh token itself is dead — quarantine the
-    /// account (`clauth login` is the only fix). See
+    /// account (`tollgate login` is the only fix). See
     /// [`refresh_rejection_is_terminal`] for the status/body split.
     Invalid(TokenFailure),
     /// The refresh token may still be good: a transport failure, 429, 5xx, or a
@@ -490,7 +490,7 @@ pub(crate) fn stored_scopes(
 /// the value round-tripped through the browser.
 ///
 /// Errs as [`TokenFailure`] rather than `anyhow::Error` so the rejection body —
-/// which reached a login toast and `clauth login`'s stderr verbatim — has
+/// which reached a login toast and `tollgate login`'s stderr verbatim — has
 /// nowhere to ride.
 pub(crate) fn exchange_code(
     code: &str,
@@ -537,14 +537,14 @@ enum KickError {
     /// never reads a response BODY, so one cannot arrive here — but a ureq
     /// transport error can still echo a server-supplied HEADER (`ureq_proto`'s
     /// `BadLocationHeader` Display's the raw `Location` value), so treat this as
-    /// log-only rather than as clauth-authored text.
+    /// log-only rather than as tollgate-authored text.
     Other(anyhow::Error),
 }
 
 /// Operator-log rendering of a kick failure, for the diagnostic `logline!` when
 /// a kick dies on something the recovery paths don't handle (non-401/429 status,
 /// transport, body encode). Never a notification surface: `logline!` writes the
-/// daemon log or `~/.clauth/clauth.log`, which is where the status belongs now
+/// daemon log or `~/.tollgate/tollgate.log`, which is where the status belongs now
 /// that user-facing copy withholds it. Pure so the mapping is unit-testable
 /// without HTTP.
 fn describe_kick_failure(err: &KickError) -> String {
@@ -605,7 +605,7 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 /// listener can pin the emitted header set (`kick_emits_cc_message_wire_shape`).
 /// Carries Claude Code's `/v1/messages` client shape — the SDK instrumentation +
 /// full beta set CC sends — minus the per-session headers
-/// (`x-claude-code-session-id`, `x-client-request-id`) clauth has no honest value
+/// (`x-claude-code-session-id`, `x-client-request-id`) tollgate has no honest value
 /// for, and the host-derived `x-stainless-arch/os/runtime-version` (see
 /// [`KICK_STAINLESS_PACKAGE_VERSION`]). The `system` prefix stays: an OAuth token
 /// without it is rejected as non-CC inference.
@@ -749,7 +749,7 @@ pub(crate) fn auto_start_kick(
     let Ok(rotation_guard) = RotationGuard::acquire(name) else {
         return KickResult::not_opened_with(first_rl);
     };
-    // macOS only: clauth can't write the Keychain item this session's CC reads,
+    // macOS only: tollgate can't write the Keychain item this session's CC reads,
     // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
     if crate::runtime::rotation_blocked_for(name) {
         return KickResult::not_opened_with(first_rl);
@@ -861,7 +861,7 @@ fn sidecar_repair_transient(name: &ProfileName, e: &anyhow::Error) -> crate::for
     sidecar_write_failed(name)
 }
 
-/// CLA-ROLL: a live `clauth start` session is holding the ROTATING pair,
+/// CLA-ROLL: a live `tollgate start` session is holding the ROTATING pair,
 /// because it started before the sidecar was armed. See
 /// [`crate::format::Cause::LiveSessionOnRotatingChain`].
 fn live_session_on_rotating_chain(name: &ProfileName) -> crate::format::Transient {
@@ -928,7 +928,7 @@ fn env_has_api_key(env: &BTreeMap<String, String>) -> bool {
 /// How a profile's dead chain reads when the chain is not the whole of what it
 /// has, or `None` when the caller's own `login_expired` rendering applies. The
 /// one place that split is decided — the rotate toast, the quarantine's own
-/// log line and `clauth rolling-token`'s bail all route through it, so no two
+/// log line and `tollgate rolling-token`'s bail all route through it, so no two
 /// of them can prescribe different commands for one state.
 ///
 /// The two arms carry `mcp::preflight_target`'s two predicates. The ORDER is
@@ -937,7 +937,7 @@ fn env_has_api_key(env: &BTreeMap<String, String>) -> bool {
 /// the gate has to refuse it for the key BEFORE reaching its quarantine arm,
 /// while here the own-endpoint arm already excludes it. An account serving its
 /// own inference is told the split state
-/// whether or not clauth recognises its provider (a dead chain beside a
+/// whether or not tollgate recognises its provider (a dead chain beside a
 /// working key reads the same on litellm as on DeepSeek), and a RECOGNISED
 /// keyless one is told about the key. A keyless unrecognised endpoint falls
 /// through to `None` on purpose — it may be a local model needing no key, the
@@ -1020,13 +1020,13 @@ fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) 
 }
 
 /// Body of each [`refresh_all`] worker. Holds the per-profile rotation lock
-/// across the ENTIRE HTTP window so an external `clauth start <name>` cannot
+/// across the ENTIRE HTTP window so an external `tollgate start <name>` cannot
 /// begin a refresh of the same single-use token while ours is in flight (the
 /// state flock can't — it must release across the round trip). Ordering rule
 /// (matches `ProfileRuntime::acquire`): RotationGuard OUTERMOST, then state
 /// flock inside.
 ///
-/// A live `clauth start` session is rotated like any other profile: it reads
+/// A live `tollgate start` session is rotated like any other profile: it reads
 /// the same `.credentials.json` this writes, so it picks the new pair up on its
 /// next request rather than racing for the chain.
 ///
@@ -1048,7 +1048,7 @@ fn rotate_one_inner(
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         with_state_lock(|_held| {
-            // macOS only: clauth can't write the Keychain item this session's CC
+            // macOS only: tollgate can't write the Keychain item this session's CC
             // reads, so rotating would sign it out. Skipping returns
             // Persisted(false) (`runtime::rotation_blocked_by_live_session`).
             if crate::runtime::rotation_blocked_for(name) {
@@ -1087,7 +1087,7 @@ fn rotate_one_inner(
     let outcome = match refresh_result(&rt, scopes.as_deref()) {
         Ok(tok) => apply_rotated_tokens_locked(config, name, tok),
         Err(e) => {
-            logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
+            logline!("tollgate: refresh for '{name}' failed: {}", e.log_detail());
             // This `OpResult`'s only sink is the TUI's Danger toast, whose first
             // line already reads `refresh for '<name>' failed` — so the OAuth
             // arm carries the NEXT STEP alone rather than restating the
@@ -1118,7 +1118,7 @@ fn rotate_one_inner(
 /// Profiles `refresh_all` would rotate, as `(name, refresh_token)` pairs.
 /// Extracted so tests can pin the inclusion logic without the network.
 /// Diverged-active profiles are included only when `force`. A live
-/// `clauth start` session does not exclude a profile: it shares the credential
+/// `tollgate start` session does not exclude a profile: it shares the credential
 /// file a rotation writes, so it follows the new pair instead of being cut off
 /// from one.
 pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(ProfileName, String)> {
@@ -1188,7 +1188,7 @@ pub(crate) fn refresh_all(
             let name_for_handle = name.clone();
             let h = std::thread::spawn(move || {
                 // Holds the per-profile RotationGuard across the HTTP window so
-                // an external `clauth start <name>` cannot double-spend this
+                // an external `tollgate start <name>` cannot double-spend this
                 // single-use token mid-rotation.
                 let outcome = rotate_one_inner(&config, &name, Some(&activity), &sender);
                 (name, outcome)
@@ -1357,7 +1357,7 @@ pub(crate) fn apply_rotated_tokens_locked(
     // Rotation coherence (#1): a rotation of the ACTIVE profile revokes the
     // single-use refresh token the macOS Keychain copy carries — the running
     // `claude` (which re-reads the Keychain per request) would sign out at
-    // that stale token's expiry while every clauth copy stays green (observed
+    // that stale token's expiry while every tollgate copy stays green (observed
     // on-device 2026-07-07). The mirror DECISION and the creds snapshot are
     // made under the locked section below, so the written pair is exactly the
     // persisted one; the `/usr/bin/security` shell-out itself runs after the
@@ -1439,7 +1439,7 @@ pub(crate) fn apply_rotated_tokens_locked(
         // from the freshly rotated chain on EVERY rotation, active or parked —
         // a fast disk write inside the locked section, same durability class
         // as the credential save above. The pair itself still never leaves
-        // clauth custody; only the (refresh-less) access token rolls forward.
+        // tollgate custody; only the (refresh-less) access token rolls forward.
         // An ABSENT sidecar is stamped too (it arms on the next rotation —
         // closes the race where a switch gate sees a comfortable chain before
         // any sidecar exists); only a NotLongLived mis-fill is left alone, so
@@ -1483,13 +1483,13 @@ pub(crate) fn apply_rotated_tokens_locked(
             // the switch-in gate retries the stamp. The stale rolling token keeps
             // serving until its real expiry, and every surface shows that
             // countdown honestly.
-            logline!("clauth: rotated '{name}' but re-stamping session-token.json failed: {e:#}");
+            logline!("tollgate: rotated '{name}' but re-stamping session-token.json failed: {e:#}");
         }
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() && cfg.is_active(name) {
             if crate::claude::has_session_token(name) {
                 // CLA-SPLIT: the live slot intentionally holds this profile's
-                // static session token — the rotated pair is the clauth-private
+                // static session token — the rotated pair is the tollgate-private
                 // USAGE chain and must never be mirrored over it. Quiet: this
                 // is the designed steady state, not a divergence.
                 // CLA-ROLL: what DOES ship to the Keychain for a rolling-token
@@ -1515,7 +1515,7 @@ pub(crate) fn apply_rotated_tokens_locked(
                 }
             } else if live_login_is_foreign(name, &old_access) {
                 logline!(
-                    "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
+                    "tollgate: rotated '{name}' but the live login diverged (a re-login tollgate \
                      doesn't own). Keychain left untouched; {}",
                     crate::format::RESOLVE_IN_TUI
                 );
@@ -1526,7 +1526,7 @@ pub(crate) fn apply_rotated_tokens_locked(
                 // write just failed (logged above). Never ship the rotating
                 // pair to the Keychain for a rolling-token profile; the
                 // previous rolling bearer keeps serving until the roll heals
-                // (next rotation, the switch gate, or a `clauth rolling-token` re-arm).
+                // (next rotation, the switch gate, or a `tollgate rolling-token` re-arm).
                 // A NotLongLived mis-fill deliberately does NOT take this
                 // branch: a disengaged split behaves as vanilla (the pair
                 // mirror below is what keeps CC alive there).
@@ -1543,7 +1543,7 @@ pub(crate) fn apply_rotated_tokens_locked(
     #[cfg(target_os = "macos")]
     if let Some(creds) = mirror {
         // The vanilla mirror writes `Keep::Everything` too, so the item's
-        // login must be one clauth put there first — the same foreign gate
+        // login must be one tollgate put there first — the same foreign gate
         // the split mirror runs (the reasons sit on its block below).
         // Candidates this path knows: the pre-rotation bearer (what an
         // earlier mirror wrote) and the bearer being written (the idempotent
@@ -1556,28 +1556,28 @@ pub(crate) fn apply_rotated_tokens_locked(
             crate::keychain::ItemLoginState::Ours | crate::keychain::ItemLoginState::Corrupt => {
                 if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
                     logline!(
-                        "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
-                         running claude signs out when its old token expires; run `clauth {name}` \
+                        "tollgate: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
+                         running claude signs out when its old token expires; run `tollgate {name}` \
                          to reinstall"
                     );
                 }
             }
             crate::keychain::ItemLoginState::NotOurs => logline!(
-                "clauth: rotated '{name}' but the macOS Keychain login is not one clauth \
+                "tollgate: rotated '{name}' but the macOS Keychain login is not one tollgate \
                  recognizes (an out-of-band re-login, or a mirror write that failed a rotation \
                  back). Keychain left untouched; {}",
                 crate::format::RESOLVE_IN_TUI
             ),
             crate::keychain::ItemLoginState::Unreadable(e) => logline!(
-                "clauth: rotated '{name}' but the macOS Keychain item could not be read to \
+                "tollgate: rotated '{name}' but the macOS Keychain item could not be read to \
                  check its login ({e}); mirror skipped, the previous bearer keeps serving until \
-                 it expires. Run `clauth {name}` to reinstall"
+                 it expires. Run `tollgate {name}` to reinstall"
             ),
         }
     }
     // CLA-SPLIT foreign gate for the rolling mirror: `Keep::Everything`
     // preserves the item's sibling blocks, so the item's login must be one
-    // clauth put there first — the file layer stops being evidence once CC
+    // tollgate put there first — the file layer stops being evidence once CC
     // migrates into the Keychain, and an out-of-band `/login` leaves B's
     // blocks to ride under A's bearer. Runs here, beside the write it gates,
     // because the read is a `security` subprocess the state flock must never
@@ -1601,22 +1601,22 @@ pub(crate) fn apply_rotated_tokens_locked(
             crate::keychain::ItemLoginState::Ours | crate::keychain::ItemLoginState::Corrupt => {
                 if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
                     logline!(
-                        "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
-                         running claude signs out when its old token expires; run `clauth {name}` \
+                        "tollgate: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
+                         running claude signs out when its old token expires; run `tollgate {name}` \
                          to reinstall"
                     );
                 }
             }
             crate::keychain::ItemLoginState::NotOurs => logline!(
-                "clauth: rotated '{name}' but the macOS Keychain login is not one clauth \
+                "tollgate: rotated '{name}' but the macOS Keychain login is not one tollgate \
                  recognizes (an out-of-band re-login, or a mirror write that failed a rotation \
                  back). Keychain left untouched; {}",
                 crate::format::RESOLVE_IN_TUI
             ),
             crate::keychain::ItemLoginState::Unreadable(e) => logline!(
-                "clauth: rotated '{name}' but the macOS Keychain item could not be read to \
+                "tollgate: rotated '{name}' but the macOS Keychain item could not be read to \
                  check its login ({e}); mirror skipped, the previous rolling bearer keeps \
-                 serving until it expires. Run `clauth {name}` to reinstall"
+                 serving until it expires. Run `tollgate {name}` to reinstall"
             ),
         }
     }
@@ -1625,12 +1625,12 @@ pub(crate) fn apply_rotated_tokens_locked(
 
 /// Adopt the live session's OWN token rotation instead of fighting it
 /// (rotation coherence — the future-proof half). The running `claude` and
-/// clauth hold ONE single-use refresh family; whoever refreshes first revokes
+/// tollgate hold ONE single-use refresh family; whoever refreshes first revokes
 /// the other. Rather than racing, concede: CC maintains
 /// `~/.claude/.credentials.json` as a regular-file mirror of its Keychain
 /// login (rewritten at least on every CC launch), a prompt-free read path to
 /// CC's current pair. When that mirror holds a FRESHER pair for the SAME
-/// account, adopt it into the profile store — no refresh spent — so clauth
+/// account, adopt it into the profile store — no refresh spent — so tollgate
 /// stays correct whatever refresh schedule a future Claude Code ships.
 ///
 /// Gates, in order — every one must pass:
@@ -1773,7 +1773,7 @@ pub(crate) fn try_adopt_live_rotation(
 
     // CLA-SPLIT: this profile's live slot holds its STATIC session token, so
     // `classify_credentials_link` judges it against `session-token.json` while
-    // every gate below reads and every write targets the clauth-private usage
+    // every gate below reads and every write targets the tollgate-private usage
     // pair in `credentials.json`. A live slot that stops holding the static
     // token classifies Diverged, and adopting would overwrite the usage chain
     // with a login that is not it. Same invariant
@@ -1860,9 +1860,9 @@ pub(crate) fn try_adopt_live_rotation(
             .unwrap_or_else(|| REFUSAL_UNPROVABLE_IDENTITY.to_string());
         if adopt_refusal_should_announce(name, &key) {
             logline!(
-                "clauth: live login for '{name}' is newer but its identity can't be proven \
+                "tollgate: live login for '{name}' is newer but its identity can't be proven \
                  (no cached account id and the stored token is dead). Not adopting; \
-                 resolve in the clauth TUI or re-run clauth login {name}"
+                 resolve in the tollgate TUI or re-run tollgate login {name}"
             );
         }
         return None;
@@ -1877,8 +1877,8 @@ pub(crate) fn try_adopt_live_rotation(
         let refusal_key = format!("{REFUSAL_FOREIGN_ACCOUNT}:{live_id}");
         if adopt_refusal_should_announce(name, &refusal_key) {
             logline!(
-                "clauth: live login for '{name}' belongs to a DIFFERENT account. Not adopting; \
-                 capture it via the clauth TUI divergence flow if that was intentional"
+                "tollgate: live login for '{name}' belongs to a DIFFERENT account. Not adopting; \
+                 capture it via the tollgate TUI divergence flow if that was intentional"
             );
         }
         return None;
@@ -1927,9 +1927,9 @@ pub(crate) fn try_adopt_live_rotation(
     // the scheduler's `carry_external_rotation` (inlined here because the
     // config guard is already held); without it, an active recovered by a
     // CC-side re-login stays excluded from the fallback walk and refused as a
-    // switch target until a manual `clauth login`.
+    // switch target until a manual `tollgate login`.
     if cfg.set_auth_broken(name, false) {
-        logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
+        logline!("tollgate: '{name}' re-authenticated: auth_broken cleared");
         // Persist against fresh disk state (see `set_auth_broken_persisted`):
         // the adopt just proved the chain is alive, but this process's config
         // may be older than a concurrent CLI account mutation.
@@ -1937,7 +1937,7 @@ pub(crate) fn try_adopt_live_rotation(
     }
     write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
     logline!(
-        "clauth: adopted the live session's rotated login for '{name}' \
+        "tollgate: adopted the live session's rotated login for '{name}' \
          (the running claude refreshed first, so no token spent)"
     );
     // Off macOS the hand-back path is the SYMLINK, and CC's refresh renames a
@@ -1955,9 +1955,9 @@ pub(crate) fn try_adopt_live_rotation(
     #[cfg(not(target_os = "macos"))]
     if let Err(e) = crate::claude::force_link_profile_credentials(name) {
         logline!(
-            "clauth: adopted the live login for '{name}' but relinking \
+            "tollgate: adopted the live login for '{name}' but relinking \
              .credentials.json failed: {e:#}. A running claude signs out when \
-             its token expires; run `clauth {name}` to reinstall"
+             its token expires; run `tollgate {name}` to reinstall"
         );
     }
     Some((
@@ -1966,7 +1966,7 @@ pub(crate) fn try_adopt_live_rotation(
     ))
 }
 
-/// Whether the live `.credentials.json` holds a login clauth does NOT own —
+/// Whether the live `.credentials.json` holds a login tollgate does NOT own —
 /// i.e. genuinely [`crate::claude::LinkState::Diverged`] and not merely a
 /// stale regular-file mirror of this profile's own pre-rotation pair. On
 /// macOS Claude Code rewrites the live file as a regular-file copy of the
@@ -2018,7 +2018,7 @@ const AUTH_GATE_GRACE_MS: i64 = crate::claude::BACKUP_EXPIRY_GRACE_MS;
 pub(crate) enum AuthGate {
     /// Safe to install the target's stored credentials as-is: a third-party
     /// (api-key) profile, an OAuth token with real life left, or a profile whose
-    /// live `clauth start` session keeps its own chain fresh.
+    /// live `tollgate start` session keeps its own chain fresh.
     Ready,
     /// The target's expiring OAuth token was refreshed and the rotated pair
     /// persisted; install the refreshed credentials.
@@ -2085,14 +2085,14 @@ fn vanilla_install_gate(
             // into a client already trying to refresh a refresh-less
             // credential, which signs the session out moments later — so
             // "identical bytes, identical verdict" has to include the one arm
-            // that INSTALLS a mint, or `clauth static-token` calls a file
+            // that INSTALLS a mint, or `tollgate static-token` calls a file
             // EXPIRED that the very next switch serves happily.
             let clock_dead = expiring(expires_at, false);
             if clock_dead {
                 logline!(
-                    "clauth: '{name}' long-lived token has expired (or sits inside Claude \
+                    "tollgate: '{name}' long-lived token has expired (or sits inside Claude \
                      Code's own five-minute refresh window) — re-mint with \
-                     `claude setup-token` (clauth login {name} --setup-token)"
+                     `claude setup-token` (tollgate login {name} --setup-token)"
                 );
                 return AuthGate::Broken;
             }
@@ -2106,9 +2106,9 @@ fn vanilla_install_gate(
         // per-switch chokepoint, rather than on every hot-path stat.
         Some(crate::claude::SessionTokenStatus::NotLongLived) => {
             logline!(
-                "clauth: '{name}' session-token.json holds a rotating pair (refresh \
+                "tollgate: '{name}' session-token.json holds a rotating pair (refresh \
                  token present), not a long-lived mint — ignoring it; re-capture \
-                 with `clauth login {name} --setup-token`"
+                 with `tollgate login {name} --setup-token`"
             );
         }
         None => {}
@@ -2133,8 +2133,8 @@ fn vanilla_install_gate(
         return AuthGate::Transient(rotation_lock_unavailable(name));
     };
     // macOS only, same mechanism as the other rotation legs: a switch TARGET can
-    // carry its own live `clauth start` session whose CC reads a Keychain item
-    // clauth can't write (`runtime::rotation_blocked_by_live_session`).
+    // carry its own live `tollgate start` session whose CC reads a Keychain item
+    // tollgate can't write (`runtime::rotation_blocked_by_live_session`).
     //
     // This RELOCATES the spend, it does not avoid it. Reaching this line means
     // the token is inside the grace — which IS Claude Code's own 5-minute
@@ -2159,7 +2159,7 @@ enum LockWait {
     /// `acquire`'s blocking is what makes their pre/post-guard re-reads exact.
     Block,
     /// Never park. The scheduler's re-stamp leg runs INLINE on the tick
-    /// thread, and this gate's own acquisition carries no deadline — a `clauth
+    /// thread, and this gate's own acquisition carries no deadline — a `tollgate
     /// start` holding the lock across its recursive `~/.claude` copy would stall
     /// every account's poll while the heartbeat (stamped in the main loop)
     /// stays fresh. `runtime::ROTATION_LOCK_TIMEOUT` is no help here: it bounds
@@ -2209,7 +2209,7 @@ fn rolling_install_gate(
     ) {
         match crate::claude::heal_misfilled_sidecar(name) {
             Ok(crate::claude::HealOutcome::Healed) => logline!(
-                "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
+                "tollgate: '{name}' mis-filled sidecar quarantined; static mint restored \
                  (the rolling token re-arms on the next rotation)"
             ),
             // A concurrent repair — or whatever writes the sidecar — already
@@ -2220,9 +2220,9 @@ fn rolling_install_gate(
             Ok(crate::claude::HealOutcome::NotMisfilled) => {}
             Ok(crate::claude::HealOutcome::NoLiveBackup) => {
                 logline!(
-                    "clauth: '{name}' sidecar is mis-filled and no live static backup exists \
+                    "tollgate: '{name}' sidecar is mis-filled and no live static backup exists \
                      to restore — the split stays disengaged; re-capture with \
-                     `clauth login {name} --setup-token`"
+                     `tollgate login {name} --setup-token`"
                 );
                 return match wait {
                     // The switch/arm paths keep the pre-split behavior: the
@@ -2239,7 +2239,7 @@ fn rolling_install_gate(
                 };
             }
             Err(e) => {
-                logline!("clauth: '{name}' mis-filled sidecar could not be quarantined ({e:#})");
+                logline!("tollgate: '{name}' mis-filled sidecar could not be quarantined ({e:#})");
                 return AuthGate::Transient(sidecar_repair_transient(name, &e));
             }
         }
@@ -2265,7 +2265,7 @@ fn rolling_install_gate(
     // Mint-shaped, stale, or absent: everything below mutates the sidecar or
     // the chain, so it serializes with rotations on the cross-process guard.
     // On the Block path, `acquire` BLOCKS on the flock, so its error arm is a
-    // filesystem or permissions problem under `~/.clauth` and never contention
+    // filesystem or permissions problem under `~/.tollgate` and never contention
     // — the same correction upstream made to `Cause::RotationLockUnavailable`.
     // On the NoWait path a held lock IS contention, and gets its own cause.
     let guard = match wait {
@@ -2292,7 +2292,7 @@ fn rolling_install_gate(
     // just cleared, with the flag now off so nothing ever re-stamps it: a
     // dies-in-hours credential with no exit. Disk is what the clear wrote, so
     // disk decides; an unreadable profile keeps the pre-guard routing rather
-    // than letting an ~/.clauth hiccup break the arm this leg exists for.
+    // than letting an ~/.tollgate hiccup break the arm this leg exists for.
     if matches!(crate::profile::load_profile(name), Ok(p) if !p.rolling_token) {
         return match wait {
             // The switch-in path still has an install to make — the same
@@ -2316,12 +2316,12 @@ fn rolling_install_gate(
         RollAttempt::WriteFailed(e) => {
             return if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
-                    "clauth: '{name}' rolling-token write failed ({e:#}); sessions stay on {}",
+                    "tollgate: '{name}' rolling-token write failed ({e:#}); sessions stay on {}",
                     serving_desc(name)
                 );
                 AuthGate::Ready
             } else {
-                logline!("clauth: '{name}' rolling-token write failed ({e:#})");
+                logline!("tollgate: '{name}' rolling-token write failed ({e:#})");
                 AuthGate::Transient(sidecar_repair_transient(name, &e))
             };
         }
@@ -2335,8 +2335,8 @@ fn rolling_install_gate(
         RollAttempt::GrantUnusable => {
             return if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
-                    "clauth: '{name}' usage chain's recorded grant cannot mint a rolling \
-                     bearer (re-run `clauth login {name}` to record it); installing {}",
+                    "tollgate: '{name}' usage chain's recorded grant cannot mint a rolling \
+                     bearer (re-run `tollgate login {name}` to record it); installing {}",
                     serving_desc(name)
                 );
                 AuthGate::Ready
@@ -2372,7 +2372,7 @@ fn rolling_install_gate(
             // is the difference between "no backup existed" and "the backup is
             // there and could not be installed".
             if let Err(e) = crate::claude::restore_static_mint(name) {
-                logline!("clauth: '{name}' static-mint restore failed ({e:#})");
+                logline!("tollgate: '{name}' static-mint restore failed ({e:#})");
             }
             // `sidecar_live` alone decides — never `restored ||`. A restore
             // reports true for installing the backup, not for the backup being
@@ -2385,8 +2385,8 @@ fn rolling_install_gate(
             // not that coupling.
             if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
-                    "clauth: '{name}' usage chain is dead — sessions degrade to {} \
-                     (`clauth login {name}` revives the chain and the rolling token)",
+                    "tollgate: '{name}' usage chain is dead — sessions degrade to {} \
+                     (`tollgate login {name}` revives the chain and the rolling token)",
                     serving_desc(name)
                 );
                 AuthGate::Ready
@@ -2400,7 +2400,7 @@ fn rolling_install_gate(
         AuthGate::Transient(e) => {
             if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
-                    "clauth: '{name}' chain refresh hit a transient failure ({}); \
+                    "tollgate: '{name}' chain refresh hit a transient failure ({}); \
                      installing {} while the rolling token retries",
                     e.text_with_status(),
                     serving_desc(name)
@@ -2433,14 +2433,14 @@ pub(crate) fn arm_rolling_token(
             } else {
                 anyhow::bail!(
                     "'{name}' could not arm the rolling sidecar (a mis-filled sidecar with no \
-                     backup?). Re-capture with `clauth login {name} --setup-token`, or clear \
+                     backup?). Re-capture with `tollgate login {name} --setup-token`, or clear \
                      the sidecar, then re-run"
                 )
             }
         }
         AuthGate::Broken => {
             anyhow::bail!(
-                "'{name}' usage chain is dead · run `clauth login {name}` first, then re-run"
+                "'{name}' usage chain is dead · run `tollgate login {name}` first, then re-run"
             )
         }
         // CLI surface: `text_with_status` is the flavor that names the HTTP
@@ -2524,7 +2524,7 @@ pub(crate) fn restamp_rolling_token(
             Some((crate::claude::SidecarKind::Rolling, oauth))
                 if oauth.expires_at.is_some_and(|exp| exp > now + ROLLING_RESTAMP_HORIZON_MS)
         ) {
-            logline!("clauth: re-stamped '{name}' session token ahead of its expiry");
+            logline!("tollgate: re-stamped '{name}' session token ahead of its expiry");
         }
     }
     // In-process switches stay excluded for the whole is-active check + write
@@ -2543,7 +2543,7 @@ pub(crate) fn restamp_rolling_token(
     {
         // CLA-SPLIT foreign gate, same rule as the rotation hook's split
         // mirror: `Keep::Everything` preserves the item's sibling blocks, so
-        // the item's login must be one clauth put there first (the file
+        // the item's login must be one tollgate put there first (the file
         // layer is not evidence once CC migrates into the Keychain).
         // Candidates: the pre-re-stamp bearer and the bearer being written.
         let incoming = creds.access_token().map(str::to_string);
@@ -2556,19 +2556,19 @@ pub(crate) fn restamp_rolling_token(
             // quarantines the truncated bytes and the write heals the item.
             crate::keychain::ItemLoginState::Ours | crate::keychain::ItemLoginState::Corrupt => {
                 if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
-                    logline!("clauth: re-stamped '{name}' but the Keychain mirror failed: {e:#}");
+                    logline!("tollgate: re-stamped '{name}' but the Keychain mirror failed: {e:#}");
                 }
             }
             crate::keychain::ItemLoginState::NotOurs => logline!(
-                "clauth: re-stamped '{name}' but the macOS Keychain login is not one clauth \
+                "tollgate: re-stamped '{name}' but the macOS Keychain login is not one tollgate \
                  recognizes (an out-of-band re-login, or a mirror write that failed a rotation \
                  back). Keychain left untouched; {}",
                 crate::format::RESOLVE_IN_TUI
             ),
             crate::keychain::ItemLoginState::Unreadable(e) => logline!(
-                "clauth: re-stamped '{name}' but the macOS Keychain item could not be read to \
+                "tollgate: re-stamped '{name}' but the macOS Keychain item could not be read to \
                  check its login ({e}); mirror skipped, the previous rolling bearer keeps \
-                 serving until it expires. Run `clauth {name}` to reinstall"
+                 serving until it expires. Run `tollgate {name}` to reinstall"
             ),
         }
     }
@@ -2620,8 +2620,8 @@ enum RollAttempt {
     /// `stamp_rolling_token` refuses it — permanently, until a re-login
     /// records the real grant. Its own arm rather than `WriteFailed`, because
     /// rendering it as a filesystem problem with a retry hint points the
-    /// operator at `~/.clauth` permissions when the only fix is
-    /// `clauth login`.
+    /// operator at `~/.tollgate` permissions when the only fix is
+    /// `tollgate login`.
     GrantUnusable,
 }
 
@@ -2729,7 +2729,7 @@ fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> 
 
 /// Reconcile the in-memory profile with the on-disk store; the `_guard`
 /// witness proves the [`RotationGuard`] is held, which makes the disk read
-/// stable. A cross-process peer (the daemon, a second clauth) rotates and
+/// stable. A cross-process peer (the daemon, a second tollgate) rotates and
 /// persists under this same flock, and a caller that loaded config from disk
 /// once (CLI, MCP) can hold a snapshot predating that write. Tokens are opaque
 /// and no writer rewinds the store (see the scheduler's `fresher_disk_pair`),
@@ -2854,7 +2854,7 @@ fn gate_under_guard(
             // The endpoint's status no longer reaches any refusal copy, so this
             // is where an operator reads it — the daemon's `deferring switch`
             // line and the CLI/TUI/MCP refusals all carry canned text now.
-            logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
+            logline!("tollgate: refresh for '{name}' failed: {}", e.log_detail());
             match e {
                 RefreshError::Invalid(_) => {
                     mark_auth_broken(config, name, true);
@@ -2906,9 +2906,9 @@ pub(crate) fn mark_auth_broken(
             // scheduler spends any profile holding a refresh token).
             let sentence = third_party_dead_chain_copy(cfg.find(name), name)
                 .unwrap_or_else(|| crate::format::login_expired(name).line());
-            logline!("clauth: {sentence} (flagged auth_broken)");
+            logline!("tollgate: {sentence} (flagged auth_broken)");
         } else {
-            logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
+            logline!("tollgate: '{name}' re-authenticated: auth_broken cleared");
         }
     }
     // Persisted on every call so a refused write is retried by the next one —
@@ -2918,7 +2918,7 @@ pub(crate) fn mark_auth_broken(
     // that never reached disk.
     if let Err(e) = crate::profile::set_auth_broken_persisted(name, broken) {
         let direction = if broken { "set" } else { "clear" };
-        logline!("clauth: failed to persist auth_broken {direction} for '{name}': {e:#}");
+        logline!("tollgate: failed to persist auth_broken {direction} for '{name}': {e:#}");
     }
 }
 

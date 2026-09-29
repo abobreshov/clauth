@@ -1,10 +1,10 @@
 //! `GET /api/v1/panes` — every herdr pane on this host, joined on process ids
-//! to the clauth sessions running inside them.
+//! to the tollgate sessions running inside them.
 //!
 //! The join is on pids only: a registry row belongs to a pane when its pid is
 //! the pane's foreground process group or one of the processes running inside
-//! it, and its kind is what that matching process is — a `clauth start` is the
-//! pane's own session, anything else is a delegate. The `tokens.clauth` display
+//! it, and its kind is what that matching process is — a `tollgate start` is the
+//! pane's own session, anything else is a delegate. The `tokens.tollgate` display
 //! tag rides along and never joins anything.
 
 use std::collections::HashMap;
@@ -127,7 +127,7 @@ pub(crate) struct HerdrState {
     reason: Option<String>,
 }
 
-/// One pane, in herdr's own order, with its clauth sessions.
+/// One pane, in herdr's own order, with its tollgate sessions.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PaneEntry {
     pane_id: String,
@@ -144,7 +144,7 @@ pub(crate) struct PaneEntry {
     #[schema(required = true)]
     cwd: Option<String>,
     focused: bool,
-    /// The `tokens.clauth` display tag, `null` when absent; never used to join.
+    /// The `tokens.tollgate` display tag, `null` when absent; never used to join.
     #[schema(required = true)]
     tag: Option<String>,
     /// The pane's foreground process group, `null` when its `process-info` did
@@ -160,7 +160,7 @@ pub(crate) struct PaneEntry {
     agent_session_id: Option<String>,
 }
 
-/// One clauth session running inside a pane.
+/// One tollgate session running inside a pane.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PaneSession {
     session_id: String,
@@ -179,19 +179,19 @@ pub(crate) struct PaneSession {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionKind {
     /// The row's pid leads the pane's foreground process group (the pane's own
-    /// `clauth start` or `clauth resume`), or it is a listed member that is a
-    /// `clauth` running `start` or `resume` under a wrapper. On Windows herdr
+    /// `tollgate start` or `tollgate resume`), or it is a listed member that is a
+    /// `tollgate` running `start` or `resume` under a wrapper. On Windows herdr
     /// lists only the pane's agent root, so the supervisor is never seen there
     /// and no session joins (the herdr half of the bridge is linux + macOS).
     Session,
-    /// Any other listed process inside the pane (a `claude` child, a `clauth
-    /// mcp` in flight, a wrapper-launched `clauth` whose argv is unreadable).
+    /// Any other listed process inside the pane (a `claude` child, a `tollgate
+    /// mcp` in flight, a wrapper-launched `tollgate` whose argv is unreadable).
     Delegate,
 }
 
-/// `GET /api/v1/panes` — every herdr pane with the clauth sessions inside it.
+/// `GET /api/v1/panes` — every herdr pane with the tollgate sessions inside it.
 ///
-/// Joined on process ids, never on the `tokens.clauth` tag. Herdr absent
+/// Joined on process ids, never on the `tokens.tollgate` tag. Herdr absent
 /// answers 200 with `present: false`, the one fixed sentence naming the state,
 /// and no panes — never an error. At most `1 + N` herdr calls at 2 s each,
 /// where `N` is the pane count.
@@ -199,9 +199,9 @@ pub(crate) enum SessionKind {
     get,
     path = "/api/v1/panes",
     responses(
-        (status = 200, description = "every herdr pane on this host with the clauth sessions running inside it, joined on process ids (the foreground process group leader is the pane's own session, as is a listed `clauth` running `start` or `resume` under a wrapper; any other listed process is a delegate; the display tag never joins; on Windows herdr lists only the pane's agent root, so no session joins there); at most 1 + N herdr calls at 2 s each", body = PanesBody),
+        (status = 200, description = "every herdr pane on this host with the tollgate sessions running inside it, joined on process ids (the foreground process group leader is the pane's own session, as is a listed `tollgate` running `start` or `resume` under a wrapper; any other listed process is a delegate; the display tag never joins; on Windows herdr lists only the pane's agent root, so no session joins there); at most 1 + N herdr calls at 2 s each", body = PanesBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -288,7 +288,7 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
             SessionKind::Session
         } else {
             match processes.iter().find(|entry| entry.pid == row.pid) {
-                Some(entry) if is_clauth_session(entry) => SessionKind::Session,
+                Some(entry) if is_tollgate_session(entry) => SessionKind::Session,
                 Some(_) => SessionKind::Delegate,
                 None => continue,
             }
@@ -317,13 +317,13 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
     pane_entry(pane, group_id, sessions)
 }
 
-/// A listed member that is the pane's own session under a wrapper: a `clauth`
+/// A listed member that is the pane's own session under a wrapper: a `tollgate`
 /// running one of the verbs that register a session row, `start` or `resume`.
 /// The `.exe` stem strip is forward-compatibility only: herdr 0.9.0 lists no
-/// `clauth.exe` on Windows (only the pane's agent root), so nothing reaches it.
-fn is_clauth_session(entry: &ProcessEntry) -> bool {
+/// `tollgate.exe` on Windows (only the pane's agent root), so nothing reaches it.
+fn is_tollgate_session(entry: &ProcessEntry) -> bool {
     let stem = entry.name.strip_suffix(".exe").unwrap_or(&entry.name);
-    stem == "clauth"
+    stem == crate::identity::NAME
         && matches!(
             entry
                 .argv
@@ -344,7 +344,7 @@ fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>
         agent_status: pane.agent_status,
         cwd: pane.cwd,
         focused: pane.focused,
-        tag: pane.tokens.and_then(|tokens| tokens.clauth),
+        tag: pane.tokens.and_then(|tokens| tokens.tollgate),
         foreground_process_group_id: group_id,
         sessions,
         agent_session_id: pane

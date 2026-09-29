@@ -1,5 +1,5 @@
 //! Shell-completions feature coverage: the advertised
-//! `clauth completions install [shell]` path. `print_script` is a pure
+//! `tollgate completions install [shell]` path. `print_script` is a pure
 //! shell→script lookup; `install_rc` / `install_fish` write into home-derived
 //! paths, so they run under a home sandbox.
 
@@ -15,7 +15,7 @@ fn print_script_supports_bash_zsh_fish() {
 }
 
 /// Every shell's script must offer `--isolated` under the `start` subcommand —
-/// it's a documented `clauth start` flag (`main.rs`) and was previously uncovered.
+/// it's a documented `tollgate start` flag (`main.rs`) and was previously uncovered.
 #[test]
 fn every_shell_completes_start_isolated_flag() {
     // (script body, the flag token as each shell spells its `start` branch)
@@ -96,7 +96,7 @@ fn no_shell_offers_the_removed_rescue_flags() {
     }
 }
 
-/// `clauth start --with-fallback <TAB>` is the canonical shape — clap only sees
+/// `tollgate start --with-fallback <TAB>` is the canonical shape — clap only sees
 /// the flag before the profile name — so the profile list has to follow it in the
 /// two position-sensitive shells. fish matches on the subcommand alone and is
 /// unaffected.
@@ -132,7 +132,7 @@ fn no_shell_completes_a_profile_after_start_auto() {
     );
 }
 
-/// `clauth switch` completes profile names ∪ live-sid stems at its first
+/// `tollgate switch` completes profile names ∪ live-sid stems at its first
 /// position and profile names at the second (after a sid), so each shell must
 /// offer both shapes in the right slot. The grammar walk above collects
 /// subcommand names and long flags only, so it is blind to this positional
@@ -152,8 +152,8 @@ fn every_shell_completes_switchs_both_positions() {
     })
     .expect("bash must have a switch first-position arm");
     assert!(
-        bash_pos1.contains(r#"profiles=$(clauth __complete 2>/dev/null)"#)
-            && bash_pos1.contains(r#"sids=$(clauth __complete --live-sessions 2>/dev/null)"#)
+        bash_pos1.contains(r#"profiles=$(tollgate __complete 2>/dev/null)"#)
+            && bash_pos1.contains(r#"sids=$(tollgate __complete --live-sessions 2>/dev/null)"#)
             && bash_pos1.contains(r#"compgen -W "${profiles} ${sids}""#),
         "bash must offer profiles ∪ live sids at switch's first position (word 2)",
     );
@@ -164,7 +164,7 @@ fn every_shell_completes_switchs_both_positions() {
     })
     .expect("bash must have a switch second-position arm");
     assert!(
-        bash_pos2.contains(r#"profiles=$(clauth __complete 2>/dev/null)"#)
+        bash_pos2.contains(r#"profiles=$(tollgate __complete 2>/dev/null)"#)
             && !bash_pos2.contains("--live-sessions"),
         "bash must offer profiles at switch's second position (word 3), never sids",
     );
@@ -193,13 +193,13 @@ fn every_shell_completes_switchs_both_positions() {
 
     // fish's condition and its offered lists are one line each, so the pin
     // that ties them together is the whole line.
-    let profiles_pos1 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile"#;
-    let sids_pos1 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session"#;
-    let profiles_pos2 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile"#;
+    let profiles_pos1 = r#"complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_profiles)" -d Profile"#;
+    let sids_pos1 = r#"complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_sessions)" -d Session"#;
+    let profiles_pos2 = r#"complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__tollgate_profiles)" -d Profile"#;
     assert!(
         FISH.contains(profiles_pos1) && FISH.contains(sids_pos1),
         "fish must offer profiles ∪ live sids at switch's first position \
-         (the token right after `clauth switch`)",
+         (the token right after `tollgate switch`)",
     );
     assert!(
         FISH.contains(profiles_pos2),
@@ -208,14 +208,14 @@ fn every_shell_completes_switchs_both_positions() {
     // The sid list is the first-position offer alone: exactly one completion
     // line may name it, or a repointed second position would read as covered.
     assert_eq!(
-        FISH.matches("(__clauth_sessions)").count(),
+        FISH.matches("(__tollgate_sessions)").count(),
         1,
         "the sid list must not leak into the second position",
     );
     assert!(
-        FISH.contains(r#"function __clauth_sessions"#)
-            && FISH.contains(r#"clauth __complete --live-sessions 2>/dev/null"#),
-        "the __clauth_sessions function must shell out to the live-sessions mode",
+        FISH.contains(r#"function __tollgate_sessions"#)
+            && FISH.contains(r#"tollgate __complete --live-sessions 2>/dev/null"#),
+        "the __tollgate_sessions function must shell out to the live-sessions mode",
     );
 }
 
@@ -246,7 +246,7 @@ fn session_stem_completion_lists_registry_stems_only() {
         crate::live_sessions::register(&row).expect("register row");
     }
     // A foreign file in the registry dir is skipped.
-    let dir = sb.home().join(".clauth").join("live_sessions");
+    let dir = sb.home().join(".tollgate").join("live_sessions");
     std::fs::write(dir.join("notes.txt"), b"{}").expect("seed a foreign file");
 
     assert_eq!(
@@ -344,9 +344,9 @@ fn login_flags_matches_claps_login_args() {
     );
 }
 
-/// `clauth herdr install` and `clauth herdr uninstall` are the only herdr
+/// `tollgate herdr install` and `tollgate herdr uninstall` are the only herdr
 /// subcommands whose flags the scripts offer, so the flag branches must track
-/// them: after `clauth herdr config get <key>` clap refuses `--key
+/// them: after `tollgate herdr config get <key>` clap refuses `--key
 /// --no-config --yes`, and the scripts must not complete what clap rejects.
 #[test]
 fn herdr_flags_are_offered_only_under_install_and_uninstall() {
@@ -406,19 +406,19 @@ fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     // offer below it is the only one the `install` clause may gate.
     assert!(
         FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a install"#),
-        "fish must still offer `install` right after `clauth herdr`"
+        "fish must still offer `install` right after `tollgate herdr`"
     );
     assert!(
         FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a uninstall"#),
-        "fish must still offer `uninstall` right after `clauth herdr`"
+        "fish must still offer `uninstall` right after `tollgate herdr`"
     );
     assert!(
         FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a config"#),
-        "fish must still offer `config` right after `clauth herdr`"
+        "fish must still offer `config` right after `tollgate herdr`"
     );
 }
 
-/// `clauth devices pair` and `clauth devices add` are the only devices verbs
+/// `tollgate devices pair` and `tollgate devices add` are the only devices verbs
 /// that take `--control`/`--sessions`: clap refuses them after `revoke` and
 /// `allow-sessions`, so each shell's flag offer is gated on exactly those two
 /// verbs, by the guard text the walk above cannot judge (it asserts presence,
@@ -468,7 +468,7 @@ fn devices_flags_are_offered_only_under_pair_and_add() {
 }
 
 /// The scripts are hand-written (clap_complete's stable generator can't
-/// reproduce the live `clauth __complete` profile-name shellout), so nothing
+/// reproduce the live `tollgate __complete` profile-name shellout), so nothing
 /// structural keeps them level with the grammar — they had already drifted three
 /// subcommands and a root flag behind it. This walks the real clap `Command`
 /// tree and fails on the next drift instead of waiting for someone to notice.
@@ -581,7 +581,7 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
     );
 }
 
-/// The slice of `script` that completes the word right after `clauth`: the
+/// The slice of `script` that completes the word right after `tollgate`: the
 /// subcommand names and the root's own flags.
 fn root_branch(shell: &str, script: &str) -> Option<String> {
     match shell {
@@ -804,7 +804,7 @@ fn print_script_rejects_unsupported_shell() {
     );
 }
 
-/// `completions install bash` writes the script under `~/.clauth/completions/`
+/// `completions install bash` writes the script under `~/.tollgate/completions/`
 /// and appends an idempotent `source` line to `~/.bashrc`.
 #[cfg(unix)]
 #[test]
@@ -815,9 +815,9 @@ fn install_bash_writes_script_and_sources_it_in_rc() {
     install(Some("bash")).expect("install bash completions");
 
     let script = home_path
-        .join(".clauth")
+        .join(".tollgate")
         .join("completions")
-        .join("clauth.bash");
+        .join("tollgate.bash");
     assert!(
         script.is_file(),
         "the bash completion script must be written"
@@ -825,7 +825,7 @@ fn install_bash_writes_script_and_sources_it_in_rc() {
     assert!(
         std::fs::read_to_string(&script)
             .expect("read script")
-            .contains("complete -F _clauth clauth"),
+            .contains("complete -F _tollgate tollgate"),
         "the written script must be the bash completion body",
     );
 
@@ -848,7 +848,7 @@ fn install_bash_is_idempotent_across_reruns() {
     install(Some("bash")).expect("second install");
 
     let rc = std::fs::read_to_string(home_path.join(".bashrc")).expect("read .bashrc");
-    let count = rc.matches("# clauth completions").count();
+    let count = rc.matches("# tollgate completions").count();
     assert_eq!(count, 1, "the rc source block must be written exactly once");
 }
 
@@ -865,7 +865,7 @@ fn install_fish_writes_into_fish_completions_dir() {
         .join(".config")
         .join("fish")
         .join("completions")
-        .join("clauth.fish");
+        .join("tollgate.fish");
     assert!(
         script.is_file(),
         "fish completions must be written to the fish completions dir",
@@ -915,9 +915,9 @@ fn answer_is_yes_declines_on_n_or_other_input() {
 // break is invisible to it — and worse, it DEMANDS the offending line be
 // present, so the assertion that should have caught the CLA-ROLL apostrophe
 // (`'feed[feed a profile's …]'`, which terminated the zsh single-quoted spec
-// and left the whole `_clauth` function unparseable) is the one that certified
-// it. `clauth completions install zsh` writes that file and sources it from the
-// user's rc, so the blast radius was completion for the ENTIRE `clauth`
+// and left the whole `_tollgate` function unparseable) is the one that certified
+// it. `tollgate completions install zsh` writes that file and sources it from the
+// user's rc, so the blast radius was completion for the ENTIRE `tollgate`
 // command, plus a parse error on every new shell.
 //
 // The only thing that can see that class is the shell itself.
@@ -927,7 +927,7 @@ fn answer_is_yes_declines_on_n_or_other_input() {
 #[cfg(unix)]
 fn parse_check(bin: &str, args: &[&str], script: &str, ext: &str) -> Option<std::process::Output> {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join(format!("clauth{ext}"));
+    let path = dir.path().join(format!("tollgate{ext}"));
     std::fs::write(&path, script).expect("write script");
     match std::process::Command::new(bin)
         .args(args)
@@ -947,8 +947,8 @@ fn parse_check(bin: &str, args: &[&str], script: &str, ext: &str) -> Option<std:
 fn lint_failure(shell: &str, bin: &str, script: &str, out: &std::process::Output) -> String {
     let mut msg = format!(
         "the {shell} completion script does not parse: `{bin}` exited {}.\n\
-         This ships verbatim — `clauth completions install {shell}` writes it and sources it \
-         from the user's rc, so a parse error here kills completion for the ENTIRE clauth \
+         This ships verbatim — `tollgate completions install {shell}` writes it and sources it \
+         from the user's rc, so a parse error here kills completion for the ENTIRE tollgate \
          command, not just the new verb.\n{bin} said:\n{}\n",
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stderr),
@@ -975,9 +975,9 @@ fn lint_failure(shell: &str, bin: &str, script: &str, out: &std::process::Output
 fn every_completion_script_parses_in_its_own_shell() {
     // A skip must not be able to masquerade as a pass. nextest (what CI runs)
     // discards a passing test's output, so the eprintln alone would be silent:
-    // CI sets CLAUTH_REQUIRE_SHELL_LINT=1 and a missing shell becomes a
+    // CI sets TOLLGATE_REQUIRE_SHELL_LINT=1 and a missing shell becomes a
     // failure there, while a dev box without fish still gets a useful run.
-    let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+    let strict = std::env::var("TOLLGATE_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
     let mut parsed: Vec<&str> = Vec::new();
     for (shell, bin, args, script, ext) in [
         ("bash", "bash", &["-n"][..], &BASH, ".bash"),
@@ -988,7 +988,7 @@ fn every_completion_script_parses_in_its_own_shell() {
             None => {
                 assert!(
                     !strict,
-                    "{bin} is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+                    "{bin} is not installed, but TOLLGATE_REQUIRE_SHELL_LINT=1 demands it"
                 );
                 eprintln!("SKIP: {bin} not installed; the {shell} script was NOT parsed");
             }
@@ -1017,7 +1017,7 @@ fn every_completion_script_parses_in_its_own_shell() {
 #[test]
 fn the_zsh_leg_would_catch_an_apostrophe_in_a_description() {
     let broken = concat!(
-        "_clauth() {\n",
+        "_tollgate() {\n",
         "    _values 'subcommand' 'feed[feed a profile's session token]'\n",
         "}\n"
     );
@@ -1106,15 +1106,15 @@ fn every_shell_drops_the_manual_login_flag() {
 fn every_shell_completes_limit_reset_from_the_codex_roster_only() {
     assert!(BASH.contains(
         r#"[ "$prev" = "limit-reset" ]; then
-        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )"#
+        COMPREPLY=( $(compgen -W "$(tollgate __complete --codex 2>/dev/null)" -- "${cur}") )"#
     ));
     assert!(ZSH.contains(
         r#"[[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")"#
+        profiles=("${(@f)$(tollgate __complete --codex 2>/dev/null)}")"#
     ));
     assert!(FISH.contains(
-        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
+        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(tollgate __complete --codex 2>/dev/null)" -d Profile"#
     ));
     for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         // The shared claude-roster group line in each shell.
@@ -1143,9 +1143,9 @@ fn codex_completion_names_are_the_codex_roster() {
         ..crate::profile::AppState::default()
     })
     .expect("claude state");
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    let tollgate = crate::profile::tollgate_dir().expect("tollgate dir");
     std::fs::write(
-        clauth.join("codex-profiles.toml"),
+        tollgate.join("codex-profiles.toml"),
         "profiles = [\"cx\", \"cy\"]\n",
     )
     .expect("codex state");

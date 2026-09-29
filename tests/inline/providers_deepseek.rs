@@ -62,7 +62,7 @@ fn stats_unfunded_with_no_wallets_carries_the_refusal_alone() {
 /// `is_available: false` is DeepSeek's verdict that the balance cannot fund a
 /// call, and the response still carries the wallets. Dropping them left the
 /// reader unable to see how short the account was, and the old copy claimed
-/// clauth could not read a figure it had in hand.
+/// tollgate could not read a figure it had in hand.
 #[test]
 fn stats_unfunded_keeps_the_wallet_rows_beside_the_refusal() {
     let raw = DeepSeekResponse {

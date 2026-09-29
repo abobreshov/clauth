@@ -1,7 +1,7 @@
 //! Cross-profile `settings.json` synchronizer.
 //!
 //! `runtime::write_merged_settings` computes each profile's runtime
-//! `settings.json` once per `clauth start`, from the `~/.claude/settings.json`
+//! `settings.json` once per `tollgate start`, from the `~/.claude/settings.json`
 //! base plus that profile's `config.toml` overrides. Without reconciliation a
 //! setting the user changes inside a live Claude Code session lands only in that
 //! profile's runtime copy: the next start rebuilds from the base and the change
@@ -17,7 +17,7 @@
 //! drive the design:
 //!
 //! - Writing the winner's shared fields back into `~/.claude/settings.json` is
-//!   what stops a thrash: the next `clauth start` recomputes from an
+//!   what stops a thrash: the next `tollgate start` recomputes from an
 //!   already-updated base and reproduces the same bytes, so the recompute and
 //!   the sync agree instead of overwriting each other. A runtimes-only sync
 //!   would be undone on every start.
@@ -28,7 +28,7 @@
 //!   neither propagate outward nor be overwritten by a sibling's — which the
 //!   symmetric [`key_role`] rule gives for free.
 //!
-//! With no live `clauth start` session there is nothing to reconcile and nothing
+//! With no live `tollgate start` session there is nothing to reconcile and nothing
 //! to lose: teardown discards each session's runtime tree, so the base is the
 //! only surviving member and the engine's `members.len() < 2` short-circuit makes
 //! a sync a no-op. That is why this runs on the session watchdog and needs no
@@ -46,7 +46,7 @@ use serde::Deserialize;
 use crate::jsonsync::{KeyPath, KeyRule};
 use crate::lock::with_state_lock;
 use crate::logline::logline;
-use crate::profile::{claude_dir, clauth_dir};
+use crate::profile::{claude_dir, tollgate_dir};
 use crate::runtime::MANAGED_ENV_KEYS;
 
 /// Top-level `settings.json` keys every member keeps as its own. See
@@ -102,7 +102,7 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// obtains one), or a model choice. Copying such a key into a sibling member points that
 /// account's session at the wrong endpoint, spends the wrong key, or bills the
 /// wrong model. Everything else `settings.json` holds is operator preference
-/// (`hooks`, `permissions`, `statusLine`, theme, non-clauth env vars) and is
+/// (`hooks`, `permissions`, `statusLine`, theme, non-tollgate env vars) and is
 /// shared.
 ///
 /// The set has two halves:
@@ -139,7 +139,7 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
     }
 }
 
-/// Every `settings.json` clauth reconciles: the operator's own
+/// Every `settings.json` tollgate reconciles: the operator's own
 /// `~/.claude/settings.json` plus each SHARED per-session runtime copy, via
 /// [`crate::jsonsync::runtime_files_under`].
 fn known_paths() -> Result<Vec<PathBuf>> {
@@ -198,9 +198,9 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         }
         Err(e) => {
             if !CODEX_ROSTER_WARNED.swap(true, Ordering::Relaxed) {
-                let path = clauth_dir().ok()?.join("codex-profiles.toml");
+                let path = tollgate_dir().ok()?.join("codex-profiles.toml");
                 logline!(
-                    "clauth: {} did not yield the codex roster ({}); settings.json sync \
+                    "tollgate: {} did not yield the codex roster ({}); settings.json sync \
                      reads every profile dir as claude until it reads cleanly",
                     path.display(),
                     e.root_cause()
@@ -214,7 +214,7 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         .into_iter()
         .map(|n| n.to_string())
         .collect();
-    let profiles = clauth_dir().ok()?.join("profiles");
+    let profiles = tollgate_dir().ok()?.join("profiles");
     let Ok(entries) = std::fs::read_dir(&profiles) else {
         return Some(keys);
     };
@@ -255,7 +255,7 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
 fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     if !ENV_KEYS_WARNED.swap(true, Ordering::Relaxed) {
         logline!(
-            "clauth: settings.json sync paused — {} {reason}; \
+            "tollgate: settings.json sync paused — {} {reason}; \
              the affected profiles' custom [env] keys are unknown, so no \
              settings are synced until it reads cleanly",
             path.display()

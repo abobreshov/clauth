@@ -1,15 +1,15 @@
 //! Daemon presence + the single-fetcher lease (dual-scheduler dedup, #27).
 //!
-//! Three `~/.clauth` flock files, peers in the same dir:
-//!   * `clauthd.lock` — the daemon singleton + **presence beacon**. Held for
+//! Three `~/.tollgate` flock files, peers in the same dir:
+//!   * `tollgated.lock` — the daemon singleton + **presence beacon**. Held for
 //!     life by the running daemon; a display-only try-lock tells the TUI header
 //!     whether a daemon is up (an advisory lock auto-releases on process death,
 //!     so a dead daemon reads as absent on the next probe). Paired with
 //!     `status.json`'s freshness it drives the `[ daemon ]` header chip
 //!     ([`daemon_health`]). [`singleton_held`] reads the same lock as a decision
-//!     for `clauth daemon --status`, where not knowing has to be an error rather
+//!     for `tollgate daemon --status`, where not knowing has to be an error rather
 //!     than a dim chip.
-//!   * `clauthd-standby.lock` — the **standby slot** ([`StandbySlot`], #57). One
+//!   * `tollgated-standby.lock` — the **standby slot** ([`StandbySlot`], #57). One
 //!     waiter may park on the singleton lock; every later instance is
 //!     [`Claim::Redundant`] and exits, so a spawner that fires repeatedly can no
 //!     longer pile up parked daemons.
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::profile::clauth_dir;
+use crate::profile::tollgate_dir;
 
 /// How stale `status.json` may be before the `[ daemon ]` header chip flips
 /// green→amber.
@@ -55,12 +55,12 @@ const _: () = assert!(
 /// The `[ daemon ]` header chip's three display states, derived from the daemon
 /// singleton flock (presence) + the `generated_at` stamp inside `status.json`
 /// (health — the daemon's own write time, not the file's mtime). Nothing here
-/// gates fetching — that is [`FetchLease`] — but `clauth daemon --status` does
+/// gates fetching — that is [`FetchLease`] — but `tollgate daemon --status` does
 /// answer a caller's spawn-or-not off it, and the probe TAKES the flock it
 /// tests, so a concurrent claim must survive that (see [`CLAIM_ATTEMPTS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonHealth {
-    /// No daemon: `clauthd.lock` is free (never started, or the holder died).
+    /// No daemon: `tollgated.lock` is free (never started, or the holder died).
     /// The chip is dim; the TUI self-fetches under its own lease.
     Absent,
     /// A daemon holds the lock but its feed is stale/unwritten — wedging,
@@ -75,7 +75,7 @@ pub(crate) enum DaemonHealth {
 /// (the chip simply dims — never a false "daemon up"). Never CREATES the
 /// lock file: a missing file means no daemon has ever started here.
 pub(crate) fn daemon_health() -> DaemonHealth {
-    let Ok(dir) = clauth_dir() else {
+    let Ok(dir) = tollgate_dir() else {
         return DaemonHealth::Absent;
     };
     let Ok(lock_file) = OpenOptions::new()
@@ -125,16 +125,16 @@ pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
     now_ms.saturating_sub(generated_ms) <= DAEMON_STALE_MS
 }
 
-/// What a starting `clauth daemon` is allowed to become (#57).
+/// What a starting `tollgate daemon` is allowed to become (#57).
 ///
 /// Standby exists because a supervisor's instance must be able to take over
 /// from a manually-run one without a clean exit it would never be restarted
 /// from (launchd `KeepAlive{SuccessfulExit=false}`). It is capped at ONE waiter:
-/// before the cap, every `clauth daemon` a repeat-firing spawner started parked
+/// before the cap, every `tollgate daemon` a repeat-firing spawner started parked
 /// forever, which is how one box collected two dozen of them.
 #[derive(Debug)]
 pub(crate) enum Claim {
-    /// Took `clauthd.lock`. Run the scheduler; hold the guard for life.
+    /// Took `tollgated.lock`. Run the scheduler; hold the guard for life.
     Active(DaemonLock),
     /// Another daemon holds the lock and this process took the one standby
     /// slot. [`StandbySlot::promote`] blocks until the holder exits.
@@ -164,7 +164,7 @@ impl DaemonLock {
 }
 
 /// The one standby slot: the (still unlocked) singleton handle this process
-/// will block on, plus the `clauthd-standby.lock` flock that keeps every later
+/// will block on, plus the `tollgated-standby.lock` flock that keeps every later
 /// instance out of the queue.
 #[derive(Debug)]
 pub(crate) struct StandbySlot {
@@ -179,7 +179,7 @@ impl StandbySlot {
     pub(crate) fn promote(self) -> Result<DaemonLock> {
         self.active
             .lock()
-            .context("failed to acquire the clauth daemon lock")?;
+            .context("failed to acquire the tollgate daemon lock")?;
         drop(self.slot);
         Ok(DaemonLock::active(self.active))
     }
@@ -187,8 +187,8 @@ impl StandbySlot {
 
 /// How many times a non-[`Claim::Active`] outcome is re-tried before it stands.
 /// **Every presence probe TAKES the flock it tests** — [`daemon_health`] (TUI
-/// header, 1 Hz), [`singleton_held`] (`clauth daemon --status` at whatever rate a
-/// supervisor polls, plus once per `clauth start --with-fallback`, which refuses
+/// header, 1 Hz), [`singleton_held`] (`tollgate daemon --status` at whatever rate a
+/// supervisor polls, plus once per `tollgate start --with-fallback`, which refuses
 /// when no daemon is there to decide its switches) and [`standby_waiting`] (the
 /// slot file) try-lock a free file and release it microseconds later — so a single
 /// lost try-lock does not prove a daemon is there. A real holder keeps its lock for the process
@@ -286,29 +286,29 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
             .or_insert(0) += 1;
     }
     let active = crate::profile::open_state_file(&dir.join(super::LOCK_FILE))
-        .context("failed to open the clauth daemon lock file")?;
+        .context("failed to open the tollgate daemon lock file")?;
     match active.try_lock() {
         Ok(()) => return Ok(Claim::Active(DaemonLock::active(active))),
         Err(std::fs::TryLockError::WouldBlock) => {}
         Err(std::fs::TryLockError::Error(e)) => {
-            return Err(e).context("failed to lock the clauth daemon lock file");
+            return Err(e).context("failed to lock the tollgate daemon lock file");
         }
     }
     if !standby {
         return Ok(Claim::Redundant);
     }
     let slot = crate::profile::open_state_file(&dir.join(super::STANDBY_LOCK_FILE))
-        .context("failed to open the clauth daemon standby lock file")?;
+        .context("failed to open the tollgate daemon standby lock file")?;
     match slot.try_lock() {
         Ok(()) => Ok(Claim::Standby(StandbySlot { active, slot })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(Claim::Redundant),
         Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).context("failed to lock the clauth daemon standby lock file")
+            Err(e).context("failed to lock the tollgate daemon standby lock file")
         }
     }
 }
 
-/// `clauth daemon --replace`: terminate the running daemon and take the
+/// `tollgate daemon --replace`: terminate the running daemon and take the
 /// singleton lock, for an in-place upgrade (#57). Always yields [`Claim::Active`]
 /// on success; every failure mode is an `Err`, never a silent stand-down.
 ///
@@ -320,9 +320,9 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
 /// a console daemon), waits for the flock to auto-release on death (bounded),
 /// escalates once, then claims. The
 /// identity guard narrows the recycled-pid window [`holder_pid`] documents by
-/// requiring the pid to still be a running `clauth daemon` (not merely a clauth
-/// process — `clauth start`/`mcp`/`tui` share the binary name), so a stale pid
-/// recycled onto an unrelated process, or onto another clauth subcommand, is
+/// requiring the pid to still be a running `tollgate daemon` (not merely a tollgate
+/// process — `tollgate start`/`mcp`/`tui` share the binary name), so a stale pid
+/// recycled onto an unrelated process, or onto another tollgate subcommand, is
 /// never signalled.
 pub(crate) fn claim_by_replacing(dir: &Path) -> Result<Claim> {
     claim_by_replacing_with(dir, REPLACE_WAIT, REPLACE_POLL)
@@ -402,7 +402,9 @@ pub(crate) fn stop_running_with(
     // Death is the event, not the free lock: a parked standby takes the flock
     // the instant it is released, so a free-lock wait would sit out both
     // passes and then SIGKILL a pid that is already gone.
-    terminate_holder(wait, poll, |pid| (!pid_is_clauth_daemon(pid)).then_some(()))?;
+    terminate_holder(wait, poll, |pid| {
+        (!pid_is_tollgate_daemon(pid)).then_some(())
+    })?;
     if held_past_probes(attempts, retry)? {
         // The successor's own start reclaims whatever gateway was left.
         return Ok(DaemonStop::Replaced);
@@ -412,7 +414,7 @@ pub(crate) fn stop_running_with(
 }
 
 /// Whether a daemon holds the singleton, re-tested past transient probe holds
-/// (TUI header at 1 Hz, `clauth daemon --status`) that take the flock and
+/// (TUI header at 1 Hz, `tollgate daemon --status`) that take the flock and
 /// release it microseconds later: a real holder keeps its lock for the process
 /// lifetime, so anything that clears on retry was a reader.
 fn held_past_probes(attempts: u32, retry: Duration) -> Result<bool> {
@@ -439,11 +441,11 @@ fn terminate_holder<T>(
     mut released: impl FnMut(u32) -> Option<T>,
 ) -> Result<T> {
     let Some(pid) = holder_pid() else {
-        anyhow::bail!("a clauth daemon is running but its pid is unreadable; kill it manually");
+        anyhow::bail!("a tollgate daemon is running but its pid is unreadable; kill it manually");
     };
-    if !pid_is_clauth_daemon(pid) {
+    if !pid_is_tollgate_daemon(pid) {
         anyhow::bail!(
-            "the recorded daemon pid {pid} is not a running clauth daemon (it exited during \
+            "the recorded daemon pid {pid} is not a running tollgate daemon (it exited during \
              handover or was recycled); re-run once it settles, or kill the daemon manually"
         );
     }
@@ -457,12 +459,12 @@ fn terminate_holder<T>(
     }
     if !sent_term && !sent_kill {
         anyhow::bail!(
-            "could not signal the running clauth daemon (pid {pid}): no kill tool is on PATH \
+            "could not signal the running tollgate daemon (pid {pid}): no kill tool is on PATH \
              (`kill` on unix, `taskkill` on Windows); kill it manually"
         );
     }
     anyhow::bail!(
-        "the running clauth daemon (pid {pid}) did not release the lock within {}s of the force \
+        "the running tollgate daemon (pid {pid}) did not release the lock within {}s of the force \
          kill; it may be wedged uninterruptibly",
         wait.as_secs()
     )
@@ -521,18 +523,18 @@ pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     cmd.status().is_ok()
 }
 
-/// Confirm `pid` is still a running `clauth daemon` before `--replace` signals
+/// Confirm `pid` is still a running `tollgate daemon` before `--replace` signals
 /// it, narrowing the recycled-pid window [`holder_pid`] documents. The check is
-/// on the daemon ROLE, not the binary name: `clauth start` (resident around a
-/// live Claude Code session), `clauth mcp`, and `clauth tui` all share
-/// `comm == "clauth"`, so a name-only guard would let `--replace` force-kill
-/// one of them if the stale pid recycled onto it. Requiring argv `clauth daemon …`
-/// excludes every other subcommand and every non-clauth process. A pid that has
+/// on the daemon ROLE, not the binary name: `tollgate start` (resident around a
+/// live Claude Code session), `tollgate mcp`, and `tollgate tui` all share
+/// `comm == "tollgate"`, so a name-only guard would let `--replace` force-kill
+/// one of them if the stale pid recycled onto it. Requiring argv `tollgate daemon …`
+/// excludes every other subcommand and every non-tollgate process. A pid that has
 /// exited (the in-handover window: recorded pid gone, successor holds the lock)
 /// or that can't be verified reads as false, so `--replace` bails and the
 /// operator re-runs against the settled successor rather than signalling blind.
 #[cfg(target_os = "linux")]
-fn pid_is_clauth_daemon(pid: u32) -> bool {
+fn pid_is_tollgate_daemon(pid: u32) -> bool {
     // `/proc/<pid>/cmdline` is NUL-separated argv; a gone pid fails the read.
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
@@ -545,7 +547,7 @@ fn pid_is_clauth_daemon(pid: u32) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn pid_is_clauth_daemon(pid: u32) -> bool {
+fn pid_is_tollgate_daemon(pid: u32) -> bool {
     // macOS/BSD: `ps -p <pid> -o command=` prints the full argv, space-joined. A
     // missing pid prints nothing; a failed `ps` reads false so a broken probe
     // never green-lights a signal.
@@ -563,10 +565,10 @@ fn pid_is_clauth_daemon(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn pid_is_clauth_daemon(pid: u32) -> bool {
+fn pid_is_tollgate_daemon(pid: u32) -> bool {
     // `tasklist` gives the image name but not the full argv, so this confirms
-    // only that the pid is a clauth image (rejecting a recycle onto an unrelated
-    // process). It can't tell the daemon from another clauth subcommand here — a
+    // only that the pid is a tollgate image (rejecting a recycle onto an unrelated
+    // process). It can't tell the daemon from another tollgate subcommand here — a
     // documented residual on Windows, where the recycle window is a handful of
     // instructions wide. A failed probe reads false: never signal unverified.
     let Ok(out) = std::process::Command::new("tasklist")
@@ -575,31 +577,37 @@ fn pid_is_clauth_daemon(pid: u32) -> bool {
     else {
         return false;
     };
+    // An exact image-name match on the CSV's first field, never a substring:
+    // a substring would also accept upstream's `clauth.exe`-style neighbours
+    // and any image that merely contains the name.
+    let image = format!("\"{}.exe\"", crate::identity::NAME);
     out.status.success()
-        && String::from_utf8_lossy(&out.stdout)
-            .to_ascii_lowercase()
-            .contains("clauth")
+        && String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            line.split(',')
+                .next()
+                .is_some_and(|first| first.trim().eq_ignore_ascii_case(&image))
+        })
 }
 
-/// Shared argv test for the unix identity guards: argv[0]'s basename is `clauth`
+/// Shared argv test for the unix identity guards: argv[0]'s basename is `tollgate`
 /// and argv[1] is `daemon`. Takes owned tokens so both the `/proc` (NUL-split
 /// bytes) and `ps` (whitespace-split str) callers feed one predicate.
 #[cfg(unix)]
 fn cmdline_is_daemon(mut args: impl Iterator<Item = Vec<u8>>) -> bool {
-    let argv0_is_clauth = args
+    let argv0_is_tollgate = args
         .next()
         .and_then(|a| String::from_utf8(a).ok())
-        .map(|a| a.rsplit('/').next().unwrap_or(&a) == "clauth")
+        .map(|a| a.rsplit('/').next().unwrap_or(&a) == crate::identity::NAME)
         .unwrap_or(false);
     let argv1_is_daemon = args
         .next()
         .and_then(|a| String::from_utf8(a).ok())
         .is_some_and(|a| a == "daemon");
-    argv0_is_clauth && argv1_is_daemon
+    argv0_is_tollgate && argv1_is_daemon
 }
 
 /// Overwrite the unlocked [`PID_FILE`] sidecar with the current pid. The pid
-/// deliberately does NOT live in `clauthd.lock`: Windows locks are mandatory
+/// deliberately does NOT live in `tollgated.lock`: Windows locks are mandatory
 /// (`LockFileEx`), so a `--status` reader in another process cannot read bytes
 /// the daemon holds under its exclusive lock — the sidecar is the one place
 /// every platform can read. Only ever one writer (the single Active daemon),
@@ -609,7 +617,7 @@ fn cmdline_is_daemon(mut args: impl Iterator<Item = Vec<u8>>) -> bool {
 /// a live unrelated process. Best-effort: a daemon that can't write its own pid
 /// still runs (the sidecar then reads as "unknown").
 fn stamp_pid() -> std::io::Result<()> {
-    let dir = clauth_dir().map_err(std::io::Error::other)?;
+    let dir = tollgate_dir().map_err(std::io::Error::other)?;
     let mut file = crate::profile::open_state_file(&dir.join(super::PID_FILE))?;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
@@ -632,7 +640,7 @@ fn stamp_pid() -> std::io::Result<()> {
 /// dead daemon is out of reach; only this in-handover window can surface a stale
 /// one, and truncate-first keeps it to a handful of instructions.
 pub(crate) fn holder_pid() -> Option<u32> {
-    let dir = clauth_dir().ok()?;
+    let dir = tollgate_dir().ok()?;
     let body = std::fs::read_to_string(dir.join(super::PID_FILE)).ok()?;
     // No terminating newline → the stamp is torn or absent. Never guess.
     body.strip_suffix('\n')?.trim().parse().ok()
@@ -646,7 +654,7 @@ pub(crate) fn holder_pid() -> Option<u32> {
 /// in `daemon.log`. Never creates the file: a missing one is a real "no daemon
 /// has ever started here".
 pub(crate) fn singleton_held() -> Result<bool> {
-    let dir = clauth_dir()?;
+    let dir = tollgate_dir()?;
     let path = dir.join(super::LOCK_FILE);
     let file = match OpenOptions::new().read(true).write(true).open(&path) {
         Ok(f) => f,
@@ -654,7 +662,7 @@ pub(crate) fn singleton_held() -> Result<bool> {
         Err(e) => {
             return Err(e).with_context(|| {
                 format!(
-                    "failed to open the clauth daemon lock file {}",
+                    "failed to open the tollgate daemon lock file {}",
                     path.display()
                 )
             });
@@ -665,15 +673,15 @@ pub(crate) fn singleton_held() -> Result<bool> {
         Ok(()) => Ok(false),
         Err(std::fs::TryLockError::WouldBlock) => Ok(true),
         Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).context("failed to test the clauth daemon lock file")
+            Err(e).context("failed to test the tollgate daemon lock file")
         }
     }
 }
 
-/// True when a second `clauth daemon` is parked in the standby slot. Never
+/// True when a second `tollgate daemon` is parked in the standby slot. Never
 /// creates the file: a missing one means nobody has ever stood by here.
 pub(crate) fn standby_waiting() -> bool {
-    let Ok(dir) = clauth_dir() else {
+    let Ok(dir) = tollgate_dir() else {
         return false;
     };
     let Ok(file) = OpenOptions::new()
@@ -720,10 +728,10 @@ impl FetchLease {
         if held.is_some() {
             return true;
         }
-        let Ok(dir) = clauth_dir() else {
+        let Ok(dir) = tollgate_dir() else {
             return false;
         };
-        // The lease file lives in `~/.clauth`; ensure the dir exists (best-effort,
+        // The lease file lives in `~/.tollgate`; ensure the dir exists (best-effort,
         // 0o700) so a first-run TUI with no daemon can still take the lease.
         // `serve()` already creates it for the daemon; a TUI normally reaches here
         // with the dir already present (profiles live in it).
@@ -747,7 +755,7 @@ impl FetchLease {
 /// leaving the subsystem that owns it.
 #[cfg(test)]
 pub(crate) fn daemon_lock_path() -> std::path::PathBuf {
-    clauth_dir().expect("clauth dir").join(super::LOCK_FILE)
+    tollgate_dir().expect("tollgate dir").join(super::LOCK_FILE)
 }
 
 /// Open + exclusively lock the daemon singleton, standing in for a live daemon.
@@ -757,7 +765,7 @@ pub(crate) fn daemon_lock_path() -> std::path::PathBuf {
 /// stay in scope — the flock releases when it drops.
 #[cfg(test)]
 pub(crate) fn hold_daemon_lock() -> File {
-    let dir = clauth_dir().expect("clauth dir");
+    let dir = tollgate_dir().expect("tollgate dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let file =
         crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open the daemon lock");

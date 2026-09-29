@@ -220,7 +220,7 @@ fn the_stand_down_is_scoped_to_a_live_session() {
     let exp_secs = |lead_ms: i64| (now + lead_ms) / 1000;
 
     // A LIVE session holds the chain for the rest of the test.
-    let sessions = home.home().join(".clauth/profiles/cx-standdown/sessions");
+    let sessions = home.home().join(".tollgate/profiles/cx-standdown/sessions");
     std::fs::create_dir_all(&sessions).expect("mkdir sessions");
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
@@ -425,7 +425,7 @@ fn fake_transport_stands_down_for_any_live_session_and_keeps_the_kick() {
         name,
         &codex_auth_body(&jwt_with_exp((now / 1000) + 400), "rt.a"),
     );
-    let sessions = home.home().join(".clauth/profiles/cx-fake/sessions");
+    let sessions = home.home().join(".tollgate/profiles/cx-fake/sessions");
     std::fs::create_dir_all(&sessions).expect("mkdir sessions");
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
     pid.lock().expect("lock");
@@ -468,7 +468,7 @@ fn the_belt_never_restores_under_a_live_session() {
     write_codex_store(name, "{ half a wri");
 
     // A live session — codex is the writer.
-    let sessions = home.home().join(".clauth/profiles/cx-belt-live/sessions");
+    let sessions = home.home().join(".tollgate/profiles/cx-belt-live/sessions");
     std::fs::create_dir_all(&sessions).expect("mkdir");
     let pid = crate::runtime::open_pid_file(&sessions.join("1")).expect("pid");
     pid.lock().expect("lock");
@@ -559,7 +559,7 @@ fn a_successful_rotation_does_not_reset_the_breaker() {
 }
 
 /// The post-guard re-read catches a live codex rotating the store in the
-/// window between the pre-guard capture and the guarded read — clauth must
+/// window between the pre-guard capture and the guarded read — tollgate must
 /// NOT then spend the token codex just rotated away.
 #[test]
 fn a_rotation_under_the_guard_window_is_caught() {
@@ -662,7 +662,7 @@ fn a_terminal_verdict_leaves_a_quarantine_record_and_a_rotation_clears_it() {
             .expect_err("a quarantined chain refuses")
             .to_string(),
         "'cx-quarantine': codex chain is broken (reused since 2026-08-13T00:00:00Z), \
-         run `clauth login cx-quarantine --codex --browser`"
+         run `tollgate login cx-quarantine --codex --browser`"
     );
     // A later kick re-hearing the same verdict keeps the first stamp: `since`
     // names when the chain died, not the last time the server said so.

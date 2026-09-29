@@ -31,7 +31,6 @@ fn toggles() -> RowState {
         spend_budget: false,
         switch_off_when_budget_spent: true,
         preemptive: false,
-        auto_update: true,
         refresh_spent: true,
         auto_start_queue: true,
         any_auto_start: true,
@@ -667,16 +666,13 @@ fn auto_update_sits_in_the_scheduler_band_after_rotation() {
     assert!(auto < pos(GlobalConfigRow::WeeklyThreshold));
 }
 
-/// The row is a plain toggle on both tiers (never dimmed, never a cycle) and
-/// its hint names the env override on and the silence off — the exact copy,
-/// since both strings are provisional pending cloudy's equality pick.
+/// Self-update is compiled out of this build: the row renders a dimmed off
+/// knob on both tiers and its hint says why.
 #[test]
-fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
-    let mut off_state = toggles();
-    off_state.auto_update = false;
+fn auto_update_renders_dimmed_off_with_the_disabled_hint() {
     {
         let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-        let on = line_text(&detail_row(
+        let row = line_text(&detail_row(
             GlobalConfigRow::AutoUpdate,
             false,
             toggles(),
@@ -684,54 +680,24 @@ fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
             None,
         ));
         assert!(
-            on.contains("─●"),
-            "full-tier on renders the slide switch: {on}"
-        );
-        let off = line_text(&detail_row(
-            GlobalConfigRow::AutoUpdate,
-            false,
-            off_state,
-            tunables(),
-            None,
-        ));
-        assert!(
-            off.contains("○─"),
-            "full-tier off renders the hollow knob: {off}"
+            row.contains("○─"),
+            "full-tier renders the hollow knob: {row}"
         );
     }
     {
         let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
-        let on = line_text(&detail_row(
+        let row = line_text(&detail_row(
             GlobalConfigRow::AutoUpdate,
             false,
             toggles(),
             tunables(),
             None,
         ));
-        assert!(
-            on.contains("[on]"),
-            "compatible-tier on renders the bracket: {on}"
-        );
-        let off = line_text(&detail_row(
-            GlobalConfigRow::AutoUpdate,
-            false,
-            off_state,
-            tunables(),
-            None,
-        ));
-        assert!(
-            off.contains("[off]"),
-            "compatible-tier off renders the bracket: {off}"
-        );
+        assert!(row.contains("[off]"), "compatible-tier renders off: {row}");
     }
 
-    let hint_on = row_hint(GlobalConfigRow::AutoUpdate, toggles(), tunables()).expect("hint");
-    assert_eq!(
-        hint_on,
-        "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
-    );
-    let hint_off = row_hint(GlobalConfigRow::AutoUpdate, off_state, tunables()).expect("hint");
-    assert_eq!(hint_off, "no update checks");
+    let hint = row_hint(GlobalConfigRow::AutoUpdate, toggles(), tunables()).expect("hint");
+    assert_eq!(hint, crate::update::DISABLED_MESSAGE);
 }
 
 /// Value rows fold the live value into their hint, so cycling a row re-explains

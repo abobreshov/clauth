@@ -29,7 +29,7 @@ pub(crate) struct ProfileSnapshot {
 /// A profile's roster sort key, for ordering only.
 ///
 /// The variants never interleave: every windowed profile outranks every wallet
-/// one, which outranks every profile clauth holds no figure for. That last step
+/// one, which outranks every profile tollgate holds no figure for. That last step
 /// is what keeps "no figure" from reading as "full".
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RosterRank {
@@ -37,7 +37,7 @@ pub(crate) enum RosterRank {
     Window(f64),
     /// A provider reporting a wallet rather than a window. Amounts are compared
     /// only within one `currency`: ordering 1117 CNY against 31 USD needs an
-    /// exchange rate clauth does not have and could not keep fresh.
+    /// exchange rate tollgate does not have and could not keep fresh.
     Balance { currency: String, amount: f64 },
     /// Nothing cached, or nothing a wallet could be read out of.
     Unknown,
@@ -140,14 +140,14 @@ fn authority_host(host: &str) -> Option<&str> {
     // `base_url_host` splits without validating, `Profile::base_url` is raw config
     // text, and nothing in the crate parses a url — so `http://::1/v1` arrives
     // here as `::1` from the commonest IPv6-url typo there is. Refusing it is a
-    // deliberate cut: clauth does not guess which authority a malformed one meant.
+    // deliberate cut: tollgate does not guess which authority a malformed one meant.
     match host.rsplit_once(':') {
         Some((h, port)) => (!h.contains(':') && is_port(port)).then_some(h),
         None => Some(host),
     }
 }
 
-/// The locality marker a base-url host earns, or `None` for a host clauth
+/// The locality marker a base-url host earns, or `None` for a host tollgate
 /// cannot place. Both roster carriers ([`roster_bracket`] and [`profile_line`])
 /// call this on the host string each already holds, so one predicate answers for
 /// both surfaces.
@@ -172,10 +172,10 @@ fn authority_host(host: &str) -> Option<&str> {
 /// a multi-interface box cannot connect to, so matching only that form would fire
 /// on every spelling except the working one. The bare `fe80::1%eth0` is refused
 /// with every other unbracketed IPv6, which RFC 3986 has no authority syntax for
-/// — a reachable config typo that clauth declines to guess at, not an impossible
+/// — a reachable config typo that tollgate declines to guess at, not an impossible
 /// input. See [`authority_host`].
 ///
-/// NOT placed, each for its own reason. Any other NAME, because clauth resolves
+/// NOT placed, each for its own reason. Any other NAME, because tollgate resolves
 /// nothing — `ollama`, but equally `foo.localhost` and `localhost.`, which RFC
 /// 6761 does guarantee as loopback; widening to those is a live option rather
 /// than an oversight. And `100.64/10`, carrier-grade NAT space a mesh VPN happens
@@ -260,12 +260,12 @@ fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
     a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.total_cmp(&b.2))
 }
 
-/// The roster marker a profile earns in THIS session's block. A `clauth start`
+/// The roster marker a profile earns in THIS session's block. A `tollgate start`
 /// runtime marks the profile the session is pinned to and the account the global
 /// link points at separately; a global session IS the global link, so the active
-/// profile carries both names; a custom config dir holds no clauth session
+/// profile carries both names; a custom config dir holds no tollgate session
 /// profile, so only the global link gets a name. The old bare `(active)` read as
-/// "this session's account" where a `clauth start` session does not spend the
+/// "this session's account" where a `tollgate start` session does not spend the
 /// active profile at all.
 fn marker(p: &ProfileSnapshot, auth: &SessionAuth) -> Option<&'static str> {
     match auth {
@@ -400,7 +400,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
 
 /// What a `switch_profile` does to *this* session, keyed on how it reads its
 /// credentials. A global session reads the exact file `switch_profile`
-/// repoints; an isolated session (a `clauth start` runtime or a custom
+/// repoints; an isolated session (a `tollgate start` runtime or a custom
 /// `CLAUDE_CONFIG_DIR`) reads its own, so a switch can't disturb it. The
 /// subject is the lead-in [`switch_effect_note`] adds — a client that shows
 /// tool names only never sees a bare `switch`. Pure mapping — the caller
@@ -414,7 +414,7 @@ without disturbing this one, use the `delegate` tool."
             .to_string(),
         SessionAuth::IsolatedRuntime(name) => format!(
             "repoints the global `~/.claude` credentials, but THIS session runs in an \
-isolated `clauth start` runtime pinned to `{name}` and is unaffected. Only a later session on \
+isolated `tollgate start` runtime pinned to `{name}` and is unaffected. Only a later session on \
 the global credentials adopts the change."
         ),
         SessionAuth::IsolatedCustom => "repoints the global `~/.claude` credentials, but \
@@ -434,7 +434,7 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 }
 
 /// How this session's runtime tree maps onto the real global one, for the only
-/// tier that has such a tree. A `clauth start` runtime looks per-profile, so a
+/// tier that has such a tree. A `tollgate start` runtime looks per-profile, so a
 /// model editing `CLAUDE.md` or `skills/…` under it may believe the edit is
 /// scoped. The note frames the consequence, and now states the transport too:
 /// the caller probes the tree once (`runtime::link_mode_of`) and the note names
@@ -455,12 +455,12 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 /// dir carries a per-session suffix (`runtime-<sid>`, the sid being `<pid>-<seq>`),
 /// so any literal spelled here would point at a directory that does not exist.
 /// It also names no destination past `~/.claude/`. Whether an entry there chains
-/// on somewhere else is the operator's own layout rather than anything clauth
+/// on somewhere else is the operator's own layout rather than anything tollgate
 /// builds: a box may reach its skills dir through a `~/.claude/skills`
 /// symlink, and a box without one would be told a falsehood.
 ///
 /// `Global` has no runtime dir, and `IsolatedCustom` is a foreign
-/// `CLAUDE_CONFIG_DIR` whose layout clauth does not own, so neither may claim
+/// `CLAUDE_CONFIG_DIR` whose layout tollgate does not own, so neither may claim
 /// this layout. Pure mapping; the caller resolves the [`SessionAuth`] and probes
 /// the verdict.
 pub(crate) fn runtime_paths_note(auth: &SessionAuth, probe: LinkProbe) -> Option<String> {
@@ -489,7 +489,7 @@ host, at the watchdog's cadence on a copy host."
     ))
 }
 
-/// The block's first line: who this session is, resolved per tier. A `clauth
+/// The block's first line: who this session is, resolved per tier. A `tollgate
 /// start` runtime names the profile it is pinned to and the account the global
 /// link points at; a global session IS the global link, so the active profile
 /// is the session's own account; a custom config dir names only the fact of
@@ -544,7 +544,7 @@ const MODELS_NOTE: &str = "some providers alias claude model names to their own 
 
 /// Init-time `instructions` block: identity intro, the session-resolved identity
 /// line, a generic model-alias note, the runtime-path note that tier earns, a
-/// one-line tool router, then the grouped roster. This block is the only clauth
+/// one-line tool router, then the grouped roster. This block is the only tollgate
 /// text a session is guaranteed to hold: tool descriptions are deferred in some
 /// harnesses and unloaded until searched for, so the router line stays even
 /// though every tool carries its own description. Per-tool mechanics do NOT
@@ -561,10 +561,10 @@ pub(crate) fn instructions_block(
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "clauth manages multiple accounts (\"profiles\"): each an isolated credential set / \
+        "tollgate manages multiple accounts (\"profiles\"): each an isolated credential set / \
 subscription. Use its tools to compare usage headroom across accounts, relink the active \
 account, or delegate a task to another account without spending this session's window. These \
-tools see CLAUDE CODE accounts only — clauth also manages codex accounts, which are invisible \
+tools see CLAUDE CODE accounts only — tollgate also manages codex accounts, which are invisible \
 here and switch through its CLI.\n\n",
     );
     if let Some(line) = identity_line(profiles, auth) {
@@ -580,7 +580,7 @@ here and switch through its CLI.\n\n",
     out.push_str(&format!(
         "Tools: `profiles` (accounts + cached usage, zero quota; `scope:\"session\"` for this \
 session's own), `switch_profile` ({}), `delegate` (run a task on another account; the only tool \
-that spends), `monitor` (check, collect or stop a backgrounded delegate, or wait on clauth's \
+that spends), `monitor` (check, collect or stop a backgrounded delegate, or wait on tollgate's \
 state).\n\n",
         switch_router_clause(auth),
     ));
@@ -617,7 +617,7 @@ fn pct_clause(v: Option<f64>) -> String {
 /// `switch_profile`, `target` for `delegate`.
 ///
 /// Three readings the clause keeps apart, because collapsing any two of them
-/// tells the reader clauth lost something it holds: no profile at all reads
+/// tells the reader tollgate lost something it holds: no profile at all reads
 /// `none` and names no window (there is no account whose windows could be
 /// reported); a third-party account with a figure reads whichever headroom
 /// [`windows_prose`] renders for it; an account with nothing cached — OAuth or
@@ -700,7 +700,7 @@ pub(crate) fn digest_prose(d: &Value) -> String {
 }
 
 /// The state-waiting mode's reply: the change it caught, the baseline it
-/// armed, or the wait that found nothing, then the delegates clauth is holding.
+/// armed, or the wait that found nothing, then the delegates tollgate is holding.
 /// Self-labels `monitor` — the reply names the tool that can be called again,
 /// and a label naming a tool the handshake does not list sends the model
 /// searching for one.
@@ -712,7 +712,7 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
     listing
 }
 
-/// The delegate jobs clauth is holding, one line each, or nothing at all when
+/// The delegate jobs tollgate is holding, one line each, or nothing at all when
 /// it holds none.
 ///
 /// Empty rather than a "no jobs" line: a session that never delegated should
@@ -732,7 +732,7 @@ fn jobs_listing_prose(p: &Value) -> String {
     if rows.is_empty() {
         return String::new();
     }
-    let mut out = String::from("delegates clauth holds:");
+    let mut out = String::from("delegates tollgate holds:");
     for row in rows {
         let job_id = row
             .get("job_id")
@@ -800,7 +800,7 @@ fn age_phrase(row: &Value) -> String {
 /// How old the figures in a headroom payload are, and whether that is past
 /// anything a live scheduler produces. Dating a figure is what lets a reader
 /// discount it; suppressing a stale one would turn a known-old number into no
-/// number, which reads as clauth having lost track of the account. A payload
+/// number, which reads as tollgate having lost track of the account. A payload
 /// carrying no age at all (the roster, which spends no tokens dating rows that
 /// are current) still says `stale` when it is.
 fn freshness_clause(v: &Value) -> String {
@@ -846,10 +846,10 @@ fn age_clause(v: &Value) -> String {
 /// or a third-party account's own figures in place of a pool it does not draw
 /// on. `unknown` answers for an empty cache on either side and for nothing
 /// else — no cache is not a zero. A third-party account with no figure yet says
-/// only that, no denial: what clauth cannot answer for is the provider's own
+/// only that, no denial: what tollgate cannot answer for is the provider's own
 /// limits, which is exactly what the denial would be claiming to know.
 ///
-/// A third-party account is told it has no 5h/7d limit only when clauth knows
+/// A third-party account is told it has no 5h/7d limit only when tollgate knows
 /// it has none. A provider that publishes usage windows of its own (z.ai,
 /// Alibaba, MiniMax) HAS the limits whether or not this one response carried any, so a
 /// denial beside its figure is false; a provider answering with a wallet or a
@@ -941,7 +941,7 @@ fn windows_prose(windows: &Value) -> String {
 /// Per-model throughput rows (`which`'s full summary or a roster's warnings).
 /// A healthy row is the model's name and rate; `degraded` and the rate-limit
 /// flag appear as words only when true, the retry delay with them. The sample
-/// count is clauth's own confidence telemetry, not a figure a reader acts on,
+/// count is tollgate's own confidence telemetry, not a figure a reader acts on,
 /// so it stays in the JSON spelling. A row whose store key was the `default`
 /// placeholder carries no `model` field at all (`throughput_row` omits it) and
 /// renders the rate alone — the same nameless reading the delegate warning
@@ -1037,7 +1037,7 @@ fn profile_line(row: &Value) -> String {
     // The three account-state markers render as one contiguous run, so a
     // reader meets one group rather than three scattered through the line.
     // Which of them refuses a delegate, and on which exemption, is
-    // `preflight_target`'s rule. `canceled` follows them because clauth has no
+    // `preflight_target`'s rule. `canceled` follows them because tollgate has no
     // cancel gate: it informs the pick, it does not block it.
     if row
         .get("disabled")
@@ -1153,7 +1153,7 @@ pub(crate) fn switch_profile_prose(p: &Value) -> String {
     match p.get("ok").and_then(Value::as_bool) {
         Some(true) => {
             // A null `previous` is the logged-out state the switch started from
-            // (clauth knows there was none), not a figure clauth lost.
+            // (tollgate knows there was none), not a figure tollgate lost.
             let previous = p
                 .get("previous")
                 .and_then(Value::as_str)
@@ -1180,7 +1180,7 @@ pub(crate) fn switch_profile_prose(p: &Value) -> String {
 const USAGE_BUDGET: usize = 320;
 
 /// The token-usage object of a delegate envelope as one clause. The two fields
-/// clauth's envelope contract documents always render and read as English
+/// tollgate's envelope contract documents always render and read as English
 /// (`input N tokens`), or `input unknown tokens` when the wire carries no
 /// number, because a run that produced no output is real signal and the
 /// clause never drops. Every other key renders one clause per surviving
@@ -1195,7 +1195,7 @@ const USAGE_BUDGET: usize = 320;
 /// would print twice, and the total drops, leaving the leaves; a total that
 /// disagrees with its breakdown renders alongside it, because dropping it
 /// would hide a figure. A string that parses as a number IS the figure,
-/// because clauth fronts third-party proxies that stringify numerics. The
+/// because tollgate fronts third-party proxies that stringify numerics. The
 /// dotted path locates a figure for reading, never for round-tripping: a
 /// dotted key and a nesting render the same (`{"a.b":1}` and `{"a":{"b":1}}`),
 /// and an array index joins the path the same way, so `{"a":[1]}` and
@@ -1479,7 +1479,7 @@ pub(crate) fn result_file_prose(path: &str, sha256: &str, e: &Value) -> String {
 /// Prose for a delegate envelope: the verdict (`finished` / `failed` / `timed
 /// out`), the self-report, cost and tokens, then the kill/resume markers. The
 /// raw envelope may carry more of claude's own fields; those stay in the JSON
-/// spelling, and this names the fields clauth documents.
+/// spelling, and this names the fields tollgate documents.
 pub(crate) fn envelope_prose(e: &Value) -> String {
     let mut out = String::new();
     let ran_for = || {
@@ -1766,10 +1766,10 @@ pub(super) fn running_status_prose(p: &Value) -> String {
     if let Some(q) = p.get("quota") {
         out.push_str(&format!("; quota: {}", windows_prose(q)));
     }
-    // Its own line, quoted: this is the delegate's words rather than clauth's
+    // Its own line, quoted: this is the delegate's words rather than tollgate's
     // report about it. Escaped, because those words are ANOTHER account's model
     // output arriving verbatim in a model-facing reply, and a bare `"` in them
-    // would close the span early and let the rest read as clauth's own prose.
+    // would close the span early and let the rest read as tollgate's own prose.
     if let Some(tail) = p.get("tail").and_then(Value::as_str) {
         out.push_str(&format!("\n    \"{}\"", escape_quoted(tail)));
     }

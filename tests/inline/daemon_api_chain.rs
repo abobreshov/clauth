@@ -47,8 +47,8 @@ fn seeded_chain() -> ConfigHandle {
 }
 
 fn status_feed() -> serde_json::Value {
-    let path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json");
     serde_json::from_slice(&std::fs::read(path).expect("status.json written"))
         .expect("feed is json")
@@ -357,7 +357,7 @@ fn a_held_chain_gate_refuses_each_route_with_409() {
 fn a_state_lock_timeout_is_503_on_each_chain_route() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_chain());
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
     let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
         .expect("open holder handle");
     holder.lock().expect("hold the flock");
@@ -459,7 +459,7 @@ fn an_order_edit_answers_the_order_that_landed_after_a_delete_behind_its_back() 
     );
     assert_eq!(
         lines.snapshot(),
-        vec!["clauth api: device 'test' reordered the chain to [beta, alpha]".to_string()],
+        vec!["tollgate api: device 'test' reordered the chain to [beta, alpha]".to_string()],
         "the audit line records the order that landed"
     );
 }
@@ -634,9 +634,9 @@ fn a_successful_chain_edit_logs_an_audit_line() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth api: device 'test' reordered the chain to [beta, alpha, gamma]".to_string(),
-            "clauth api: device 'test' set 'alpha' threshold to 90".to_string(),
-            "clauth api: device 'test' set wrap_off to true".to_string(),
+            "tollgate api: device 'test' reordered the chain to [beta, alpha, gamma]".to_string(),
+            "tollgate api: device 'test' set 'alpha' threshold to 90".to_string(),
+            "tollgate api: device 'test' set wrap_off to true".to_string(),
         ]
     );
 }
@@ -678,11 +678,11 @@ fn a_chain_edit_failure_answers_500_edit_failed() {
 
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_chain());
-    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    let tollgate_dir = crate::profile::tollgate_dir().expect("tollgate dir");
 
-    // order and wrap-off save whole state into ~/.clauth; fail that dir.
-    std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o500))
-        .expect("chmod clauth dir read-only");
+    // order and wrap-off save whole state into ~/.tollgate; fail that dir.
+    std::fs::set_permissions(&tollgate_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod tollgate dir read-only");
     let answers: Vec<(&str, Response)> = [
         ("/chain/order", r#"{"members":["beta","alpha","gamma"]}"#),
         ("/chain/wrap-off", r#"{"wrap_off":true}"#),
@@ -699,8 +699,8 @@ fn a_chain_edit_failure_answers_500_edit_failed() {
     })
     .collect();
     // Restore before any assertion so a red still lets the sandbox clean up.
-    std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o700))
-        .expect("restore clauth dir perms");
+    std::fs::set_permissions(&tollgate_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore tollgate dir perms");
     for (path, resp) in answers {
         assert_eq!(
             resp.status,
@@ -720,7 +720,7 @@ fn a_chain_edit_failure_answers_500_edit_failed() {
         );
     }
 
-    // The threshold leg writes into the member's own dir, which ~/.clauth's
+    // The threshold leg writes into the member's own dir, which ~/.tollgate's
     // mode does not gate; fail it at the profile dir instead.
     let beta_dir = crate::profile::profile_dir(&ProfileName::from("beta")).expect("beta dir");
     std::fs::set_permissions(&beta_dir, std::fs::Permissions::from_mode(0o500))

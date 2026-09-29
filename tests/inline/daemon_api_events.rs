@@ -32,7 +32,7 @@ fn feed(active: &str, generated_at: &str) -> String {
 }
 
 fn status_path() -> PathBuf {
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
     crate::profile::mkdir_700(&dir).expect("mkdir");
     dir.join("status.json")
 }
@@ -627,7 +627,7 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
         codex_fallback_chain: Vec::new(),
         codex_wrap_off: false,
         refresh_interval_ms: 120_000,
-        clauth_version: env!("CARGO_PKG_VERSION").to_string(),
+        tollgate_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: None,
         profiles: Vec::new(),
     };
@@ -1116,7 +1116,7 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
             "pane_id": "pane-1", "workspace_id": "ws-1", "tab_id": "tab-1", "agent": "claude",
             "agent_status": "working", "cwd": "/home/user/repos/app", "foreground_cwd": "/home/user/repos/app",
             "terminal_title": "\u{2733} Refactor the parser", "terminal_title_stripped": "Refactor the parser",
-            "tokens": {"clauth": "DS5"}, "scroll": {"viewport_rows": 57}, "revision": 12, "focused": true
+            "tokens": {"tollgate": "DS5"}, "scroll": {"viewport_rows": 57}, "revision": 12, "focused": true
         }]}})
         .to_string()
             + "\n";

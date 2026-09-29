@@ -1,6 +1,6 @@
 //! Pure profile/usage → display-string formatters, plus the cross-surface
 //! diagnostic messages. No UI dependencies, so the TUI, the CLI subcommands
-//! (e.g. `clauth which`), and the headless daemon all share one spelling.
+//! (e.g. `tollgate which`), and the headless daemon all share one spelling.
 //!
 //! Deliberately the ratatui-free tier only. Helpers that emit `Span`/`Style`
 //! live in `tui/render/format.rs`; single-screen or domain-local display glue
@@ -33,7 +33,7 @@ pub(crate) struct Message {
 
 impl Message {
     /// Single-line form for a CLI `bail!` or a `logline!` body (`head: detail`).
-    /// The caller prepends any `clauth `/`clauth daemon: ` log prefix.
+    /// The caller prepends any `tollgate `/`tollgate daemon: ` log prefix.
     pub(crate) fn line(&self) -> String {
         match &self.detail {
             Some(d) => format!("{}: {}", self.head, d),
@@ -73,19 +73,19 @@ pub(crate) enum Retry {
     /// telling someone to check their connection over a 429 is wrong advice.
     Wait,
     /// The cause already names its own next step, so a second one would
-    /// contradict it (`check permissions on ~/.clauth` followed by `check your
+    /// contradict it (`check permissions on ~/.tollgate` followed by `check your
     /// connection and retry` gives two different and incompatible reasons to
     /// retry, one of which is wrong).
     Stated,
     /// There is nothing left to retry in-process: `PendingLogin::run` has no
     /// retry path around its code exchange, so whatever the status, the only
-    /// action available is running `clauth login` again. Stated as the ABSENCE
+    /// action available is running `tollgate login` again. Stated as the ABSENCE
     /// of a retry loop rather than as a fact about the code or the listener,
     /// because this correctly stops being true the moment someone adds one.
     Restart,
 }
 
-/// Every transient cause clauth can state, as a CLOSED set.
+/// Every transient cause tollgate can state, as a CLOSED set.
 ///
 /// Deliberately not one open `String` field. The historically-real accident is
 /// `format!("{status}: {body}")` handed to a free-text cause, and that no longer
@@ -106,7 +106,7 @@ pub(crate) enum Cause {
     /// Already-canned copy from `oauth::TokenFailure`.
     Endpoint(&'static str),
     /// The per-profile rotation lock could not be CREATED or OPENED — a
-    /// filesystem or permissions problem under `~/.clauth`.
+    /// filesystem or permissions problem under `~/.tollgate`.
     ///
     /// Not contention, despite what this arm used to say. `RotationGuard::
     /// acquire` ends in a blocking `File::lock()`, so a sibling worker or a live
@@ -124,7 +124,7 @@ pub(crate) enum Cause {
     /// the file in front of it, so this is a filesystem problem and not an
     /// account one.
     SidecarWriteFailed(String),
-    /// CLA-ROLL: a live `clauth start` session is still holding this profile's
+    /// CLA-ROLL: a live `tollgate start` session is still holding this profile's
     /// ROTATING pair, because it started before the sidecar was armed. The
     /// session converges onto the sidecar in place on its own next swap poll,
     /// so the refusal is a short-retry transient, never a restart: measured, a
@@ -159,17 +159,17 @@ pub(crate) enum Cause {
     /// setup-token mint (no scope beyond the setup pair, no plan stamp), so
     /// stamping a rolling bearer from it is refused — the bearer could later
     /// be preserved as "the mint". Not a filesystem problem and not retryable
-    /// in-process: only a fresh `clauth login` records the chain's real grant.
+    /// in-process: only a fresh `tollgate login` records the chain's real grant.
     RollingGrantUnrecorded(String),
     /// CLA-ROLL: the sidecar holds a rotating pair (mis-filled) with no live
     /// mint backup to heal it, and the caller runs on the thread that must not
     /// fall into the blocking vanilla gate (the scheduler's re-stamp leg —
     /// which also has no re-stamp work to do on a disengaged split). Not
-    /// retryable in-process: only a fresh `clauth login <p> --setup-token`
+    /// retryable in-process: only a fresh `tollgate login <p> --setup-token`
     /// re-captures the mint.
     SidecarMisfilled(String),
     /// The cross-process state flock could not be taken inside its bounded
-    /// wait — another clauth process is busy under `~/.clauth` (on macOS that
+    /// wait — another tollgate process is busy under `~/.tollgate` (on macOS that
     /// flock is even held across `/usr/bin/security` shell-outs, bounded in
     /// aggregate by `lock::SUBPROCESS_BUDGET`). Surfaced by the CLA-ROLL
     /// sidecar repair and the gate's rotation-adoption leg alike. Genuine
@@ -183,7 +183,7 @@ pub(crate) enum Cause {
     StateLockBusy(String),
     /// The cross-process state flock could not be CREATED or OPENED during
     /// the gate's rotation-adoption leg — a filesystem or permissions problem
-    /// under `~/.clauth`, not contention. The gate aborted rather than
+    /// under `~/.tollgate`, not contention. The gate aborted rather than
     /// refresh from a pair a sibling may already have advanced. Distinct from
     /// [`Self::StateLockBusy`] on purpose — that copy says a busy sibling
     /// will finish, which a fault never does. Same contention-vs-fault split
@@ -214,18 +214,20 @@ impl Cause {
             Self::Endpoint(canned) => (*canned).to_string(),
             Self::RotationLockUnavailable(profile) => {
                 format!(
-                    "could not lock '{profile}' for a token refresh; check permissions on ~/.clauth"
+                    "could not lock '{profile}' for a token refresh; check permissions on ~/.tollgate"
                 )
             }
-            Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
+            Self::InternalLock => {
+                "tollgate hit an internal lock error, restart tollgate".to_string()
+            }
             Self::SidecarWriteFailed(profile) => {
                 format!(
-                    "could not write '{profile}' session token · check permissions on ~/.clauth"
+                    "could not write '{profile}' session token · check permissions on ~/.tollgate"
                 )
             }
             Self::LiveSessionOnRotatingChain(profile) => {
                 format!(
-                    "'{profile}' has a live clauth start session still on its rotating login; retry in a moment"
+                    "'{profile}' has a live tollgate start session still on its rotating login; retry in a moment"
                 )
             }
             Self::RotationLockHeld(profile) => {
@@ -235,24 +237,24 @@ impl Cause {
                 format!(
                     "'{profile}' usage chain has no recorded grant beyond the setup-token \
                      scopes, so a rolling bearer cannot be told from a mint · run \
-                     `clauth login {profile}` to record the chain's real grant"
+                     `tollgate login {profile}` to record the chain's real grant"
                 )
             }
             Self::SidecarMisfilled(profile) => {
                 format!(
                     "'{profile}' session token holds a rotating pair and no live mint backup \
-                     exists to heal it · re-capture with `clauth login {profile} --setup-token`"
+                     exists to heal it · re-capture with `tollgate login {profile} --setup-token`"
                 )
             }
             Self::StateLockBusy(profile) => {
                 format!(
-                    "another clauth process holds ~/.clauth's state lock · '{profile}' left \
+                    "another tollgate process holds ~/.tollgate's state lock · '{profile}' left \
                      unchanged"
                 )
             }
             Self::StateLockUnavailable(profile) => {
                 format!(
-                    "could not lock '{profile}' for a token refresh; check permissions on ~/.clauth"
+                    "could not lock '{profile}' for a token refresh; check permissions on ~/.tollgate"
                 )
             }
             Self::PersistFailed(profile) => {
@@ -317,7 +319,7 @@ impl Transient {
             Retry::Connection => ": check your connection and retry",
             Retry::Wait => ": retry in a moment",
             Retry::Stated => "",
-            Retry::Restart => ": run clauth login again for a fresh code",
+            Retry::Restart => ": run tollgate login again for a fresh code",
         }
     }
 
@@ -326,7 +328,7 @@ impl Transient {
         format!("{}{}", self.cause.text(), self.suffix())
     }
 
-    /// The causes only a fresh `clauth login` clears — no in-process retry
+    /// The causes only a fresh `tollgate login` clears — no in-process retry
     /// can: an unrecorded chain grant ([`Cause::RollingGrantUnrecorded`]) and
     /// a mis-filled sidecar with nothing live to heal it
     /// ([`Cause::SidecarMisfilled`]). The scheduler paces these on the same
@@ -336,7 +338,7 @@ impl Transient {
     /// `credentials.json`, and a `--setup-token` re-mint writes a mint, which
     /// disarms rather than re-arms), which is why these holds carry a
     /// credential-file watch in the scheduler: a write to any watched file —
-    /// the fix, or clauth's own successful rotation, either of which is
+    /// the fix, or tollgate's own successful rotation, either of which is
     /// reason to re-judge — releases the leash on the next scan instead of
     /// waiting out the clock.
     pub(crate) fn permanent_until_relogin(&self) -> bool {
@@ -361,24 +363,24 @@ impl Transient {
 /// pre-flight's quarantine arm, and — through
 /// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
 /// the quarantine's own log line, wherever the profile neither serves its own
-/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
+/// inference nor is a recognised keyless one. `tollgate rolling-token`'s dead-chain bail takes that
 /// same `None` case but words its own sentence, since it also has to say the
 /// arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
         detail: Some(format!(
-            "refresh token revoked or invalid: run clauth login {name}"
+            "refresh token revoked or invalid: run tollgate login {name}"
         )),
     }
 }
 
 /// A third-party profile with no inference auth source: an api key is the only
 /// credential that fixes it, so the fix names the `--api-key` command — a bare
-/// `clauth login <name>` on a third-party profile runs the browser flow (OAuth
+/// `tollgate login <name>` on a third-party profile runs the browser flow (OAuth
 /// for most providers, the console flow on Alibaba) and leaves the missing key
 /// missing, while `--api-key` also lifts any quarantine the profile carries
-/// (`clauth login` is the documented quarantine recovery, AUTH-1 in
+/// (`tollgate login` is the documented quarantine recovery, AUTH-1 in
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
 /// line, so the surfaces cannot spell one state two ways. Those last three
@@ -388,7 +390,7 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// routes a console-carrying Alibaba profile to [`third_party_dead_console`]
 /// instead, which says the opposite about the key.
 pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
-    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+    format!("profile has no api key: {name} (run `tollgate login {name} --api-key <key>`)")
 }
 
 /// A third-party profile whose stored OAuth chain is dead while it still has
@@ -423,14 +425,14 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
     format!(
         "stored OAuth chain is dead, its api key still works: {name} \
-         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+         (run `tollgate login {name} --api-key <key>` to clear the quarantine)"
     )
 }
 
 /// An Alibaba profile whose stored OAuth chain is dead while its console
 /// session has expired too: the split state, named so the reader learns both
 /// halves — the api key still serves inference, and one command restores the
-/// console. `cmd_login` diverts a bare `clauth login <name>` on Alibaba to the
+/// console. `cmd_login` diverts a bare `tollgate login <name>` on Alibaba to the
 /// console capture flow, so the command is exactly that.
 ///
 /// Rendered only by `oauth::third_party_dead_chain_copy`'s own-endpoint arm,
@@ -455,7 +457,7 @@ pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> Stri
 pub(crate) fn third_party_dead_console(name: &crate::profile::ProfileName) -> String {
     format!(
         "console session expired, stored OAuth chain is dead: {name} \
-         (run `clauth login {name}` to re-capture the console; the api key still serves inference)"
+         (run `tollgate login {name}` to re-capture the console; the api key still serves inference)"
     )
 }
 
@@ -483,9 +485,9 @@ pub(crate) fn refresh_transient_cli(
     }
 }
 
-/// The one spelling for "go fix this in the app". The surface is the `clauth`
+/// The one spelling for "go fix this in the app". The surface is the `tollgate`
 /// TUI, never a bare "the TUI" (which reads as some other UI).
-pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
+pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the tollgate TUI";
 
 /// The `s` a count needs: singular at one.
 pub(crate) fn plural(n: usize) -> &'static str {
@@ -588,7 +590,7 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
 /// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
 /// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
-/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions
+/// that stay UTC by design — the daemon `logline!` prefix and `tollgate sessions
 /// --json`'s `updated` — do not route through here.
 /// Returns `None` when the instant falls outside chrono's representable range.
 pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
@@ -727,7 +729,7 @@ pub(crate) fn start_pick_line(name: &str, demand: &[String]) -> String {
 /// The stderr line a real `--auto` launch prints before `start::run`.
 pub(crate) fn start_launch_line(name: &str, demand: &[String]) -> String {
     format!(
-        "clauth: starting on '{name}'{}",
+        "tollgate: starting on '{name}'{}",
         start_demand_suffix(demand)
     )
 }

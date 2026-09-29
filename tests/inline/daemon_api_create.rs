@@ -131,8 +131,8 @@ fn seed_control(creation: bool) {
 }
 
 fn ctx_with_probe(probe: PaneProbe) -> Arc<ApiContext> {
-    let status_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let status_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json");
     ApiContext::for_tests(config(), status_path, None, probe)
 }
@@ -189,7 +189,7 @@ fn the_gate_order_is_key_then_grant_and_a_view_device_gets_the_table_refusal() {
     let no_grant = serde_json::json!({
         "ok": false,
         "error": "sessions_grant_required",
-        "reason": "this device lacks the sessions grant; run `clauth devices allow-sessions <name>` on the host to grant it",
+        "reason": "this device lacks the sessions grant; run `tollgate devices allow-sessions <name>` on the host to grant it",
     });
     let relative = body_with("relative/dir", "{}");
     let valid = body_with(&cwd, "{}");
@@ -337,7 +337,7 @@ fn bare_claude_starts_kind_claude_and_reads_back_blocked() {
         [
             "agent",
             "start",
-            "clauth-w1-p2",
+            "tollgate-w1-p2",
             "--kind",
             "claude",
             "--pane",
@@ -374,7 +374,7 @@ fn bare_claude_starts_kind_claude_and_reads_back_blocked() {
             vec![
                 "agent",
                 "start",
-                "clauth-w1-p2",
+                "tollgate-w1-p2",
                 "--kind",
                 "claude",
                 "--pane",
@@ -399,7 +399,7 @@ fn a_kind_reaches_agent_start_with_that_kind() {
         [
             "agent",
             "start",
-            "clauth-w1-p2",
+            "tollgate-w1-p2",
             "--kind",
             "codex",
             "--pane",
@@ -428,7 +428,7 @@ fn a_kind_reaches_agent_start_with_that_kind() {
         vec![
             "agent",
             "start",
-            "clauth-w1-p2",
+            "tollgate-w1-p2",
             "--kind",
             "codex",
             "--pane",
@@ -439,16 +439,16 @@ fn a_kind_reaches_agent_start_with_that_kind() {
     );
 }
 
-/// A clauth profile runs `pane run <pane> clauth start <profile>` and answers
+/// A tollgate profile runs `pane run <pane> tollgate start <profile>` and answers
 /// `agent_status: null`, with no read-back.
 #[test]
-fn a_profile_runs_clauth_start_and_answers_null_status() {
+fn a_profile_runs_tollgate_start_and_answers_null_status() {
     let sb = HomeSandbox::new();
     let cwd = cwd(&sb);
     seed_control(true);
     let (probe, calls) = seam(|args| match args {
         ["tab", "create", ..] => ok(TAB_CREATED),
-        ["pane", "run", "w1:p2", "clauth", "start", "acme"] => ok(""),
+        ["pane", "run", "w1:p2", "tollgate", "start", "acme"] => ok(""),
         _ => Answer::NeverRan,
     });
     let ctx = ctx_with_probe(probe);
@@ -479,7 +479,7 @@ fn a_profile_runs_clauth_start_and_answers_null_status() {
         argv_list(&calls),
         vec![
             vec!["tab", "create", "--cwd", &cwd, "--no-focus"],
-            vec!["pane", "run", "w1:p2", "clauth", "start", "acme"],
+            vec!["pane", "run", "w1:p2", "tollgate", "start", "acme"],
         ]
     );
     assert_eq!(
@@ -588,7 +588,7 @@ fn herdr_refusals_map_and_close_the_tab() {
                 vec![
                     "agent",
                     "start",
-                    "clauth-w1-p2",
+                    "tollgate-w1-p2",
                     "--kind",
                     "bogus",
                     "--pane",
@@ -603,7 +603,7 @@ fn herdr_refusals_map_and_close_the_tab() {
         assert_eq!(
             lines.snapshot(),
             vec![format!(
-                "clauth api: device 'test' agent start refused by herdr: {UNSUPPORTED_KIND}"
+                "tollgate api: device 'test' agent start refused by herdr: {UNSUPPORTED_KIND}"
             )]
         );
     }
@@ -636,7 +636,7 @@ fn herdr_refusals_map_and_close_the_tab() {
                 vec![
                     "agent",
                     "start",
-                    "clauth-w1-p2",
+                    "tollgate-w1-p2",
                     "--kind",
                     "bogus",
                     "--pane",
@@ -651,9 +651,11 @@ fn herdr_refusals_map_and_close_the_tab() {
             lines.snapshot(),
             vec![
                 format!(
-                    "clauth api: device 'test' agent start refused by herdr: {UNSUPPORTED_KIND}"
+                    "tollgate api: device 'test' agent start refused by herdr: {UNSUPPORTED_KIND}"
                 ),
-                format!("clauth api: device 'test' tab close 'w1:t2' failed: {TAB_CLOSE_REFUSED}"),
+                format!(
+                    "tollgate api: device 'test' tab close 'w1:t2' failed: {TAB_CLOSE_REFUSED}"
+                ),
             ]
         );
     }
@@ -684,7 +686,7 @@ fn the_audit_line_names_device_form_cwd_tab_and_pane() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: device 'test' created a session form='claude' cwd='{cwd}' tab='w1:t2' pane='w1:p2'"
+            "tollgate api: device 'test' created a session form='claude' cwd='{cwd}' tab='w1:t2' pane='w1:p2'"
         )]
     );
 }
@@ -773,7 +775,7 @@ fn a_tab_create_that_does_not_answer_is_logged_and_503() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: device 'test' tab create in cwd '{cwd}' did not answer (deadline or \
+            "tollgate api: device 'test' tab create in cwd '{cwd}' did not answer (deadline or \
              spawn failure); a tab may exist unattributed"
         )]
     );
@@ -790,8 +792,8 @@ fn an_unparseable_profiles_toml_answers_500_and_logs() {
     let (probe, calls) = seam(|_| ok(TAB_CREATED));
     let ctx = ctx_with_probe(probe);
 
-    let state_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let state_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("profiles.toml");
     std::fs::write(&state_path, "[serve\nsession_creation = tru").expect("corrupt profiles.toml");
 
@@ -811,7 +813,7 @@ fn an_unparseable_profiles_toml_answers_500_and_logs() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: session creation refused, profiles.toml does not read: {unreadable:#}"
+            "tollgate api: session creation refused, profiles.toml does not read: {unreadable:#}"
         )]
     );
     assert!(calls_of(&calls).is_empty(), "herdr was never asked");
@@ -852,7 +854,7 @@ fn a_hung_agent_start_times_out_closes_and_answers_502() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth api: device 'test' agent start did not answer (deadline or spawn failure)"
+            "tollgate api: device 'test' agent start did not answer (deadline or spawn failure)"
                 .to_string()
         ]
     );
@@ -863,7 +865,7 @@ fn a_hung_agent_start_times_out_closes_and_answers_502() {
             vec![
                 "agent",
                 "start",
-                "clauth-w1-p2",
+                "tollgate-w1-p2",
                 "--kind",
                 "claude",
                 "--pane",
@@ -913,7 +915,7 @@ fn agent_start_server_not_running_closes_and_answers_503() {
             vec![
                 "agent",
                 "start",
-                "clauth-w1-p2",
+                "tollgate-w1-p2",
                 "--kind",
                 "claude",
                 "--pane",
@@ -936,7 +938,7 @@ fn a_refused_pane_run_closes_and_answers_502() {
     seed_control(true);
     let (probe, calls) = seam(|args| match args {
         ["tab", "create", ..] => ok(TAB_CREATED),
-        ["pane", "run", "w1:p2", "clauth", "start", "acme"] => failed(PANE_NOT_FOUND_ENVELOPE),
+        ["pane", "run", "w1:p2", "tollgate", "start", "acme"] => failed(PANE_NOT_FOUND_ENVELOPE),
         ["tab", "close", "w1:t2"] => ok(""),
         _ => Answer::NeverRan,
     });
@@ -967,14 +969,14 @@ fn a_refused_pane_run_closes_and_answers_502() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: device 'test' pane run refused by herdr: {PANE_NOT_FOUND_ENVELOPE}"
+            "tollgate api: device 'test' pane run refused by herdr: {PANE_NOT_FOUND_ENVELOPE}"
         )]
     );
     assert_eq!(
         argv_list(&calls),
         vec![
             vec!["tab", "create", "--cwd", &cwd, "--no-focus"],
-            vec!["pane", "run", "w1:p2", "clauth", "start", "acme"],
+            vec!["pane", "run", "w1:p2", "tollgate", "start", "acme"],
             vec!["tab", "close", "w1:t2"],
         ]
     );
@@ -1013,7 +1015,8 @@ fn a_tab_create_with_a_non_envelope_stdout_is_502() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            "clauth api: device 'test' tab create answered an unparseable envelope: {}".to_string()
+            "tollgate api: device 'test' tab create answered an unparseable envelope: {}"
+                .to_string()
         ]
     );
     assert_eq!(
@@ -1050,7 +1053,7 @@ fn the_cwd_is_sanitized_in_the_audit_line() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "clauth api: device 'test' created a session form='claude' cwd='{}' tab='w1:t2' pane='w1:p2'",
+            "tollgate api: device 'test' created a session form='claude' cwd='{}' tab='w1:t2' pane='w1:p2'",
             cwd.replace('\n', " ")
         )]
     );
@@ -1060,8 +1063,8 @@ fn the_cwd_is_sanitized_in_the_audit_line() {
 fn agent_name_fits_herdrs_rule_past_p9() {
     // herdr 0.9.1 (measured 2026-09-26) names the tenth pane `w1:pA`, and
     // `agent start` refuses any uppercase name with `invalid_agent_name`.
-    assert_eq!(agent_name("w1:p2"), "clauth-w1-p2");
-    assert_eq!(agent_name("w1:pD"), "clauth-w1-p_d");
+    assert_eq!(agent_name("w1:p2"), "tollgate-w1-p2");
+    assert_eq!(agent_name("w1:pD"), "tollgate-w1-p_d");
     assert_ne!(agent_name("w1:pD"), agent_name("w1:pd"));
     let ok = |n: &str| {
         n.len() <= 32

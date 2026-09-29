@@ -1,4 +1,4 @@
-//! `clauth herdr install`: the one command that sets the herdr plugin up.
+//! `tollgate herdr install`: the one command that sets the herdr plugin up.
 //!
 //! herdr owns plugin installation and prints its own preview of every command a
 //! plugin would run before registering it, so this shells out with stdio
@@ -25,24 +25,24 @@ use serde_json::Value;
 use crate::out::{errln, out, outln};
 
 /// The manifest `id`, and the prefix of every qualified action id.
-const PLUGIN_ID: &str = "clauth";
+const PLUGIN_ID: &str = crate::identity::HERDR_PLUGIN_ID;
 /// The action a keybinding points at: opens the dashboard popup.
-const OPEN_ACTION: &str = "clauth.open";
+const OPEN_ACTION: &str = "tollgate.open";
 /// `owner/repo/subdir`, the only source shape `herdr plugin install` accepts.
-const GITHUB_SOURCE: &str = "uwuclxdy/clauth/herdr-plugin";
+const GITHUB_SOURCE: &str = crate::identity::HERDR_GITHUB_SOURCE;
 /// The fetch URL behind `GITHUB_SOURCE`: the release probe's `git ls-remote
 /// --tags` reads the repo's release tags without a checkout.
-const GITHUB_REMOTE: &str = "https://github.com/uwuclxdy/clauth.git";
+const GITHUB_REMOTE: &str = "https://github.com/abobreshov/clauth.git";
 /// Offered when `--key` is absent. `prefix+` is herdr's own leader.
 pub(crate) const DEFAULT_KEY: &str = "prefix+a";
 /// The pane-metadata name `report-profile.sh` publishes the account under.
-const TOKEN: &str = "$clauth";
+const TOKEN: &str = "$tollgate";
 /// The pane-metadata name the MCP server publishes delegate state under. The
 /// sidebar row `install` writes is the only template that renders it, so the
 /// row names it only while the `delegate_row_text` knob is on.
-const DELEGATE_TOKEN: &str = "$clauth_delegate";
-/// Marks this crate's additions inside a file clauth does not own.
-const MARKER: &str = "# clauth herdr plugin";
+const DELEGATE_TOKEN: &str = "$tollgate_delegate";
+/// Marks this crate's additions inside a file tollgate does not own.
+const MARKER: &str = "# tollgate herdr plugin";
 
 pub(crate) fn install(
     key: Option<&str>,
@@ -73,7 +73,7 @@ pub(crate) fn install(
 
     // The install lands at the newest release tag, so an install is
     // reproducible and matches the commit the heal compares against. The
-    // probe failure never fails the install: a manual `clauth herdr install`
+    // probe failure never fails the install: a manual `tollgate herdr install`
     // is the user's own act, and the heal re-pins a stale install later.
     let release = match latest_release_target() {
         Ok(release) => release,
@@ -102,7 +102,7 @@ pub(crate) fn install(
     let key = resolve_key(key, yes)?;
 
     if no_config {
-        outln!("clauth: herdr's config left alone (--no-config)");
+        outln!("tollgate: herdr's config left alone (--no-config)");
         print_manual(&key, delegate_row_text);
         return Ok(());
     }
@@ -112,11 +112,11 @@ pub(crate) fn install(
     let (text, plan, removed, noop) = install_resync(&existing, &key, delegate_row_text)?;
 
     for note in &plan.notes {
-        outln!("clauth: {note}");
+        outln!("tollgate: {note}");
     }
 
     if noop {
-        outln!("clauth: herdr's config already carries everything clauth would add");
+        outln!("tollgate: herdr's config already carries everything tollgate would add");
         return Ok(());
     }
 
@@ -139,22 +139,22 @@ pub(crate) fn install(
     outln!("");
 
     if !confirm("write these to herdr's config?", yes)? {
-        outln!("clauth: herdr's config was left alone");
+        outln!("tollgate: herdr's config was left alone");
         print_manual(&key, delegate_row_text);
         return Ok(());
     }
 
-    if let Err(error) = write_validated(&path, &existing, &text, &bin, "what clauth would add") {
+    if let Err(error) = write_validated(&path, &existing, &text, &bin, "what tollgate would add") {
         // The plugin install already landed before the config write: name the
         // half-done state rather than let the refusal read as a full no-op.
         errln!(
-            "clauth: the plugin install landed; the config was left alone. fix what herdr reports, then rerun `clauth herdr install`"
+            "tollgate: the plugin install landed; the config was left alone. fix what herdr reports, then rerun `tollgate herdr install`"
         );
         return Err(error);
     }
 
-    outln!("clauth: wrote {}", path.display());
-    outln!("clauth: press {key} in herdr to open the dashboard");
+    outln!("tollgate: wrote {}", path.display());
+    outln!("tollgate: press {key} in herdr to open the dashboard");
     Ok(())
 }
 
@@ -163,8 +163,8 @@ pub(crate) fn install(
 /// wordings without driving `install`'s subprocesses.
 fn installing_line(tag: Option<&str>) -> String {
     match tag {
-        Some(tag) => format!("clauth: installing {GITHUB_SOURCE} at {tag} into herdr"),
-        None => format!("clauth: installing {GITHUB_SOURCE} into herdr"),
+        Some(tag) => format!("tollgate: installing {GITHUB_SOURCE} at {tag} into herdr"),
+        None => format!("tollgate: installing {GITHUB_SOURCE} into herdr"),
     }
 }
 
@@ -173,7 +173,7 @@ fn installing_line(tag: Option<&str>) -> String {
 /// test pins the wording.
 fn unpinned_release_note(error: &anyhow::Error) -> String {
     format!(
-        "clauth: could not resolve the latest release ({error:#}); installing {GITHUB_SOURCE} unpinned"
+        "tollgate: could not resolve the latest release ({error:#}); installing {GITHUB_SOURCE} unpinned"
     )
 }
 
@@ -282,13 +282,13 @@ fn refuse_over_local_link(entry: Option<&RegistryEntry>) -> Result<()> {
     }
     let root = entry.plugin_root.clone().unwrap_or_default();
     bail!(
-        "herdr has the clauth plugin linked from a local checkout: {root}\n\
-         `clauth herdr install` installs the published plugin and never replaces a live tree;\n\
-         relink it with `herdr plugin link {root}`, or `clauth herdr uninstall` first to switch to the GitHub install"
+        "herdr has the tollgate plugin linked from a local checkout: {root}\n\
+         `tollgate herdr install` installs the published plugin and never replaces a live tree;\n\
+         relink it with `herdr plugin link {root}`, or `tollgate herdr uninstall` first to switch to the GitHub install"
     );
 }
 
-/// The running herdr when clauth was launched from one of its panes, else
+/// The running herdr when tollgate was launched from one of its panes, else
 /// whatever is on `PATH`. Inside a pane the injected path names the binary that
 /// owns the session being configured, which a bare name can miss.
 pub(crate) fn herdr_bin() -> String {
@@ -356,14 +356,14 @@ pub(crate) fn read_config(path: &Path) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e).with_context(|| {
             format!(
-                "cannot read herdr's config at {} (encoding or permissions); fix it before clauth edits it",
+                "cannot read herdr's config at {} (encoding or permissions); fix it before tollgate edits it",
                 path.display()
             )
         }),
     }
 }
 
-/// One clauth entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Plugin tab reads CC's registry.
+/// One tollgate entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Plugin tab reads CC's registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryEntry {
     pub(crate) enabled: bool,
@@ -388,7 +388,7 @@ pub(crate) struct RegistryEntry {
 pub(crate) struct HerdrProbe {
     /// The version token after `herdr ` in `herdr --version`.
     pub(crate) version: Option<String>,
-    /// `None` when clauth is not in the registry.
+    /// `None` when tollgate is not in the registry.
     pub(crate) entry: Option<RegistryEntry>,
     pub(crate) config_path: Option<PathBuf>,
     /// Registry read failed (not "absent"); `None` when it was only absent.
@@ -591,7 +591,7 @@ pub(crate) struct HerdrPane {
 
 #[derive(Deserialize)]
 pub(crate) struct HerdrTokens {
-    pub(crate) clauth: Option<String>,
+    pub(crate) tollgate: Option<String>,
 }
 
 /// `pane list`'s `agent_session` (herdr 0.9.0: `{"agent":"claude","kind":"id",
@@ -695,13 +695,13 @@ pub(crate) fn plugin_list_json(entry: &str) -> String {
 
 // Real `herdr plugin list --json` entries, captured against 0.8.0 on 2026-08-13. They live here rather than in one test file because every consumer that reads a field off a `RegistryEntry` has to pin its reading against herdr's own spelling: a hand-built fixture agrees with whatever the reader guessed, which is how `source_kind` was first read as `link` when herdr emits `local`.
 #[cfg(test)]
-pub(crate) const LINKED: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
+pub(crate) const LINKED: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/tollgate/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"tollgate","platforms":["linux","macos"],"plugin_id":"tollgate","plugin_root":"/home/uwuclxdy/repos/rs/tollgate/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
 #[cfg(test)]
-pub(crate) const GITHUB: &str = r#"{"enabled":true,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123","managed_path":"/home/u/.config/herdr/plugins/clauth","installed_unix_ms":1784231727746},"version":"0.1.0"}"#;
+pub(crate) const GITHUB: &str = r#"{"enabled":true,"min_herdr_version":"0.8.0","name":"tollgate","platforms":["linux","macos"],"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"abc123","managed_path":"/home/u/.config/herdr/plugins/tollgate","installed_unix_ms":1784231727746},"version":"0.1.0"}"#;
 #[cfg(test)]
-pub(crate) const DISABLED: &str = r#"{"enabled":false,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
+pub(crate) const DISABLED: &str = r#"{"enabled":false,"min_herdr_version":"0.8.0","name":"tollgate","platforms":["linux","macos"],"plugin_id":"tollgate","plugin_root":"/home/uwuclxdy/repos/rs/tollgate/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
 #[cfg(test)]
-pub(crate) const STALE: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/gone/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0","warnings":["manifest unavailable: No such file or directory (os error 2)"]}"#;
+pub(crate) const STALE: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/tollgate/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"tollgate","platforms":["linux","macos"],"plugin_id":"tollgate","plugin_root":"/gone/tollgate/herdr-plugin","source":{"kind":"local"},"version":"0.1.0","warnings":["manifest unavailable: No such file or directory (os error 2)"]}"#;
 
 fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
     let entry = root
@@ -765,7 +765,7 @@ static HEAL_THROTTLE: crate::plugin_host::HealThrottle = crate::plugin_host::Hea
 /// checkout's `resolved_commit` against the newest release tag's commit — an
 /// install lands at that tag, so a matching commit means current — never the
 /// manifest version number, which is display metadata and would make the
-/// installed entry lie. Callers: the daemon tick and `clauth mcp` startup,
+/// installed entry lie. Callers: the daemon tick and `tollgate mcp` startup,
 /// mirroring the claude plugin's detached heal. Success and failure both log
 /// through `logline!`, never stdout.
 ///
@@ -778,9 +778,10 @@ pub(crate) fn heal_detached(saved_auto_update: bool) {
         return;
     }
     // This heal is a network update (herdr's install fetches from GitHub), so
-    // the same shared gate that governs clauth's own binary update gates it —
-    // the saved toggle AND `CLAUTH_NO_UPDATE` — before the throttle claim so
-    // a disabled box never even claims an attempt.
+    // the same shared gate that governs tollgate's own binary update gates it,
+    // before the throttle claim so a disabled box never even claims an
+    // attempt. Self-update is compiled out of this build (plan §4.0), so the
+    // gate is always shut and this heal is a no-op.
     if !crate::update::updates_enabled(saved_auto_update) {
         return;
     }
@@ -807,7 +808,7 @@ pub(crate) fn heal_detached(saved_auto_update: bool) {
         match plugin_heal_line() {
             Ok(Some(line)) => crate::logline::logline!("{line}"),
             Ok(None) => {}
-            Err(e) => crate::logline::logline!("clauth: herdr plugin heal failed: {e:#}"),
+            Err(e) => crate::logline::logline!("tollgate: herdr plugin heal failed: {e:#}"),
         }
         // Last action, after every env-touching step: the claim's drop clears
         // one atomic and nothing else, so it is safe past the send.
@@ -857,8 +858,8 @@ pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<
     }
     // Never hijack a fork: the user vetted whatever source they installed
     // from, and the heal only ever reinstalls the canonical repo.
-    if entry.source_owner.as_deref() != Some("uwuclxdy")
-        || entry.source_repo.as_deref() != Some("clauth")
+    if entry.source_owner.as_deref() != Some(crate::identity::repo_owner())
+        || entry.source_repo.as_deref() != Some(crate::identity::repo_name())
     {
         return Ok(None);
     }
@@ -1046,7 +1047,7 @@ fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Outp
 
 /// Stamp the floor at now, so [`heal_detached`] refuses every attempt for the
 /// next window. For a test that drives a caller of the heal (the daemon tick,
-/// `clauth mcp` startup) and is about something else.
+/// `tollgate mcp` startup) and is about something else.
 #[cfg(test)]
 pub(crate) fn arm_heal_throttle_for_test() {
     HEAL_THROTTLE.arm_for_test();
@@ -1063,7 +1064,7 @@ fn resolve_key(key: Option<&str>, yes: bool) -> Result<String> {
         Some(k) => k.trim().to_string(),
         None if yes || !is_tty() => DEFAULT_KEY.to_string(),
         None => {
-            out!("clauth: key that opens the dashboard [{DEFAULT_KEY}] ");
+            out!("tollgate: key that opens the dashboard [{DEFAULT_KEY}] ");
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
             match line.trim() {
@@ -1093,16 +1094,16 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Default-no: every caller changes something clauth does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines.
+/// Default-no: every caller changes something tollgate does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines.
 fn confirm(question: &str, yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }
     if !is_tty() {
-        errln!("clauth: not a terminal; rerun with --yes");
+        errln!("tollgate: not a terminal; rerun with --yes");
         return Ok(false);
     }
-    out!("clauth: {question} [y/N] ");
+    out!("tollgate: {question} [y/N] ");
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let answer = line.trim();
@@ -1110,7 +1111,7 @@ fn confirm(question: &str, yes: bool) -> Result<bool> {
 }
 
 fn print_manual(key: &str, delegate_row_text: bool) {
-    outln!("clauth: add these to herdr's config.toml yourself:");
+    outln!("tollgate: add these to herdr's config.toml yourself:");
     outln!("");
     outln!("{}", binding_block(key));
     outln!("{}", sidebar_block(delegate_row_text));
@@ -1118,7 +1119,7 @@ fn print_manual(key: &str, delegate_row_text: bool) {
 
 fn binding_block(key: &str) -> String {
     format!(
-        "{MARKER}\n[[keys.command]]\nkey = \"{key}\"\ntype = \"plugin_action\"\ncommand = \"{OPEN_ACTION}\"\ndescription = \"clauth accounts\"\n"
+        "{MARKER}\n[[keys.command]]\nkey = \"{key}\"\ntype = \"plugin_action\"\ncommand = \"{OPEN_ACTION}\"\ndescription = \"tollgate accounts\"\n"
     )
 }
 
@@ -1130,7 +1131,7 @@ fn sidebar_block(delegate_row_text: bool) -> String {
 }
 
 /// The claude row template, the knob's only effect: with `delegate_row_text`
-/// on, the agent group also names `$clauth_delegate`, so a running delegate
+/// on, the agent group also names `$tollgate_delegate`, so a running delegate
 /// reads as text beside the row. Off is today's row, byte for byte.
 fn sidebar_row(delegate_row_text: bool) -> String {
     let agent = if delegate_row_text {
@@ -1165,7 +1166,7 @@ impl ConfigPlan {
             return;
         }
         self.notes.push(format!(
-            "your config spells the table {what} belongs in a way clauth cannot extend by appending, so add it yourself:\n{}",
+            "your config spells the table {what} belongs in a way tollgate cannot extend by appending, so add it yourself:\n{}",
             block.trim_start_matches('\n')
         ));
     }
@@ -1199,7 +1200,7 @@ pub(crate) enum SidebarState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigStatus {
     pub(crate) parsed: bool,
-    /// The key spelling bound to `clauth.open`, when one is.
+    /// The key spelling bound to `tollgate.open`, when one is.
     pub(crate) bound_key: Option<String>,
     pub(crate) sidebar: SidebarState,
 }
@@ -1220,7 +1221,7 @@ pub(crate) fn config_status(existing: &str) -> ConfigStatus {
     }
 }
 
-/// The key spelling of the entry bound to `clauth.open`, if any.
+/// The key spelling of the entry bound to `tollgate.open`, if any.
 fn bound_key(doc: &toml::Value) -> Option<String> {
     doc.get("keys")
         .and_then(|k| k.get("command"))
@@ -1257,14 +1258,14 @@ fn sidebar_state(doc: &toml::Value) -> SidebarState {
 ///
 /// Both verdicts route through the same helpers `config_status` uses, so the row and the install plan cannot drift.
 ///
-/// The resync callers (`install`, `heal`) strip clauth's marked blocks before
+/// The resync callers (`install`, `heal`) strip tollgate's marked blocks before
 /// planning, so a knob toggle plans against the base the strip left and
 /// re-appends the row the knob now asks for. A block the strip kept as
 /// user-owned comes through here intact, and the verdicts below report it
 /// as hand-owned instead of re-adding it.
 fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<ConfigPlan> {
     let doc: toml::Value = toml::from_str(existing)
-        .context("herdr's config.toml does not parse; fix it before wiring clauth into it")?;
+        .context("herdr's config.toml does not parse; fix it before wiring tollgate into it")?;
 
     let mut plan = ConfigPlan {
         append: String::new(),
@@ -1309,7 +1310,7 @@ fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<Con
 
 /// Appends whatever `plan_config` says is missing, after stripping the blocks
 /// a previous run wrote: the strip is what makes a knob toggle rewrite
-/// exactly clauth's own blocks, and an unchanged knob reconstructs the same
+/// exactly tollgate's own blocks, and an unchanged knob reconstructs the same
 /// text, so the write (and the `herdr config check` behind it) is skipped.
 /// Returns the plan's notes (the pieces it refused to touch), empty when it
 /// wrote everything.
@@ -1320,22 +1321,28 @@ pub(crate) fn heal(
     delegate_row_text: bool,
 ) -> Result<Vec<String>> {
     let existing = read_config(config_path)?;
-    // An existing `clauth.open` binding is the user's key choice: heal
-    // refreshes what clauth wrote, it must not re-key the binding. The
+    // An existing `tollgate.open` binding is the user's key choice: heal
+    // refreshes what tollgate wrote, it must not re-key the binding. The
     // caller's key applies only when nothing binds the action yet.
     let plan_key = config_status(&existing)
         .bound_key
         .unwrap_or_else(|| key.to_string());
     let (text, plan, _) = resync_text(&existing, &plan_key, delegate_row_text)?;
     if text != existing {
-        write_validated(config_path, &existing, &text, bin, "what clauth would add")?;
+        write_validated(
+            config_path,
+            &existing,
+            &text,
+            bin,
+            "what tollgate would add",
+        )?;
     }
     Ok(plan.notes)
 }
 
 /// The resync seam `install` and `heal` write through: strip the blocks
-/// clauth wrote, plan on what is left, append the plan. A knob toggle then
-/// rewrites exactly the blocks clauth wrote — the strip takes the old blocks
+/// tollgate wrote, plan on what is left, append the plan. A knob toggle then
+/// rewrites exactly the blocks tollgate wrote — the strip takes the old blocks
 /// off, the plan re-adds the row the knob now asks for, nothing user-owned
 /// moves — while an unchanged knob reconstructs the text byte for byte,
 /// which is what keeps the callers' writes a no-op. A block the user edited
@@ -1413,7 +1420,7 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>, bool) {
     let mut stripped_block = false;
     let mut kept_after_stripped = false;
     // The block being skipped: marker + header + table lines, buffered rather
-    // than committed line by line, because a line clauth did not write turns
+    // than committed line by line, because a line tollgate did not write turns
     // the whole block user-owned and it must be restored, header included.
     // Committing early strands the tail lines under a table whose header was
     // already removed.
@@ -1431,7 +1438,7 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>, bool) {
                 skipping = false;
                 // A block one of the generators would write is stripped; an
                 // edited block is the user's now and is restored whole.
-                if is_clauth_block(&block) {
+                if is_tollgate_block(&block) {
                     removed.extend(stripped(&mut block));
                     stripped_block = true;
                 } else {
@@ -1442,7 +1449,7 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>, bool) {
             } else if is_block_line(header.as_deref().unwrap_or(""), lead) {
                 block.push(raw.to_string());
             } else {
-                // A line clauth did not write: the block is user-owned, so
+                // A line tollgate did not write: the block is user-owned, so
                 // the strip keeps everything it would have removed. The plan
                 // then sees the binding as hand-owned and re-adds nothing.
                 skipping = false;
@@ -1473,7 +1480,7 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>, bool) {
                 block.push(h.to_string());
                 skipping = true;
             } else {
-                // A standalone marker: clauth's marker, nothing below it.
+                // A standalone marker: tollgate's marker, nothing below it.
                 removed.extend(stripped(&mut block));
             }
             continue;
@@ -1481,9 +1488,9 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>, bool) {
 
         out.push(raw.to_string());
     }
-    // A block running to the file's end is clauth's unless a user edited it.
+    // A block running to the file's end is tollgate's unless a user edited it.
     if skipping {
-        if is_clauth_block(&block) {
+        if is_tollgate_block(&block) {
             removed.extend(stripped(&mut block));
         } else {
             kept_after_stripped |= stripped_block;
@@ -1503,14 +1510,14 @@ fn stripped(block: &mut Vec<String>) -> impl Iterator<Item = String> + '_ {
         .map(|l| l.strip_suffix('\n').unwrap_or(&l).to_string())
 }
 
-/// Whether a buffered block is one clauth itself would write: the sidebar
+/// Whether a buffered block is one tollgate itself would write: the sidebar
 /// block under either knob variant (a toggle still strips the old row), or
 /// the binding block with the key read back off its own `key =` line, so a
-/// binding is clauth's whatever key `install` was run under. The block may
+/// binding is tollgate's whatever key `install` was run under. The block may
 /// open with the blank the marker branch pops into the buffer (`install`
 /// prepends it before its blocks), and a block ending the file may carry no
 /// trailing newline; the candidates carry neither.
-fn is_clauth_block(block: &[String]) -> bool {
+fn is_tollgate_block(block: &[String]) -> bool {
     let text = block.concat();
     let text = text.strip_prefix('\n').unwrap_or(&text);
     let text = text.strip_suffix('\n').unwrap_or(text);
@@ -1530,7 +1537,7 @@ fn is_clauth_block(block: &[String]) -> bool {
 }
 
 /// The key a binding block binds, read back off its own `key = "..."` line.
-/// The binding comparison runs modulo this key, so a block is clauth's
+/// The binding comparison runs modulo this key, so a block is tollgate's
 /// whatever key `install` was run under, while any other edit keeps it.
 fn key_from_block(block: &[String]) -> Option<String> {
     block.iter().find_map(|raw| {
@@ -1554,7 +1561,7 @@ pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
         (text != previous).then_some((path, previous, text, removed))
     };
 
-    outln!("clauth: this removes the clauth plugin from herdr");
+    outln!("tollgate: this removes the tollgate plugin from herdr");
     if let Some((path, _, _, removed)) = &config_edit {
         let mut diff = removed.clone();
         // The first removed line is the blank `install` prepends before its first block; `install`'s diff trims it, so this one does too.
@@ -1572,10 +1579,10 @@ pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
     let question = if config_edit.is_some() {
         "remove the plugin and these config lines?"
     } else {
-        "remove the clauth plugin from herdr?"
+        "remove the tollgate plugin from herdr?"
     };
     if !confirm(question, yes)? {
-        outln!("clauth: cancelled; nothing was removed");
+        outln!("tollgate: cancelled; nothing was removed");
         return Ok(());
     }
 
@@ -1591,16 +1598,19 @@ pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
             &previous,
             &text,
             &bin,
-            "the config without clauth's blocks",
+            "the config without tollgate's blocks",
         )?;
-        outln!("clauth: removed clauth's additions from {}", path.display());
+        outln!(
+            "tollgate: removed tollgate's additions from {}",
+            path.display()
+        );
         config_cleaned = true;
     }
 
     match uninstall_plugin(&bin) {
-        Ok(PluginUninstall::Done) => outln!("clauth: uninstalled the herdr plugin"),
+        Ok(PluginUninstall::Done) => outln!("tollgate: uninstalled the herdr plugin"),
         Ok(PluginUninstall::NotInstalled) => {
-            outln!("clauth: herdr had no clauth plugin to uninstall (plugin not installed)")
+            outln!("tollgate: herdr had no tollgate plugin to uninstall (plugin not installed)")
         }
         Err(error) => {
             // The note rides the error's context chain, so a non-tty caller
@@ -1629,7 +1639,7 @@ fn unlink_failure_note(bin: &str) -> String {
     format!("the config was already cleaned; finish with `{bin} plugin uninstall {PLUGIN_ID}`")
 }
 
-/// `herdr plugin uninstall clauth`. herdr exits 1 with a `plugin not installed` line when there is nothing to remove; the caller treats that as a no-op. The phrase must start a line, so a real failure that merely mentions it still fails.
+/// `herdr plugin uninstall tollgate`. herdr exits 1 with a `plugin not installed` line when there is nothing to remove; the caller treats that as a no-op. The phrase must start a line, so a real failure that merely mentions it still fails.
 fn uninstall_plugin(bin: &str) -> Result<PluginUninstall> {
     let out = Command::new(bin)
         .args(["plugin", "uninstall", PLUGIN_ID])
@@ -1677,14 +1687,14 @@ fn mentions_token(value: &toml::Value) -> bool {
 /// A config already carrying a complaint of its own still gets wired. `herdr
 /// config check` diagnoses the whole file, so refusing on its exit code alone
 /// locks anyone with one stale key out of this command over something that
-/// predates it. Only a diagnostic this edit ADDS is clauth's to refuse over.
+/// predates it. Only a diagnostic this edit ADDS is tollgate's to refuse over.
 /// `edit` names the change for the refusal message; both callers refuse with
 /// nothing written.
 fn write_validated(path: &Path, previous: &str, text: &str, bin: &str, edit: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let probe = tempfile::Builder::new()
-        .prefix(".clauth-herdr")
+        .prefix(".tollgate-herdr")
         .tempfile_in(dir)?;
 
     let before = check_config(bin, probe.path(), previous)?;
@@ -1697,7 +1707,7 @@ fn write_validated(path: &Path, previous: &str, text: &str, bin: &str, edit: &st
         );
     }
     for stale in &before {
-        errln!("clauth: herdr already says this about your config: {stale}");
+        errln!("tollgate: herdr already says this about your config: {stale}");
     }
 
     // Shortcut, with its ceiling: a truncating in-place write is what keeps the
@@ -1746,9 +1756,9 @@ fn check_config(bin: &str, probe: &Path, text: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-// ── Knob read path (`clauth herdr config get`) ─────────────────────────────
+// ── Knob read path (`tollgate herdr config get`) ─────────────────────────────
 
-/// `clauth herdr config get <key>` — the plugin scripts' read path for the
+/// `tollgate herdr config get <key>` — the plugin scripts' read path for the
 /// knobs persisted under `[herdr]` in profiles.toml. One value per line in a
 /// shell shape: `fit|half|split-right|split-top` for `popup_width`, `on|off`
 /// for the bools, the

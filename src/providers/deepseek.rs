@@ -37,7 +37,7 @@ pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
 ///
 /// `is_available` is DeepSeek's own verdict that the balance is sufficient for
 /// api calls (its wording, in the reference linked above), never a statement
-/// about whether clauth could read one. The response carries `balance_infos`
+/// about whether tollgate could read one. The response carries `balance_infos`
 /// either way, so an unfunded account ships its figures beside the refusal
 /// rather than in place of them.
 fn stats(raw: &DeepSeekResponse) -> ThirdPartyStats {

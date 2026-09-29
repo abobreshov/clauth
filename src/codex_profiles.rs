@@ -1,4 +1,4 @@
-//! `~/.clauth/codex-profiles.toml` — the codex half of the profile roster.
+//! `~/.tollgate/codex-profiles.toml` — the codex half of the profile roster.
 //!
 //! Codex profiles live in their own state file; claude profiles stay in
 //! `profiles.toml` ([`crate::profile::AppState`]), which this module never
@@ -18,11 +18,11 @@
 //! key, and it is why the CLI grammar (pinned here for the whole series)
 //! needs no `--codex` on name-taking verbs:
 //!
-//! - `clauth <name>` / `clauth delete <name>` — the bare name resolves against
+//! - `tollgate <name>` / `tollgate delete <name>` — the bare name resolves against
 //!   the claude roster first, then this one; membership decides the harness,
 //!   nothing else has to. Claude-first also arbitrates the state uniqueness
 //!   cannot promise: two hand-edited state files both claiming a name.
-//! - `clauth login <name> --codex` — the create/re-auth verb (an adoption of
+//! - `tollgate login <name> --codex` — the create/re-auth verb (an adoption of
 //!   the operator's own codex login); the flag picks which file the profile
 //!   lives in and appears only there.
 //! - rename follows the bare-name rule when its surface (the TUI) gains
@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::lock::StateLock;
 use crate::profile::{
     DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileName,
-    atomic_write_600, clauth_dir, mkdir_700, read_toml_file,
+    atomic_write_600, mkdir_700, read_toml_file, tollgate_dir,
 };
 
 /// The codex roster and its per-harness slots: the same four fields
@@ -203,14 +203,14 @@ impl CodexState {
     /// holds the cross-process state lock, and the only caller is
     /// [`CodexState::update`], which acquired it around the load.
     fn save(&self, _witness: &StateLock) -> Result<()> {
-        mkdir_700(&clauth_dir()?)?;
+        mkdir_700(&tollgate_dir()?)?;
         atomic_write_600(&codex_state_path()?, toml::to_string_pretty(self)?)
             .context("failed to write codex-profiles.toml")
     }
 }
 
 fn codex_state_path() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("codex-profiles.toml"))
+    Ok(tollgate_dir()?.join("codex-profiles.toml"))
 }
 
 /// Mtime of `codex-profiles.toml`, `None` when absent — the reload

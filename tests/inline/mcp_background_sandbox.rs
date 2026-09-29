@@ -21,7 +21,7 @@ use std::time::Duration;
 /// pinned on.
 #[test]
 fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
-    let profile = format!("clauth-f1-leak-probe-{}", std::process::id());
+    let profile = format!("tollgate-f1-leak-probe-{}", std::process::id());
     let home = HomeSandbox::new();
 
     // Resolved while `HOME_TEST_LOCK` is still held, when no other test's env
@@ -85,7 +85,7 @@ fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
     // `real_home` was captured at the top while the lock was held, so it is
     // the OS-resolved home by construction.
     let real_job_path = real_home
-        .join(".clauth")
+        .join(".tollgate")
         .join("jobs")
         .join(format!("{job_id}.json"));
 

@@ -1,7 +1,7 @@
 //! Stdout that survives the reader leaving.
 //!
 //! Rust ignores `SIGPIPE`, so a write into a pipe whose reader is gone comes
-//! back `EPIPE` and `println!` panics on it — `clauth sessions | head -3`
+//! back `EPIPE` and `println!` panics on it — `tollgate sessions | head -3`
 //! printed a Rust panic and exited 101 where a CLI should just stop. Restoring
 //! the default disposition once at startup is the usual fix and the wrong one
 //! for this binary: `std` sets no `MSG_NOSIGNAL` on Linux socket writes, so it
@@ -19,7 +19,7 @@
 //! payload, so a gone reader ends the run at exit 0. Stderr carries diagnostics
 //! and the fatal-error line, so a gone reader drops the line and the run
 //! continues to its own exit code — exiting there would let a closed stderr
-//! take down a whole `clauth start` session over a background `logline!`.
+//! take down a whole `tollgate start` session over a background `logline!`.
 //!
 //! [`errln!`] is for the FOREGROUND CLI, and keeps the stdout half's strictness
 //! about every other write error: a run that cannot write its own error message

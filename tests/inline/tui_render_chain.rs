@@ -880,7 +880,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
 }
 
 // A switch-grade kick-rejected member — headroom, but the messages limiter won't
-// let clauth start it — shows the `claude code blocked` pill driven by `kick_lift`.
+// let tollgate start it — shows the `claude code blocked` pill driven by `kick_lift`.
 #[test]
 fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
@@ -1250,7 +1250,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
             "status          [ disabled ]".to_string(),
             "├ excluded from the walk, enable it on the setup tab".to_string(),
             "│               [ auth broken ]".to_string(),
-            "└ re-login with clauth login a".to_string(),
+            "└ re-login with tollgate login a".to_string(),
         ],
         "both facts stack on one rail, each naming its own fix"
     );
@@ -1273,7 +1273,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
         vec![
             "status          [ auth broken ]".to_string(),
-            "└ re-login with clauth login a".to_string(),
+            "└ re-login with tollgate login a".to_string(),
         ],
         "a single pill stays a lone `└` — nothing to connect"
     );

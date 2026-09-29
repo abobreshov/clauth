@@ -479,7 +479,7 @@ fn non_diverged_switch_refuses_a_disabled_target() {
     .expect_err("a disabled target must be refused");
     assert_eq!(
         err.to_string(),
-        "'target': account is disabled, run `clauth enable target`"
+        "'target': account is disabled, run `tollgate enable target`"
     );
     assert!(
         config
@@ -545,7 +545,7 @@ fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
     .expect_err("a disabled target must be refused");
     assert_eq!(
         err.to_string(),
-        "'target': account is disabled, run `clauth enable target`"
+        "'target': account is disabled, run `tollgate enable target`"
     );
     assert!(
         !called.load(std::sync::atomic::Ordering::SeqCst),
@@ -626,7 +626,7 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
     )
     .expect_err("a revoked target must refuse the switch");
     assert!(
-        err.to_string().contains("clauth login target"),
+        err.to_string().contains("tollgate login target"),
         "the refusal names the recovery, got: {err}"
     );
 

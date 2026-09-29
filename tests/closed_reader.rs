@@ -8,7 +8,7 @@
 //! Unix only, and not for lack of a Windows story: the child resolves its home
 //! through `dirs`, which on Windows reads `FOLDERID_Profile` from the shell API
 //! and no environment variable at all, so the run could not be pointed away
-//! from the operator's real `~/.clauth`. `HOME_OVERRIDE` is `#[cfg(test)]`
+//! from the operator's real `~/.tollgate`. `HOME_OVERRIDE` is `#[cfg(test)]`
 //! state inside the crate, which a spawned binary is not. The contract these
 //! tests pin is platform-independent; only the sandbox is not.
 #![cfg(unix)]
@@ -23,18 +23,18 @@ use tempfile::TempDir;
 /// under a child that has not finished starting.
 fn failing_command(stderr: Stdio) -> (TempDir, Child) {
     let home = tempfile::tempdir().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_clauth"))
+    let child = Command::new(env!("CARGO_BIN_EXE_tollgate"))
         .args(["info", "no-such-session-id"])
         .env("HOME", home.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
         .spawn()
-        .expect("spawn clauth");
+        .expect("spawn tollgate");
     (home, child)
 }
 
-/// The regression: `clauth <failing command> 2>&1 | head` reported 101 and
+/// The regression: `tollgate <failing command> 2>&1 | head` reported 101 and
 /// printed nothing, because `eprintln!` panicked on the `EPIPE` and took
 /// `exit_code`'s mapping with it — while the panic message went to that same
 /// closed pipe. A reader that left cannot change the code the run exits with.

@@ -67,7 +67,7 @@ pub(crate) struct ChainWrapOffOk {
         (status = 200, description = "the new order landed; canonical member names in that order", body = ChainOrderOk),
         (status = 400, description = "the body held no parseable member list (`bad_request`), or the list is not a permutation of the chain (`chain_order_invalid`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 409, description = "a chain edit or a switch is already in flight (`edit_in_progress`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`), or the edit failed (`edit_failed`)", body = ErrorBody)
@@ -114,7 +114,7 @@ pub(crate) fn order(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Res
     }) {
         Ok(saved) => {
             logline!(
-                "clauth api: device '{}' reordered the chain to [{}]",
+                "tollgate api: device '{}' reordered the chain to [{}]",
                 caller.device_for_log(),
                 saved
                     .iter()
@@ -143,7 +143,7 @@ pub(crate) fn order(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Res
         (status = 200, description = "the threshold landed; the canonical profile name and the stored value", body = ChainThresholdOk),
         (status = 400, description = "the body held no parseable fields, or the threshold is not finite or outside 0..=100 (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "a chain edit or a switch is already in flight (`edit_in_progress`), or the profile is not a chain member (`not_a_member`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
@@ -179,7 +179,7 @@ pub(crate) fn threshold(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) ->
     }) {
         Ok(()) => {
             logline!(
-                "clauth api: device '{}' set '{}' threshold to {}",
+                "tollgate api: device '{}' set '{}' threshold to {}",
                 caller.device_for_log(),
                 canonical,
                 parsed.threshold
@@ -206,7 +206,7 @@ pub(crate) fn threshold(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) ->
         (status = 200, description = "the wrap-off flag landed", body = ChainWrapOffOk),
         (status = 400, description = "the body held no parseable wrap_off (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 409, description = "a chain edit or a switch is already in flight (`edit_in_progress`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`), or the edit failed (`edit_failed`)", body = ErrorBody)
@@ -228,7 +228,7 @@ pub(crate) fn wrap_off(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> 
     }) {
         Ok(()) => {
             logline!(
-                "clauth api: device '{}' set wrap_off to {}",
+                "tollgate api: device '{}' set wrap_off to {}",
                 caller.device_for_log(),
                 parsed.wrap_off
             );
@@ -269,7 +269,7 @@ fn run_chain_edit<T>(
             // The open anyhow chain goes to daemon.log, the surface the operator
             // owns; the body keeps only what the closed set reflects.
             logline!(
-                "clauth api: device '{}' {label} refused: {}",
+                "tollgate api: device '{}' {label} refused: {}",
                 caller.device_for_log(),
                 sanitize_for_log(&format!("{e:#}"))
             );

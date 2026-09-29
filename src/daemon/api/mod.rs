@@ -1,11 +1,11 @@
-//! `clauth daemon --listen` — the TLS REST API.
+//! `tollgate daemon --listen` — the TLS REST API.
 //!
 //! Opt-in, off unless an address is passed. It exists for one deployment: the
 //! daemon on the machine that holds the accounts, a client (the tray) on
 //! another machine on the same network. Everything else about the daemon stays
 //! file-based.
 //!
-//! Cross-platform, like the rest of clauth: macOS, Linux, and Windows. Only
+//! Cross-platform, like the rest of tollgate: macOS, Linux, and Windows. Only
 //! [`tls`] knows which platform it is on — where lego's certificates live and
 //! how this host's FQDN is discovered. Nothing else below branches.
 //!
@@ -153,7 +153,7 @@ fn claim_slot() -> Option<ConnectionSlot> {
     // may start.
     if !SATURATION_LOGGED.swap(true, Ordering::AcqRel) {
         logline!(
-            "clauth api: at {MAX_CONNECTIONS} concurrent connections; refusing more \
+            "tollgate api: at {MAX_CONNECTIONS} concurrent connections; refusing more \
              until one finishes"
         );
     }
@@ -194,7 +194,7 @@ impl Prepared {
 /// running daemon, so a certificate that had just been renewed badly used to
 /// take the incumbent down and then abort — leaving the host with no daemon at
 /// all, and with it no refresh and no auto-switch, not merely no listener.
-/// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
+/// `wiki/Daemon.md` recommends `tollgate daemon --replace --listen` as the
 /// post-`lego renew` hook, which makes the documented automation the trigger.
 /// Settled first, a bad renewal is a no-op: the incumbent keeps running.
 /// The `--standby` park the result can be carried through is unbounded, so
@@ -214,7 +214,7 @@ pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Pre
 ///
 /// The bind and the import deliberately happen here, below the singleton claim
 /// and below a standby's promotion. The import is the one write a listener's
-/// start makes to `~/.clauth`, and a start that will not serve (redundant,
+/// start makes to `~/.tollgate`, and a start that will not serve (redundant,
 /// TLS-dead, or without its port) has no business making it. Binding above
 /// the claim died `--replace --listen` on the port its dying incumbent still
 /// held, exited a plain second instance non-zero on a boot race its contract
@@ -244,11 +244,11 @@ pub(crate) fn serve_prepared(
     );
 
     let spawned = std::thread::Builder::new()
-        .name("clauth-api-accept".into())
+        .name("tollgate-api-accept".into())
         .spawn(move || accept_loop(&listener, &tls_config, &ctx));
     spawned.context("failed to spawn the REST API accept thread")?;
 
-    logline!("clauth daemon: REST API listening on https://{listen}");
+    logline!("tollgate daemon: REST API listening on https://{listen}");
     Ok(())
 }
 
@@ -261,7 +261,7 @@ fn accept_loop(
         let (stream, peer) = match listener.accept() {
             Ok(accepted) => accepted,
             Err(e) => {
-                logline!("clauth api: accept failed: {e}");
+                logline!("tollgate api: accept failed: {e}");
                 std::thread::sleep(ACCEPT_BACKOFF);
                 continue;
             }
@@ -277,7 +277,7 @@ fn accept_loop(
         let tls_config = Arc::clone(tls_config);
         let ctx = Arc::clone(ctx);
         let spawned = std::thread::Builder::new()
-            .name("clauth-api-conn".into())
+            .name("tollgate-api-conn".into())
             .spawn(move || {
                 // Moved in, so the slot is released when this thread ends
                 // however it ends.
@@ -287,7 +287,7 @@ fn accept_loop(
         if let Err(e) = spawned {
             // The slot moved into the closure that was never created, so it
             // dropped with it; nothing to release here.
-            logline!("clauth api: failed to spawn a connection thread: {e}");
+            logline!("tollgate api: failed to spawn a connection thread: {e}");
         }
     }
 }
@@ -327,7 +327,7 @@ fn serve_connection(
     let conn = match rustls::ServerConnection::new(Arc::clone(tls_config)) {
         Ok(conn) => conn,
         Err(e) => {
-            logline!("clauth api: TLS setup failed for {peer}: {e}");
+            logline!("tollgate api: TLS setup failed for {peer}: {e}");
             return;
         }
     };
@@ -354,7 +354,9 @@ fn serve_connection(
             Ok(Some(req)) => req,
             Err(http::RequestError::Io(e)) => {
                 if served == 0 {
-                    logline!("clauth api: {peer}: connection failed before a request arrived: {e}");
+                    logline!(
+                        "tollgate api: {peer}: connection failed before a request arrived: {e}"
+                    );
                 }
                 break;
             }
@@ -363,7 +365,7 @@ fn serve_connection(
                 // message would start, so answer and close rather than try to
                 // resynchronize on a stream an attacker may be framing.
                 let response = e.response();
-                logline!("clauth api: {peer} - <unparsed> -> {}", response.status);
+                logline!("tollgate api: {peer} - <unparsed> -> {}", response.status);
                 let _ = http::write_response(
                     reader.stream_mut(),
                     response,
@@ -387,9 +389,9 @@ fn serve_connection(
                 .device
                 .as_deref()
                 .map_or_else(|| "-".to_string(), http::sanitize_for_log);
-            logline!("clauth api: {peer} {device} {summary} -> 101");
+            logline!("tollgate api: {peer} {device} {summary} -> 101");
             if let Err(e) = http::write_upgrade_head(reader.stream_mut(), &hijack.accept) {
-                logline!("clauth api: {peer}: failed to write the upgrade head: {e}");
+                logline!("tollgate api: {peer}: failed to write the upgrade head: {e}");
                 break;
             }
             let (stream, leftover) = reader.into_parts();
@@ -442,14 +444,14 @@ fn serve_connection(
             .as_deref()
             .map_or_else(|| "-".to_string(), http::sanitize_for_log);
         logline!(
-            "clauth api: {peer} {device} {summary} -> {}",
+            "tollgate api: {peer} {device} {summary} -> {}",
             response.status
         );
         if let Err(e) = http::write_response(reader.stream_mut(), response, &disposition, expires) {
             if is_client_stream_close(is_stream, &e) {
-                logline!("clauth api: {peer}: stream closed by the client");
+                logline!("tollgate api: {peer}: stream closed by the client");
             } else {
-                logline!("clauth api: {peer}: failed to write the response: {e}");
+                logline!("tollgate api: {peer}: failed to write the response: {e}");
             }
             break;
         }

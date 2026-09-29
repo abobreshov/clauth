@@ -1,7 +1,7 @@
 //! `GET /api/v1/events` — the server-sent-events stream.
 //!
 //! One connection, one stream: the client learns every published-feed change
-//! (the bytes of `~/.clauth/status.json`, keyed on its entity tag), every
+//! (the bytes of `~/.tollgate/status.json`, keyed on its entity tag), every
 //! herdr agent-status change, and — on every (re)connect — every pane's current
 //! agent status from the handshake's `pane.list`, without polling. The stream
 //! runs until the connection's deadline and then closes cleanly, so an
@@ -92,7 +92,7 @@ fn keepalive_due(last_frame: Instant, now: Instant, interval: Duration) -> bool 
     responses(
         (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects", content_type = "text/event-stream", body = String),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -447,7 +447,7 @@ fn list_panes(path: &Path) -> std::io::Result<PaneSnapshot> {
     stream.set_read_timeout(Some(WAIT_POLL))?;
     stream.set_write_timeout(Some(WAIT_POLL))?;
     stream
-        .write_all(b"{\"id\":\"clauth-events:list\",\"method\":\"pane.list\",\"params\":{}}\n")?;
+        .write_all(b"{\"id\":\"tollgate-events:list\",\"method\":\"pane.list\",\"params\":{}}\n")?;
     let line = read_one_line(&mut stream, &mut Vec::new())?;
     let value: serde_json::Value = serde_json::from_slice(&line)
         .map_err(|_| std::io::Error::other("bad pane.list response"))?;
@@ -503,7 +503,7 @@ fn subscribe(path: &Path, pane_ids: &[String]) -> std::io::Result<HerdrConn> {
     subscriptions.push(serde_json::json!({"type": "pane.created"}));
     subscriptions.push(serde_json::json!({"type": "pane.closed"}));
     let request = serde_json::json!({
-        "id": "clauth-events",
+        "id": "tollgate-events",
         "method": "events.subscribe",
         "params": {"subscriptions": subscriptions},
     });

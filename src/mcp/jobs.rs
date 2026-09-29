@@ -2,7 +2,7 @@
 //!
 //! A background delegate returns a `job_id` at once and finishes on a detached
 //! blocking task. The result must outlive the originating tool call AND be
-//! collectable later, so it lands on disk at `~/.clauth/jobs/<job_id>.json`
+//! collectable later, so it lands on disk at `~/.tollgate/jobs/<job_id>.json`
 //! rather than an in-memory registry. Writes are atomic (tmp + rename) so a
 //! concurrent reader never sees
 //! a torn file. No lock is taken: the path is keyed by a unique `job_id` and the
@@ -19,7 +19,7 @@
 //! model never learns the id from the call it was minted for. So the record is
 //! written to keep the spent window's result rather than to answer that caller,
 //! and the id is recovered afterwards by ENUMERATION rather than by delivery:
-//! `monitor` with no `job_ids` lists it, `clauth jobs` prints it, and the TUI's
+//! `monitor` with no `job_ids` lists it, `tollgate jobs` prints it, and the TUI's
 //! delegates pane draws it. All three go through [`list_banded`], and so through
 //! [`list`] beneath it.
 //!
@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
 use crate::logline::logline;
-use crate::profile::clauth_dir;
+use crate::profile::tollgate_dir;
 
 /// Retain a `done` file this long AFTER IT FINISHES before GC reaps it: a day,
 /// so a result survives a reboot and the overnight gap between sessions — the
@@ -205,7 +205,7 @@ pub(crate) struct JobRecord {
     /// carries the exact value a `delegate({session_id})` accepts. `None` before
     /// the first event names one, on a record an older server wrote (the
     /// `default`), and on a `done` record whose envelope carried none (every
-    /// completion arm stamps it — the id clauth pinned at the spawn).
+    /// completion arm stamps it — the id tollgate pinned at the spawn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
     /// Dead fields on new records: a delegate has no wall clock or idle ceiling
@@ -262,7 +262,7 @@ pub(crate) struct JobRecord {
     /// older server wrote, so the default keeps those parseable.
     #[serde(default)]
     pub(crate) crashed: bool,
-    /// Which `clauth mcp` server process minted this record — its liveness
+    /// Which `tollgate mcp` server process minted this record — its liveness
     /// marker pid, held by that server for its whole life, so a later server
     /// reads "owner alive" by probing one flock instead of waiting out the
     /// silence window. `0` on a record an older server wrote (which held no
@@ -319,7 +319,7 @@ pub(crate) struct RunningSpec {
 }
 
 pub(crate) fn jobs_dir() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("jobs"))
+    Ok(tollgate_dir()?.join("jobs"))
 }
 
 /// Lowercase base-36 digits for [`base36`], ordered by value so `n % 36`
@@ -395,7 +395,7 @@ const LIVE_SUFFIX: &str = ".live.json";
 /// Persist a record atomically (tmp + rename, so a reader sees either the old
 /// file or the fully-written new one, never a torn write). Owner-only: a job
 /// file carries the delegate's prompt and the account's full response, and lands
-/// under `~/.clauth`, so it rides the 0o600 dir-0o700 invariant.
+/// under `~/.tollgate`, so it rides the 0o600 dir-0o700 invariant.
 fn write_atomic(record: &JobRecord, kind: RecordKind) -> Result<()> {
     let bytes = serde_json::to_vec(record)?;
     crate::profile::atomic_write_600(&job_path(&record.job_id, kind)?, &bytes)?;
@@ -497,7 +497,7 @@ pub(crate) fn promote(spec: &RunningSpec) -> Result<()> {
 /// running-only fields default away: a finished job has no deadline left to
 /// count down to and no tail worth keeping beside its whole result. The run's
 /// session id rides the record off the envelope's own `session_id` key — every
-/// completion arm stamps it (the id clauth pinned at the spawn), so a collected
+/// completion arm stamps it (the id tollgate pinned at the spawn), so a collected
 /// completion is resumable, and the listing names the handle beside the job id.
 pub(crate) fn write_done(
     job_id: &str,
@@ -574,7 +574,7 @@ pub(crate) enum Claim {
 
 /// Which delivery path claimed a record. Recorded in the delivery ledger so a
 /// later `monitor` naming the id can say what happened to it — by whom, when —
-/// instead of hedging that clauth may never have minted it.
+/// instead of hedging that tollgate may never have minted it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Claimant {
     /// A `monitor` collect delivered the result in its own reply.
@@ -683,7 +683,7 @@ fn write_delivery_ledger(record: &JobRecord, claimant: Claimant) {
         return;
     };
     if let Err(e) = crate::profile::atomic_write_600(&path, &bytes) {
-        logline!("clauth: delivery ledger {} failed: {e}", path.display());
+        logline!("tollgate: delivery ledger {} failed: {e}", path.display());
     }
 }
 
@@ -751,7 +751,7 @@ pub(crate) fn claim(job_id: &str, claimant: Claimant) -> Claim {
 
 /// Whether a blocking run's liveness record stands under this id.
 ///
-/// The one fact that separates "clauth never minted this" from "clauth minted it
+/// The one fact that separates "tollgate never minted this" from "tollgate minted it
 /// and its result is going back through the blocking call that owns it" — two
 /// answers a caller acts on differently, and only this file tells them apart.
 /// Guarded by [`is_safe_job_id`] here rather than at the caller, because it is
@@ -775,7 +775,7 @@ pub(crate) fn remove_liveness(job_id: &str) {
 
 // ── server owner liveness ────────────────────────────────────────────────────
 
-/// Where a live `clauth mcp` server's liveness marker stands: one flock-held
+/// Where a live `tollgate mcp` server's liveness marker stands: one flock-held
 /// `<pid>` file per server process, the same discipline as the bare-session
 /// markers in `runtime::live_bare`. The flock is released by the kernel on ANY
 /// death — crash, kill, SIGKILL — so a record's owner liveness is readable by a
@@ -784,9 +784,9 @@ pub(crate) fn remove_liveness(job_id: &str) {
 ///
 /// Deliberately a namespace of its own rather than `live_bare`'s: that dir
 /// counts BARE `claude` sessions into the fleet tally, and a server running
-/// under a `clauth start` session is not one of them.
+/// under a `tollgate start` session is not one of them.
 fn mcp_live_dir() -> Result<PathBuf> {
-    Ok(clauth_dir()?.join("mcp_live"))
+    Ok(tollgate_dir()?.join("mcp_live"))
 }
 
 /// Whether THIS process holds a server marker: the fail-safe that keeps a
@@ -1050,7 +1050,7 @@ pub(crate) enum JobLiveness {
 /// means two different things depending on which spelling holds it and only the
 /// pair answers "is anything already waiting on this".
 ///
-/// One derivation for every surface that names a record's situation — `clauth
+/// One derivation for every surface that names a record's situation — `tollgate
 /// jobs`, `monitor`'s listing and the TUI's delegates pane — so none of them can
 /// give one record a different name, a different band, or a different word.
 /// `src/tui/render/plugin.rs` keeps only what a TERMINAL adds on top: the glyph
@@ -1143,7 +1143,7 @@ impl StoredJob {
 
     /// Which of the four situations this record is in.
     ///
-    /// The one classification in the crate: `clauth jobs`, `monitor`'s listing
+    /// The one classification in the crate: `tollgate jobs`, `monitor`'s listing
     /// and the TUI's delegates pane all read a record's situation from here, so
     /// none of them can answer differently about one file.
     ///
@@ -1183,7 +1183,7 @@ impl StoredJob {
 /// order, which is arbitrary and not stable across two calls on an unchanged
 /// store — a fan-out whose members land inside one millisecond enumerated
 /// differently every time, so a model diffing two replies saw changes that had
-/// not happened and an operator watching `clauth jobs` saw rows swap under a
+/// not happened and an operator watching `tollgate jobs` saw rows swap under a
 /// still store.
 ///
 /// **`job_id` is not an arbitrary string here**, which is why it is the

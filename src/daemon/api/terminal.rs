@@ -176,7 +176,7 @@ pub(crate) fn request(ctx: &ApiContext, req: &Request, device: &Device, pane_id:
         HerdrPaneRect::Rect(rect) => rect,
     };
     crate::logline::logline!(
-        "clauth api: device '{}' opened {} on pane '{}'",
+        "tollgate api: device '{}' opened {} on pane '{}'",
         super::http::sanitize_for_log(&device.name),
         mode.as_str(),
         super::http::sanitize_for_log(pane_id)
@@ -336,7 +336,7 @@ pub(crate) fn run(
         Ok(child) => child,
         Err(e) => {
             crate::logline::logline!(
-                "clauth api: device '{}' {} stream on pane '{}' failed to spawn herdr: {e}",
+                "tollgate api: device '{}' {} stream on pane '{}' failed to spawn herdr: {e}",
                 hijack.device,
                 hijack.mode.as_str(),
                 pane_for_log
@@ -374,7 +374,7 @@ pub(crate) fn run(
     let (input_done_tx, input_done_rx) = std::sync::mpsc::channel::<()>();
     let mut input_child_stdin = std::mem::replace(&mut child.stdin, Box::new(std::io::sink()));
     let input_writer = std::thread::Builder::new()
-        .name("clauth-api-terminal-input".into())
+        .name("tollgate-api-terminal-input".into())
         .spawn(move || {
             while let Ok(line) = input_rx.recv() {
                 if input_child_stdin.write_all(&line).is_err() {
@@ -390,7 +390,7 @@ pub(crate) fn run(
         // Without the input writer the audit would keep saying input was sent
         // while nothing moved, so the stream ends rather than lie.
         crate::logline::logline!(
-            "clauth api: failed to spawn the terminal input writer thread: {e}"
+            "tollgate api: failed to spawn the terminal input writer thread: {e}"
         );
         child.terminate();
         child.reap();
@@ -406,7 +406,7 @@ pub(crate) fn run(
     let relay_done = relay_done_tx;
     let mut relay_child_stdout = std::mem::replace(&mut child.stdout, Box::new(std::io::empty()));
     let relay = std::thread::Builder::new()
-        .name("clauth-api-terminal-relay".into())
+        .name("tollgate-api-terminal-relay".into())
         .spawn(move || {
             let mut reader = std::io::BufReader::new(&mut relay_child_stdout);
             let mut line = String::new();
@@ -417,7 +417,7 @@ pub(crate) fn run(
                     Ok(_) => {
                         if line.len() > MAX_HERDR_LINE {
                             crate::logline::logline!(
-                                "clauth api: herdr stream on pane '{}' exceeded the line ceiling",
+                                "tollgate api: herdr stream on pane '{}' exceeded the line ceiling",
                                 relay_pane
                             );
                             break;
@@ -440,7 +440,9 @@ pub(crate) fn run(
         Err(e) => {
             // Without the relay nothing drains herdr's stdout; end the stream
             // rather than let a full pipe wedge the child.
-            crate::logline::logline!("clauth api: failed to spawn the terminal relay thread: {e}");
+            crate::logline::logline!(
+                "tollgate api: failed to spawn the terminal relay thread: {e}"
+            );
             child.terminate();
             child.reap();
             let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1011, "internal"));
@@ -519,7 +521,7 @@ pub(crate) fn run(
                 }
                 ClientFrame::Bad(why) => {
                     crate::logline::logline!(
-                        "clauth api: device '{}' sent a malformed frame on pane '{}': {why}",
+                        "tollgate api: device '{}' sent a malformed frame on pane '{}': {why}",
                         hijack.device,
                         pane_for_log
                     );
@@ -594,13 +596,13 @@ pub(crate) fn run(
         // locks and no slot.
         drop(relay);
         crate::logline::logline!(
-            "clauth api: terminal relay on pane '{}' outlived its teardown",
+            "tollgate api: terminal relay on pane '{}' outlived its teardown",
             pane_for_log
         );
     }
     child.reap();
     crate::logline::logline!(
-        "clauth api: device '{}' {} stream on pane '{}' closed{}",
+        "tollgate api: device '{}' {} stream on pane '{}' closed{}",
         hijack.device,
         hijack.mode.as_str(),
         pane_for_log,
@@ -646,7 +648,7 @@ fn client_command(
     match kind {
         Some("terminal.input") => {
             crate::logline::logline!(
-                "clauth api: device '{}' sent terminal.input to pane '{}'",
+                "tollgate api: device '{}' sent terminal.input to pane '{}'",
                 hijack.device,
                 hijack.pane_for_log
             );
@@ -659,7 +661,7 @@ fn client_command(
             // read as "the user asked", never as a default the server imposed.
             let phone_shaped = cols.is_some_and(|c| c < 80) || rows.is_some_and(|r| r < 24);
             crate::logline::logline!(
-                "clauth api: device '{}' resized pane '{}' to {}x{}{}",
+                "tollgate api: device '{}' resized pane '{}' to {}x{}{}",
                 hijack.device,
                 hijack.pane_for_log,
                 cols.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),

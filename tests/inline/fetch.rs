@@ -315,7 +315,7 @@ fn identity_anchor_refuses_blank_or_absent_uuid() {
 
 // ── login /profile probe (one request, both values) ──────────────────────────
 //
-// `clauth login` used to hit /profile TWICE ~5s apart with the same fresh token:
+// `tollgate login` used to hit /profile TWICE ~5s apart with the same fresh token:
 // once for the tier, once for the uuid, each discarding what the other wanted.
 
 /// A `/profile` body carrying any combination of the two values the login reads.
@@ -460,7 +460,7 @@ fn a_login_anchor_overwrites_the_previous_account() {
         &crate::profile::ProfileName::from("acme"),
         Some(&crate::profile::AccountId::from("uuid-first".to_string())),
     );
-    // The reauth-onto-a-DIFFERENT-account case: `clauth login` is the
+    // The reauth-onto-a-DIFFERENT-account case: `tollgate login` is the
     // authoritative (re)seeder, so unlike the ride-along backfill it must
     // replace the anchor rather than keep proving the old identity.
     seed_login_anchor(
@@ -658,7 +658,7 @@ fn from_subscription_type_defaults_to_unknown_not_pro() {
 
 /// Round-trip: `login_profile_from_raw` writes `"free"` into the stored token for
 /// a `Free` account, so `from_subscription_type` has to read it back. Without the
-/// arm every Free login classified `Unknown` and rendered as no-tier — clauth
+/// arm every Free login classified `Unknown` and rendered as no-tier — tollgate
 /// failing to read its own write, on the one tier that has no `has_claude_*` flag
 /// to recover it.
 #[test]
@@ -1136,7 +1136,7 @@ fn window_duration_survives_a_hostile_provider_label() {
 #[test]
 fn take_profile_fetch_honors_ttl_force_and_expiry() {
     // Sandboxed: the decision now stamps a per-profile file, which must never
-    // land in the real `~/.clauth`.
+    // land in the real `~/.tollgate`.
     let _home = crate::testutil::HomeSandbox::new();
     let t0 = 1_000_000_000_000u64;
 

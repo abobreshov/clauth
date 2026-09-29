@@ -3,7 +3,7 @@
 # and codex panes. Re-publishes the pane's account on a timer, so the sidebar
 # tag follows an account swap that fires no herdr event: a `--with-fallback`
 # session moving onto the next chain member, or a bare `claude` following a
-# `clauth switch`. Each tick it re-reads herdr's own per-pane agent record and
+# `tollgate switch`. Each tick it re-reads herdr's own per-pane agent record and
 # re-reports as THAT agent, so the tag follows the harness too — a codex
 # watcher never clears the tag a later claude pane publishes, and vice versa.
 # When the pane runs neither claude nor codex, it clears the tag and exits, so
@@ -16,8 +16,8 @@ pane="${1:?usage: watch-profile.sh <pane-id> <pidfile>}"
 pidfile="${2:?usage: watch-profile.sh <pane-id> <pidfile>}"
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 # The tag_watch_secs knob wins over the env, which wins over the 5s default;
-# a predating clauth answers nothing, so the env/default chain still holds.
-interval=$(clauth herdr config get tag_watch_secs 2>/dev/null || printf '%s' "${CLAUTH_PROFILE_WATCH_INTERVAL:-5}")
+# a predating tollgate answers nothing, so the env/default chain still holds.
+interval=$(tollgate herdr config get tag_watch_secs 2>/dev/null || printf '%s' "${TOLLGATE_PROFILE_WATCH_INTERVAL:-5}")
 # A non-numeric interval would make `sleep` fail instantly, zero would hot-spin
 # the loop, and a hand-edited knob of absurd magnitude overflows `sleep`'s
 # parser; clamp non-numeric to the default, and the range to [1 s, 1 h].
@@ -67,7 +67,7 @@ while :; do
     case "$live" in
         claude | codex) ;;
         *)
-            "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --clear-token clauth --clear-display-agent >/dev/null 2>&1
+            "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" --clear-token tollgate --clear-display-agent >/dev/null 2>&1
             exit 0
             ;;
     esac
@@ -76,7 +76,7 @@ while :; do
     # agent just read: a codex watcher on a pane that now runs claude re-reports
     # as claude (and the reverse), never its spawn-time harness.
     HERDR_PANE_ID="$pane" HERDR_PLUGIN_EVENT_JSON='' HERDR_PLUGIN_CONTEXT_JSON='' \
-        CLAUTH_PANE_AGENT="$live" \
+        TOLLGATE_PANE_AGENT="$live" \
         "$dir/report-profile.sh" >/dev/null 2>&1 || true
     sleep "$interval"
 done

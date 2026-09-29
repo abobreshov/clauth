@@ -63,7 +63,7 @@ fn empty_config() -> crate::profile::ConfigHandle {
 fn ctx() -> std::sync::Arc<ApiContext> {
     crate::daemon::api::devices::seed_for_tests(DEVICE, Tier::Control, TOKEN)
         .expect("pair the fixture device");
-    let status_path = crate::profile::clauth_dir().unwrap().join("status.json");
+    let status_path = crate::profile::tollgate_dir().unwrap().join("status.json");
     ApiContext::for_tests(
         empty_config(),
         status_path,
@@ -94,7 +94,7 @@ fn openssl(args: &[&str]) -> bool {
 /// indefinitely, with nothing to notice. CI sets this on the platforms whose
 /// images carry `openssl`; a developer box without it still runs the rest of the
 /// suite, and now says on stderr which tests it did not run.
-const REQUIRE_TLS_FIXTURE_ENV: &str = "CLAUTH_REQUIRE_TLS_FIXTURE";
+const REQUIRE_TLS_FIXTURE_ENV: &str = "TOLLGATE_REQUIRE_TLS_FIXTURE";
 
 /// Announce — or refuse — a run with no `openssl` to build certificates with.
 fn no_tls_fixture() {
@@ -106,7 +106,7 @@ fn no_tls_fixture() {
          accept an untested TLS listener on this machine"
     );
     crate::logline::logline!(
-        "clauth tests: `openssl` is not on PATH — SKIPPING every test that needs a \
+        "tollgate tests: `openssl` is not on PATH — SKIPPING every test that needs a \
          certificate, which is all TLS coverage there is. Set {REQUIRE_TLS_FIXTURE_ENV}=1 \
          to make this a failure instead"
     );
@@ -206,7 +206,7 @@ pub(crate) fn generate_chain(
         "-days",
         "3650",
         "-subj",
-        "/CN=clauth-test-ca",
+        "/CN=tollgate-test-ca",
         "-addext",
         "basicConstraints=critical,CA:TRUE",
     ];
@@ -266,7 +266,7 @@ pub(crate) fn generate_chain(
 }
 
 /// A present-but-failing `openssl` must fail the run, not skip it. The missing
-/// case is covered by `no_tls_fixture` + `CLAUTH_REQUIRE_TLS_FIXTURE`; the
+/// case is covered by `no_tls_fixture` + `TOLLGATE_REQUIRE_TLS_FIXTURE`; the
 /// FAILING case is the one CI's required legs were silently passing on — a
 /// generation failure reports green over zero listener coverage.
 ///
@@ -400,7 +400,7 @@ fn a_real_tls_request_is_served_end_to_end() {
     let home = HomeSandbox::new();
     let ctx = ctx();
     let feed = r#"{"schema":1,"active_profile":"alpha","profiles":[]}"#;
-    crate::profile::mkdir_700(&crate::profile::clauth_dir().unwrap()).expect("mkdir");
+    crate::profile::mkdir_700(&crate::profile::tollgate_dir().unwrap()).expect("mkdir");
     std::fs::write(&ctx.status_path, feed).expect("seed feed");
 
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
@@ -524,7 +524,7 @@ fn the_log_line_for_a_long_unauthenticated_path_is_bounded() {
         );
     });
 
-    // "clauth api: " (12) + a peer address (≤21) + " - " (3, no device) + the
+    // "tollgate api: " (12) + a peer address (≤21) + " - " (3, no device) + the
     // summary (≤131: `http::LOG_TEXT_LIMIT` plus its "..." marker) + " -> 401"
     // (7).
     let bound = 12 + 21 + 3 + 131 + 7;
@@ -563,7 +563,7 @@ fn fixture() -> Option<Fixture> {
     let home = HomeSandbox::new();
     let ctx = ctx();
     let feed = r#"{"schema":1,"active_profile":"alpha","profiles":[]}"#.to_string();
-    crate::profile::mkdir_700(&crate::profile::clauth_dir().unwrap()).expect("mkdir");
+    crate::profile::mkdir_700(&crate::profile::tollgate_dir().unwrap()).expect("mkdir");
     std::fs::write(&ctx.status_path, &feed).expect("seed feed");
 
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
@@ -592,7 +592,7 @@ fn fixture() -> Option<Fixture> {
 /// Handles exactly one connection and stops when either side closes.
 ///
 /// Runs on a detached thread holding only owned data. That is safe here where
-/// it usually would not be: it never resolves a path or touches `~/.clauth`, so
+/// it usually would not be: it never resolves a path or touches `~/.tollgate`, so
 /// it cannot outlive the test's `HomeSandbox` and reach the operator's real
 /// tree. It ends when either side closes, or on its own read deadline.
 fn fragmenting_proxy(
@@ -1243,7 +1243,7 @@ fn the_connection_cap_admits_up_to_the_limit_and_releases_on_drop() {
 /// certificate that fails to load after that point takes the incumbent down and
 /// then aborts, leaving the host with no daemon at all — no refresh, no
 /// auto-switch, not merely no listener. `wiki/Daemon.md` recommends
-/// `clauth daemon --replace --listen` as the post-`lego renew` hook, so the
+/// `tollgate daemon --replace --listen` as the post-`lego renew` hook, so the
 /// documented automation is the trigger.
 ///
 /// What this pins is that a bad certificate is discovered in `prepare`, which
@@ -1258,7 +1258,9 @@ fn the_connection_cap_admits_up_to_the_limit_and_releases_on_drop() {
 fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
     let _home = HomeSandbox::new();
     let empty = tempfile::tempdir().expect("tempdir");
-    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    let tls_json = crate::profile::tollgate_dir()
+        .expect("dir")
+        .join("tls.json");
     #[allow(clippy::expect_used)]
     std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
     std::fs::write(
@@ -1293,7 +1295,9 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
 fn a_tailnet_bind_without_a_certificate_refuses_with_the_tailscale_route() {
     let _home = HomeSandbox::new();
     let empty = tempfile::tempdir().expect("tempdir");
-    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    let tls_json = crate::profile::tollgate_dir()
+        .expect("dir")
+        .join("tls.json");
     std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
     std::fs::write(
         &tls_json,
@@ -1401,7 +1405,9 @@ fn a_tailnet_bind_refuses_on_reload_when_the_lego_certificate_is_gone() {
     let _home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
     let empty = tempfile::tempdir().expect("empty lego dir");
-    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    let tls_json = crate::profile::tollgate_dir()
+        .expect("dir")
+        .join("tls.json");
     std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
     std::fs::write(
         &tls_json,
@@ -1473,10 +1479,10 @@ fn a_second_listener_instance_yields_to_the_daemon_holding_the_port() {
     };
     let incumbent_port = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = incumbent_port.local_addr().expect("addr");
-    let dir = crate::profile::clauth_dir().expect("dir");
+    let dir = crate::profile::tollgate_dir().expect("dir");
     // `serve` would create this; the claim has to run before it, so the test
     // stands the dir up itself.
-    std::fs::create_dir_all(&dir).expect("mkdir ~/.clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.tollgate");
     let _incumbent = match crate::daemon::probe::claim_singleton(&dir, false).expect("claim") {
         crate::daemon::probe::Claim::Active(lock) => lock,
         _ => panic!("an uncontended sandbox must yield an active claim"),
@@ -1506,7 +1512,9 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
     // An empty cert dir: a present `tls.json` pointing there, so `prepare`
     // itself fails to load the certificate rather than skipping the listener.
     let empty = tempfile::tempdir().expect("tempdir");
-    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    let tls_json = crate::profile::tollgate_dir()
+        .expect("dir")
+        .join("tls.json");
     std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
     std::fs::write(
         &tls_json,
@@ -1517,7 +1525,7 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
     // would fail here for a different reason.
     let incumbent_port = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = incumbent_port.local_addr().expect("addr");
-    let dir = crate::profile::clauth_dir().expect("dir");
+    let dir = crate::profile::tollgate_dir().expect("dir");
     let incumbent = match crate::daemon::probe::claim_singleton(&dir, false).expect("claim") {
         crate::daemon::probe::Claim::Active(lock) => lock,
         _ => panic!("an uncontended sandbox must yield an active claim"),
@@ -1538,7 +1546,7 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
     // THE assertion: the incumbent is still the holder. Under the order-flip
     // regression this reads Redundant only via the incumbent FLOCK staying
     // held: the incumbent here is this test's own process, which does not run
-    // as `clauth daemon` by argv, so `claim_by_replacing` would bail at the
+    // as `tollgate daemon` by argv, so `claim_by_replacing` would bail at the
     // pid identity guard (an `Err`, never a signal) and the flock is never
     // released either way. The pin's true red is the error-text assert above:
     // under the regression the bind fails above the claim, `serve` returns
@@ -1554,25 +1562,25 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
 }
 
 // The legacy import sits below the singleton claim and below the bind. It is
-// the one write a listener's start makes to `~/.clauth`, so a `--listen` start
+// the one write a listener's start makes to `~/.tollgate`, so a `--listen` start
 // that dies on TLS preparation, yields as redundant, or loses its port must
 // leave `auth_token.json` and the device list exactly as it found them. The
 // byte comparisons assert through `assert!` on purpose: a red must not print
 // token bytes.
 
-/// A token a clauth from before pairing left behind, importable as it stands.
+/// A token a tollgate from before pairing left behind, importable as it stands.
 const LEGACY_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-/// `~/.clauth/auth_token.json` inside the sandbox.
+/// `~/.tollgate/auth_token.json` inside the sandbox.
 fn legacy_file() -> std::path::PathBuf {
-    crate::profile::clauth_dir()
+    crate::profile::tollgate_dir()
         .expect("dir")
         .join("auth_token.json")
 }
 
-/// `~/.clauth/devices.json` inside the sandbox.
+/// `~/.tollgate/devices.json` inside the sandbox.
 fn device_list() -> std::path::PathBuf {
-    crate::profile::clauth_dir()
+    crate::profile::tollgate_dir()
         .expect("dir")
         .join("devices.json")
 }
@@ -1629,8 +1637,8 @@ fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
 /// in this process, released when the test ends. `serve` would create the dir
 /// itself; the claim has to run first, so this stands it up.
 fn incumbent_claim() -> crate::daemon::probe::DaemonLock {
-    let dir = crate::profile::clauth_dir().expect("dir");
-    std::fs::create_dir_all(&dir).expect("mkdir ~/.clauth");
+    let dir = crate::profile::tollgate_dir().expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.tollgate");
     match crate::daemon::probe::claim_singleton(&dir, false).expect("claim") {
         crate::daemon::probe::Claim::Active(lock) => lock,
         other => panic!("an uncontended sandbox must yield an active claim: {other:?}"),
@@ -1776,7 +1784,7 @@ fn a_start_that_loses_its_port_imports_nothing() {
     let err = super::serve_prepared(
         prepared,
         empty_config(),
-        crate::profile::clauth_dir()
+        crate::profile::tollgate_dir()
             .expect("dir")
             .join("status.json"),
         crate::daemon::LiveStores::default(),
@@ -1823,7 +1831,7 @@ fn a_start_that_serves_imports_the_legacy_token() {
     super::serve_prepared(
         prepared,
         empty_config(),
-        crate::profile::clauth_dir()
+        crate::profile::tollgate_dir()
             .expect("dir")
             .join("status.json"),
         crate::daemon::LiveStores::default(),
@@ -2149,7 +2157,7 @@ fn a_promoted_standby_serves_the_certificate_that_landed_during_its_park() {
 
     // serve's standby arm: take the slot, park, promote on the holder's exit.
     let incumbent = incumbent_claim();
-    let dir = crate::profile::clauth_dir().expect("dir");
+    let dir = crate::profile::tollgate_dir().expect("dir");
     let crate::daemon::probe::Claim::Standby(slot) =
         crate::daemon::probe::claim_singleton(&dir, true).expect("claim")
     else {
@@ -2382,12 +2390,12 @@ fn the_request_line_names_the_device() {
     let logged = lines.snapshot();
     assert_eq!(logged.len(), 2, "{logged:#?}");
     assert!(
-        logged[0].starts_with("clauth api: 127.0.0.1:")
+        logged[0].starts_with("tollgate api: 127.0.0.1:")
             && logged[0].ends_with(&format!(" {DEVICE} GET /api/v1/health -> 200")),
         "{logged:#?}"
     );
     assert!(
-        logged[1].starts_with("clauth api: 127.0.0.1:")
+        logged[1].starts_with("tollgate api: 127.0.0.1:")
             && logged[1].ends_with(" - GET /api/v1/status -> 401"),
         "{logged:#?}"
     );
@@ -2475,7 +2483,7 @@ fn a_pairing_over_tls_hands_back_a_working_token_and_logs_no_secret() {
     }
     assert_eq!(logged.len(), 3, "{logged:#?}");
     assert!(
-        logged[0].starts_with("clauth api: 127.0.0.1:")
+        logged[0].starts_with("tollgate api: 127.0.0.1:")
             && logged[0].ends_with(" paired device 'phone' (view)"),
         "{logged:#?}"
     );

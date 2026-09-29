@@ -1,7 +1,7 @@
-//! `clauth list` — a human-readable account table.
+//! `tollgate list` — a human-readable account table.
 //!
 //! Renders over the typed entries `daemon::build_profile_entries` produces —
-//! the same entries `build_status` serializes into the body `clauth status
+//! the same entries `build_status` serializes into the body `tollgate status
 //! --json` prints — so every column sourced from those entries cannot drift
 //! from `status`. The codex roster renders as its own section under that
 //! table, over the entries `daemon::build_codex_entries` produces, which
@@ -24,7 +24,7 @@ use crate::out::out;
 use crate::profile::{AppConfig, load_config};
 use crate::profile_json::Window;
 
-/// `clauth list [--all|--disabled]` — print the account table. `include_disabled`
+/// `tollgate list [--all|--disabled]` — print the account table. `include_disabled`
 /// mirrors `build_profile_entries`'s flag: disabled profiles are hidden by
 /// default (the active profile is always kept, disabled or not). A codex
 /// profile has no disabled state, so the flag leaves the codex section alone.
@@ -214,7 +214,7 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
         config.state.refresh_interval_ms,
     );
     if entries.is_empty() && codex_entries.is_empty() {
-        return "no accounts yet. add one with `clauth login <name>`.\n".to_string();
+        return "no accounts yet. add one with `tollgate login <name>`.\n".to_string();
     }
 
     let rows: Vec<Row> = entries.iter().map(|e| Row::from_entry(config, e)).collect();

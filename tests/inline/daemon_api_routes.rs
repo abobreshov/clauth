@@ -5,7 +5,7 @@
 //!
 //! Everything runs against a [`HomeSandbox`] tempdir and `keychain::enabled()`
 //! is false under `cfg(test)`, so the switch paths exercise the file/symlink
-//! model only and never touch the operator's real `~/.clauth`, `~/.claude`, or
+//! model only and never touch the operator's real `~/.tollgate`, `~/.claude`, or
 //! the Keychain. No network: tokens are minted without an expiry, so the
 //! pre-install auth gate returns `Ready` without calling the refresher.
 
@@ -47,8 +47,8 @@ fn ctx_with_live(
     live: crate::daemon::LiveStores,
 ) -> std::sync::Arc<ApiContext> {
     seed_device(DEVICE, Tier::Control, TOKEN);
-    let status_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
+    let status_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
         .join("status.json");
     ApiContext::for_tests(config, status_path, Some(live), panes::absent_probe())
 }
@@ -1234,7 +1234,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
                         "",
                         r#"{"error":{"code":"agent_not_ready","message":"agent claude blocked during startup"},"id":"cli:agent:start"}"#,
                     ),
-                    ["pane", "run", "w1:p2", "clauth", "start", "alpha"] => out(
+                    ["pane", "run", "w1:p2", "tollgate", "start", "alpha"] => out(
                         false,
                         "",
                         r#"{"error":{"code":"pane_not_found","message":"pane w1:p2 not found"},"id":"cli:pane:run"}"#,
@@ -1754,7 +1754,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
 
     // A held state flock is the one retryable refusal, for both routes that
     // take it. Seeded before the wedge, like the existing 503 pin.
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
     let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
         .expect("open holder handle");
     holder.lock().expect("hold the flock");
@@ -1904,12 +1904,12 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
 
     // A chain edit that fails on disk answers the route's own 500 edit_failed,
     // distinct from the router's device-list `internal` driven below. order and
-    // wrap-off save whole state into ~/.clauth; threshold writes the member dir.
+    // wrap-off save whole state into ~/.tollgate; threshold writes the member dir.
     {
         use std::os::unix::fs::PermissionsExt;
-        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
-        std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o500))
-            .expect("chmod clauth dir read-only");
+        let tollgate_dir = crate::profile::tollgate_dir().expect("tollgate dir");
+        std::fs::set_permissions(&tollgate_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod tollgate dir read-only");
         let answers: Vec<(&str, Response)> = [
             ("/chain/order", r#"{"members":["beta","alpha","gamma"]}"#),
             ("/chain/wrap-off", r#"{"wrap_off":true}"#),
@@ -1926,8 +1926,8 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         })
         .collect();
         // Restore before any assertion so a red still lets the sandbox clean up.
-        std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o700))
-            .expect("restore clauth dir perms");
+        std::fs::set_permissions(&tollgate_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore tollgate dir perms");
         for (path, resp) in answers {
             check_answer(&doc, "POST", path, 500, &resp, &mut driven, &mut produced);
         }
@@ -1961,7 +1961,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     // An unreadable device list refuses every authenticated route with 500, and
     // the pairing redemption hits the same store when it mints the device.
     std::fs::write(
-        crate::profile::clauth_dir()
+        crate::profile::tollgate_dir()
             .expect("dir")
             .join("devices.json"),
         b"{ not json",
@@ -2294,7 +2294,7 @@ fn an_unreadable_device_list_refuses_every_request() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
     std::fs::write(
-        crate::profile::clauth_dir()
+        crate::profile::tollgate_dir()
             .expect("dir")
             .join("devices.json"),
         b"{ not json",
@@ -2621,7 +2621,7 @@ fn status_serves_the_on_disk_feed_verbatim() {
     let home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
     let feed = r#"{"schema":1,"active_profile":"alpha","profiles":[]}"#;
-    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("dir")).expect("mkdir");
+    crate::profile::mkdir_700(&crate::profile::tollgate_dir().expect("dir")).expect("mkdir");
     std::fs::write(&ctx.status_path, feed).expect("seed feed");
     let _ = home;
 
@@ -3014,7 +3014,7 @@ fn a_switch_to_a_clock_expired_target_does_not_invert_the_lock_order() {
     );
 }
 
-/// The switch is the same action `clauth <name>` and the MCP tool perform, so
+/// The switch is the same action `tollgate <name>` and the MCP tool perform, so
 /// it inherits their refusal sentences — not their anyhow chains. The IO arms
 /// of a switch carry context strings that name absolute paths under the
 /// operator's home (`failed to publish /home/…/credentials.json`); a reason
@@ -3169,14 +3169,14 @@ fn a_refused_switch_reflects_the_authored_sentence() {
     assert_eq!(body["error"], serde_json::json!("switch_refused"));
     assert_eq!(
         body["reason"],
-        serde_json::json!("'beta': account is disabled, run `clauth enable beta`")
+        serde_json::json!("'beta': account is disabled, run `tollgate enable beta`")
     );
 }
 
 /// A config snapshot a tick old must not misfile a genuine refusal as an
 /// unexpected failure. `ensure_switch_target_ok` re-reads the roster off disk
 /// under the state flock precisely because the daemon holds a handle a
-/// concurrent `clauth delete` can leave behind; the refusal it raises there is
+/// concurrent `tollgate delete` can leave behind; the refusal it raises there is
 /// still authored, still carries the fix, and must still answer 409 — the
 /// route's own membership check passed a moment earlier, so answering 500 for
 /// what the disk says a tick later mislabels a refusal the operator can act
@@ -3220,17 +3220,17 @@ fn a_target_vanishing_mid_switch_answers_refused_not_failed() {
 }
 
 /// A held state flock is the one retryable refusal, and its reason is the
-/// closed `StateLockTimeout` Display — `~/.clauth/.lock` spelled as a literal,
+/// closed `StateLockTimeout` Display — `~/.tollgate/.lock` spelled as a literal,
 /// never the sandbox's absolute home. Posed with the same independent open
 /// file description `tests/inline/lock.rs` uses to stand in for a second
-/// clauth process, plus the thread-local deadline override so the wait is
+/// tollgate process, plus the thread-local deadline override so the wait is
 /// milliseconds, not 25 s.
 #[test]
 fn a_state_lock_timeout_is_503_with_a_path_free_reason() {
     let _home = HomeSandbox::new();
     // Seeded BEFORE the wedge: `seeded_config` takes the state flock itself.
     let ctx = ctx_with(seeded_config());
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
     let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
         .expect("open holder handle");
     holder.lock().expect("hold the flock");
@@ -3285,7 +3285,7 @@ fn a_switch_line_names_the_device() {
     assert!(
         lines
             .snapshot()
-            .contains(&"clauth api: device 'test' switched to 'beta'".to_string()),
+            .contains(&"tollgate api: device 'test' switched to 'beta'".to_string()),
         "{:#?}",
         lines.snapshot()
     );
@@ -3321,7 +3321,7 @@ fn a_refused_switch_line_names_the_device() {
         lines
             .snapshot()
             .iter()
-            .any(|line| line.starts_with("clauth api: device 'test' switch to 'beta' refused: ")),
+            .any(|line| line.starts_with("tollgate api: device 'test' switch to 'beta' refused: ")),
         "{:#?}",
         lines.snapshot()
     );

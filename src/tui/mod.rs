@@ -76,6 +76,6 @@ mod showcase;
 
 // Test-only: `HomeSandbox::drop` joins detached `spawn_worker` threads before it
 // clears `HOME_OVERRIDE`, so a worker can never resolve the operator's real
-// `$HOME` and lock under their `~/.clauth`.
+// `$HOME` and lock under their `~/.tollgate`.
 #[cfg(test)]
 pub(crate) use app::join_test_workers;

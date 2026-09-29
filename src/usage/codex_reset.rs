@@ -1,18 +1,18 @@
-//! Spending a banked codex usage-limit reset (`clauth limit-reset`).
+//! Spending a banked codex usage-limit reset (`tollgate limit-reset`).
 //!
 //! The usage poll already READS the banked count off `wham/usage`
 //! (`rate_limit_reset_credits.available_count`, carried on `UsageInfo` as
 //! `codex_reset_credits` and shown as `↺ N` on the Overview's codex row while
 //! one is available).
-//! This module is the one place clauth SPENDS one, and only because the
-//! operator asked for it: `clauth limit-reset <name>`. Nothing here is on a
+//! This module is the one place tollgate SPENDS one, and only because the
+//! operator asked for it: `tollgate limit-reset <name>`. Nothing here is on a
 //! timer, and nothing retries.
 //!
 //! The wire is codex's own, verified against openai/codex
 //! (`backend-client/src/client/rate_limit_resets.rs`, `types.rs`, and the TUI's
 //! `/usage` reset picker): a GET lists the account's credits, and a POST
 //! consumes one by id under a fresh idempotency key. codex reads a reply's
-//! `code` as a closed set; clauth keeps it an open string, so a code a newer
+//! `code` as a closed set; tollgate keeps it an open string, so a code a newer
 //! backend adds is reported as unconfirmed rather than failing to parse AFTER
 //! the reset may already have been spent.
 //!
@@ -29,7 +29,7 @@ use super::fetch::iso_to_epoch_secs;
 use crate::format::{local_stamp, plural, truncate};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
-/// one a clauth-held login reaches (see `codex::CODEX_USAGE_URL`).
+/// one a tollgate-held login reaches (see `codex::CODEX_USAGE_URL`).
 pub(crate) const CODEX_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 /// Consumes one credit.
@@ -236,7 +236,7 @@ pub(crate) fn list_reset_credits_at(
 }
 
 /// The consume body. `credit_id` is optional on codex's wire (the server then
-/// picks); clauth always names the credit its prompt described.
+/// picks); tollgate always names the credit its prompt described.
 fn consume_body(redeem_request_id: &str, credit_id: &str) -> String {
     serde_json::json!({
         "redeem_request_id": redeem_request_id,
@@ -328,7 +328,7 @@ pub(crate) fn limit_reset_prompt(
     credit: &ResetCredit,
 ) -> String {
     format!(
-        "clauth: use a usage-limit reset on '{name}'? {} · {} · 1 of {} available. \
+        "tollgate: use a usage-limit reset on '{name}'? {} · {} · 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
         credit.label(),
         expiry(credit),
@@ -343,11 +343,11 @@ pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<
     let mut lines = vec![if next.is_some() {
         let n = credits.stated_count();
         format!(
-            "clauth: '{name}' has {n} usage-limit reset{} available.",
+            "tollgate: '{name}' has {n} usage-limit reset{} available.",
             plural(n as usize)
         )
     } else {
-        format!("clauth: {}.", no_resets_available(name))
+        format!("tollgate: {}.", no_resets_available(name))
     }];
     for credit in &credits.credits {
         let marked = next == Some(credit.id.as_str());
@@ -383,7 +383,7 @@ fn token_rejected(name: &str) -> String {
 }
 
 fn check_list_hint(name: &str) -> String {
-    format!("check `clauth limit-reset {name} --list` before retrying")
+    format!("check `tollgate limit-reset {name} --list` before retrying")
 }
 
 /// A failed GET. Nothing was spent, and every line says so.
@@ -397,7 +397,7 @@ pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
             format!("could not reach codex to list the resets on '{name}'; no reset was used")
         }
         ResetCallError::Parse => format!(
-            "codex answered the reset list for '{name}' in a shape clauth does not read; \
+            "codex answered the reset list for '{name}' in a shape tollgate does not read; \
              no reset was used"
         ),
     }
@@ -418,7 +418,7 @@ pub(crate) fn consume_failure(name: &str, err: &ResetCallError) -> String {
             check_list_hint(name)
         ),
         ResetCallError::Parse => format!(
-            "codex answered the reset request for '{name}' in a shape clauth does not read, \
+            "codex answered the reset request for '{name}' in a shape tollgate does not read, \
              so the reset may or may not have gone through; {}",
             check_list_hint(name)
         ),
@@ -437,7 +437,7 @@ pub(crate) fn outcome_line(
         ConsumeOutcome::Reset { windows_reset } => {
             let left = (credits.stated_count() - 1).max(0);
             Ok(format!(
-                "clauth: used a usage-limit reset on '{name}': {windows_reset} window{} \
+                "tollgate: used a usage-limit reset on '{name}': {windows_reset} window{} \
                  reopened, {left} left.",
                 plural(windows_reset.max(0) as usize)
             ))
@@ -447,7 +447,7 @@ pub(crate) fn outcome_line(
         )),
         ConsumeOutcome::NoCredit => Err(format!(
             "that reset on '{name}' is no longer available (used or expired meanwhile); \
-             run `clauth limit-reset {name} --list` to see what is left"
+             run `tollgate limit-reset {name} --list` to see what is left"
         )),
         ConsumeOutcome::Unknown(code) => Err(format!(
             "codex answered the reset request for '{name}' with an unrecognized code {:?}, \

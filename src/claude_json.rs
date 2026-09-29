@@ -3,14 +3,14 @@
 //! Claude Code keeps one large config file — `~/.claude.json` for normal use —
 //! holding user-global state (`projects`, `mcpServers`, `tips`, `userID`)
 //! alongside an account-specific `oauthAccount` block and a few billing/usage
-//! caches. `clauth start <profile>` runs Claude Code against a per-profile
+//! caches. `tollgate start <profile>` runs Claude Code against a per-profile
 //! runtime tree with its OWN `.claude.json`, because a single shared file leaks
 //! one account's identity into another: Claude Code trusts the cached
 //! `oauthAccount` and does not re-derive it from the loaded token on a normal
 //! startup (its bootstrap merge keeps the cached identity when the server
 //! reports a different account).
 //!
-//! This module keeps every clauth-managed `.claude.json` (the global file plus
+//! This module keeps every tollgate-managed `.claude.json` (the global file plus
 //! each profile runtime's copy) in sync EXCEPT for [`PER_PROFILE_FIELDS`], which
 //! each file keeps as its own. Sync is "latest write wins" at file granularity:
 //! each tick the newest parseable file is the source for the shared fields,
@@ -61,7 +61,7 @@ const PER_PROFILE_FIELDS: &[&str] = &[
 /// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 
-/// Every `.claude.json` clauth reconciles: the global file plus each SHARED
+/// Every `.claude.json` tollgate reconciles: the global file plus each SHARED
 /// per-session runtime copy, via [`crate::jsonsync::runtime_files_under`].
 fn known_paths() -> Result<Vec<PathBuf>> {
     Ok(crate::jsonsync::runtime_files_under(

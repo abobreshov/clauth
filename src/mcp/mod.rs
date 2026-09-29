@@ -1,6 +1,6 @@
-//! `clauth mcp` — MCP JSON-RPC 2.0 server over stdio (rmcp).
+//! `tollgate mcp` — MCP JSON-RPC 2.0 server over stdio (rmcp).
 //!
-//! Exposes clauth profiles to a live Claude Code session: list/usage, switch,
+//! Exposes tollgate profiles to a live Claude Code session: list/usage, switch,
 //! and delegate. The rest of the binary stays synchronous; [`serve`] builds a
 //! scoped current-thread tokio runtime and blocks on the stdio server.
 //!
@@ -54,10 +54,10 @@ use crate::usage::{
 use digest::{DigestMode, DigestTracker};
 use render::{ProfileSnapshot, RosterRank};
 
-/// Marks the `clauth mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
-/// for the Plugin tab's handshake check. clauth owns both sides of that spawn, so
+/// Marks the `tollgate mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
+/// for the Plugin tab's handshake check. tollgate owns both sides of that spawn, so
 /// an env marker beats inferring it from the client identity in a request.
-pub(crate) const MCP_PROBE_ENV: &str = "CLAUTH_MCP_PROBE";
+pub(crate) const MCP_PROBE_ENV: &str = "TOLLGATE_MCP_PROBE";
 
 /// Cap on the salvaged assistant text carried back by a killed delegate. The
 /// tail is kept: it is the part closest to a usable answer.
@@ -292,7 +292,7 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     if config.is_auth_broken(name) {
         row["auth_broken"] = serde_json::json!(true);
     }
-    // Informational, not a refusal: clauth has no cancel gate, and a canceled
+    // Informational, not a refusal: tollgate has no cancel gate, and a canceled
     // account still delegates on whatever the org's post-cancellation plan
     // allows. It rides here because the picker is choosing where to spend.
     // `is_canceled_cached` is the one cancellation predicate every surface
@@ -423,7 +423,7 @@ impl ProfileNotFoundFix {
             ProfileNotFoundFix::OmitFilter => "omit `names` for every account".to_string(),
             ProfileNotFoundFix::CodexAccount(held) => format!(
                 "{held} names a CODEX account, which these tools do not manage — they are Claude \
-                 Code only. Switch it with `clauth <name>`"
+                 Code only. Switch it with `tollgate <name>`"
             ),
         }
     }
@@ -445,7 +445,7 @@ fn live_usage_json(profile: Option<&str>, windows: Option<&ProfileWindows>) -> s
     payload["profile"] = serde_json::json!(profile);
     // The two shares an OAuth reader acts on directly, beside the window array
     // they were read from: this clause is a footer rather than a table, and 5h/7d
-    // are the pools every other such figure in clauth refers to.
+    // are the pools every other such figure in tollgate refers to.
     if let ProfileWindows::Oauth { usage, .. } = windows {
         let usage = usage.as_deref();
         // The same liveness the published `windows` array filters on (#74):
@@ -472,7 +472,7 @@ fn single_block(prose: String) -> Vec<ContentBlock> {
 
 /// The result file a `result: "file"` delegate writes, keyed by the run's id.
 fn result_file_path(id: &str) -> std::result::Result<std::path::PathBuf, String> {
-    let dir = crate::profile::clauth_dir()
+    let dir = crate::profile::tollgate_dir()
         .map_err(|e| e.to_string())?
         .join("jobs")
         .join("results");
@@ -546,13 +546,13 @@ fn fold_active_live_usage(
 /// The profile half of a delegate call's endpoint, name-keyed: the target
 /// profile's stored endpoint in the roster's own host spelling, `anthropic`
 /// only for an account routing through neither an `[env] ANTHROPIC_BASE_URL`
-/// nor an effective managed `base_url`. `None` when clauth cannot read that
+/// nor an effective managed `base_url`. `None` when tollgate cannot read that
 /// account's config, which the renderer treats as "cannot say" rather than as
 /// Anthropic.
 ///
 /// The question is "where did this request go", so it reads
 /// [`crate::profile::stored_endpoint`] (both profile sources, env first) and
-/// not `is_third_party` (which answers "is the provider one clauth has a
+/// not `is_third_party` (which answers "is the provider one tollgate has a
 /// typed integration for"), not `usage_cache_is_third_party` (which answers
 /// "which cache holds this account's figures"), and not `Profile::is_oauth`
 /// (which reads the managed field alone). All four disagree somewhere, and
@@ -705,7 +705,7 @@ fn fold_delegate_live_usage(
 }
 
 #[derive(Clone)]
-pub(crate) struct ClauthServer {
+pub(crate) struct TollgateServer {
     tool_router: ToolRouter<Self>,
     /// `Some` only when the serve path resolved a herdr pane: `delegate` then
     /// reports `working`/`idle` as a pane metadata token. A server built
@@ -811,21 +811,21 @@ pub(crate) struct DelegateArgs {
     /// raw `--permission-mode` in `args`.
     permission_mode: Option<String>,
     /// Where the result envelope goes. `result: "file"` writes the envelope
-    /// under `~/.clauth` and returns its path, sha256 and cost line only; the
+    /// under `~/.tollgate` and returns its path, sha256 and cost line only; the
     /// model Reads the file for the body. Unset (default): the envelope rides
     /// the reply inline.
     result: Option<String>,
     /// Additional environment variables passed to the delegate session. Values
-    /// you set for `CLAUDE_CONFIG_DIR`, `CLAUTH_MCP_DEPTH` and
-    /// `CLAUTH_DELEGATE_SESSION_ID` are replaced by clauth's own. Read
+    /// you set for `CLAUDE_CONFIG_DIR`, `TOLLGATE_MCP_DEPTH` and
+    /// `TOLLGATE_DELEGATE_SESSION_ID` are replaced by tollgate's own. Read
     /// `code.claude.com/docs/en/env-vars.md` to see what
     /// Claude Code supports.
     env: Option<HashMap<String, String>>,
-    /// Extra CLI arguments that go after the `claude -p` clauth invokes. Your
+    /// Extra CLI arguments that go after the `claude -p` tollgate invokes. Your
     /// arguments come last, so they win where a flag repeats (including
     /// `--model` when `model` is set). `--session-id`, `--resume` and
-    /// `--fork-session` are refused: clauth pins the session id and exports it
-    /// as `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
+    /// `--fork-session` are refused: tollgate pins the session id and exports it
+    /// as `TOLLGATE_DELEGATE_SESSION_ID`; resume through `session_id`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -847,7 +847,7 @@ pub(crate) struct MonitorArgs {
 }
 
 #[tool_router]
-impl ClauthServer {
+impl TollgateServer {
     pub(crate) fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -870,7 +870,7 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "List of clauth accounts with their cached usage headrooms. A window's \
+        description = "List of tollgate accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
 can carry `disabled`, `login expired`, `no api key` or `subscription canceled`; when `delegate` \
 refuses an account, its refusal names the state and the fix. `subscription canceled` never means \
@@ -1105,7 +1105,7 @@ disturbing this session, use `delegate`."
     }
 
     #[tool(
-        description = "Run a task on another clauth account. `delegate` starts a fresh `claude` \
+        description = "Run a task on another tollgate account. `delegate` starts a fresh `claude` \
 session on that account and returns its final response. This is like the Agent tool, but the \
 agent runs on a different account's login.\n\n\
 The delegate knows nothing about this conversation. Put everything it needs into `prompt`.\n\n\
@@ -1208,8 +1208,8 @@ across accounts."
                 "`permission_mode` cannot combine with `--permission-mode` in `args`: drop one",
             ));
         }
-        // clauth owns the session id: it pins the id the child runs under and
-        // exports it as `CLAUTH_DELEGATE_SESSION_ID`, which hook exemptions
+        // tollgate owns the session id: it pins the id the child runs under and
+        // exports it as `TOLLGATE_DELEGATE_SESSION_ID`, which hook exemptions
         // key on. A raw flag landing after the pin (caller `args` run last)
         // would move the child off that id and silently break the equality,
         // so refuse every spelling that can name or fork a session.
@@ -1221,8 +1221,8 @@ across accounts."
         }) {
             return Ok(delegate_refusal(
                 "`args` cannot carry `--session-id`, `--resume`/`-r` or `--fork-session`: \
-                 clauth pins the delegate's session id and exports it as \
-                 `CLAUTH_DELEGATE_SESSION_ID`; resume through the `session_id` argument",
+                 tollgate pins the delegate's session id and exports it as \
+                 `TOLLGATE_DELEGATE_SESSION_ID`; resume through the `session_id` argument",
             ));
         }
         // The result mode is a closed set: unset means inline, `"file"` means
@@ -1601,7 +1601,7 @@ across accounts."
                                     ));
                                 }
                                 Err(reason) => logline!(
-                                    "clauth: result file write failed: {reason}; falling back to inline"
+                                    "tollgate: result file write failed: {reason}; falling back to inline"
                                 ),
                             }
                         }
@@ -1622,7 +1622,7 @@ across accounts."
                             .map(|m| format!("`{}` as job `{}`", m.profile, m.job_id))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        logline!("clauth: abandoned delegate fan-out continues: {names_and_ids}");
+                        logline!("tollgate: abandoned delegate fan-out continues: {names_and_ids}");
                         let jobs = members
                             .into_iter()
                             .map(|m| {
@@ -1727,7 +1727,7 @@ across accounts."
             // delta into a reply that does not exist. The id reaches an
             // operator through the log line.
             Joined::HandedOff(job_id) => {
-                logline!("clauth: abandoned delegate on `{target}` continues as job `{job_id}`");
+                logline!("tollgate: abandoned delegate on `{target}` continues as job `{job_id}`");
                 let payload = serde_json::json!({
                     "job_id": job_id,
                     "profile": target,
@@ -1762,7 +1762,7 @@ across accounts."
                     return Ok(result_file_reply(&path, &sha256, &payload, is_error));
                 }
                 Err(reason) => {
-                    logline!("clauth: result file write failed: {reason}; falling back to inline")
+                    logline!("tollgate: result file write failed: {reason}; falling back to inline")
                 }
             }
         }
@@ -1779,7 +1779,7 @@ across accounts."
 With `job_ids`: a running job reports its account, elapsed time, and its latest output. A \
 finished job also hands back its result. With `job_ids` and `cancel: true`, the named jobs are \
 asked to stop and each hands back whatever it produced.\n\n\
-Without `job_ids`: lists at most 10 delegates clauth holds, live runs first. An interrupted \
+Without `job_ids`: lists at most 10 delegates tollgate holds, live runs first. An interrupted \
 blocking `delegate` (its caller walked away mid-run) keeps running as a background job, and that \
 listing is where you find its id."
     )]
@@ -1843,13 +1843,13 @@ listing is where you find its id."
 
 /// Env var carrying the MCP delegation depth; the child `claude` inherits
 /// `depth+1` so a delegate cannot itself delegate (hard cap at 1).
-const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
+const MCP_DEPTH_ENV: &str = "TOLLGATE_MCP_DEPTH";
 
 /// Env var naming the session id the delegate's `claude` runs under. It
 /// inherits to every process the delegate starts, so a consumer keying an
 /// exemption on it must match the payload's `session_id`, never the value's
 /// presence — the objective-first hook is the consumer this exists for.
-const DELEGATE_SESSION_ENV: &str = "CLAUTH_DELEGATE_SESSION_ID";
+const DELEGATE_SESSION_ENV: &str = "TOLLGATE_DELEGATE_SESSION_ID";
 
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -2078,7 +2078,7 @@ where
                     // JoinSet-level error has no member to file it under. The
                     // slot stays `None` and folds into that member's own
                     // "result lost" row below, so the siblings keep their places.
-                    Some(Err(e)) => logline!("clauth: delegate fan-out join error: {e}"),
+                    Some(Err(e)) => logline!("tollgate: delegate fan-out join error: {e}"),
                     None => {}
                 }
             }
@@ -2467,7 +2467,7 @@ fn prepend_note(mut result: CallToolResult, note: &str) -> CallToolResult {
 
 /// Most rows the listing names before it stops naming them.
 ///
-/// Spending hundreds of rows on a caller who asked whether clauth's state had
+/// Spending hundreds of rows on a caller who asked whether tollgate's state had
 /// moved is the cost this surface was reworked to refuse.
 ///
 /// **This bound deliberately CUTS ACROSS the store's retention rule, and that is
@@ -2479,11 +2479,11 @@ fn prepend_note(mut result: CallToolResult, note: &str) -> CallToolResult {
 /// agreed with retention; that reasoning is what shipped a listing which evicted
 /// the long-running delegate the mode exists to name, so do not restore it.
 ///
-/// An operator wanting all of them runs `clauth jobs`, which bands the same way
+/// An operator wanting all of them runs `tollgate jobs`, which bands the same way
 /// and caps nothing.
 const LISTING_MAX: usize = 10;
 
-/// Fold the delegate jobs clauth is holding into a state-mode reply.
+/// Fold the delegate jobs tollgate is holding into a state-mode reply.
 ///
 /// Adds nothing at all when the store is empty, so a session that has never
 /// delegated pays nothing for a listing it has no use for — the same
@@ -2858,7 +2858,7 @@ fn read_collectable(job_id: &str) -> WaitOutcome {
 /// The running-check payload both `monitor` arms render, so the one-id and
 /// several-ids spellings cannot drift. `now` is epoch ms.
 ///
-/// A field clauth structurally cannot have is ABSENT rather than `unknown`: no
+/// A field tollgate structurally cannot have is ABSENT rather than `unknown`: no
 /// `last_output_secs_ago` before the first line arrives, no `idle_kill_in_secs`
 /// when the record carries no idle deadline, no `wall_kill_in_secs` when it
 /// carries no wall clock, no tail when there is none.
@@ -2909,7 +2909,7 @@ pub(crate) fn running_payload_for_test(
 
 /// The epoch-ms a job id's stamp segment decodes to, base-36, `None` for a
 /// token off the mint SHAPE. It answers what the stamp says and never whether
-/// clauth minted the id: the shape gate admits any lowercase stamp, so a
+/// tollgate minted the id: the shape gate admits any lowercase stamp, so a
 /// pre-shortening all-digit id decodes far-future while a word like `d-day-1`
 /// decodes to 1970. Those land in OPPOSITE age branches of [`unknown_job_reason`],
 /// which is why both of them hedge the mint rather than presupposing a job.
@@ -2981,7 +2981,7 @@ fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> 
 /// records who delivered the job and when, so an id whose result already
 /// reached someone is answered with that delivery rather than hedged. Past
 /// that, only the FIRST branch is a derivation, and only of the SHAPE: a token
-/// that is not `d-<base36>-<digits>` was never a clauth job at all. Past that
+/// that is not `d-<base36>-<digits>` was never a tollgate job at all. Past that
 /// gate the stamp bounds a job's age and nothing more — it cannot say which
 /// cause fired, since a job minted a day ago may equally have been collected
 /// five minutes ago, and it cannot even say the id was minted, because the
@@ -2999,7 +2999,7 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // know. Everything below hedges; this does not. A blocking delegate's record
     // is real and minted, so the three generic clauses are each false for it —
     // never collected, never dropped, and certainly minted — and answering an id
-    // clauth is holding a live run under with "clauth may never have minted it"
+    // tollgate is holding a live run under with "tollgate may never have minted it"
     // is the mirror of the M5 defect where it asserted a mint it could not know.
     if jobs::liveness_exists(job_id) {
         return format!(
@@ -3016,20 +3016,20 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
     }
     let Some(minted_at) = job_id_minted_at(job_id) else {
         return format!(
-            "unknown job_id: {job_id} — clauth never minted it (a real id reads \
+            "unknown job_id: {job_id} — tollgate never minted it (a real id reads \
              `d-<base36-ms>-<counter>`); check the id `delegate` handed back"
         );
     };
-    let collected = "already collected by an earlier `monitor` call or delivered by clauth's \
+    let collected = "already collected by an earlier `monitor` call or delivered by tollgate's \
                      auto-delivery hook";
-    // Neither age branch can tell a real id from a token clauth never minted,
+    // Neither age branch can tell a real id from a token tollgate never minted,
     // so both carry this rather than presupposing a job existed. The stamp is
     // what splits them and it discriminates nothing: at a 2026 clock `d-day-1`
     // decodes to 1970 and takes the aged branch while `d-notebook-1` decodes
     // past today and takes the fresh one, and every pre-M5 all-digit id decodes
     // far-future into that same fresh branch. Putting it on the aged branch
     // alone would answer the rarer half.
-    let unminted = "clauth may never have minted it at all (a real id reads \
+    let unminted = "tollgate may never have minted it at all (a real id reads \
                     `d-<base36-ms>-<counter>`)";
     if now.saturating_sub(minted_at) > jobs::DONE_TTL_MS {
         // Collection leads even here. Every delivery evicts through its
@@ -3058,7 +3058,7 @@ fn delivered_job_reason(job_id: &str, ledger: &jobs::DeliveryLedger) -> String {
         .unwrap_or_default();
     match ledger.by.as_str() {
         "hook" => format!(
-            "unknown job_id: {job_id} — its result was delivered by clauth's auto-delivery \
+            "unknown job_id: {job_id} — its result was delivered by tollgate's auto-delivery \
              hook{at}; check this session's earlier replies for it"
         ),
         "monitor" => format!(
@@ -3137,11 +3137,11 @@ struct BackgroundOpts {
 enum WaitEnd {
     /// The caller stopped the run through `monitor({cancel: true})`.
     Cancelled,
-    /// `try_wait` itself failed, so clauth no longer knows the child's state.
+    /// `try_wait` itself failed, so tollgate no longer knows the child's state.
     Failed(String),
 }
 
-/// True when the caller pins its own `--output-format` in `args`. clauth then
+/// True when the caller pins its own `--output-format` in `args`. tollgate then
 /// spawns no format flag of its own, and the child's output shape is unknown.
 fn sets_output_format(extra_args: &[String]) -> bool {
     extra_args
@@ -3367,7 +3367,7 @@ fn read_stdout<R: std::io::Read>(
 ///
 /// ONE builder for the kill path, the non-zero exit and the unparseable
 /// envelope. The argument was won for the kill path and written into its own
-/// doc comment — the target account's window is spent whether or not clauth
+/// doc comment — the target account's window is spent whether or not tollgate
 /// keeps the output, so discarding it is a second loss on top of the first — and
 /// nothing about the other two exits makes it less true. Three copies of the
 /// clause rule is how they drift.
@@ -3378,7 +3378,7 @@ fn read_stdout<R: std::io::Read>(
 /// [`crate::start::rescue_teardown`], which defers to a live sibling — so the
 /// reply hands back the handle and never tells a caller its transcript is gone.
 ///
-/// `pinned` is the id clauth spawned the run under (`--session-id`/`--resume`):
+/// `pinned` is the id tollgate spawned the run under (`--session-id`/`--resume`):
 /// the handle is the capture's own id when one exists, else the pinned one —
 /// which is the SAME id, so the fallback is exact, never a guess. The
 /// no-handle clause fires only when both are absent, which is the pre-spawn
@@ -3396,11 +3396,11 @@ fn salvage_envelope(
     // The clause and the field it promises are decided together, so a reply can
     // never offer a handle it did not attach. No id means no handle, whatever
     // the isolation was: a run that died before any event named a session AND
-    // was never pinned has no transcript clauth ever saw, so it is told that
+    // was never pinned has no transcript tollgate ever saw, so it is told that
     // and nothing else.
     let handle = match capture.session_id.as_deref().or(pinned) {
         None => {
-            reason.push_str(". no session id ever reached clauth, so there is no resume handle");
+            reason.push_str(". no session id ever reached tollgate, so there is no resume handle");
             None
         }
         Some(id) => {
@@ -3448,13 +3448,14 @@ fn cancelled_envelope(
 /// Claude Code resolves `--resume <id>` only within `projects/<slug-of-cwd>/`, so
 /// a resume spawned anywhere else is told the conversation does not exist.
 ///
-/// `latest` is refused, though `clauth resume` takes it: the newest session in
+/// `latest` is refused, though `tollgate resume` takes it: the newest session in
 /// the whole store is usually the operator's own live one, and spending an
 /// account's window continuing that is never what a delegate meant by it.
 fn resolve_resume_workspace(session_id: &str) -> std::result::Result<std::path::PathBuf, String> {
     if session_id == "latest" {
         return Err(
-            "resume needs an exact session id; `latest` is a `clauth resume` shorthand".to_string(),
+            "resume needs an exact session id; `latest` is a `tollgate resume` shorthand"
+                .to_string(),
         );
     }
     let workspace = crate::sessions::workspace_of(session_id).ok_or_else(|| {
@@ -3485,7 +3486,7 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
     if given_real != workspace_real {
         return Err(format!(
             "cwd '{given}' is not the workspace this session was recorded in ('{}'); \
-             drop `cwd` and clauth uses the recorded one",
+             drop `cwd` and tollgate uses the recorded one",
             workspace.display()
         ));
     }
@@ -3527,7 +3528,7 @@ fn delegate_session_id(resume: Option<&str>) -> std::result::Result<String, Stri
 /// Compose a delegate's environment on `command`: drop inherited provider
 /// routing + the outgoing activation's custom env keys
 /// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
-/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
+/// tollgate's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
 /// and the delegate session id can't be overridden, and
 /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when the caller didn't set
 /// it.
@@ -3606,7 +3607,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // not inherit whoever was globally active — or, with no marker to read
     // (`switch_off` clears it without touching the file), the departed
     // account whose entries are still in the live settings (mirrors
-    // `clauth start`).
+    // `tollgate start`).
     let stale_env_keys = crate::actions::outgoing_env_keys(&config);
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
@@ -3675,8 +3676,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // Isolated only: suppress operator/project MCP servers for a clean blind
     // session (mirrors `start.rs`). A shared delegate inherits its config-dir's
     // MCP servers so it can do research/nav. Recursion stays capped either way:
-    // the `CLAUTH_MCP_DEPTH` guard refuses a nested `delegate` even when the child
-    // loads clauth's own server. Callers can still pass `--mcp-config` (and
+    // the `TOLLGATE_MCP_DEPTH` guard refuses a nested `delegate` even when the child
+    // loads tollgate's own server. Callers can still pass `--mcp-config` (and
     // `--strict-mcp-config`) via `args` to scope a shared delegate.
     if opts.isolation == Isolation::Isolated {
         command.arg("--strict-mcp-config");
@@ -3696,7 +3697,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(id) = opts.resume {
         command.args(["--resume", id]);
     } else {
-        // the pinned id is what CLAUTH_DELEGATE_SESSION_ID names, so a hook
+        // the pinned id is what TOLLGATE_DELEGATE_SESSION_ID names, so a hook
         // exemption keyed on that var scopes to exactly this session
         command.args(["--session-id", &session_id]);
     }
@@ -3729,7 +3730,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Err(e) = crate::live_sessions::update_as_session(runtime.session_id(), |fields| {
         fields.set_pid(child.id())
     }) {
-        logline!("clauth: re-keying the delegate session onto its child failed: {e}");
+        logline!("tollgate: re-keying the delegate session onto its child failed: {e}");
     }
     // A child exists, so the target's window is being spent from here: a caller
     // that walks away now gets this run handed off to a job file rather than
@@ -3880,7 +3881,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             throttle_scan,
         } => {
             // A non-zero exit can be a throttle; record it so `profiles` can flag
-            // the model as rate-limited (clauth never sees inference 429s any
+            // the model as rate-limited (tollgate never sees inference 429s any
             // other way).
             if let RateLimit::Yes { retry_after_s } = rate_limit_hint(&throttle_scan) {
                 crate::throughput::record_rate_limit(
@@ -3945,7 +3946,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 /// shape — `dead_key_fp` is data in ([`dead_key_fingerprint`] reads it), and
 /// the cache drop + verdict write ([`record_dead_key`]) run at the call site.
 ///
-/// `session_id` is the id clauth pinned at the spawn, so every arm's envelope
+/// `session_id` is the id tollgate pinned at the spawn, so every arm's envelope
 /// carries a resumable handle even when nothing the child streamed named one.
 ///
 /// Split out because the live spawn paths have no unit test by standing decision
@@ -3966,7 +3967,7 @@ enum RunOutcome {
         envelope: serde_json::Value,
         throttle_scan: String,
     },
-    /// A clean exit whose output was no envelope clauth could read, salvaged.
+    /// A clean exit whose output was no envelope tollgate could read, salvaged.
     /// The throttle scan rides beside it so the caller-side arms see the same
     /// sources the reason did.
     Unparseable(serde_json::Value, String),
@@ -4011,7 +4012,7 @@ fn classify_run(
         };
     }
     match parse_delegate_envelope(stdout.trim()) {
-        // The envelope is the delegate's own self-report; the one field clauth
+        // The envelope is the delegate's own self-report; the one field tollgate
         // may add is the id it pinned, when the child's envelope did not carry
         // one — the same id, so the reply is never without a resume handle.
         Ok(mut envelope) => {
@@ -4130,7 +4131,7 @@ fn preflight_target(
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
         return Err(format!(
-            "profile is disabled: {name} (run `clauth enable {name}`)"
+            "profile is disabled: {name} (run `tollgate enable {name}`)"
         ));
     }
     // BEFORE the quarantine arm, and that order is the whole of what the
@@ -4145,7 +4146,7 @@ fn preflight_target(
     // is ADMITTED (owner ruling 2026-08-30, "let the delegate run"): the dead
     // chain feeds usage polling, the spawned `claude` never reads it, so the
     // run would have succeeded. `has_own_inference_endpoint` is the shared
-    // predicate — whether clauth RECOGNISES the host says nothing about
+    // predicate — whether tollgate RECOGNISES the host says nothing about
     // whether inference works against it. What is left is the account with
     // nothing but the dead chain, refused with `switch`'s own sentence
     // (`actions.rs`, its AUTH-1 arm) so the two surfaces cannot spell that
@@ -4153,11 +4154,11 @@ fn preflight_target(
     if config.is_auth_broken(name) && !crate::claude::has_own_inference_endpoint(profile) {
         return Err(crate::format::login_expired(name).line());
     }
-    // The provider's own verdict, not clauth's guess at a figure: the freshest
+    // The provider's own verdict, not tollgate's guess at a figure: the freshest
     // cached third-party stats say this account cannot fund a call, so the
     // spawn would die mid-run on the provider's refusal (a 402) after the
     // setup spend. A missing cache is no verdict — an OAuth member, or a
-    // provider clauth has never fetched for — and passes. The age rides so a
+    // provider tollgate has never fetched for — and passes. The age rides so a
     // reader can discount a verdict the provider's next fetch may replace.
     // Bounded to third-party profiles: a hand-edited config can strand a
     // stale verdict on a profile that no longer runs third-party, where no
@@ -4738,7 +4739,7 @@ impl Handoff {
         match jobs::promote(&spec) {
             Ok(()) => self.install(ReservedJob { spec, cancel }),
             Err(reason) => {
-                logline!("clauth: delegate hand-off failed, its result is lost: {reason}");
+                logline!("tollgate: delegate hand-off failed, its result is lost: {reason}");
                 // The run stays attached and its liveness record stands, so it
                 // gets its entry back: without it a cancel-mode `monitor` would
                 // hold the grace on a record whose id nothing holds, answering
@@ -4781,7 +4782,7 @@ impl Handoff {
                 drop(state);
                 reserved.abandon();
                 logline!(
-                    "clauth: delegate landed while `{job_id}` was being minted; its result is lost"
+                    "tollgate: delegate landed while `{job_id}` was being minted; its result is lost"
                 );
                 Abandoned::Kept
             }
@@ -5049,7 +5050,7 @@ fn spawn_delegate(
         // declaration order, i.e. AFTER the send, which would let a test's
         // teardown clear the home override while this one still runs. Harmless
         // for THIS guard, whose report shells out and reads the process env
-        // rather than clauth's override — but the registry's contract is that
+        // rather than tollgate's override — but the registry's contract is that
         // nothing touching `$HOME` outlives the send, and a guard that silently
         // sits outside it is how that contract goes false later.
         drop(_pane_end);
@@ -5112,7 +5113,7 @@ fn detach_test_gate_with(timeout: std::time::Duration) {
         && let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout)
     {
         crate::out::errln!(
-            "clauth: the detach start gate was never released ({timeout:?}) — a test armed \
+            "tollgate: the detach start gate was never released ({timeout:?}) — a test armed \
              `arm_detach_gate` and did not send; proceeding so the run fails on its own \
              assertion instead of hanging"
         );
@@ -5120,7 +5121,7 @@ fn detach_test_gate_with(timeout: std::time::Duration) {
 }
 
 /// Reduce `claude`'s captured stdout to its single terminal `type:"result"`
-/// envelope. Under clauth's own `stream-json` the reader already retained just
+/// envelope. Under tollgate's own `stream-json` the reader already retained just
 /// that line, but a caller-pinned `--output-format json` emits the bare object
 /// and a `--verbose` one the full transcript ARRAY (every `system`
 /// thinking-token / tool-io / `assistant` event) — valid input that would
@@ -5295,9 +5296,9 @@ fn dead_key_fingerprint(scan: &str, fp: Option<u64>) -> Option<u64> {
 /// invalidation that ran and the fix, never a re-check.
 fn dead_key_clause(name: &str) -> String {
     format!(
-        ". the provider refused this run (401) naming the api key invalid; clauth dropped \
+        ". the provider refused this run (401) naming the api key invalid; tollgate dropped \
          this account's cached balance — `profiles` shows no figure for '{name}' until the \
-         key is re-captured (`clauth login {name} --api-key`)"
+         key is re-captured (`tollgate login {name} --api-key`)"
     )
 }
 
@@ -5317,7 +5318,7 @@ fn record_dead_key(name: &ProfileName, fp: u64) {
 /// failure path re-checks the freshest cached third-party stats before the
 /// reply names the balance gone. Three verdicts: the cache confirms funding
 /// (the balance may be intact), the cache confirms the account cannot fund a
-/// run (the balance is named gone, backed by the verdict), or clauth holds no
+/// run (the balance is named gone, backed by the verdict), or tollgate holds no
 /// figure (stated, never guessed). The MCP layer never fetches, so the cache
 /// is the freshest re-check there is; its age rides the clause either way.
 ///
@@ -5330,7 +5331,7 @@ fn balance_requalification(profile: &str, scan: &str) -> Option<String> {
     let name = ProfileName::from(profile);
     let Some(stats) = load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE) else {
         return Some(
-            ". the provider refused this run (402); clauth holds no cached balance to \
+            ". the provider refused this run (402); tollgate holds no cached balance to \
              re-check, so nothing here declares the account dead"
                 .to_string(),
         );
@@ -5341,13 +5342,13 @@ fn balance_requalification(profile: &str, scan: &str) -> Option<String> {
     let headline = render::third_party_headline(&stats);
     Some(if stats.is_available {
         format!(
-            ". the provider refused this run (402), but clauth's freshest cached balance \
+            ". the provider refused this run (402), but tollgate's freshest cached balance \
              reads {headline}{age} — the balance may be intact; re-check it before \
              retiring this account"
         )
     } else {
         format!(
-            ". the provider refused this run (402), and clauth's freshest cached balance \
+            ". the provider refused this run (402), and tollgate's freshest cached balance \
              confirms the account cannot fund a run: {headline}{age}"
         )
     })
@@ -5408,7 +5409,7 @@ const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 // `router = self.tool_router` dispatches from the stored router. Left off, the
 // macro's default rebuilds `Self::tool_router()` on every call.
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for ClauthServer {
+impl ServerHandler for TollgateServer {
     fn get_info(&self) -> ServerConfig {
         // Both of these are wrong by default. Empty capabilities make a
         // spec-compliant client (Claude Code) expose no tools at all, even
@@ -5467,7 +5468,7 @@ impl ServerHandler for ClauthServer {
 /// block rather than failing the handshake.
 fn build_instructions() -> String {
     let Ok(config) = load_config() else {
-        return "clauth manages multiple Claude Code accounts (\"profiles\"). \
+        return "tollgate manages multiple Claude Code accounts (\"profiles\"). \
             Call `profiles` for live usage figures."
             .to_string();
     };
@@ -5489,12 +5490,12 @@ fn build_instructions() -> String {
     render::instructions_block(&snapshots, &auth, probe)
 }
 
-/// Whether this `clauth mcp` process should hold a bare-session marker. Pure, so
+/// Whether this `tollgate mcp` process should hold a bare-session marker. Pure, so
 /// both refusals are exercised without an env or a spawn.
 ///
 /// `Global` is the whole signal: a server reading the global `~/.claude`
 /// credentials is the MCP half of a bare `claude`, while every isolated tier
-/// reads its own file — a supervised `clauth start` session, already registered,
+/// reads its own file — a supervised `tollgate start` session, already registered,
 /// or a `delegate` child, which gets `CLAUDE_CONFIG_DIR` in the same builder as
 /// its depth marker and so needs no depth check of its own here.
 fn bare_marker_wanted(auth: &crate::which::SessionAuth, is_probe: bool) -> bool {
@@ -5513,7 +5514,7 @@ fn hold_bare_session_marker() -> Option<std::fs::File> {
     match crate::runtime::register_bare_session() {
         Ok(file) => Some(file),
         Err(e) => {
-            logline!("clauth: bare-session marker not registered: {e:#}");
+            logline!("tollgate: bare-session marker not registered: {e:#}");
             None
         }
     }
@@ -5540,7 +5541,7 @@ fn startup() -> Option<std::fs::File> {
     // handshake: the gate is two registry reads inline, and a needed heal runs
     // on its own thread (throttled inside `heal_detached`), never on stdout.
     //
-    // Not under the Plugin tab's boot probe, which spawns a real `clauth mcp`
+    // Not under the Plugin tab's boot probe, which spawns a real `tollgate mcp`
     // and kills it within seconds: a heal started there is a mutating lifecycle
     // call the tab never confirmed, torn off mid-sequence, with the `claude`
     // grandchild left to finish its registry write unsignalled.
@@ -5557,7 +5558,7 @@ fn startup() -> Option<std::fs::File> {
         crate::herdr::heal_detached(auto_update);
     }
     // Held across `block_on`, so the flock drops with the process however it dies
-    // — a bare `claude` runs no clauth teardown, SIGKILL least of all.
+    // — a bare `claude` runs no tollgate teardown, SIGKILL least of all.
     hold_bare_session_marker()
 }
 
@@ -5571,7 +5572,7 @@ pub(crate) fn serve() -> Result<()> {
     let _server_marker = match jobs::hold_server_marker() {
         Ok(guard) => Some(guard),
         Err(e) => {
-            logline!("clauth: server marker not registered: {e:#}");
+            logline!("tollgate: server marker not registered: {e:#}");
             None
         }
     };
@@ -5597,7 +5598,7 @@ async fn run_server(delegate_dot: bool) -> Result<()> {
     // process inherited from herdr, and a per-call re-read would race a
     // delegate with a changed environment.
     let server =
-        ClauthServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve(delegate_dot));
+        TollgateServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve(delegate_dot));
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

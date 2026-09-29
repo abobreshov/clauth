@@ -159,8 +159,8 @@ fn watermark_advances_across_idle_days_and_is_monotonic() {
 #[test]
 fn save_load_round_trip() {
     let sb = crate::testutil::HomeSandbox::new();
-    let dir = sb.home().join(".clauth");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&dir).expect("mkdir .tollgate");
 
     let mut l = Ledger::default();
     l.record(
@@ -185,8 +185,8 @@ fn save_load_round_trip() {
 #[test]
 fn hours_survive_record_save_load_apply() {
     let sb = crate::testutil::HomeSandbox::new();
-    let dir = sb.home().join(".clauth");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&dir).expect("mkdir .tollgate");
 
     let mut hours = [HourTokens::default(); 24];
     hours[5] = HourTokens {
@@ -254,8 +254,8 @@ fn hours_survive_record_save_load_apply() {
 #[test]
 fn v1_ledger_without_hours_loads_applies_and_rerecords() {
     let sb = crate::testutil::HomeSandbox::new();
-    let dir = sb.home().join(".clauth");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&dir).expect("mkdir .tollgate");
     std::fs::write(
         dir.join("token_ledger.json"),
         r#"{
@@ -345,7 +345,7 @@ fn v1_ledger_without_hours_loads_applies_and_rerecords() {
 #[test]
 fn load_missing_is_empty() {
     let sb = crate::testutil::HomeSandbox::new();
-    let l = Ledger::load(&sb.home().join(".clauth"));
+    let l = Ledger::load(&sb.home().join(".tollgate"));
     assert!(l.recorded_through.is_none());
     assert!(l.days.is_empty());
 }
@@ -358,8 +358,8 @@ fn load_missing_is_empty() {
 #[test]
 fn v1_ledger_without_flag_loads_backfill_pending() {
     let sb = crate::testutil::HomeSandbox::new();
-    let dir = sb.home().join(".clauth");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&dir).expect("mkdir .tollgate");
     std::fs::write(
         dir.join("token_ledger.json"),
         r#"{

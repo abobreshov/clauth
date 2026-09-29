@@ -5,7 +5,7 @@
 //! fourth panel means restructuring the screen.
 //!
 //! The left panel is one cursor-driven selector over the integration checks
-//! (clauth on PATH, mcpServers wiring, plugin install, CC version, and a
+//! (tollgate on PATH, mcpServers wiring, plugin install, CC version, and a
 //! `runtime` row that folds every CLAUDE profile's live sessions / credential link /
 //! token freshness into one summary). Each row is a status dot + label, the
 //! verdict in the detail pane. Enter descends into the detail pane; `f` applies
@@ -511,9 +511,9 @@ fn tag_refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'stat
 /// row nothing it can do.
 fn herdr_row_text_tooltip(app: &App) -> &'static str {
     if app.plugin.herdr_config.as_ref().is_some_and(|c| !c.parsed) {
-        "herdr's config doesn't parse, so clauth can't rewrite the row"
+        "herdr's config doesn't parse, so tollgate can't rewrite the row"
     } else {
-        "herdr's config can't be read, so clauth can't rewrite the row"
+        "herdr's config can't be read, so tollgate can't rewrite the row"
     }
 }
 
@@ -601,7 +601,7 @@ const TAIL_MIN_W: usize = 8;
 
 /// The line under the list. Owner's words, verbatim: the pane takes no keys, so
 /// this is the whole of what it offers beyond the list itself.
-const DELEGATES_STEER: &str = "manage delegates in clauth app on web or mobile (coming soon)";
+const DELEGATES_STEER: &str = "manage delegates in tollgate app on web or mobile (coming soon)";
 
 /// Rows the delegates pane takes: its content plus [`PANE_CHROME`], capped so
 /// the master-detail above keeps [`MASTER_MIN`] rows, and `0` when that leaves
@@ -718,7 +718,7 @@ fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'st
         ),
         Span::styled(cells.facts.join(" · "), theme::dim()),
     ];
-    // The delegate's own words, quoted so they cannot read as clauth's report
+    // The delegate's own words, quoted so they cannot read as tollgate's report
     // about it, and last so the columns before them never move.
     let used: usize = spans.iter().map(Span::width).sum();
     let room = width.saturating_sub(used + 4); // the 2-space gap and both quotes
@@ -735,7 +735,7 @@ fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'st
 // stored record, plus the two things a TERMINAL adds to it.
 //
 // The four situations, the word for each, and the band a row sits in all live on
-// `JobPhase` in `src/mcp/jobs.rs`, because `clauth jobs` and `monitor`'s listing
+// `JobPhase` in `src/mcp/jobs.rs`, because `tollgate jobs` and `monitor`'s listing
 // answer the same questions and three copies of one rule is how they drift. What
 // stays here is presentation and only presentation: the glyph and the hue. The
 // word is mandatory beside the mark either way — three of the four share the `●`
@@ -780,7 +780,7 @@ struct DelegateCells {
 /// One cell set per stored record, in the order they arrive.
 ///
 /// **It sorts nothing.** Banding is `jobs::list_banded`'s, which is what
-/// `recompute_plugin_checks` reads the store through, and what `clauth jobs` and
+/// `recompute_plugin_checks` reads the store through, and what `tollgate jobs` and
 /// `monitor`'s listing read it through as well. This pane used to band its own
 /// already-rendered cells off the same shared rank, which could not drift TODAY
 /// and was still two sort sites: a later change to `list_banded` — a tiebreak, a

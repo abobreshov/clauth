@@ -1384,14 +1384,14 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::Disabled => "enable it on the setup tab".to_string(),
         UsageDiag::Canceled => "this subscription has been canceled".to_string(),
         UsageDiag::KickSwitchGrade { auto_start: true } => {
-            "clauth is re-testing periodically".to_string()
+            "tollgate is re-testing periodically".to_string()
         }
         UsageDiag::KickSwitchGrade { auto_start: false } => {
             "won't recover with auto-start off, enable it".to_string()
         }
         UsageDiag::KickBurst => "claude code hit a burst limit".to_string(),
         UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
-        UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
+        UsageDiag::AuthBroken => format!("re-login with tollgate login {profile_name}"),
         UsageDiag::WeeklyHard => "weekly limit is spent".to_string(),
         UsageDiag::BudgetSpent => "raise max spend on the fallback tab".to_string(),
         UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
@@ -1496,12 +1496,12 @@ fn build_tp_rows(
                 // (Alibaba), or a dead api key (any other provider, whose
                 // verdict only a 401 can produce).
                 Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
-                    "console login expired, run clauth login"
+                    "console login expired, run tollgate login"
                 }
                 Some(FetchStatus::AuthExpired) if profile.provider != Some(Provider::Alibaba) => {
                     "api key rejected, re-enter it on the setup tab"
                 }
-                Some(FetchStatus::AuthExpired) => "console login needed, run clauth login",
+                Some(FetchStatus::AuthExpired) => "console login needed, run tollgate login",
                 // A profile no leg will ever fetch must not claim to be
                 // loading — the same rule `oauth_empty_msg` applies. An Alibaba
                 // profile is never in here: its quota runs on the console
@@ -1593,7 +1593,7 @@ fn build_tp_rows(
         // interior would send the report nowhere.
         lines.extend(
             wrap_words(
-                "looks wrong? report at github.com/uwuclxdy/clauth/issues",
+                "looks wrong? report at github.com/abobreshov/clauth/issues",
                 usize::from(inner_w),
             )
             .into_iter()

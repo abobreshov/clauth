@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::logline::logline;
 use crate::pricing::PriceTable;
-use crate::profile::{atomic_write_600, claude_dir, clauth_dir, mkdir_700};
+use crate::profile::{atomic_write_600, claude_dir, mkdir_700, tollgate_dir};
 
 /// Bytes read from a file's head to recover its workspace and first user
 /// message. The session id comes from the filename stem, not the head, so this
@@ -696,7 +696,7 @@ fn group_by_workspace(sessions: Vec<SessionInfo>) -> Vec<WorkspaceGroup> {
     out
 }
 
-/// Every transcript across the stores `clauth sessions` browses — the global
+/// Every transcript across the stores `tollgate sessions` browses — the global
 /// store plus every live isolated runtime's own — deduped by session id and
 /// unsorted, with nothing opened: a `read_dir` walk and one stat per file.
 /// Fail-soft throughout — an unreadable store is skipped, never fatal.
@@ -727,7 +727,7 @@ pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
 }
 
 /// A file mtime as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS+00:00`), the machine
-/// shape `clauth sessions --json` and the sessions API share. A pre-epoch time
+/// shape `tollgate sessions --json` and the sessions API share. A pre-epoch time
 /// clamps to epoch 0.
 pub(crate) fn updated_iso(t: SystemTime) -> String {
     let secs = t
@@ -740,13 +740,13 @@ pub(crate) fn updated_iso(t: SystemTime) -> String {
 // ── Targeted lookup: one session, without the index's per-transcript reads ────
 //
 // [`build_index`] head- AND tail-reads every transcript to build previews, which
-// a by-id caller then throws away: 11.3 s for `clauth info latest` over a
+// a by-id caller then throws away: 11.3 s for `tollgate info latest` over a
 // 12k-session store, against 44 ms for the same answer here. The lookups below
 // walk that store for filenames and mtimes, then read the head of the ONE file
 // they resolved to.
 //
 // The GLOBAL store only, unlike the index. A live isolated runtime's own store
-// belongs to a session another process is running; `clauth resume` and the
+// belongs to a session another process is running; `tollgate resume` and the
 // `delegate` resume both spawn against the shared store, where Claude Code would
 // answer `No conversation found` for an id that only exists in an isolated tree.
 // An isolated run's transcript reaches this store once the rescue lifts it out.
@@ -766,7 +766,7 @@ pub(crate) struct SessionRef {
 }
 
 /// A transcript in a live isolated runtime's own store: real, listed by
-/// `clauth sessions`, and unreachable by a resume until that run ends and the
+/// `tollgate sessions`, and unreachable by a resume until that run ends and the
 /// rescue lifts it into the shared store.
 #[derive(Debug, Clone)]
 pub(crate) struct IsolatedHold {
@@ -853,7 +853,7 @@ pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
 ///
 /// These are never resolutions — a resume spawns against the shared store and
 /// cannot read any of them. They exist to EXPLAIN what the shared store alone
-/// cannot: a session `clauth sessions` just listed is not "no session found",
+/// cannot: a session `tollgate sessions` just listed is not "no session found",
 /// and the newest session on the machine going missing from `latest` is not a
 /// reason to silently resume the second newest.
 pub(crate) fn live_isolated_holds() -> Vec<IsolatedHold> {
@@ -942,13 +942,13 @@ pub(crate) fn annotate_all(groups: &mut [WorkspaceGroup], price: Option<&PriceTa
 
 // ── A3: session → last-ran-profile store ─────────────────────────────────────
 //
-// A single GLOBAL file under `~/.clauth/` keyed by session id (NOT per-profile —
+// A single GLOBAL file under `~/.tollgate/` keyed by session id (NOT per-profile —
 // a shared-store session is cross-profile, so its owner can't live under any one
-// profile dir). Hand-rolled load/save against `clauth_dir()`, mirroring
+// profile dir). Hand-rolled load/save against `tollgate_dir()`, mirroring
 // `pricing.rs` / `token_ledger.rs`, since the crate has no shared global-cache
 // helper.
 
-/// Global store filename under `~/.clauth/`.
+/// Global store filename under `~/.tollgate/`.
 const SESSION_PROFILES_FILE: &str = "session_profiles.json";
 
 /// Which profile a session last ran under. A stored `Contested` is distinct from
@@ -970,10 +970,10 @@ struct SessionProfiles {
     sessions: HashMap<String, SessionOwner>,
 }
 
-/// `~/.clauth/session_profiles.json`; `None` only when the home dir can't be
+/// `~/.tollgate/session_profiles.json`; `None` only when the home dir can't be
 /// resolved.
 fn store_path() -> Option<PathBuf> {
-    clauth_dir().ok().map(|d| d.join(SESSION_PROFILES_FILE))
+    tollgate_dir().ok().map(|d| d.join(SESSION_PROFILES_FILE))
 }
 
 /// Load the store, or an empty one when absent/unreadable/corrupt — a missing
@@ -1039,7 +1039,7 @@ pub(crate) fn stamp_exact_owner(session_id: &str, profile: &str) {
         Ok(held) => held,
         Err(e) => {
             crate::logline::to_logfile(format_args!(
-                "clauth: skipping the exact session owner stamp: {e}"
+                "tollgate: skipping the exact session owner stamp: {e}"
             ));
             return;
         }
@@ -1058,7 +1058,7 @@ pub(crate) fn stamp_exact_owner(session_id: &str, profile: &str) {
     drop(held);
     if let Err(e) = result {
         crate::logline::to_logfile(format_args!(
-            "clauth: failed to stamp exact session owner: {e}"
+            "tollgate: failed to stamp exact session owner: {e}"
         ));
     }
 }
@@ -1080,7 +1080,7 @@ fn touched_since(path: &Path, since: SystemTime) -> bool {
     mtime_of(path).is_some_and(|mtime| mtime >= since)
 }
 
-/// Record which sessions a `clauth start` run owned into the global store.
+/// Record which sessions a `tollgate start` run owned into the global store.
 ///
 /// `projects_dir` is where the run's transcripts landed: an isolated runtime's
 /// own `runtime-isolated-<sid>/projects/` (`isolated = true` — every file maps to
@@ -1106,7 +1106,7 @@ fn touched_since(path: &Path, since: SystemTime) -> bool {
 /// The keep-set and refusal checks are computed above the state flock; they
 /// read nothing it protects, and a session going live between the read and the
 /// prune only widens the keep-set — the safe direction. The read-modify-write
-/// then runs under the flock so two concurrent `clauth start` runs retain, fold
+/// then runs under the flock so two concurrent `tollgate start` runs retain, fold
 /// their stamps, and save serially instead of clobbering each other. Best-effort
 /// throughout: the session already ran, so any IO error is logged and swallowed
 /// — never propagated to fail `start`.
@@ -1163,7 +1163,7 @@ pub(crate) fn stamp_run_sessions(
         Ok(())
     });
     if let Err(e) = result {
-        logline!("clauth: failed to stamp session owners: {e}");
+        logline!("tollgate: failed to stamp session owners: {e}");
     }
 }
 
@@ -1201,13 +1201,13 @@ struct PruneKeep {
 fn prepare_prune(paths: &[PathBuf], walk_complete: bool) -> Option<PruneKeep> {
     if !walk_complete {
         logline!(
-            "clauth: refusing to prune session owners: the global transcript walk was incomplete"
+            "tollgate: refusing to prune session owners: the global transcript walk was incomplete"
         );
         return None;
     }
     if paths.is_empty() {
         logline!(
-            "clauth: refusing to prune session owners: the global transcript walk returned nothing"
+            "tollgate: refusing to prune session owners: the global transcript walk returned nothing"
         );
         return None;
     }
@@ -1318,9 +1318,9 @@ pub(crate) fn rescue_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     // letting another local user list session ids even though the files
     // themselves stay 0600. Birth only, not a retighten: a dir this call finds
     // already on disk (e.g. left loose by a pre-fix build) keeps its existing
-    // mode, same as `enforce_clauth_perms`'s own no-op-on-existing behavior —
-    // and that retighten walk is scoped to `~/.clauth` only, deliberately never
-    // `~/.claude`, which clauth does not own outright.
+    // mode, same as `enforce_tollgate_perms`'s own no-op-on-existing behavior —
+    // and that retighten walk is scoped to `~/.tollgate` only, deliberately never
+    // `~/.claude`, which tollgate does not own outright.
     if let Some(parent) = dst.parent() {
         mkdir_700(parent)?;
     }
@@ -1448,7 +1448,7 @@ pub(crate) fn rescue_isolated_store(iso_projects: &Path, global_projects: &Path)
     for src in paths {
         match rescue_session_transcript(&src, iso_projects, global_projects) {
             Ok(_) => moved += 1,
-            Err(e) => logline!("clauth: failed to rescue {}: {e}", src.display()),
+            Err(e) => logline!("tollgate: failed to rescue {}: {e}", src.display()),
         }
     }
     moved
@@ -1540,7 +1540,7 @@ pub(crate) fn rescue_isolated_sidecars(iso_root: &Path, global_root: &Path) -> u
         let dst = global_root.join(&name);
         if is_symlink(&dst) {
             logline!(
-                "clauth: skipping rescue of {}, {} is a symlink",
+                "tollgate: skipping rescue of {}, {} is a symlink",
                 src.display(),
                 dst.display()
             );
@@ -1551,14 +1551,14 @@ pub(crate) fn rescue_isolated_sidecars(iso_root: &Path, global_root: &Path) -> u
         } else {
             match rescue_file(&src, &dst) {
                 Ok(_) => moved += 1,
-                Err(e) => logline!("clauth: failed to rescue {}: {e}", src.display()),
+                Err(e) => logline!("tollgate: failed to rescue {}: {e}", src.display()),
             }
         }
     }
     if !untouched.is_empty() {
         untouched.sort();
         logline!(
-            "clauth: left {} in the isolated store (not session state)",
+            "tollgate: left {} in the isolated store (not session state)",
             untouched.join(", ")
         );
     }
@@ -1573,7 +1573,7 @@ pub(crate) fn rescue_isolated_sidecars(iso_root: &Path, global_root: &Path) -> u
 fn rescue_tree(src: &Path, dst: &Path, depth: usize) -> usize {
     if depth == 0 {
         logline!(
-            "clauth: rescue depth cap reached at {}, leaving the subtree",
+            "tollgate: rescue depth cap reached at {}, leaving the subtree",
             src.display()
         );
         return 0;
@@ -1593,7 +1593,7 @@ fn rescue_tree(src: &Path, dst: &Path, depth: usize) -> usize {
         let target = dst.join(entry.file_name());
         if is_symlink(&target) {
             logline!(
-                "clauth: skipping rescue of {}, {} is a symlink",
+                "tollgate: skipping rescue of {}, {} is a symlink",
                 path.display(),
                 target.display()
             );
@@ -1605,7 +1605,7 @@ fn rescue_tree(src: &Path, dst: &Path, depth: usize) -> usize {
         }
         match rescue_file(&path, &target) {
             Ok(_) => moved += 1,
-            Err(e) => logline!("clauth: failed to rescue {}: {e}", path.display()),
+            Err(e) => logline!("tollgate: failed to rescue {}: {e}", path.display()),
         }
     }
     moved

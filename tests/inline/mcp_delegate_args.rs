@@ -72,7 +72,7 @@ fn seed_third_party_profiles(names: &[&str]) {
     }
 }
 
-/// Drive the async `delegate` tool with `CLAUTH_MCP_DEPTH` cleared, so the
+/// Drive the async `delegate` tool with `TOLLGATE_MCP_DEPTH` cleared, so the
 /// recursion guard does not mask the argument guard under test. Every caller
 /// holds a `HomeSandbox`, whose `HOME_TEST_LOCK` serializes the env mutation.
 ///
@@ -85,7 +85,7 @@ fn call_delegate(args: DelegateArgs) -> CallToolResult {
     // SAFETY: test-only, serialized by the sandbox's HOME_TEST_LOCK.
     unsafe { std::env::remove_var(MCP_DEPTH_ENV) };
 
-    let server = ClauthServer::new();
+    let server = TollgateServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -549,9 +549,9 @@ fn subagent_type_is_passed_as_the_agent_flag() {
     );
 }
 
-/// The session-identity flags are clauth-owned, not a typed-vs-raw duplicate:
+/// The session-identity flags are tollgate-owned, not a typed-vs-raw duplicate:
 /// a raw spelling would land AFTER the pin (`args` run last) and move the
-/// child off the id `CLAUTH_DELEGATE_SESSION_ID` names. Every spelling that
+/// child off the id `TOLLGATE_DELEGATE_SESSION_ID` names. Every spelling that
 /// can name or fork a session is refused, typed twin or none.
 #[test]
 fn raw_session_flags_in_args_are_refused() {
@@ -566,12 +566,12 @@ fn raw_session_flags_in_args_are_refused() {
         });
         assert_refusal(
             &result,
-            &["`CLAUTH_DELEGATE_SESSION_ID`", raw, "`session_id`"],
+            &["`TOLLGATE_DELEGATE_SESSION_ID`", raw, "`session_id`"],
         );
     }
 }
 
-/// The wiring `CLAUTH_DELEGATE_SESSION_ID` exemptions key on: one binding
+/// The wiring `TOLLGATE_DELEGATE_SESSION_ID` exemptions key on: one binding
 /// feeds both the env var and the `--session-id`/`--resume` flag, so the
 /// exported id is always the id the child runs under. `run_delegate` cannot
 /// run without a real `claude` child, so the pin is a source scan, the same
@@ -926,8 +926,8 @@ fn fanout_reserve_failure_is_refused_by_name() {
     // Enabled members: a disabled one would refuse at the pre-flight before
     // the reserve this test pins.
     seed_profiles(&["solo", "vendor"], false);
-    let jobs = home.home().join(".clauth").join("jobs");
-    std::fs::create_dir_all(jobs.parent().unwrap()).expect("clauth dir");
+    let jobs = home.home().join(".tollgate").join("jobs");
+    std::fs::create_dir_all(jobs.parent().unwrap()).expect("tollgate dir");
     std::fs::write(&jobs, b"not a dir").expect("jobs path is a file");
 
     let result = call_delegate(DelegateArgs {
@@ -941,11 +941,11 @@ fn fanout_reserve_failure_is_refused_by_name() {
 
 // ── resume infers the account from the conversation record ──────────────────
 
-/// Seed `~/.clauth/conversations/<id>.json` carrying `told`, written through
+/// Seed `~/.tollgate/conversations/<id>.json` carrying `told`, written through
 /// the crate's own atomic 0600 writer so the fixture is exactly the bytes the
 /// hook itself writes.
 fn seed_conversation_record(home: &std::path::Path, id: &str, told: Option<&str>) {
-    let dir = home.join(".clauth").join("conversations");
+    let dir = home.join(".tollgate").join("conversations");
     std::fs::create_dir_all(&dir).expect("records dir");
     let path = dir.join(format!("{id}.json"));
     let bytes = serde_json::to_vec(&serde_json::json!({ "told": told })).expect("record json");
@@ -1037,7 +1037,7 @@ fn an_explicit_profiles_wins_over_the_record_for_a_resume() {
     );
 }
 
-/// The record's `told` names an account clauth does not hold: the existing
+/// The record's `told` names an account tollgate does not hold: the existing
 /// not-found refusal, the same path an explicit unknown name takes.
 #[test]
 fn a_resume_record_naming_an_unknown_account_refuses_profile_not_found() {
@@ -1069,13 +1069,13 @@ fn a_path_shaped_resume_id_is_refused_not_read() {
     // The bare-id check is the only thing between this id and the join, so
     // make the traversal physically reachable: `conversations/..` resolves
     // through the dir, and the kernel walk cannot pass a missing component.
-    std::fs::create_dir_all(home.home().join(".clauth").join("conversations"))
+    std::fs::create_dir_all(home.home().join(".tollgate").join("conversations"))
         .expect("records dir");
     // Decoy at the traversal destination: with the bare-id check dropped,
     // `record_path` joins `conversations/../escape.json`, which resolves to
     // exactly this file — so the drop resolves the target and this test reds
     // on the wrong refusal instead of passing on a silent read failure.
-    let decoy = home.home().join(".clauth").join("escape.json");
+    let decoy = home.home().join(".tollgate").join("escape.json");
     let bytes = serde_json::to_vec(&serde_json::json!({ "told": "solo" })).expect("decoy json");
     crate::profile::atomic_write_600(&decoy, bytes).expect("decoy write");
 
@@ -1185,7 +1185,7 @@ fn background_single_keyless_third_party_refuses_before_reserving_a_job() {
     });
     assert_refusal(
         &result,
-        &["profile has no api key: zzbg-ds (run `clauth login zzbg-ds --api-key <key>`)"],
+        &["profile has no api key: zzbg-ds (run `tollgate login zzbg-ds --api-key <key>`)"],
     );
     assert_no_job_keys(&result);
     assert_no_job_files();
@@ -1206,7 +1206,7 @@ fn background_single_disabled_target_refuses_before_reserving_a_job() {
     });
     assert_refusal(
         &result,
-        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
+        &["profile is disabled: zzbg-off (run `tollgate enable zzbg-off`)"],
     );
     assert_no_job_keys(&result);
     assert_no_job_files();
@@ -1288,7 +1288,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
     });
     assert_refusal(
         &result,
-        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
+        &["profile is disabled: zzbg-off (run `tollgate enable zzbg-off`)"],
     );
     assert_no_job_keys(&result);
     assert_no_job_files();
@@ -1347,7 +1347,7 @@ fn a_valid_fanout_returns_one_job_per_account() {
     assert_ne!(ids[0], ids[1], "job ids are distinct");
 
     // Hold the sandbox until both detached tasks finish, so their `write_done`
-    // lands under the sandbox and never the real `~/.clauth`.
+    // lands under the sandbox and never the real `~/.tollgate`.
     crate::testutil::assert_jobs_done(2);
 }
 
@@ -1930,7 +1930,7 @@ fn an_unfunded_fanout_member_refuses_the_call_before_any_spawn() {
     assert_refusal(&result, &["broke", "balance too low"]);
 }
 
-/// No cache at all — an OAuth member, or a provider clauth has never fetched
+/// No cache at all — an OAuth member, or a provider tollgate has never fetched
 /// for — carries no verdict, and preflight passes: the gate reads the
 /// provider's verdict, never a guess at a figure.
 #[test]
@@ -1994,7 +1994,7 @@ fn the_keyless_sentence_outranks_the_unfunded_one() {
     let profile = config.find(&pn).expect("seeded profile resolves");
     let reason = super::preflight_target(profile, &config, &pn).expect_err("refused");
     assert_eq!(
-        reason, "profile has no api key: nokey (run `clauth login nokey --api-key <key>`)",
+        reason, "profile has no api key: nokey (run `tollgate login nokey --api-key <key>`)",
         "the keyless sentence is the refusal, not the unfunded one"
     );
 }
@@ -2017,7 +2017,7 @@ fn the_disabled_sentence_outranks_the_unfunded_one() {
         prompt: Some("hi".to_string()),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled", "clauth enable"]);
+    assert_refusal(&result, &["profile is disabled", "tollgate enable"]);
     let text = first_text(&result);
     assert!(
         !text.contains("failed: cannot fund a run"),

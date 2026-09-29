@@ -45,7 +45,7 @@ pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
 
 /// Whether a `StatRow` label names the account's spendable balance, in either
 /// spelling a cache on disk can carry: the current [`DEEPSEEK_BALANCE_ROW_LABEL`],
-/// or the legacy `total` an older clauth wrote and the generic scanner still
+/// or the legacy `total` an older tollgate wrote and the generic scanner still
 /// passes an endpoint's own key through as. Every reader that singles the
 /// wallet row out — the overview balance column, the MCP roster's rank and its
 /// rendered figure — asks this, so a rename lives in one place.
@@ -427,12 +427,12 @@ impl ThirdPartyStats {
 
 impl ThirdPartyStats {
     /// These stats as the [`UsageInfo`] the scheduling layer reads, or `None`
-    /// when this provider published no window clauth recognises.
+    /// when this provider published no window tollgate recognises.
     ///
     /// A provider bar and an OAuth window are the same measurement — a rolling
     /// percentage with a reset instant — so mapping the two labels the chain
     /// actually judges (`5h`, `7d`) lets a third-party member take part in
-    /// auto-switch, `clauth list`'s used columns, and the published
+    /// auto-switch, `tollgate list`'s used columns, and the published
     /// `status.json` `windows` array with no per-provider branching downstream.
     ///
     /// Two deliberate exclusions:
@@ -482,7 +482,7 @@ pub(crate) struct StatRow {
 /// What every surface says when a provider reports the account cannot fund a
 /// call. One spelling, because the roster line, the Usage tab and the MCP
 /// headline all render it and a reader meets more than one of them. It is a
-/// verdict the PROVIDER reached, never clauth failing to read a figure, which
+/// verdict the PROVIDER reached, never tollgate failing to read a figure, which
 /// is what the old `balance unavailable` wording claimed.
 pub(crate) const LOW_BALANCE: &str = "balance too low";
 

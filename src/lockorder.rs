@@ -1,6 +1,6 @@
 //! Globally-ordered locks that enforce a single acquisition order in code.
 //!
-//! Every shared lock in clauth carries a *rank* — its position in one global
+//! Every shared lock in tollgate carries a *rank* — its position in one global
 //! order. A thread may only acquire a lock whose rank is strictly greater than
 //! the highest rank it already holds. Acquiring out of that order is the
 //! classic lock-order-inversion that deadlocks, so we assert it the moment a
@@ -183,7 +183,7 @@ pub(crate) mod rank {
         /// Deliberately INSIDE `Config` (400) and OUTSIDE `State` (500). The rank
         /// is what enforces the latter: taking or expiring the clock does file IO,
         /// and the state flock is a CROSS-PROCESS serialization point, so holding
-        /// it across that IO lengthens contention for every other clauth process.
+        /// it across that IO lengthens contention for every other tollgate process.
         /// Move an `expire_profile_ttl` back inside a `with_state_lock` and this
         /// asserts.
         ProfileTtl = 450;
@@ -378,7 +378,7 @@ impl<T, R: Rank> RankedMutex<T, R> {
     /// behind.
     ///
     /// `daemon::api`'s switch gate is still the only caller, on every platform
-    /// clauth targets.
+    /// tollgate targets.
     pub(crate) fn try_lock(&self) -> Result<RankedGuard<'_, T>, TryLockError> {
         let rank = RankGuard::enter::<R>();
         match self.inner.try_lock() {

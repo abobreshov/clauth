@@ -31,20 +31,20 @@ fn startup_heals_a_broken_plugin_registration() {
     );
 }
 
-/// The herdr heal at startup is a NETWORK update, so it reads the saved
-/// `[update]` toggle fresh: a server started with `auto_update = false` on
-/// disk reinstalls nothing, and one started with it back on reaches the fake
-/// install — proving the saved-off call never claimed the throttle floor.
+/// The herdr heal at startup is a NETWORK update, and self-update is compiled
+/// out of this build (plan §4.0): a server started with `auto_update = false`
+/// on disk reinstalls nothing, and one started with it back on reinstalls
+/// nothing either.
 #[cfg(unix)]
 #[test]
-fn startup_herdr_heal_follows_the_saved_update_toggle() {
+fn startup_herdr_heal_is_a_noop_in_this_build() {
     use std::ffi::OsStr;
 
     use crate::testutil::join_background_tasks;
 
     let home = HomeSandbox::new();
     let stale = crate::herdr::plugin_list_json(
-        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+        r#"{"enabled":true,"plugin_id":"tollgate","source":{"kind":"github","owner":"abobreshov","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
@@ -73,18 +73,16 @@ fn startup_herdr_heal_follows_the_saved_update_toggle() {
         "a server started with the saved toggle off reinstalls nothing"
     );
 
-    // The saved-off call must not have claimed the throttle: back on, a
-    // server started fresh reads the new value and installs.
+    // Back on, a server started fresh reads the new value: still nothing
+    // installs.
     let mut state = crate::profile::load_app_state().expect("load state");
     state.update.auto_update = true;
     crate::profile::save_app_state(&state).expect("persist on toggle");
 
     let _marker = super::startup();
     join_background_tasks();
-    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
-    assert_eq!(
-        log.trim(),
-        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
-        "a server started with the saved toggle on reaches the fake install"
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "self-update is compiled out: a server started with the saved toggle on installs nothing either"
     );
 }

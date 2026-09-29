@@ -63,14 +63,16 @@ fn the_codex_engine_carries_its_own_spawn_facts() {
 }
 
 /// The codex scrub drops its managed keys and the claude actives, and strips
-/// an inherited CLAUDE_CONFIG_DIR only when it names a tree clauth built — an
-/// operator's own custom dir is not clauth's to strip.
+/// an inherited CLAUDE_CONFIG_DIR only when it names a tree tollgate built — an
+/// operator's own custom dir is not tollgate's to strip.
 #[test]
-fn the_codex_scrub_is_managed_keys_plus_clauth_runtime_hygiene() {
+fn the_codex_scrub_is_managed_keys_plus_tollgate_runtime_hygiene() {
     let home = crate::testutil::HomeSandbox::new();
     let engine: &dyn HarnessEngine = &CodexEngine;
 
-    let runtime_dir = home.home().join(".clauth/profiles/started/runtime-4242-0");
+    let runtime_dir = home
+        .home()
+        .join(".tollgate/profiles/started/runtime-4242-0");
     {
         let _env = crate::testutil::ConfigDirSandbox::new(&home, &runtime_dir);
         let mut cmd = std::process::Command::new("probe");
@@ -105,7 +107,7 @@ fn the_codex_scrub_is_managed_keys_plus_clauth_runtime_hygiene() {
         assert_eq!(
             env.get("CLAUDE_CONFIG_DIR"),
             Some(&None),
-            "an inherited clauth runtime claim is scrubbed from a codex spawn"
+            "an inherited tollgate runtime claim is scrubbed from a codex spawn"
         );
     }
     {
@@ -121,14 +123,14 @@ fn the_codex_scrub_is_managed_keys_plus_clauth_runtime_hygiene() {
     }
 }
 
-/// The claude engine's mirror hygiene: an inherited clauth codex home is
+/// The claude engine's mirror hygiene: an inherited tollgate codex home is
 /// scrubbed from a claude spawn, a foreign CODEX_HOME is not.
 #[test]
-fn the_claude_scrub_strips_only_a_clauth_codex_home() {
+fn the_claude_scrub_strips_only_a_tollgate_codex_home() {
     let home = crate::testutil::HomeSandbox::new();
     let engine: &dyn HarnessEngine = &ClaudeEngine;
 
-    let codex_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let codex_home = home.home().join(".tollgate/profiles/cx/codex-home-4242-0");
     {
         let _env = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
         let mut cmd = std::process::Command::new("probe");
@@ -136,7 +138,7 @@ fn the_claude_scrub_strips_only_a_clauth_codex_home() {
         assert_eq!(
             crate::testutil::env_overrides(&cmd).get("CODEX_HOME"),
             Some(&None),
-            "a clauth codex home claim is scrubbed from a claude spawn"
+            "a tollgate codex home claim is scrubbed from a claude spawn"
         );
     }
     {
@@ -146,7 +148,7 @@ fn the_claude_scrub_strips_only_a_clauth_codex_home() {
         assert_eq!(
             crate::testutil::env_overrides(&cmd).get("CODEX_HOME"),
             None,
-            "the operator's own CODEX_HOME is not clauth's to strip"
+            "the operator's own CODEX_HOME is not tollgate's to strip"
         );
     }
 }

@@ -358,7 +358,7 @@ fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
     assert!(
         running.contains("\"reading the"),
         "the delegate's own words ride last, quoted so they cannot read as \
-         clauth's:\n{running}"
+         tollgate's:\n{running}"
     );
     assert!(
         running.contains('…'),
@@ -370,7 +370,7 @@ fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
         "a done row is dated by its finish:\n{screen}"
     );
     assert!(
-        screen.contains("manage delegates in clauth app on web or mobile (coming soon)"),
+        screen.contains("manage delegates in tollgate app on web or mobile (coming soon)"),
         "the steer line renders under the list:\n{screen}"
     );
 }
@@ -675,7 +675,7 @@ fn the_delegates_pane_renders_its_empty_state_with_the_steer_line() {
         "the empty state renders:\n{screen}"
     );
     assert!(
-        screen.contains("manage delegates in clauth app on web or mobile (coming soon)"),
+        screen.contains("manage delegates in tollgate app on web or mobile (coming soon)"),
         "and the steer line with it:\n{screen}"
     );
 }
@@ -904,7 +904,7 @@ fn delegate_row_text_renders_inert_with_tooltip_when_herdr_config_does_not_parse
         .unwrap_or_else(|| panic!("no delegate row text row:\n{screen}"));
     let row = &rows[row_idx];
     assert!(
-        screen.contains("herdr's config doesn't parse, so clauth can't rewrite the row"),
+        screen.contains("herdr's config doesn't parse, so tollgate can't rewrite the row"),
         "the tooltip renders under the focused inert row:\n{screen}"
     );
     for needle in ["❯", "delegate row text"] {

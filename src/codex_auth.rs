@@ -6,9 +6,9 @@
 //! (decision 7). Three rules fall out, and everything here serves one of
 //! them:
 //!
-//! - **Single writer.** Every clauth-side rotation runs under the profile's
+//! - **Single writer.** Every tollgate-side rotation runs under the profile's
 //!   [`RotationGuard`](crate::runtime::RotationGuard); codex-vs-codex is
-//!   handled by codex's own reload-and-skip, clauth-vs-codex by the guard.
+//!   handled by codex's own reload-and-skip, tollgate-vs-codex by the guard.
 //! - **No replay.** A failed refresh persists nothing and the SAME token is
 //!   never retried on the routine leg — a DURABLE memo (a fingerprint file
 //!   beside the store) remembers the token a tick spent its shot on, so even
@@ -23,7 +23,7 @@
 //! - **Stand down where a live carrier holds the chain.** Under real symlinks
 //!   a live session reads the very file a rotation writes, so the only race is
 //!   codex's own five-minute pre-expiry window; under the fake transport the
-//!   session holds a SEPARATE copy, so any rotation desyncs it and clauth
+//!   session holds a SEPARATE copy, so any rotation desyncs it and tollgate
 //!   stands down for the whole live session. A PARKED profile has no carrier
 //!   to defer to — waiting there is how chains die at the wham 401.
 //!
@@ -73,7 +73,7 @@ pub(crate) const CODEX_TOKEN_REFRESH_INTERVAL_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 
 /// A parsed view over a codex `auth.json`. The FULL value is kept and
 /// rewritten — read-modify-write, never a typed round-trip — so every key a
-/// newer codex writes survives a clauth rotation (the store-rewrite rule the
+/// newer codex writes survives a tollgate rotation (the store-rewrite rule the
 /// credential-install seam names).
 #[derive(Debug, Clone)]
 pub(crate) struct CodexAuth {
@@ -146,7 +146,7 @@ impl CodexAuth {
     }
 
     /// The access token's `exp`, in epoch ms — an UNVERIFIED read of the JWT
-    /// payload (clauth schedules by it, never trusts it for auth). `None` for
+    /// payload (tollgate schedules by it, never trusts it for auth). `None` for
     /// a token that is not a parseable JWT, which callers treat the way codex
     /// itself does: fall back to age-based judgment rather than failing.
     pub(crate) fn access_exp_ms(&self) -> Option<i64> {
@@ -455,7 +455,7 @@ pub(crate) fn forget_attempt(name: &str) {
 /// A terminal verdict on a chain, bound to the refresh token it judged: `kind`
 /// is `reused` (the replay answer), `expired` or `invalidated` — the three the
 /// server spells about the chain itself ([`CodexRefreshError::quarantine_kind`]
-/// says why `rejected` is not one) — or `lost`, clauth's own: the wire
+/// says why `rejected` is not one) — or `lost`, tollgate's own: the wire
 /// accepted a rotation whose pair never reached the store, so the token the
 /// store still holds is spent server-side. `at` is the RFC-3339 stamp of the
 /// pass that heard it, `token_fingerprint` the judged token's, so the record
@@ -513,7 +513,7 @@ fn mark_quarantined(name: &str, kind: &str, at: &str, token: &str) {
         && let Err(e) =
             crate::profile::atomic_write_600(&path, serde_json::to_vec(&record).unwrap_or_default())
     {
-        logline!("clauth: codex quarantine record write for '{name}' failed: {e}");
+        logline!("tollgate: codex quarantine record write for '{name}' failed: {e}");
     }
 }
 
@@ -542,7 +542,7 @@ pub(crate) fn clear_quarantine(name: &str) {
 pub(crate) fn refuse_if_quarantined(name: &str) -> Result<()> {
     if let Some(q) = read_quarantine(name) {
         anyhow::bail!(
-            "'{name}': codex chain is broken ({} since {}), run `clauth login {name} --codex \
+            "'{name}': codex chain is broken ({} since {}), run `tollgate login {name} --codex \
              --browser`",
             q.kind,
             q.at
@@ -566,7 +566,7 @@ pub(crate) fn record_lkg(name: &str, bytes: &[u8]) {
     let Ok(path) = lkg_path(name) else { return };
     let same = std::fs::read(&path).map(|b| b == bytes).unwrap_or(false);
     if !same && let Err(e) = crate::profile::atomic_write_600(&path, bytes) {
-        logline!("clauth: codex last-known-good write for '{name}' failed: {e}");
+        logline!("tollgate: codex last-known-good write for '{name}' failed: {e}");
     }
 }
 
@@ -748,7 +748,7 @@ fn take_kick(name: &str) -> bool {
     false
 }
 
-/// Latch so a chain clauth cannot service logs its plight once, not every
+/// Latch so a chain tollgate cannot service logs its plight once, not every
 /// tick (the daemon log would otherwise truncate). Keyed by profile and
 /// plight — a store unreadable AND unrestorable, a memo path that refuses the
 /// write — and cleared when that plight heals: a good read, a memo that lands.
@@ -845,7 +845,7 @@ pub(crate) fn standby_pass(
                                 clear_bad_reads(name);
                                 clear_plight_warn(name, "corrupt");
                                 logline!(
-                                    "clauth: '{name}' codex auth.json read bad for \
+                                    "tollgate: '{name}' codex auth.json read bad for \
                                      {}s — restored the last-known-good copy",
                                     (now_ms - first_ms) / 1000
                                 );
@@ -856,7 +856,7 @@ pub(crate) fn standby_pass(
                                 // tick until a re-login and truncate the log.
                                 if plight_warn_once(name, "corrupt") {
                                     logline!(
-                                        "clauth: '{name}' codex auth.json is unreadable and the \
+                                        "tollgate: '{name}' codex auth.json is unreadable and the \
                                          belt could not restore it: {e:#}"
                                     );
                                 }
@@ -965,7 +965,7 @@ pub(crate) fn standby_pass(
         // Latched: a path that stays unwritable would otherwise say so every
         // tick, since the chain stays due until the memo lands.
         if plight_warn_once(name, "memo") {
-            logline!("clauth: codex refresh for '{name}' not sent: {e:#}");
+            logline!("tollgate: codex refresh for '{name}' not sent: {e:#}");
         }
         return StandbyOutcome::MemoFailed;
     }
@@ -986,7 +986,7 @@ pub(crate) fn standby_pass(
                     // burning the single-use chain. Only a successful POLL
                     // (phase 5's wire) clears the breaker; a persistently
                     // 401ing account trips it after two forced attempts.
-                    logline!("clauth: rotated codex chain for '{name}'");
+                    logline!("tollgate: rotated codex chain for '{name}'");
                     StandbyOutcome::Rotated
                 }
                 Err(e) => {
@@ -998,9 +998,9 @@ pub(crate) fn standby_pass(
                     // before a kick-forced retry earns the server's `reused`.
                     mark_quarantined(name, "lost", &now_rfc3339, &fresh_token);
                     logline!(
-                        "clauth: '{name}' codex rotation succeeded on the wire but the \
+                        "tollgate: '{name}' codex rotation succeeded on the wire but the \
                          store write failed ({e}); the chain is spent, run \
-                         `clauth login {name} --codex --browser`"
+                         `tollgate login {name} --codex --browser`"
                     );
                     StandbyOutcome::Failed
                 }
@@ -1013,7 +1013,7 @@ pub(crate) fn standby_pass(
             if let Some(kind) = e.quarantine_kind() {
                 mark_quarantined(name, kind, &now_rfc3339, &fresh_token);
             }
-            logline!("clauth: codex refresh for '{name}' failed: {e}");
+            logline!("tollgate: codex refresh for '{name}' failed: {e}");
             StandbyOutcome::Failed
         }
     }
