@@ -1108,6 +1108,53 @@ fn a_stale_expired_read_cannot_delete_a_newer_hold() {
     assert!(lock.exists());
 }
 
+/// The same interleaving seen from the reader: its unlocked read finds the
+/// expired deadline, a renewal lands while it waits on the flock, and its
+/// refused removal reads the renewed hold back instead of reporting none.
+/// The test holds the flock itself so the renewal lands in that window; a
+/// reader that reads only after the renewal sees it directly, so the result
+/// is the same either way.
+#[test]
+fn a_reader_whose_removal_is_refused_honours_the_renewed_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let fp = WalletHolds::fingerprint(MANAGEMENT);
+    WalletHolds::persistent().hold(MANAGEMENT, 0, None);
+    let floor_ms = u64::try_from(WALLET_HOLD_FLOOR.as_millis()).unwrap();
+    let now = floor_ms + 1;
+    let path = WalletHolds::hold_path(&fp).unwrap();
+
+    let lock = crate::profile::open_state_file(&path.with_extension("lock")).unwrap();
+    lock.lock().unwrap();
+    let left = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| WalletHolds::persistent().remaining(MANAGEMENT, now));
+        std::thread::sleep(Duration::from_millis(200));
+        let renewed = serde_json::to_vec(&PersistedWalletHold {
+            version: WALLET_HOLD_VERSION,
+            until_ms: now + 600_000,
+        })
+        .unwrap();
+        crate::profile::atomic_write_600(&path, renewed).unwrap();
+        lock.unlock().unwrap();
+        reader.join().unwrap()
+    });
+    assert_eq!(left, Some(Duration::from_secs(600)));
+    assert_eq!(persisted_raw(MANAGEMENT), Some(now + 600_000));
+}
+
+/// A skewed persisted deadline past the cap is rewritten to the clamped value
+/// by the next hold write, not kept as it stands.
+#[test]
+fn a_hold_write_rewrites_a_skewed_deadline_to_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let holds = WalletHolds::persistent();
+    holds.hold(MANAGEMENT, 0, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    std::fs::write(&path, r#"{"version":1,"until_ms":18446744073709551615}"#).unwrap();
+    WalletHolds::persistent().hold(MANAGEMENT, 0, None);
+    let cap_ms = u64::try_from(WalletHolds::cap().as_millis()).unwrap();
+    assert_eq!(persisted_raw(MANAGEMENT), Some(cap_ms));
+}
+
 /// Threads standing in for processes (each its own store, its own open of
 /// the flock) hammer `hold` and `remaining` on one credential, some reading
 /// at a time when the shorter holds have already expired: the file ends at

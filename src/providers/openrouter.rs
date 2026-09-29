@@ -558,14 +558,19 @@ impl WalletHolds {
 
     /// The persisted deadline for `fingerprint`, when one is in force at
     /// `now_ms`. An expired file is removed (see [`Self::remove_if_expired`]);
-    /// an unreadable one reads as none.
+    /// an unreadable one reads as none. When that removal is refused because
+    /// another process renewed the hold after the unlocked read, the renewed
+    /// deadline is read back and honoured rather than reported as no hold.
     fn persisted_until(fingerprint: &[u8; 32], now_ms: u64) -> Option<u64> {
-        let until = Self::read_until(&Self::hold_path(fingerprint)?)?;
-        if until <= now_ms {
-            Self::remove_if_expired(fingerprint, until, now_ms);
+        let path = Self::hold_path(fingerprint)?;
+        let until = Self::read_until(&path)?;
+        if until > now_ms {
+            return Some(until);
+        }
+        if Self::remove_if_expired(fingerprint, until, now_ms) {
             return None;
         }
-        Some(until)
+        Self::read_until(&path).filter(|&t| t > now_ms)
     }
 
     /// Remove `fingerprint`'s hold file, under its flock, only when it still
@@ -597,12 +602,15 @@ impl WalletHolds {
             return;
         };
         let cap_ms = u64::try_from(Self::cap().as_millis()).unwrap_or(u64::MAX);
-        let existing = Self::read_until(&path).map(|t| t.min(now_ms.saturating_add(cap_ms)));
+        let raw = Self::read_until(&path);
+        let existing = raw.map(|t| t.min(now_ms.saturating_add(cap_ms)));
         let hold = PersistedWalletHold {
             version: WALLET_HOLD_VERSION,
             until_ms: existing.map_or(until_ms, |t| t.max(until_ms)),
         };
-        if existing == Some(hold.until_ms) {
+        // Compared with the RAW deadline, so a skewed file past the cap is
+        // rewritten to the clamped value rather than kept as it stands.
+        if raw == Some(hold.until_ms) {
             return;
         }
         if let Ok(bytes) = serde_json::to_vec(&hold) {
