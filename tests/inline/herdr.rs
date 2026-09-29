@@ -4147,9 +4147,9 @@ fn an_ungraded_or_missing_answer_clears_the_severity_token() {
     }
 }
 
-/// A hermes pane is native: no process-info join and no `tollgate which` —
-/// the binary's native match names the account, the resolve prints its tag,
-/// and the watcher keeps re-reporting it as hermes.
+/// A bare hermes pane (no live row, no HERMES_HOME in its environ) falls back
+/// to the binary's native match: no `tollgate which`, the resolve prints the
+/// tag, and the watcher keeps re-reporting it as hermes.
 #[cfg(unix)]
 #[test]
 fn a_hermes_pane_is_tagged_from_the_binarys_native_match() {
@@ -4166,11 +4166,7 @@ fn a_hermes_pane_is_tagged_from_the_binarys_native_match() {
     assert_eq!(
         tag_log(&setup).first().map(String::as_str),
         Some("herdr tag --agent hermes"),
-        "a native pane asks with no profile"
-    );
-    assert!(
-        !setup.home.home().join("answered").exists(),
-        "a native pane never asks herdr for process-info"
+        "a bare pane with nothing to join asks with no profile"
     );
     let lines = wait_until(&setup, |ls| ls.len() >= 2);
     assert!(
@@ -4179,6 +4175,62 @@ fn a_hermes_pane_is_tagged_from_the_binarys_native_match() {
             .is_some_and(|l| l.contains("--token tollgate=herm 5%")),
         "the watcher re-reports the hermes pane instead of clearing it: {lines:?}"
     );
+    chain_stop(&setup);
+}
+
+/// Test 48, the script half: a `tollgate start <hermes-profile>` pane resolves
+/// through the live-row join like claude (its row names the profile, and the
+/// binary is asked for it under the hermes agent); a bare hermes pane passes
+/// only its HERMES_HOME, read out of `/proc/<fg>/environ`. A sentinel in the
+/// same environ never reaches the tag, the metadata or any argv.
+#[cfg(unix)]
+#[test]
+fn herdr_tag_uses_hermes_origin_and_hermes_home_join_through_the_script() {
+    // The live-row join.
+    let setup = tag_answering_setup("hermes", Some("or-main 1%\n"));
+    std::fs::write(
+        setup.home.home().join(".tollgate/live_sessions/s1.json"),
+        r#"{"session_id":"s1","start_profile":"or-main","harness":"hermes","pid":1001,"started_at":0,"isolated":false,"follows_chain":false,"intended_member":null,"chain_cursor":null,"current_member":null,"last_swap_at":null}"#,
+    )
+    .unwrap();
+    let out = chain_report_out(&setup, r#"{"agent":"hermes"}"#);
+    assert_eq!(out, "or-main\n", "the row names the profile");
+    assert_eq!(
+        tag_log(&setup).first().map(String::as_str),
+        Some("herdr tag --agent hermes -- or-main"),
+        "the binary is asked for the row's profile under the hermes agent"
+    );
+    chain_stop(&setup);
+    drop(setup);
+
+    // The HERMES_HOME join, with a sentinel riding in the same environ.
+    let setup = tag_answering_setup("hermes", Some("herm 2%\n"));
+    let proc_dir = setup.home.home().join("proc/1001");
+    std::fs::create_dir_all(&proc_dir).unwrap();
+    let home = "/home/u/.tollgate/profiles/herm/hermes-home";
+    std::fs::write(
+        proc_dir.join("environ"),
+        format!(
+            "OPENROUTER_API_KEY=sk-or-SENTINEL-ENV-KEY\0HERMES_HOME={home}\0\
+             ANTHROPIC_API_KEY=SENTINEL-ANTHROPIC\0HOME=/home/u\0"
+        ),
+    )
+    .unwrap();
+    let out = chain_report_out(&setup, r#"{"agent":"hermes"}"#);
+    assert_eq!(out, "herm 2%\n");
+    let tags = tag_log(&setup);
+    assert_eq!(
+        tags.first().map(String::as_str),
+        Some(format!("herdr tag --agent hermes --hermes-home={home}").as_str()),
+        "only HERMES_HOME is passed"
+    );
+    let lines = wait_until(&setup, |ls| !ls.is_empty());
+    for text in tags.iter().chain(lines.iter()) {
+        assert!(
+            !text.contains("SENTINEL") && !text.contains("sk-or-"),
+            "no other environ variable escapes: {text}"
+        );
+    }
     chain_stop(&setup);
 }
 

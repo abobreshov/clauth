@@ -1,0 +1,38 @@
+{
+  "config": {
+    "model_provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4.5",
+    "model_base_url_host": "openrouter.ai",
+    "providers": [],
+    "custom_providers": [],
+    "fallback_providers": [],
+    "fallback_model": [],
+    "auxiliary": {
+      "vision": {
+        "provider": "anthropic",
+        "base_url_host": "api.anthropic.com"
+      },
+      "web_extract": {
+        "provider": "openrouter",
+        "base_url_host": "openrouter.ai"
+      },
+      "compression": {
+        "provider": "openrouter",
+        "base_url_host": "openrouter.ai"
+      }
+    },
+    "delegation": {
+      "provider": null,
+      "base_url_host": null
+    },
+    "credential_pool_strategies": {},
+    "secrets": {},
+    "plugins_enabled": []
+  },
+  "managed_config_top_keys": [],
+  "env_keys": {
+    "home": [],
+    "op_env": [],
+    "managed": []
+  }
+}

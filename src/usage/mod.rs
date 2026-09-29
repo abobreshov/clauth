@@ -17,6 +17,10 @@ pub(crate) mod cards;
 pub(crate) mod collect;
 pub(crate) mod derive;
 mod fetch;
+// Hermes homes' own usage ledger (`state.db`) as `hermes:<name>` observations
+// (hermes spec §4.6): the sqlite3 read, its cache, the collect hook and the
+// daemon leg.
+pub(crate) mod hermes_local;
 // The key-bearing provider transport: no redirects, a 2 MiB body cap and an
 // end-to-end deadline on every read that carries an API key (plan v3.1 §4.2).
 pub(crate) mod keyed_http;

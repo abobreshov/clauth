@@ -281,3 +281,38 @@ fn valid_switch_repoints_active_through_the_blocking_task() {
         "a successful switch names what it does to THIS session: {text}",
     );
 }
+
+/// `switch_profile` on a Hermes name (hermes spec §2.2) is a refusal carrying
+/// M-SWITCH, the roster's spelling included, and nothing moved: Hermes
+/// switches by relaunch, and a Hermes home has no global slot to link.
+#[test]
+fn a_hermes_name_is_refused_with_the_relaunch_hint() {
+    let _home = HomeSandbox::new();
+    seed_active_linked();
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::write(
+        dir.join("hermes-profiles.toml"),
+        "schema_version = 1\n[[profiles]]\nname = \"herm\"\nprovider = \"nous\"\n\
+         mode = \"account\"\nauth = \"oauth\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n",
+    )
+    .unwrap();
+    let live = claude_dir().expect("claude dir").join(".credentials.json");
+    let before = std::fs::read_link(&live).expect("linked");
+
+    let result = call_switch("HERM");
+    assert_eq!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert!(
+        text.contains(
+            "'herm' is a Hermes profile; Hermes switches by relaunch: 'tollgate start herm'"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("profile not found"), "{text}");
+    assert_eq!(std::fs::read_link(&live).expect("still linked"), before);
+}

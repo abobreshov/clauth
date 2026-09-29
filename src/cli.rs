@@ -510,8 +510,6 @@ pub(crate) enum Command {
     /// ~/.hermes, ~/.claude, ~/.clauth or ~/.codex. `tollgate start <name>`
     /// launches one. Hermes owns its own credentials; tollgate writes only the
     /// bound key line of the home's .env.
-    // Hidden until the part 2 surfaces (completions, `show`, `pool`) land.
-    #[command(hide = true)]
     Hermes {
         #[command(subcommand)]
         cmd: HermesCommand,
@@ -538,6 +536,9 @@ pub(crate) enum Command {
         /// The codex roster instead of the claude one (for `limit-reset`).
         #[arg(long)]
         codex: bool,
+        /// The Hermes roster (for `start`, `delete` and the `hermes` verbs).
+        #[arg(long)]
+        hermes: bool,
         /// Print `~/.tollgate/live_sessions/`'s file stems instead of profile
         /// names.
         #[arg(long = "live-sessions", hide = true)]
@@ -826,11 +827,35 @@ pub(crate) enum HermesCommand {
         action: HermesAuthAction,
     },
 
-    /// List the Hermes profiles
+    /// List the Hermes profiles with this month's estimated spend
     List {
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Show one Hermes profile: its home, pool, spend and latest sessions
+    ///
+    /// Reads files and state.db only. `--check` also resolves the Hermes
+    /// install and runs every launch guard, printing each verdict; it exits 1
+    /// when one refuses.
+    Show {
+        /// Profile name.
+        name: String,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Also run the launch audit and print each guard's verdict.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Set how a pool home picks among its credentials
+    Pool {
+        /// Profile name (a pool home).
+        name: String,
+        #[command(subcommand)]
+        action: HermesPoolAction,
     },
 
     /// Remove a Hermes profile and its home
@@ -843,6 +868,41 @@ pub(crate) enum HermesCommand {
         /// Delete even while a live session holds the home.
         #[arg(long)]
         force: bool,
+    },
+}
+
+/// A Hermes credential-pool strategy (`credential_pool_strategies`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum HermesStrategyArg {
+    #[value(name = "fill_first")]
+    FillFirst,
+    #[value(name = "round_robin")]
+    RoundRobin,
+    Random,
+    #[value(name = "least_used")]
+    LeastUsed,
+}
+
+impl HermesStrategyArg {
+    /// Hermes' own spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            HermesStrategyArg::FillFirst => "fill_first",
+            HermesStrategyArg::RoundRobin => "round_robin",
+            HermesStrategyArg::Random => "random",
+            HermesStrategyArg::LeastUsed => "least_used",
+        }
+    }
+}
+
+/// `tollgate hermes pool <name> <action>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HermesPoolAction {
+    /// Run `hermes config set credential_pool_strategies.<provider> <s>` on an idle home
+    Strategy {
+        /// fill_first, round_robin, random or least_used.
+        #[arg(value_enum)]
+        strategy: HermesStrategyArg,
     },
 }
 
@@ -945,6 +1005,10 @@ pub(crate) enum HerdrCommand {
         /// `agy`).
         #[arg(long, value_name = "KIND")]
         agent: Option<String>,
+        /// A bare Hermes pane's HERMES_HOME: a tollgate Hermes home names its
+        /// profile.
+        #[arg(long, value_name = "PATH")]
+        hermes_home: Option<std::path::PathBuf>,
         /// The profile the pane burns; omitted for a native pane.
         profile: Option<String>,
     },

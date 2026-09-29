@@ -1295,6 +1295,15 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete"]),
         Command::Complete {
             codex: false,
+            hermes: false,
+            live_sessions: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--hermes"]),
+        Command::Complete {
+            codex: false,
+            hermes: true,
             live_sessions: false
         }
     ));
@@ -1302,6 +1311,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete", "--codex"]),
         Command::Complete {
             codex: true,
+            hermes: false,
             live_sessions: false
         }
     ));
@@ -1309,6 +1319,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete", "--live-sessions"]),
         Command::Complete {
             codex: false,
+            hermes: false,
             live_sessions: true
         }
     ));

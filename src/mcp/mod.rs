@@ -1046,9 +1046,18 @@ disturbing this session, use `delegate`."
         // half-switched hazard a late refusal guards against — is
         // `actions::ensure_switch_target_ok`.
         let Some(name) = config.canonical_name(&name) else {
+            // A Hermes name is a real account that switches by relaunch
+            // (M-SWITCH), not an unknown one.
+            let reason = match crate::hermes::profiles::HermesState::load()
+                .ok()
+                .and_then(|state| state.canonical_name(&name))
+            {
+                Some(hermes) => crate::hermes::m_switch(&hermes),
+                None => profile_not_found_cross_harness(&name, ProfileNotFoundFix::CallProfiles),
+            };
             let payload = serde_json::json!({
                 "ok": false,
-                "reason": profile_not_found_cross_harness(&name, ProfileNotFoundFix::CallProfiles)
+                "reason": reason
             });
             // Refused before any mutation ran, so nothing of ours moved:
             // report like the session-scope roster does (`DigestMode::Report`).

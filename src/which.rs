@@ -99,6 +99,27 @@ pub(crate) fn run(json: bool) -> Result<()> {
             }
             CodexClaim::NotACodexHome => {}
         }
+        // The Hermes arm, the same shape: a tollgate-shaped HERMES_HOME
+        // answers or answers unknown, and anything else falls through.
+        match hermes_session_profile() {
+            HermesClaim::Member(name) => {
+                if json {
+                    outln!("{}", hermes_json_view(Some(&name)));
+                } else {
+                    emit_plain(Some(&name));
+                }
+                return Ok(());
+            }
+            HermesClaim::UnknownHome => {
+                if json {
+                    outln!("{}", hermes_json_view(None));
+                } else {
+                    emit_plain(None);
+                }
+                return Ok(());
+            }
+            HermesClaim::NotAHermesHome => {}
+        }
     }
     let config = load_config()?;
     let resolved = resolve_active(&config);
@@ -168,6 +189,52 @@ fn session_profile_from_codex_home(dir: &Path) -> Option<String> {
         return None;
     }
     Some(dir.parent()?.file_name()?.to_str()?.to_string())
+}
+
+/// What a session's `HERMES_HOME` says about it (the [`CodexClaim`] twin).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HermesClaim {
+    /// A tollgate Hermes home whose profile the roster holds.
+    Member(String),
+    /// Shaped like a tollgate Hermes home, naming no roster profile (or the
+    /// roster could not be read): fail closed.
+    UnknownHome,
+    /// Not a tollgate Hermes home (unset, empty, or the operator's own).
+    NotAHermesHome,
+}
+
+fn hermes_session_profile() -> HermesClaim {
+    match std::env::var_os("HERMES_HOME").filter(|d| !d.is_empty()) {
+        Some(home) => hermes_session_profile_at(Path::new(&home)),
+        None => HermesClaim::NotAHermesHome,
+    }
+}
+
+/// [`hermes_session_profile`] with the path injected: parse
+/// `profiles/<name>/hermes-home`, then require the Hermes roster to hold it.
+pub(crate) fn hermes_session_profile_at(home: &Path) -> HermesClaim {
+    let Some(name) = crate::runtime::hermes_home_profile(home) else {
+        return HermesClaim::NotAHermesHome;
+    };
+    match crate::hermes::profiles::HermesState::load() {
+        Ok(state) if state.holds(&name) => HermesClaim::Member(name),
+        Ok(_) | Err(_) => HermesClaim::UnknownHome,
+    }
+}
+
+/// The `--json` payload for a Hermes session: the claude-shaped keys with the
+/// honest empty answer, `harness: "hermes"`, and `active` false (a Hermes
+/// home has no global slot, D-H12).
+fn hermes_json_view(name: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "profile": name,
+        "source": name.map(|_| "hermes_home"),
+        "harness": "hermes",
+        "base_url": serde_json::Value::Null,
+        "tier": serde_json::Value::Null,
+        "oauth": serde_json::Value::Null,
+        "active": false,
+    })
 }
 
 /// The `--json` payload for a codex session. The claude-shaped fields keep

@@ -99,9 +99,7 @@ fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
 /// M-SWITCH: a Hermes name given to a verb that switches or configures a
 /// claude account. Hermes switches by relaunch.
 fn hermes_switch_error(name: &str) -> anyhow::Error {
-    usage_error(format!(
-        "'{name}' is a Hermes profile; Hermes switches by relaunch: 'tollgate start {name}'"
-    ))
+    usage_error(hermes::m_switch(name))
 }
 
 /// The claude roster as one `available:` part, or none when it is empty so the
@@ -367,8 +365,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::SelfHeal => plugin_host::self_heal(),
         Command::Complete {
             codex,
+            hermes,
             live_sessions,
-        } => cmd_complete(codex, live_sessions),
+        } => cmd_complete(codex, hermes, live_sessions),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
@@ -442,9 +441,11 @@ fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     }
 }
 
-fn cmd_complete(codex: bool, live_sessions: bool) -> Result<()> {
+fn cmd_complete(codex: bool, hermes: bool, live_sessions: bool) -> Result<()> {
     if codex {
         completions::print_codex_profile_names();
+    } else if hermes {
+        completions::print_hermes_profile_names();
     } else if live_sessions {
         completions::print_session_stems();
     } else {
@@ -477,9 +478,11 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
         // tollgate's own plugin id, so guest mode does not gate them.
         cli::HerdrCommand::Link { path } => herdr::link::link(path.as_deref()),
         cli::HerdrCommand::Unlink => herdr::link::unlink(),
-        cli::HerdrCommand::Tag { agent, profile } => {
-            herdr::tag::run(profile.as_deref(), agent.as_deref())
-        }
+        cli::HerdrCommand::Tag {
+            agent,
+            hermes_home,
+            profile,
+        } => herdr::tag::run(profile.as_deref(), agent.as_deref(), hermes_home.as_deref()),
         cli::HerdrCommand::Config { cmd } => match cmd {
             cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },
@@ -1756,6 +1759,23 @@ fn cmd_hermes(cmd: cli::HermesCommand) -> Result<()> {
             Ok(())
         }
         HermesCommand::List { json } => hermes::list(json),
+        HermesCommand::Show { name, json, check } => {
+            let name = resolve(&name)?;
+            let code = hermes::show::show(&name, json, check)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        HermesCommand::Pool { name, action } => {
+            let name = resolve(&name)?;
+            let cli::HermesPoolAction::Strategy { strategy } = action;
+            let code = hermes::show::pool_strategy(&name, strategy.as_str())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         HermesCommand::Delete { name, yes, force } => {
             let name = resolve(&name)?;
             cmd_delete_hermes(&name, yes, force)

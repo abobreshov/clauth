@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "active_provider": "openrouter",
+  "providers": {},
+  "credential_pool": {
+    "openrouter": [
+      {"id": "env1", "label": "OPENROUTER_API_KEY", "source": "env:OPENROUTER_API_KEY",
+       "auth_type": "api_key", "priority": 0, "last_status": "ok", "request_count": 5,
+       "secret_fingerprint": "sha256:1b43f854967b5ae2"},
+      {"id": "m1", "label": "spare", "source": "manual", "auth_type": "api_key", "priority": 1,
+       "last_status": "ok", "request_count": 0, "secret_fingerprint": "sha256:ffffffffffff0000"},
+      {"id": "m2", "label": "lookalike", "source": "env:OPENROUTER_API_KEY", "auth_type": "api_key",
+       "priority": 2, "secret_fingerprint": "sha256:00000000deadbeef"}
+    ]
+  }
+}

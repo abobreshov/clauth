@@ -956,9 +956,13 @@ pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
         signal: None,
     };
 
-    // Teardown (§4.4 step 6): the anthropic billing check, the child-home
-    // audit and the credentials-link compare are evidence, printed as
-    // warnings; then the marker goes.
+    // Teardown (§4.4 step 6): the usage cache first (best effort, `sqlite3`
+    // only, recording the version this session ran); then the anthropic
+    // billing check, the child-home audit and the credentials-link compare,
+    // which are evidence printed as warnings; then the marker goes.
+    if let Err(e) = crate::usage::hermes_local::refresh(name, Some(&launch.install.version)) {
+        logline!("tollgate: hermes '{name}': usage read at teardown failed: {e:#}");
+    }
     if crate::hermes::post_session_anthropic_rows(
         &launch.paths.home,
         run_start,

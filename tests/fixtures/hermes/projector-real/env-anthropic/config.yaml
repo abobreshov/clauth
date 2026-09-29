@@ -1,0 +1,21 @@
+model:
+  provider: openrouter
+# Every auxiliary task pinned, as `hermes new` leaves them (G10a).
+pinned: &pinned
+  provider: openrouter
+auxiliary:
+  vision: *pinned
+  web_extract: *pinned
+  compression: *pinned
+  skills_hub: *pinned
+  approval: *pinned
+  mcp: *pinned
+  title_generation: *pinned
+  memory_query_rewrite: *pinned
+  tts_audio_tags: *pinned
+  triage_specifier: *pinned
+  kanban_decomposer: *pinned
+  profile_describer: *pinned
+  goal_judge: *pinned
+  curator: *pinned
+  monitor: *pinned

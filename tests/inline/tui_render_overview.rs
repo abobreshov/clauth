@@ -2257,8 +2257,18 @@ fn the_harness_filter_cycles_and_names_itself() {
     assert_eq!(codex.label_name(), Some("codex"));
     assert!(codex.shows_codex() && !codex.shows_claude());
 
-    assert_eq!(codex.next(), HarnessFilter::All, "three states, then back");
-    assert!(HarnessFilter::All.shows_claude() && HarnessFilter::All.shows_codex());
+    let hermes = codex.next();
+    assert_eq!(hermes, HarnessFilter::Hermes);
+    assert_eq!(hermes.label_name(), Some("hermes"));
+    assert!(hermes.shows_hermes() && !hermes.shows_claude() && !hermes.shows_codex());
+    assert!(!codex.shows_hermes() && !claude.shows_hermes());
+
+    assert_eq!(hermes.next(), HarnessFilter::All, "four states, then back");
+    assert!(
+        HarnessFilter::All.shows_claude()
+            && HarnessFilter::All.shows_codex()
+            && HarnessFilter::All.shows_hermes()
+    );
 }
 
 /// The accounts panel's top border row, which carries the panel title, its
@@ -3549,4 +3559,95 @@ fn without_read_only_rows_the_empty_state_is_unchanged() {
     assert!(text.contains("no accounts yet"), "{text}");
     assert!(text.contains("n to create one"), "{text}");
     assert!(!text.contains("tollgate accounts"), "{text}");
+}
+
+/// The Hermes section renders under its caption in the `All` and `Hermes`
+/// views only, with its count in the panel's title meta, and the estimate
+/// from the usage cache; a Hermes observation never lands among the
+/// monitors.
+#[test]
+fn the_hermes_section_renders_read_only_under_its_filter() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::create_dir_all(dir.join("profiles/herm/hermes-home")).unwrap();
+    std::fs::write(
+        dir.join("hermes-profiles.toml"),
+        "schema_version = 1\n[[profiles]]\nname = \"herm\"\nprovider = \"nous\"\n\
+         mode = \"pool\"\nauth = \"pool\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n",
+    )
+    .unwrap();
+    let now = crate::usage::now_epoch_secs();
+    let cache = crate::usage::hermes_local::HermesUsageCache {
+        schema_version: 1,
+        read_at_ms: crate::usage::now_ms(),
+        db_schema_version: Some(22),
+        period_start: crate::usage::hermes_local::rfc3339_z(
+            crate::usage::hermes_local::month_start_secs(now),
+        ),
+        rows: vec![crate::usage::hermes_local::UsageRow {
+            billing_provider: "nous".into(),
+            model: "m".into(),
+            api_calls: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: crate::usage::observation::Amount::parse("1.25").unwrap(),
+        }],
+        anthropic_since_ms: None,
+        nous_reset_at: None,
+        error: None,
+        hermes_version: None,
+    };
+    std::fs::write(
+        dir.join("profiles/herm")
+            .join(crate::usage::hermes_local::CACHE_FILE),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let mut app = App::new(config_with(
+        vec![profile("cl1", 80.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+    let draw = |app: &App| {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), app))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer()).join("\n")
+    };
+    let all = draw(&app);
+    assert!(
+        all.contains("hermes — relaunch with `tollgate start <name>`"),
+        "{all}"
+    );
+    assert!(all.contains("herm") && all.contains("nous · pool"), "{all}");
+    assert!(all.contains("$1.25 mo"), "{all}");
+    assert!(all.contains("1 claude · 1 hermes"), "{all}");
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert!(!draw(&app).contains("hermes — relaunch"));
+    app.harness_filter = HarnessFilter::Hermes;
+    let only = draw(&app);
+    assert!(
+        only.contains("hermes — relaunch") && !only.contains("cl1"),
+        "{only}"
+    );
+
+    // The observation of the same profile stays out of the monitors group.
+    app.harness_filter = HarnessFilter::All;
+    let mut obs = crate::usage::observation::AccountObservation::new(
+        "hermes:herm".into(),
+        crate::usage::observation::SourceId::Hermes,
+        crate::usage::observation::AuthKind::NativeLogin,
+        Origin::HermesProfile,
+        "herm",
+    );
+    obs.plan = Some("nous · pool home".into());
+    app.usage_extras = vec![obs];
+    assert!(app.overview_extras().is_empty());
+    assert!(!draw(&app).contains("monitors"));
 }

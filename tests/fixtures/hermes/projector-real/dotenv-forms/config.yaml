@@ -1,0 +1,13 @@
+model: nous/hermes-4-405b
+secrets:
+  onepassword:
+    enabled: true
+    env:
+      OPENROUTER_API_KEY: op://vault/openrouter/credential
+      GITHUB_TOKEN: op://vault/gh/token
+  bitwarden:
+    enabled: false
+plugins:
+  enabled: [memory, web]
+credential_pool_strategies:
+  openrouter: round_robin

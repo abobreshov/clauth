@@ -354,6 +354,7 @@ fn no_child_process_runs_under_a_tollgate_lock() {
         timeout: None,
     };
     assert_eq!(run_auth("pool-a", &action).unwrap(), 0);
+    assert_eq!(show::pool_strategy("pool-a", "round_robin").unwrap(), 0);
     crate::start::run_hermes("or-main", &["chat".into()]).unwrap();
 
     let seen = points();
@@ -362,6 +363,7 @@ fn no_child_process_runs_under_a_tollgate_lock() {
         "hermes config set",
         "the projector",
         "hermes auth",
+        "hermes config set (strategy)",
         "the Hermes session",
     ] {
         assert!(
@@ -855,5 +857,118 @@ fn list_is_the_roster_and_reads_files_only() {
     assert!(
         fx.calls().is_empty(),
         "list never runs Hermes or its interpreter"
+    );
+}
+
+/// A dir of recording stubs (`herdr`, `mise`, `hermes`, `python3`): each
+/// appends `<name> <argv> HERMES_HOME=<v>` to `calls.log` beside it.
+fn recording_stubs(sb: &HomeSandbox, names: &[&str]) -> PathBuf {
+    let bin = sb.home().join("rec-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in names {
+        let path = bin.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"{name} $* HERMES_HOME=$HERMES_HOME\" >> '{}/calls.log'\nexit 0\n",
+                bin.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+fn recorded(bin: &Path) -> Vec<String> {
+    std::fs::read_to_string(bin.join("calls.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Test 53 (H2h, §4.1 step 8): outside guest mode `new` runs `herdr
+/// integration install hermes` once with the new home as `HERMES_HOME`; in
+/// guest mode the herdr stub records nothing and the command is printed
+/// instead.
+#[test]
+fn herdr_integration_install_skipped_in_guest_mode() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let _fx = fixture(&sb);
+    let bin = recording_stubs(&sb, &["herdr"]);
+    *HERDR_OVERRIDE.lock().unwrap() = Some(bin.join("herdr"));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *HERDR_OVERRIDE.lock().unwrap() = None;
+        }
+    }
+    let _reset = Reset;
+
+    new_openrouter("or-main");
+    let home = HermesPaths::for_name("or-main").unwrap().home;
+    assert_eq!(
+        recorded(&bin),
+        [format!(
+            "herdr integration install hermes HERMES_HOME={}",
+            home.display()
+        )],
+        "one integration install, for this home"
+    );
+
+    std::fs::create_dir_all(sb.home().join(".clauth/profiles/a")).unwrap();
+    assert!(crate::identity::upstream_active(), "guest mode is on");
+    std::fs::remove_file(bin.join("calls.log")).unwrap();
+    new_openrouter("or-guest");
+    assert!(recorded(&bin).is_empty(), "guest mode runs no herdr");
+}
+
+/// Test 54: the daemon tick, `collect`, `hermes list`, `hermes show` without
+/// `--check` and `herdr tag` never execute Hermes, its interpreter or `mise`:
+/// the fixture's stub (the only Hermes and python there is) and the `mise` /
+/// `hermes` / `python3` stubs on PATH record nothing. Only `sqlite3` may run.
+#[test]
+fn daemon_never_executes_hermes_python_or_mise() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let fx = fixture(&sb);
+    new_openrouter("or-main");
+    let bin = recording_stubs(&sb, &["mise", "hermes", "python3", "python"]);
+    let path = std::ffi::OsString::from(format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    ));
+    let _pin = crate::testutil::EnvPin::new(&sb, &[("PATH", Some(path.as_os_str()))]);
+    fx.clear_rec();
+
+    crate::usage::hermes_local::reset_scan_gate_for_test();
+    crate::usage::hermes_local::refresh_detached();
+    crate::testutil::join_background_tasks();
+    assert!(
+        crate::usage::hermes_local::load("or-main").is_some(),
+        "the daemon leg wrote the usage cache"
+    );
+    let accounts = crate::usage::collect::collect(&crate::usage::collect::CollectOpts::default());
+    assert!(accounts.iter().any(|o| o.id == "hermes:or-main"));
+    list(true).unwrap();
+    list(false).unwrap();
+    show::show("or-main", true, false).unwrap();
+    crate::herdr::tag::run(Some("or-main"), Some("hermes"), None).unwrap();
+    let own = HermesPaths::for_name("or-main").unwrap().home;
+    crate::herdr::tag::run(None, Some("hermes"), Some(&own)).unwrap();
+
+    assert!(
+        fx.calls().is_empty(),
+        "no Hermes or interpreter run: {:?}",
+        fx.calls()
+    );
+    assert!(
+        recorded(&bin).is_empty(),
+        "no mise, hermes or python: {:?}",
+        recorded(&bin)
     );
 }

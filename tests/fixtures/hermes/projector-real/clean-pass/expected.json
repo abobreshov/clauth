@@ -1,0 +1,93 @@
+{
+  "config": {
+    "model_provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4.5",
+    "model_base_url_host": null,
+    "providers": [],
+    "custom_providers": [],
+    "fallback_providers": [],
+    "fallback_model": [],
+    "auxiliary": {
+      "vision": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "web_extract": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "compression": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "skills_hub": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "approval": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "mcp": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "title_generation": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "memory_query_rewrite": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "tts_audio_tags": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "triage_specifier": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "kanban_decomposer": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "profile_describer": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "goal_judge": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "curator": {
+        "provider": "openrouter",
+        "base_url_host": null
+      },
+      "monitor": {
+        "provider": "openrouter",
+        "base_url_host": null
+      }
+    },
+    "delegation": {
+      "provider": null,
+      "base_url_host": null
+    },
+    "credential_pool_strategies": {
+      "openrouter": "fill_first"
+    },
+    "secrets": {},
+    "plugins_enabled": []
+  },
+  "managed_config_top_keys": [],
+  "env_keys": {
+    "home": [
+      {
+        "key": "OPENROUTER_API_KEY",
+        "nonblank": true
+      }
+    ],
+    "op_env": [],
+    "managed": []
+  }
+}

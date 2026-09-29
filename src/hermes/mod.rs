@@ -1,5 +1,4 @@
-//! Hermes Agent as a third harness (spec `docs/specs/hermes-harness.md`,
-//! part 1).
+//! Hermes Agent as a third harness (spec `docs/specs/hermes-harness.md`).
 //!
 //! A Hermes profile is a whole Hermes home, `~/.tollgate/profiles/<name>/
 //! hermes-home`, started with `HERMES_HOME` set to it and with `HOME` set to
@@ -32,6 +31,7 @@ pub(crate) mod pool;
 pub(crate) mod profiles;
 pub(crate) mod projector;
 pub(crate) mod resolve;
+pub(crate) mod show;
 
 #[cfg(test)]
 #[path = "../../tests/inline/hermes_testkit.rs"]
@@ -60,6 +60,14 @@ pub(crate) const ROTATION_WAIT: Duration = Duration::from_secs(25);
 
 /// How long each `config set` of the auxiliary pinning may take (§4.1 step 7).
 const CONFIG_SET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// M-SWITCH (spec §2.1): the one text every surface gives a Hermes name
+/// asked to switch — the bare-name CLI switch (a usage error), the TUI's
+/// Hermes rows and the MCP `switch_profile` refusal. Hermes switches by
+/// relaunch.
+pub(crate) fn m_switch(name: &str) -> String {
+    format!("'{name}' is a Hermes profile; Hermes switches by relaunch: 'tollgate start {name}'")
+}
 
 /// Every Hermes verb refuses on Windows (spec §1).
 pub(crate) fn refuse_on_windows() -> Result<()> {
@@ -548,7 +556,66 @@ pub(crate) fn new_profile(
 
     // Step 7: pin the auxiliary providers, no lock held.
     pin_auxiliary(&name, &paths, opts.provider);
+    // Step 8 (H2h): herdr's Hermes integration for this home.
+    herdr_integration(&paths);
     Ok(())
+}
+
+/// How long `herdr integration install hermes` may take.
+const HERDR_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+/// The herdr the tests stage (a recording stub); `None` means no herdr, so a
+/// test never runs the operator's real one against its real config.
+pub(crate) static HERDR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The herdr `new` runs, when one is installed.
+fn herdr_for_integration() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        HERDR_OVERRIDE.lock().ok().and_then(|g| g.clone())
+    }
+    #[cfg(not(test))]
+    {
+        crate::herdr::resolved_bin()
+    }
+}
+
+/// §4.1 step 8 (H2h): outside guest mode, and when herdr is installed, run
+/// `HERMES_HOME=<home> herdr integration install hermes` once, so herdr
+/// recognises this home's Hermes panes; a failure is a warning. In guest mode
+/// the command is printed instead (D-H11: whether it touches herdr's own
+/// config, which upstream clauth's plugin shares, is unconfirmed). No lock is
+/// held, stdin is null, and the run is bounded.
+fn herdr_integration(paths: &HermesPaths) {
+    let text = format!(
+        "HERMES_HOME={} herdr integration install hermes",
+        paths.home.display()
+    );
+    if crate::identity::upstream_active() {
+        outln!(
+            "tollgate: guest mode leaves herdr's config alone; to have herdr tag this home's panes, run: {text}"
+        );
+        return;
+    }
+    let Some(bin) = herdr_for_integration() else {
+        return;
+    };
+    let mut command = crate::providers::billing_key::helper_command(bin);
+    crate::herdr::strip_session_env(&mut command);
+    command
+        .arg("integration")
+        .arg("install")
+        .arg("hermes")
+        .env("HERMES_HOME", &paths.home);
+    match run_bounded(
+        command,
+        HERDR_INTEGRATION_TIMEOUT,
+        "herdr integration install",
+    ) {
+        Ok(out) if out.status.success() => {}
+        _ => errln!("tollgate: warning — `{text}` did not succeed; run it by hand"),
+    }
 }
 
 /// §4.1 step 7: `<hermes> config set auxiliary.<task>.provider <provider>`
@@ -882,47 +949,11 @@ pub(crate) fn post_session_anthropic_rows(
 
 // ── `hermes list` ────────────────────────────────────────────────────────────
 
-/// `hermes list` (part 1: the roster, no estimate). Reads files only.
+/// `hermes list`: the roster with provider, mode, live state and the
+/// month-to-date estimate ([`show::list`]). Reads files and runs `sqlite3`
+/// only.
 pub(crate) fn list(json: bool) -> Result<()> {
-    let state = HermesState::load()?;
-    let rows: Vec<serde_json::Value> = state
-        .profiles()
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "name": p.name,
-                "provider": p.provider.as_str(),
-                "mode": p.mode.as_str(),
-                "auth": p.auth.as_str(),
-                "model": p.model,
-                "live": crate::runtime::has_live_session(&ProfileName::from(p.name.as_str())),
-            })
-        })
-        .collect();
-    if json {
-        outln!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
-    }
-    if rows.is_empty() {
-        outln!("no Hermes profiles; create one with 'tollgate hermes new <name>'");
-        return Ok(());
-    }
-    for p in state.profiles() {
-        let live = crate::runtime::has_live_session(&ProfileName::from(p.name.as_str()));
-        outln!(
-            "{}{}  {}  {} home  auth {}{}",
-            if live { "● " } else { "  " },
-            p.name,
-            p.provider,
-            p.mode.as_str(),
-            p.auth.as_str(),
-            p.model
-                .as_deref()
-                .map(|m| format!("  model {m}"))
-                .unwrap_or_default()
-        );
-    }
-    Ok(())
+    show::list(json)
 }
 
 // ── delete ───────────────────────────────────────────────────────────────────

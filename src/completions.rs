@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor api status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor api status mcp herdr hermes completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -30,6 +30,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
+        { [ "$prev" = "start" ] || [ "$prev" = "delete" ]; } && profiles="${profiles} $(tollgate __complete --hermes 2>/dev/null)"
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(tollgate __complete --codex 2>/dev/null)" -- "${cur}") )
@@ -52,6 +53,28 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "pair add revoke allow-sessions --json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--control --sessions" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "hermes" ]; then
+        COMPREPLY=( $(compgen -W "new key auth list show pool delete" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "hermes" ] && { [ "$prev" = "key" ] || [ "$prev" = "auth" ] || [ "$prev" = "show" ] || [ "$prev" = "pool" ] || [ "$prev" = "delete" ]; }; then
+        COMPREPLY=( $(compgen -W "$(tollgate __complete --hermes 2>/dev/null)" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "auth" ]; then
+        COMPREPLY=( $(compgen -W "add remove reset" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "pool" ]; then
+        COMPREPLY=( $(compgen -W "strategy" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 5 ] && [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "pool" ] && [ "$prev" = "strategy" ]; then
+        COMPREPLY=( $(compgen -W "fill_first round_robin random least_used" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "new" ] && [ "$prev" = "--provider" ]; then
+        COMPREPLY=( $(compgen -W "nous openrouter ollama-cloud" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "new" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--provider --model --pool --env-key --stdin --no-key" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "key" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--stdin" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "show" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json --check" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "hermes" ] && [ "${COMP_WORDS[2]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall link unlink config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
@@ -131,14 +154,16 @@ _tollgate() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install, link or uninstall the herdr plugin and bind a key to it]' \
+            'hermes[manage Hermes Agent profiles: one isolated Hermes home per account]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
-        local -a profiles
+        local -a profiles hermes
         profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
+        [[ "${words[2]}" == (start|delete) ]] && hermes=("${(@f)$(tollgate __complete --hermes 2>/dev/null)}") && _describe 'hermes profile' hermes
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
             '--auto[pick the account by the models this session may run]' \
@@ -155,6 +180,36 @@ _tollgate() {
         local -a profiles
         profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == hermes ]]; then
+        _values 'subcommand' 'new[create a Hermes profile and its home]' \
+            'key[set or replace the env-mode key]' \
+            'auth[hand off to hermes auth on the home]' \
+            'list[list the Hermes profiles with this month'"'"'s spend]' \
+            'show[show one profile: home, pool, spend, sessions]' \
+            'pool[set how a pool home picks among its credentials]' \
+            'delete[remove a Hermes profile and its home]'
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == (key|auth|show|pool|delete) ]]; then
+        local -a hermes
+        hermes=("${(@f)$(tollgate __complete --hermes 2>/dev/null)}")
+        _describe 'hermes profile' hermes
+    elif (( CURRENT == 5 )) && [[ "${words[2]}" == hermes && "${words[3]}" == auth ]]; then
+        _values 'action' 'add[add a credential; Hermes prompts for the key]' 'remove[remove one credential]' 'reset[clear a provider'"'"'s exhaustion state]'
+    elif (( CURRENT == 5 )) && [[ "${words[2]}" == hermes && "${words[3]}" == pool ]]; then
+        _values 'action' 'strategy[set the pool strategy]'
+    elif (( CURRENT == 6 )) && [[ "${words[2]}" == hermes && "${words[3]}" == pool ]]; then
+        _values 'strategy' 'fill_first' 'round_robin' 'random' 'least_used'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == new ]]; then
+        _values 'flag' '--provider[nous, openrouter or ollama-cloud]' '--model[model passed as -m at every launch]' \
+            '--pool[a credential-pool home]' '--env-key[nous only: bind NOUS_API_KEY instead of OAuth]' \
+            '--stdin[read the key as one line from stdin]' '--no-key[create the home without a key]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == key ]]; then
+        _values 'flag' '--stdin[read the key as one line from stdin]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == list ]]; then
+        _values 'flag' '--json[print JSON]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == show ]]; then
+        _values 'flag' '--json[print JSON]' '--check[also run every launch guard]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == delete ]]; then
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[delete even while a session holds the home]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
         _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]' \
             'uninstall[remove the plugin and the config lines it added]' \
@@ -327,9 +382,35 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_s
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from link" -a --path -d "Repo root or plugin dir to link"
+complete -c tollgate -f -n __fish_is_first_token -a hermes -d "Manage Hermes Agent profiles: one isolated Hermes home per account"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a new -d "Create a Hermes profile and its home"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a key -d "Set or replace the env-mode key"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a auth -d "Hand off to hermes auth on the home"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a list -d "List the Hermes profiles with this month's spend"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a show -d "Show one profile: home, pool, spend, sessions"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a pool -d "Set how a pool home picks among its credentials"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes" -a delete -d "Remove a Hermes profile and its home"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from key auth show pool delete" -a "(tollgate __complete --hermes 2>/dev/null)" -d "Hermes profile"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from auth" -a "add remove reset" -d "hermes auth action"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from pool" -a strategy -d "Set the pool strategy"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from strategy" -a "fill_first round_robin random least_used" -d Strategy
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from new" -a --provider -d "nous, openrouter or ollama-cloud"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from new" -a --model -d "Model passed as -m at every launch"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from new" -a --pool -d "A credential-pool home"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from new" -a --env-key -d "Nous only: bind NOUS_API_KEY instead of OAuth"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from new" -a --stdin -d "Read the key as one line from stdin"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from new" -a --no-key -d "Create the home without a key"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from key" -a --stdin -d "Read the key as one line from stdin"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from list" -a --json -d "Print JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from show" -a --json -d "Print JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from show" -a --check -d "Also run every launch guard"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from hermes; and __fish_seen_subcommand_from delete" -a --force -d "Delete even while a session holds the home"
 complete -c tollgate -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c tollgate -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c tollgate -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from start delete; and not __fish_seen_subcommand_from hermes" -a "(tollgate __complete --hermes 2>/dev/null)" -d "Hermes profile"
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a "(tollgate __complete --codex 2>/dev/null)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
@@ -520,6 +601,21 @@ pub(crate) fn print_session_stems() {
     for stem in live_session_stems() {
         outln!("{stem}");
     }
+}
+
+/// `__complete --hermes`: the Hermes roster, for `start`, `delete` and the
+/// `hermes` verbs. Reads the roster only; empty when it can't be read.
+pub(crate) fn print_hermes_profile_names() {
+    for name in hermes_profile_names() {
+        outln!("{name}");
+    }
+}
+
+/// The Hermes roster as completion words.
+pub(crate) fn hermes_profile_names() -> Vec<String> {
+    crate::hermes::profiles::HermesState::load()
+        .map(|state| state.names())
+        .unwrap_or_default()
 }
 
 /// `__complete --codex`: the codex roster, for the codex-only verbs

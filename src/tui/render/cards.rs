@@ -52,6 +52,7 @@ pub(super) fn observation_lines(
 fn origin_tag(obs: &AccountObservation) -> &'static str {
     match obs.origin {
         Origin::Upstream => "clauth",
+        Origin::HermesProfile => "hermes",
         _ => "monitor",
     }
 }

@@ -364,9 +364,30 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
             .is_some_and(crate::profile::is_own_profile_dir)
 }
 
+/// Whether `path` is a Hermes home by POSITION as well as name:
+/// `~/.tollgate/profiles/<name>/hermes-home` (hermes spec §3). The twin of
+/// [`is_codex_home_path`]: `which`'s Hermes arm, the herdr `--hermes-home`
+/// join and the scrub below all ask this one predicate.
+pub(crate) fn is_hermes_home_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n == crate::hermes::home::HERMES_HOME_DIR)
+        && path
+            .parent()
+            .is_some_and(crate::profile::is_own_profile_dir)
+}
+
+/// The profile a tollgate Hermes home belongs to, by position alone (the
+/// caller checks the roster).
+pub(crate) fn hermes_home_profile(path: &Path) -> Option<String> {
+    if !is_hermes_home_path(path) {
+        return None;
+    }
+    Some(path.parent()?.file_name()?.to_str()?.to_string())
+}
+
 /// Drop from `command` each session home it would inherit that names a tree
 /// tollgate built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
-/// codex home. A process spawned from inside a tollgate session otherwise
+/// codex home, `HERMES_HOME` onto a Hermes home. A process spawned from inside a tollgate session otherwise
 /// answers as that session (`tollgate which`, a `codex` run landing in another
 /// profile's home) and keeps pointing at its tree after teardown. The user's
 /// own custom dirs are theirs and stay.
@@ -378,6 +399,9 @@ pub(crate) fn scrub_tollgate_homes(command: &mut std::process::Command) {
     }
     if std::env::var_os("CODEX_HOME").is_some_and(|v| is_codex_home_path(Path::new(&v))) {
         command.env_remove("CODEX_HOME");
+    }
+    if std::env::var_os("HERMES_HOME").is_some_and(|v| is_hermes_home_path(Path::new(&v))) {
+        command.env_remove("HERMES_HOME");
     }
 }
 

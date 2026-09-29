@@ -1,0 +1,42 @@
+{
+  "config": {
+    "model_provider": "openrouter",
+    "model": "openai/gpt-5",
+    "model_base_url_host": null,
+    "providers": [
+      {
+        "key": "local",
+        "name": "Local LLM",
+        "base_url_host": "127.0.0.1"
+      }
+    ],
+    "custom_providers": [
+      {
+        "name": "corp",
+        "base_url_host": "llm.corp.example"
+      }
+    ],
+    "fallback_providers": [
+      "nous",
+      "ollama-cloud",
+      "claude-code"
+    ],
+    "fallback_model": [
+      "nous"
+    ],
+    "auxiliary": {},
+    "delegation": {
+      "provider": "custom",
+      "base_url_host": "api.anthropic.com"
+    },
+    "credential_pool_strategies": {},
+    "secrets": {},
+    "plugins_enabled": []
+  },
+  "managed_config_top_keys": [],
+  "env_keys": {
+    "home": [],
+    "op_env": [],
+    "managed": []
+  }
+}

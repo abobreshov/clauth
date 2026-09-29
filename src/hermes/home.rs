@@ -80,7 +80,8 @@ pub(crate) fn is_perms_threshold(path: &Path) -> bool {
 }
 
 /// Whether `dir` (a profile dir) holds nothing but what a crashed `new` could
-/// have left: `hermes-home/`, `child-home/` and `sessions-*` (§4.1 step 5.2).
+/// have left: `hermes-home/`, `child-home/` and `sessions-*` (§4.1 step 5.2),
+/// plus the usage cache a daemon read may have written beside them.
 /// An absent dir counts as adoptable.
 pub(crate) fn is_adoptable_leftover(dir: &Path) -> Result<bool> {
     let entries = match std::fs::read_dir(dir) {
@@ -92,8 +93,14 @@ pub(crate) fn is_adoptable_leftover(dir: &Path) -> Result<bool> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let known =
-            name == HERMES_HOME_DIR || name == CHILD_HOME_DIR || name.starts_with("sessions-");
+        // The usage cache (and its write temp) can land beside a home a
+        // crashed `new` left: a daemon read raced the crash.
+        let cache = crate::usage::hermes_local::CACHE_FILE;
+        let known = name == HERMES_HOME_DIR
+            || name == CHILD_HOME_DIR
+            || name.starts_with("sessions-")
+            || name == cache
+            || name.starts_with(&format!(".{cache}.tmp."));
         if !known {
             return Ok(false);
         }

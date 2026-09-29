@@ -488,6 +488,7 @@ pub(crate) fn failure_hint(obs: &AccountObservation) -> Option<String> {
             Origin::CodexProfile => format!("run `tollgate login {} --codex`", obs.label),
             Origin::Monitor => "replace the monitoring key".to_string(),
             Origin::Upstream => "log in again with clauth".to_string(),
+            Origin::HermesProfile => format!("run `tollgate hermes show {} --check`", obs.label),
         },
         FailureKind::RateLimited => "backing off, retries on its own".to_string(),
         FailureKind::QuotaExhausted => "wait for the reset or top up".to_string(),
@@ -525,6 +526,7 @@ pub(crate) fn header_line(obs: &AccountObservation, ctx: &CardCtx) -> CardLine {
     match obs.origin {
         Origin::Upstream => line.push(Seg::new(" (clauth)", Ink::Faint)),
         Origin::Monitor => line.push(Seg::new(" (monitor)", Ink::Faint)),
+        Origin::HermesProfile => line.push(Seg::new(" (hermes)", Ink::Faint)),
         Origin::Profile | Origin::CodexProfile => {}
     }
     if obs.best_effort {

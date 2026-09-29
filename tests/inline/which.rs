@@ -1262,3 +1262,55 @@ fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
         "a tollgate runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
     );
 }
+
+/// Test 47 (hermes spec §10 `which.rs`): a tollgate Hermes home answers for
+/// its roster profile, a well-shaped home the roster misses fails closed, the
+/// operator's own `~/.hermes` falls through; and `scrub_tollgate_homes` drops
+/// an inherited tollgate `HERMES_HOME` (never the operator's own).
+#[test]
+fn which_answers_from_a_tollgate_hermes_home_and_scrub_tollgate_homes_drops_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".tollgate");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("hermes-profiles.toml"),
+        "schema_version = 1\n[[profiles]]\nname = \"herm\"\nprovider = \"nous\"\n\
+         mode = \"account\"\nauth = \"oauth\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n",
+    )
+    .unwrap();
+    let member = dir.join("profiles").join("herm").join("hermes-home");
+    let stranger = dir.join("profiles").join("ghost").join("hermes-home");
+    let operator = home.home().join(".hermes");
+
+    assert_eq!(
+        hermes_session_profile_at(&member),
+        HermesClaim::Member("herm".into())
+    );
+    assert_eq!(
+        hermes_session_profile_at(&stranger),
+        HermesClaim::UnknownHome
+    );
+    assert_eq!(
+        hermes_session_profile_at(&operator),
+        HermesClaim::NotAHermesHome
+    );
+    assert_eq!(
+        hermes_session_profile_at(&dir.join("profiles").join("herm").join("child-home")),
+        HermesClaim::NotAHermesHome,
+        "the child home is not the Hermes home"
+    );
+    let view = hermes_json_view(Some("herm"));
+    assert_eq!(view["harness"], "hermes");
+    assert_eq!(view["source"], "hermes_home");
+    assert_eq!(view["profile"], "herm");
+
+    let removed = |value: &std::path::Path| {
+        let _pin = crate::testutil::EnvPin::new(&home, &[("HERMES_HOME", Some(value.as_os_str()))]);
+        let mut cmd = std::process::Command::new("true");
+        crate::runtime::scrub_tollgate_homes(&mut cmd);
+        cmd.get_envs()
+            .any(|(k, v)| k == "HERMES_HOME" && v.is_none())
+    };
+    assert!(removed(&member), "a tollgate Hermes home is dropped");
+    assert!(!removed(&operator), "the operator's own home stays");
+}

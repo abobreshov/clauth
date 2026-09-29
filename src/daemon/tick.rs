@@ -66,6 +66,9 @@ impl super::Daemon {
         // Monitoring-only sources (`monitors.toml`): fetch the due ones on a
         // detached thread, so a slow provider never holds the tick.
         crate::usage::monitor::poll_detached();
+        // Hermes homes' `state.db` ledgers, the same detached shape: at most
+        // one read per profile a minute, `sqlite3` only (hermes spec §4.6).
+        crate::usage::hermes_local::refresh_detached();
         // Converge a broken plugin registration in the background. The gate is two
         // registry reads inline and a needed heal runs detached (throttled inside
         // `heal_detached`), so this never blocks the run loop.

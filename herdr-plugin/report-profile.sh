@@ -134,6 +134,16 @@ adopted_codex_profile() {
     esac
 }
 
+# The HERMES_HOME of process $1, and nothing else from its environment: the
+# environ is split on NUL and only that one variable's value is kept, so no
+# other variable (a key, a token) ever enters a shell variable, the tag or a
+# log. Linux only (same uid): with no /proc there is nothing to read, and the
+# pane falls back to the native match.
+pane_hermes_home() {
+    [ -r "$proc_root/$1/environ" ] || return 0
+    tr '\0' '\n' <"$proc_root/$1/environ" 2>/dev/null | sed -n 's/^HERMES_HOME=//p' | head -1
+}
+
 # The account a row names: the member a --with-fallback session swapped onto,
 # else its launch member.
 row_profile() {
@@ -187,15 +197,17 @@ fi
 # instead of inheriting the claude-arm answer. Without a pane there is nothing
 # to clear, and the claude arm below keeps its answer.
 #
-# hermes, grok and agy are native panes: harnesses tollgate does not launch,
-# so no session row or `tollgate which` names their account. The binary
-# matches each to the one observation it can burn, and answers nothing when
-# that is ambiguous.
+# grok and agy are native panes: harnesses tollgate does not launch, so no
+# session row or `tollgate which` names their account. The binary matches each
+# to the one observation it can burn, and answers nothing when that is
+# ambiguous. hermes is both: a `tollgate start <hermes-profile>` pane resolves
+# through its live row like claude and codex, and a bare `hermes` pane through
+# its HERMES_HOME, falling back to the native match.
 agentless=""
 native=""
 case "$agent" in
-    claude | codex) ;;
-    hermes | grok | agy) native=1 ;;
+    claude | codex | hermes) ;;
+    grok | agy) native=1 ;;
     *)
         if [ -n "$pane" ]; then
             agentless=1
@@ -251,6 +263,20 @@ if [ -z "$agentless" ] && [ -z "$profile" ]; then
         # published and the watcher still spawns, so an account that appears
         # later tags the pane on the next tick.
         tag_out=$(tollgate herdr tag --agent "$agent" 2>/dev/null) || tag_out=""
+        [ -n "$tag_out" ] || definitive_empty=1
+    elif [ "$agent" = hermes ]; then
+        # A bare hermes pane: its HERMES_HOME names a tollgate Hermes home
+        # (the binary maps `profiles/<n>/hermes-home` to `hermes:<n>`), or the
+        # binary falls back to the native match. Empty is definitive, as above.
+        hermes_home=""
+        if [ -n "${fg_pid:-}" ]; then
+            hermes_home=$(pane_hermes_home "$fg_pid")
+        fi
+        if [ -n "$hermes_home" ]; then
+            tag_out=$(tollgate herdr tag --agent hermes --hermes-home="$hermes_home" 2>/dev/null) || tag_out=""
+        else
+            tag_out=$(tollgate herdr tag --agent hermes 2>/dev/null) || tag_out=""
+        fi
         [ -n "$tag_out" ] || definitive_empty=1
     elif [ "$agent" = codex ]; then
         profile=$(adopted_codex_profile)

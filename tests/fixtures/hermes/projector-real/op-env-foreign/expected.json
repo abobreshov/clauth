@@ -1,0 +1,34 @@
+{
+  "config": {
+    "model_provider": "openrouter",
+    "model": null,
+    "model_base_url_host": null,
+    "providers": [],
+    "custom_providers": [],
+    "fallback_providers": [],
+    "fallback_model": [],
+    "auxiliary": {},
+    "delegation": {
+      "provider": null,
+      "base_url_host": null
+    },
+    "credential_pool_strategies": {},
+    "secrets": {},
+    "plugins_enabled": []
+  },
+  "managed_config_top_keys": [],
+  "env_keys": {
+    "home": [],
+    "op_env": [
+      {
+        "key": "OP_SERVICE_ACCOUNT_TOKEN",
+        "nonblank": true
+      },
+      {
+        "key": "NOUS_API_KEY",
+        "nonblank": true
+      }
+    ],
+    "managed": []
+  }
+}

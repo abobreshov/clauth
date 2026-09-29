@@ -104,6 +104,13 @@ hex = "0.4"
 sha1 = "0.10"
 base64 = "0.23"
 
+[features]
+# The `hermes_projector_real` test tier (hermes spec §7): the Hermes projector
+# against real PyYAML / python-dotenv. Test-only; its tests are also
+# `#[ignore]`d, because `--all-features` turns this on in every CI leg. Its own
+# CI job runs them with the pinned venv.
+hermes-projector-real = []
+
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/
 # plugin.json` and CARGO_PKG_VERSION disagree (CC caches on that version).

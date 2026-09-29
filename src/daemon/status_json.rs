@@ -639,6 +639,40 @@ pub(crate) fn build_codex_entries(
         .collect()
 }
 
+/// One Hermes profile in `status.json` (hermes spec D-H12). There is no
+/// `active_hermes_profile`: Hermes has no global slot, and a Hermes home is
+/// launched by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub(crate) struct HermesProfileEntry {
+    pub(crate) name: String,
+    /// `nous`, `openrouter` or `ollama-cloud`.
+    pub(crate) provider: String,
+    /// The model passed as `-m` at launch, when the roster sets one.
+    #[schema(required = true)]
+    pub(crate) model: Option<String>,
+    /// `account` or `pool`.
+    pub(crate) mode: String,
+    /// A `tollgate start` (or `hermes auth`) holds the home now.
+    pub(crate) live: bool,
+}
+
+/// The `hermes_profiles[]` of `status.json`, off the Hermes roster (empty
+/// when it is absent or unreadable).
+pub(crate) fn build_hermes_entries() -> Vec<HermesProfileEntry> {
+    crate::hermes::profiles::HermesState::load()
+        .unwrap_or_default()
+        .profiles()
+        .iter()
+        .map(|p| HermesProfileEntry {
+            name: p.name.clone(),
+            provider: p.provider.as_str().to_string(),
+            model: p.model.clone(),
+            mode: p.mode.as_str().to_string(),
+            live: crate::runtime::has_live_session(&ProfileName::from(p.name.as_str())),
+        })
+        .collect()
+}
+
 /// The full `status.json` body. Field order is the published key order, and
 /// each `Option` field emits a present key holding `null` when absent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -675,6 +709,12 @@ pub(crate) struct StatusBody {
     #[schema(required = true)]
     pub(crate) gateway: Option<GatewaySlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
+    /// Additive: the Hermes roster. Its own list, never appended to
+    /// `profiles[]`: a Hermes home has no windows, tier or auth grade for a
+    /// `ProfileEntry` to carry. `default` so a reader stays additive-tolerant
+    /// of an older writer.
+    #[serde(default)]
+    pub(crate) hermes_profiles: Vec<HermesProfileEntry>,
 }
 
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
@@ -711,6 +751,7 @@ pub(crate) fn build_status(
         tollgate_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         profiles,
+        hermes_profiles: build_hermes_entries(),
     }
 }
 

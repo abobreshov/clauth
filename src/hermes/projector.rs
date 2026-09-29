@@ -306,3 +306,8 @@ fn run_projector_with(
 #[cfg(test)]
 #[path = "../../tests/inline/hermes_projector.rs"]
 mod tests;
+
+// The CI-gated tier against real PyYAML / python-dotenv (spec §7).
+#[cfg(all(test, feature = "hermes-projector-real"))]
+#[path = "../../tests/inline/hermes_projector_real.rs"]
+mod real_tests;
