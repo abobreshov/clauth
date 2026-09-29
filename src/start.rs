@@ -227,6 +227,47 @@ pub(crate) fn models_from_args(claude_args: &[String]) -> Vec<String> {
     out
 }
 
+/// The session a passthrough `--resume` names: `--resume <id>`,
+/// `--resume=<id>`, `-r <id>` or `-r=<id>`. Claude Code's `--resume` takes an
+/// OPTIONAL value, so a bare one (the picker) or one followed by another flag
+/// names nothing.
+pub(crate) fn resume_id_from_args(claude_args: &[String]) -> Option<&str> {
+    let mut args = claude_args.iter();
+    while let Some(a) = args.next() {
+        if let Some(v) = a
+            .strip_prefix("--resume=")
+            .or_else(|| a.strip_prefix("-r="))
+        {
+            return (!v.is_empty()).then_some(v);
+        }
+        if a == "--resume" || a == "-r" {
+            return args
+                .next()
+                .map(String::as_str)
+                .filter(|v| !v.is_empty() && !v.starts_with('-'));
+        }
+    }
+    None
+}
+
+/// Guest mode: copy the transcript a passthrough `--resume <id>` names into
+/// the guest store (`runtime::seed_guest_resume`), where the shared session's
+/// Claude Code looks for it. A no-op outside guest mode, with no `--resume`
+/// id, and for an id no shared store holds (Claude Code then answers for it
+/// as it would anyway — a title search, the picker, or no match).
+fn seed_guest_passthrough_resume(claude_args: &[String]) -> Result<()> {
+    if !crate::identity::upstream_active() {
+        return Ok(());
+    }
+    let Some(id) = resume_id_from_args(claude_args) else {
+        return Ok(());
+    };
+    if let Some(session) = crate::sessions::find_session(id) {
+        crate::runtime::seed_guest_resume(&session.path)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &ProfileName,
@@ -262,6 +303,13 @@ pub(crate) fn run(
     // entries are stripped too rather than landing in front of the started
     // account's endpoint.
     let stale_env_keys = crate::actions::outgoing_env_keys(config);
+
+    // Guest mode: a shared session's `projects/` is tollgate's guest store, so
+    // a passthrough `--resume <id>` naming an operator transcript would answer
+    // `No conversation found`. Seed it there the way `tollgate resume` does.
+    if isolation == Isolation::Shared {
+        seed_guest_passthrough_resume(claude_args)?;
+    }
 
     let runtime = {
         let _spinner = Spinner::start("tollgate: preparing runtime");

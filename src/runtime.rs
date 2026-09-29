@@ -1711,16 +1711,44 @@ fn gc_live_session_rows() {
 /// Shared by [`crate::start::rescue_teardown`] and the stale-runtime GC, so an
 /// unrescued isolated tree is lifted at its deletion site rather than only on a
 /// clean exit.
+///
+/// In guest mode ([`crate::identity::upstream_active`], plan §4.0) the global
+/// store is tollgate's own [`guest_claude_root`], never `claude_home`: upstream
+/// clauth owns `~/.claude` until an import, and the rescue is a write into it.
+/// Guest shared sessions, `tollgate sessions` and `tollgate resume` all read
+/// the guest store, so a rescued transcript stays reachable.
 pub(crate) fn rescue_isolated_runtime(iso_root: &Path, claude_home: &Path) -> (usize, usize) {
-    let moved = crate::sessions::rescue_isolated_store(
-        &iso_root.join("projects"),
-        &claude_home.join("projects"),
-    );
-    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
+    let guest_root;
+    let root = if crate::identity::upstream_active() {
+        let created = guest_claude_root().and_then(|root| {
+            crate::profile::mkdir_700(&root)
+                .with_context(|| format!("failed to create {}", root.display()))?;
+            Ok(root)
+        });
+        match created {
+            Ok(root) => {
+                guest_root = root;
+                guest_root.as_path()
+            }
+            Err(e) => {
+                logline!(
+                    "tollgate: guest mode: cannot rescue isolated runtime {}: {e:#}",
+                    iso_root.display()
+                );
+                return (0, 0);
+            }
+        }
+    } else {
+        claude_home
+    };
+    let moved =
+        crate::sessions::rescue_isolated_store(&iso_root.join("projects"), &root.join("projects"));
+    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, root);
     if moved > 0 || sidecars > 0 {
         logline!(
             "tollgate: rescued {moved} isolated session transcript(s) \
-             + {sidecars} sidecar file(s) into the global store"
+             + {sidecars} sidecar file(s) into {}",
+            root.display()
         );
     }
     (moved, sidecars)
@@ -4686,10 +4714,17 @@ fn is_session_alive(pid_file: &Path) -> bool {
 /// and, critically, no writable store: its CC (empty settings → default
 /// `cleanupPeriodDays`) can never write or clean the operator's `projects/`.
 ///
-/// In guest mode ([`crate::identity::upstream_active`]) a SHARED session still
-/// links the rest, but never [`GUEST_PRIVATE_CLAUDE_ENTRIES`]: `plugins/` is a
-/// private copy and `projects/` resolves to tollgate's own guest store
-/// ([`place_guest_private_entries`]).
+/// In guest mode ([`crate::identity::upstream_active`]) a SHARED session never
+/// links [`GUEST_PRIVATE_CLAUDE_ENTRIES`]: `plugins/` is a private copy and
+/// `projects/` resolves to tollgate's own guest store
+/// ([`place_guest_private_entries`]). Under real symlinks the rest is sorted
+/// by [`guest_placement`]: only the read-mostly user content in
+/// [`GUEST_LINKED_CLAUDE_ENTRIES`] still links at `~/.claude`, and every other
+/// entry (the state Claude Code writes during a session, and any name this
+/// build does not know) links into the guest store instead
+/// ([`place_guest_store_entries`]). Under fake symlinks every entry is a copy
+/// already and [`mirror_tree`] runs one-way, so no session write reaches
+/// `~/.claude` there either.
 ///
 /// `stale_env_keys` (the outgoing activation's custom env: the active
 /// profile's, or every configured profile's with no marker to read) are
@@ -4717,6 +4752,7 @@ fn build_runtime_dir_with_active_env(
 
     let guest = isolation == Isolation::Shared && crate::identity::upstream_active();
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut guest_store_names: Vec<std::ffi::OsString> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
     {
@@ -4747,14 +4783,19 @@ fn build_runtime_dir_with_active_env(
         if isolation == Isolation::Isolated {
             continue;
         }
-        // Guest mode: these two never link at the operator's trees; they are
-        // placed privately below.
-        if guest
-            && file_name
-                .to_str()
-                .is_some_and(|n| GUEST_PRIVATE_CLAUDE_ENTRIES.contains(&n))
-        {
-            continue;
+        // Guest mode: `plugins/` and `projects/` never link at the operator's
+        // trees, and under real symlinks neither does any entry a session
+        // writes; both are placed privately below. Ahead of the reuse check, so
+        // a link a pre-fix build left at `~/.claude` is repointed there.
+        if guest {
+            match guest_placement(&file_name) {
+                GuestPlacement::Private => continue,
+                GuestPlacement::Store if mode == LinkMode::Real => {
+                    guest_store_names.push(file_name);
+                    continue;
+                }
+                GuestPlacement::Store | GuestPlacement::Linked => {}
+            }
         }
         let dst = runtime.join(&file_name);
         if dst.symlink_metadata().is_ok() {
@@ -4764,6 +4805,11 @@ fn build_runtime_dir_with_active_env(
     }
     if guest {
         pending.extend(place_guest_private_entries(runtime, claude_home)?);
+        pending.extend(place_guest_store_entries(
+            runtime,
+            claude_home,
+            &guest_store_names,
+        )?);
     }
     materialize_entries(pending, mode)?;
     write_merged_settings(runtime, claude_home, profile, isolation, stale_env_keys)?;
@@ -4812,9 +4858,66 @@ fn build_runtime_dir(
 /// instead.
 const GUEST_PRIVATE_CLAUDE_ENTRIES: &[&str] = &["plugins", "projects"];
 
+/// The top-level `~/.claude/` entries a GUEST-mode real-link shared session
+/// still links at the operator's tree: the operator's own read-mostly content
+/// (memory, slash commands, subagents, skills, hooks, output styles,
+/// keybindings), which a session reads at startup and would be crippled
+/// without. Read-only in spirit, not enforced: a session CAN still write
+/// through one (a `#` memory note lands in `CLAUDE.md`, `/agents` creates a
+/// file under `agents/`), which is an edit the operator asked their session
+/// for, not state Claude Code keeps on its own. Every name NOT here or in
+/// [`GUEST_PRIVATE_CLAUDE_ENTRIES`] is private ([`GuestPlacement::Store`]),
+/// unknown names included: a new Claude Code state file fails closed.
+const GUEST_LINKED_CLAUDE_ENTRIES: &[&str] = &[
+    "CLAUDE.md",
+    "agents",
+    "commands",
+    "hooks",
+    "keybindings.json",
+    "output-styles",
+    "skills",
+];
+
+/// Where a guest-mode shared session puts one top-level `~/.claude/` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestPlacement {
+    /// [`GUEST_PRIVATE_CLAUDE_ENTRIES`], placed by [`place_guest_private_entries`].
+    Private,
+    /// [`GUEST_LINKED_CLAUDE_ENTRIES`]: linked (real) or copied (fake) as
+    /// outside guest mode.
+    Linked,
+    /// Everything else — `history.jsonl`, `todos/`, `shell-snapshots/`,
+    /// `statsig/`, `session-env/`, `file-history/`, `sessions/`, `ide/`,
+    /// `local/`, the caches and lock files, and any name this build has never
+    /// seen. Under real symlinks it links into the guest store instead
+    /// ([`place_guest_store_entries`]); under fake symlinks it is a copy the
+    /// one-way [`mirror_tree`] never writes back.
+    Store,
+}
+
+/// Classify one top-level `~/.claude/` entry for a guest-mode shared session.
+/// A name that is not UTF-8 cannot be on either list, so it is [`GuestPlacement::Store`].
+fn guest_placement(name: &std::ffi::OsStr) -> GuestPlacement {
+    match name.to_str() {
+        Some(n) if GUEST_PRIVATE_CLAUDE_ENTRIES.contains(&n) => GuestPlacement::Private,
+        Some(n) if GUEST_LINKED_CLAUDE_ENTRIES.contains(&n) => GuestPlacement::Linked,
+        _ => GuestPlacement::Store,
+    }
+}
+
 /// The dir under the data dir holding guest-mode sessions' own Claude Code
-/// state ([`guest_projects_store`]).
+/// state ([`guest_claude_root`]).
 const GUEST_CLAUDE_STEM: &str = "guest-claude";
+
+/// `~/.tollgate/guest-claude`: guest mode's stand-in for `~/.claude` wherever
+/// a session would otherwise write the operator's. Its `projects/` is the
+/// transcript store ([`guest_projects_store`]); every other entry is one a
+/// real-link shared session links there instead of at `~/.claude`
+/// ([`place_guest_store_entries`]), or an isolated session's rescued sidecar
+/// state ([`rescue_isolated_runtime`]).
+pub(crate) fn guest_claude_root() -> Result<PathBuf> {
+    Ok(tollgate_dir()?.join(GUEST_CLAUDE_STEM))
+}
 
 /// Guest mode's transcript store, `~/.tollgate/guest-claude/projects`: what a
 /// guest-mode shared session's `projects/` resolves to instead of the
@@ -4825,23 +4928,16 @@ const GUEST_CLAUDE_STEM: &str = "guest-claude";
 /// the moment it exits, and Claude Code's own `/resume` picker could never
 /// reach an earlier one.
 pub(crate) fn guest_projects_store() -> Result<PathBuf> {
-    Ok(tollgate_dir()?.join(GUEST_CLAUDE_STEM).join("projects"))
+    Ok(guest_claude_root()?.join("projects"))
 }
 
 /// Place a guest-mode shared session's private [`GUEST_PRIVATE_CLAUDE_ENTRIES`],
 /// returning the materializations still to run under the tree's own transport.
 ///
-/// - `plugins/` — COPIED at start from the operator's, under both transports.
-///   The runtime `settings.json` is seeded from the operator's base, so its
-///   `enabledPlugins` names plugins whose registry entries and cache must be
-///   present for them to load; an empty dir would start every guest session
-///   with the operator's plugins broken. The copy is the session's to rewrite
-///   (a marketplace auto-update, an install) and dies with the tree. Its cost
-///   is one tree copy per session start (144 MB / 6k files on the reference
-///   install), accepted for a mode that only lasts until the import. A copy
-///   that fails part-way is logged and the session starts on what was copied:
-///   a dangling link in the operator's plugin tree must not refuse a start that
-///   linking it used to allow.
+/// - `plugins/` — a private COPY of the operator's, under both transports,
+///   whose isolation is re-established on EVERY build ([`place_guest_plugins`]):
+///   a tree reused from an earlier build keeps its copy, and that copy may
+///   predate the registry repoint.
 /// - `projects/` — the guest store ([`guest_projects_store`]), materialized by
 ///   the caller like any other entry (a link under real symlinks, a copy the
 ///   fake-mode watchdog then mirrors against the store). Copy-on-start from
@@ -4850,7 +4946,8 @@ pub(crate) fn guest_projects_store() -> Result<PathBuf> {
 ///
 /// A link either name already holds is dropped first unless it is the one this
 /// mode places: a tree built before guest mode began links both at `~/.claude`,
-/// and the additive walk would otherwise keep that link.
+/// and the additive walk would otherwise keep that link. A `plugins` link that
+/// cannot be dropped refuses the start: everything below would write through it.
 fn place_guest_private_entries(
     runtime: &Path,
     claude_home: &Path,
@@ -4867,18 +4964,7 @@ fn place_guest_private_entries(
         }
     }
 
-    let plugins_src = claude_home.join("plugins");
-    let plugins_dst = runtime.join("plugins");
-    if plugins_dst.symlink_metadata().is_err() && plugins_src.exists() {
-        if let Err(e) = copy_tree(&plugins_src, &plugins_dst) {
-            logline!(
-                "tollgate: guest mode: the private copy of {} is incomplete ({e:#}); \
-                 the session starts on what was copied",
-                plugins_src.display()
-            );
-        }
-        repoint_guest_plugin_registry(&plugins_src, &plugins_dst);
-    }
+    place_guest_plugins(&claude_home.join("plugins"), &runtime.join("plugins"))?;
 
     crate::profile::mkdir_700(&store)
         .with_context(|| format!("failed to create {}", store.display()))?;
@@ -4887,6 +4973,201 @@ fn place_guest_private_entries(
         return Ok(vec![(store, projects_dst)]);
     }
     Ok(Vec::new())
+}
+
+/// Give a guest session a `plugins/` that cannot reach the operator's `src`,
+/// or none at all.
+///
+/// The copy is seeded once per tree (the runtime `settings.json` is seeded
+/// from the operator's base, so its `enabledPlugins` names plugins whose
+/// registry entries and cache must be present for them to load; an empty dir
+/// would start every guest session with the operator's plugins broken). Its
+/// cost is one tree copy per new tree (144 MB / 6k files on the reference
+/// install), accepted for a mode that only lasts until the import. The copy is
+/// the session's to rewrite (a marketplace auto-update, an install) and dies
+/// with the tree.
+///
+/// Then, on every build and whether or not this build made the copy: the
+/// registry is repointed ([`repoint_guest_plugin_registry`], idempotent) and
+/// checked ([`guest_plugin_registry_leak`]). Isolation FAILS CLOSED: a copy
+/// that failed part-way, a rewrite that failed, or a registry that still
+/// names the operator's tree afterwards all replace the copy with an empty
+/// private `plugins/` ([`disable_guest_plugins`]) and warn — the session
+/// starts with no plugins rather than loading, or `git pull`ing, from
+/// `~/.claude/plugins`. The empty dir is the tree's copy from then on, so a
+/// reused tree stays without plugins until it is rebuilt. Only a state this
+/// cannot repair refuses the start: a `plugins` link still in place, or a copy
+/// that cannot be set aside.
+fn place_guest_plugins(src: &Path, dst: &Path) -> Result<()> {
+    if dst
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        anyhow::bail!(
+            "guest mode: {} is still a link and could not be removed; refusing to \
+             start a session that would write through it",
+            dst.display()
+        );
+    }
+    let mut failure: Option<String> = None;
+    if dst.symlink_metadata().is_err()
+        && src.exists()
+        && let Err(e) = copy_tree(src, dst)
+    {
+        failure = Some(format!(
+            "the private copy of {} is incomplete ({e:#})",
+            src.display()
+        ));
+    }
+    if failure.is_none() && dst.is_dir() {
+        if let Err(e) = repoint_guest_plugin_registry(src, dst) {
+            failure = Some(format!("its registry could not be repointed ({e:#})"));
+        } else if let Some((file, value)) = guest_plugin_registry_leak(src, dst) {
+            failure = Some(format!(
+                "{} still names the operator's plugin tree ({value})",
+                file.display()
+            ));
+        }
+    }
+    let Some(why) = failure else {
+        return Ok(());
+    };
+    disable_guest_plugins(dst)?;
+    let warning = format!(
+        "tollgate: guest mode: {why}; this session starts with NO plugins rather \
+         than against {}",
+        src.display()
+    );
+    logline!("{warning}");
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        crate::out::errln!("{warning}");
+    }
+    Ok(())
+}
+
+/// Replace a guest session's `plugins/` copy with an empty private dir. The
+/// copy is renamed aside first, so a sibling session sharing the tree never
+/// reads a half-removed registry, then removed; a copy that cannot even be
+/// renamed aside refuses the start, since it is the one that failed isolation.
+fn disable_guest_plugins(dst: &Path) -> Result<()> {
+    if dst.symlink_metadata().is_ok() {
+        let mut aside = dst.as_os_str().to_os_string();
+        aside.push(format!(".disabled.{}", std::process::id()));
+        let aside = PathBuf::from(aside);
+        std::fs::rename(dst, &aside).with_context(|| {
+            format!(
+                "guest mode: failed to set aside {}, whose registry names the \
+                 operator's plugin tree",
+                dst.display()
+            )
+        })?;
+        if let Err(e) = std::fs::remove_dir_all(&aside) {
+            logline!(
+                "tollgate: guest mode: failed to remove {} ({e})",
+                aside.display()
+            );
+        }
+    }
+    crate::profile::mkdir_700(dst).with_context(|| format!("failed to create {}", dst.display()))
+}
+
+/// The first string in a guest `plugins/` copy's top-level registry that still
+/// reaches the operator's plugin tree `src`, with the file naming it. A string
+/// reaches it when it is `src` or under it as spelled (either spelling
+/// [`repoint_guest_plugin_registry`] rewrites), or when it names an existing
+/// path whose canonical form is under `src`'s. A top-level `*.json` that does
+/// not parse is searched for either spelling as raw bytes, and a top-level
+/// symlink counts wherever it points: Claude Code reads and writes through
+/// both, and neither is checkable otherwise.
+fn guest_plugin_registry_leak(src: &Path, dst: &Path) -> Option<(PathBuf, String)> {
+    fn find(value: &serde_json::Value, reaches: &dyn Fn(&str) -> bool) -> Option<String> {
+        match value {
+            serde_json::Value::String(s) => reaches(s).then(|| s.clone()),
+            serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, reaches)),
+            serde_json::Value::Object(map) => map.values().find_map(|v| find(v, reaches)),
+            _ => None,
+        }
+    }
+
+    let spellings = plugin_tree_spellings(src);
+    let canonical = src.canonicalize().ok();
+    let reaches = |s: &str| {
+        if spellings.iter().any(|p| names_under(s, p)) {
+            return true;
+        }
+        let path = Path::new(s);
+        path.is_absolute()
+            && canonical.as_deref().is_some_and(|root| {
+                path.canonicalize()
+                    .is_ok_and(|resolved| resolved.starts_with(root))
+            })
+    };
+    let entries = std::fs::read_dir(dst).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&path).unwrap_or_default();
+            return Some((path, target.display().to_string()));
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") || !file_type.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let hit = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => find(&value, &reaches),
+            Err(_) => spellings
+                .iter()
+                .find(|p| bytes.windows(p.len()).any(|w| w == p.as_bytes()))
+                .cloned(),
+        };
+        if let Some(value) = hit {
+            return Some((path, value));
+        }
+    }
+    None
+}
+
+/// Whether `s` is `prefix` or a path under it — a component-boundary match, so
+/// `~/.claude/plugins-other` is not under `~/.claude/plugins`.
+fn names_under(s: &str, prefix: &str) -> bool {
+    s.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR))
+}
+
+/// The spellings of the operator's plugin tree Claude Code may have recorded:
+/// `src` as given and, when a symlinked `~/.claude` makes it differ, the path
+/// its config dir resolved to.
+fn plugin_tree_spellings(src: &Path) -> Vec<String> {
+    let Some(raw) = src.to_str() else {
+        return Vec::new();
+    };
+    let mut out = vec![raw.to_string()];
+    if let Some(real) = src
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        && real != raw
+    {
+        out.push(real);
+    }
+    out
+}
+
+// Test seam: while set, every [`repoint_guest_plugin_registry`] on this thread
+// fails the write it would make, posing a registry the rewrite cannot reach.
+#[cfg(test)]
+thread_local! {
+    static FAIL_GUEST_REPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn set_fail_guest_repoint(fail: bool) {
+    FAIL_GUEST_REPOINT.with(|f| f.set(fail));
 }
 
 /// Repoint the absolute paths a guest session's private `plugins/` copy
@@ -4901,18 +5182,19 @@ fn place_guest_private_entries(
 /// write into upstream's tree this copy exists to prevent. Every top-level
 /// `*.json` in the copy is rewritten so a string that is `src` or under it
 /// names the same place under `dst` instead, which is the path Claude Code
-/// would itself record with `dst`'s config dir. Best-effort: a file that does
-/// not parse, names nothing under `src`, or fails to write is left as copied.
-fn repoint_guest_plugin_registry(src: &Path, dst: &Path) {
+/// would itself record with `dst`'s config dir.
+///
+/// Idempotent: a repointed registry names nothing under `src`, so a second
+/// pass writes nothing. A file that does not parse or names nothing under
+/// `src` is left as copied; a write that fails is an error, and the caller
+/// checks the result either way ([`guest_plugin_registry_leak`]).
+fn repoint_guest_plugin_registry(src: &Path, dst: &Path) -> Result<()> {
     fn repoint(value: &mut serde_json::Value, from: &[String], to: &str) -> bool {
         match value {
             serde_json::Value::String(s) => {
                 for prefix in from {
-                    let Some(rest) = s.strip_prefix(prefix.as_str()) else {
-                        continue;
-                    };
-                    if rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR) {
-                        *s = format!("{to}{rest}");
+                    if names_under(s, prefix) {
+                        *s = format!("{to}{}", &s[prefix.len()..]);
                         return true;
                     }
                 }
@@ -4928,23 +5210,15 @@ fn repoint_guest_plugin_registry(src: &Path, dst: &Path) {
         }
     }
 
-    let (Some(from_raw), Some(to)) = (src.to_str(), dst.to_str()) else {
-        return;
+    let from = plugin_tree_spellings(src);
+    let Some(to) = dst.to_str() else {
+        anyhow::bail!("{} is not valid UTF-8", dst.display());
     };
-    // The spelling the operator's Claude Code recorded is the one its config
-    // dir resolved to, which a symlinked `~/.claude` makes differ from `src`.
-    let mut from = vec![from_raw.to_string()];
-    if let Some(real) = src
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        && real != from_raw
-    {
-        from.push(real);
+    if from.is_empty() {
+        anyhow::bail!("{} is not valid UTF-8", src.display());
     }
-    let Ok(entries) = std::fs::read_dir(dst) else {
-        return;
-    };
+    let entries =
+        std::fs::read_dir(dst).with_context(|| format!("failed to read {}", dst.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json")
@@ -4961,16 +5235,70 @@ fn repoint_guest_plugin_registry(src: &Path, dst: &Path) {
         if !repoint(&mut value, &from, to) {
             continue;
         }
-        let written = serde_json::to_vec_pretty(&value)
-            .map_err(anyhow::Error::from)
-            .and_then(|body| atomic_write_600(&path, body).map_err(Into::into));
-        if let Err(e) = written {
-            logline!(
-                "tollgate: guest mode: {} still names the operator's plugin tree ({e:#})",
-                path.display()
-            );
+        #[cfg(test)]
+        if FAIL_GUEST_REPOINT.with(std::cell::Cell::get) {
+            anyhow::bail!("failed to write {}: injected failure", path.display());
         }
+        let body = serde_json::to_vec_pretty(&value)?;
+        atomic_write_600(&path, body)
+            .with_context(|| format!("failed to write {}", path.display()))?;
     }
+    Ok(())
+}
+
+/// Place a guest-mode REAL-LINK shared session's [`GuestPlacement::Store`]
+/// entries, returning the links still to make. Each links at the same name
+/// under [`guest_claude_root`] instead of at `~/.claude`, so the history,
+/// todos, shell snapshots and caches a session writes persist across guest
+/// sessions (as they would in `~/.claude`) without touching upstream's tree.
+///
+/// Nothing is seeded from the operator's copy: that is state, some of it
+/// sensitive (`backups/` holds `.claude.json` snapshots, `daemon/` a 0600
+/// control key), and a guest session starts it fresh. A directory entry gets an
+/// empty store dir; a file entry gets a link the session's first write creates
+/// through (a dangling link reads as "absent", which is the fresh state; the
+/// next build's [`prune_dangling_links`] drops and this re-makes it).
+///
+/// A link a pre-fix build left at `~/.claude` is dropped first, or the
+/// additive walk would keep it; one already at the store, and an entry the
+/// session made in its own tree, are kept.
+fn place_guest_store_entries(
+    runtime: &Path,
+    claude_home: &Path,
+    names: &[std::ffi::OsString],
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = guest_claude_root()?;
+    crate::profile::mkdir_700(&root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+    let mut pending = Vec::new();
+    for name in names {
+        let target = root.join(name);
+        let dst = runtime.join(name);
+        let foreign_link =
+            |dst: &Path| dst.is_symlink() && std::fs::read_link(dst).ok() != Some(target.clone());
+        if foreign_link(&dst) {
+            unlink_link(&dst, "guest-mode operator link");
+            if foreign_link(&dst) {
+                anyhow::bail!(
+                    "guest mode: {} still links outside the guest store and could not be \
+                     removed; refusing to start a session that would write through it",
+                    dst.display()
+                );
+            }
+        }
+        if dst.symlink_metadata().is_ok() {
+            continue;
+        }
+        if claude_home.join(name).is_dir() {
+            crate::profile::mkdir_700(&target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+        }
+        pending.push((target, dst));
+    }
+    Ok(pending)
 }
 
 /// Guest mode: give `tollgate resume` the transcript it names inside the guest

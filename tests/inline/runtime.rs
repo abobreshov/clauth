@@ -11429,3 +11429,483 @@ fn a_guest_codex_home_copies_the_operator_entries_instead_of_linking_them() {
         "~/.codex stays byte-identical"
     );
 }
+
+/// Every file under `root` (links not followed) whose bytes spell `needle` —
+/// a registry, cache file or anything else in a guest `plugins/` copy that
+/// still names the operator's plugin tree.
+fn files_naming(root: &Path, needle: &str) -> Vec<PathBuf> {
+    guest_tree_snapshot(root)
+        .into_iter()
+        .filter(|(_, bytes)| bytes.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        .map(|(rel, _)| rel)
+        .collect()
+}
+
+/// Write an operator plugin registry naming its own tree by ABSOLUTE path, the
+/// way Claude Code records it. Returns the tree's spelling.
+fn write_absolute_operator_registry(op_plugins: &Path) -> String {
+    let op = op_plugins.to_str().expect("utf-8 path").to_string();
+    fs::write(
+        op_plugins.join("installed_plugins.json"),
+        serde_json::json!({
+            "version": 2,
+            "plugins": {"plug@mkt": [{"installPath": format!("{op}/cache/mkt/plug/1.0")}]},
+        })
+        .to_string(),
+    )
+    .expect("write registry");
+    fs::write(
+        op_plugins.join("known_marketplaces.json"),
+        serde_json::json!({"mkt": {"installLocation": format!("{op}/marketplaces/mkt")}})
+            .to_string(),
+    )
+    .expect("write marketplaces");
+    op
+}
+
+/// C1: a `plugins/` copy an EARLIER build left in a reused tree (before the
+/// repoint existed, or from a fake-link run) still names the operator's tree.
+/// Every guest build now repoints and checks it, under both transports, and
+/// a second build over the repointed copy changes nothing (idempotent).
+#[cfg(unix)]
+#[test]
+fn a_guest_build_repoints_a_plugin_copy_an_earlier_build_left_unrepointed() {
+    for mode in [LinkMode::Real, LinkMode::Fake] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            if mode == LinkMode::Real && !host_poses(tmp.path(), "a real-symlink runtime tree") {
+                return;
+            }
+            let claude_home = stage_guest_claude_home(tmp.path());
+            let op_plugins = claude_home.join("plugins");
+            let op = write_absolute_operator_registry(&op_plugins);
+            let before = guest_tree_snapshot(&op_plugins);
+
+            let profile = configured_profile("guest");
+            let runtime = tmp.path().join(".tollgate/profiles/guest/runtime-9999-0");
+            let own = runtime.join("plugins");
+            copy_tree(&op_plugins, &own).expect("an earlier build's byte copy");
+            assert!(
+                !files_naming(&own, &op).is_empty(),
+                "the fixture's copy starts out naming the operator tree"
+            );
+            let canonical = tmp.path().join(".tollgate/profiles/guest/credentials.json");
+            fs::write(&canonical, CREDS_V1).expect("write canonical");
+            let build = || {
+                build_runtime_dir(
+                    &runtime,
+                    &claude_home,
+                    &profile,
+                    &canonical,
+                    mode,
+                    Isolation::Shared,
+                )
+                .expect("build");
+            };
+
+            build();
+            let own_str = own.to_str().expect("utf-8 path");
+            let registry: serde_json::Value = serde_json::from_slice(
+                &fs::read(own.join("installed_plugins.json")).expect("read registry"),
+            )
+            .expect("parse registry");
+            assert_eq!(
+                registry["plugins"]["plug@mkt"][0]["installPath"],
+                format!("{own_str}/cache/mkt/plug/1.0"),
+                "{mode:?}: the reused copy loads from itself"
+            );
+            assert_eq!(
+                files_naming(&own, &op),
+                Vec::<PathBuf>::new(),
+                "{mode:?}: nothing in the copy names the operator tree"
+            );
+            assert!(guest_plugin_registry_leak(&op_plugins, &own).is_none());
+
+            let repointed = guest_tree_snapshot(&own);
+            build();
+            assert_eq!(
+                guest_tree_snapshot(&own),
+                repointed,
+                "{mode:?}: a second build over a repointed copy changes nothing"
+            );
+            assert_eq!(
+                guest_tree_snapshot(&op_plugins),
+                before,
+                "{mode:?}: the operator's registry stays byte-identical"
+            );
+        });
+    }
+}
+
+/// C1, fail closed: when the rewrite cannot repoint the copy, the session
+/// still starts, but with an empty private `plugins/` — nothing in it names
+/// or resolves into the operator's tree — and says so, rather than launching
+/// against `~/.claude/plugins`.
+#[cfg(unix)]
+#[test]
+fn a_guest_registry_the_rewrite_cannot_repoint_starts_the_session_with_no_plugins() {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set_fail_guest_repoint(false);
+        }
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let op_plugins = claude_home.join("plugins");
+        let op = write_absolute_operator_registry(&op_plugins);
+        let before = guest_tree_snapshot(&op_plugins);
+
+        set_fail_guest_repoint(true);
+        let _clear = ClearOnDrop;
+        let logs = crate::logline::LogLines::new();
+        let capture = logs.capture_here();
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("the session still starts");
+        drop(capture);
+        let runtime = rt.config_dir().to_path_buf();
+        let own = runtime.join("plugins");
+
+        assert!(
+            own.is_dir() && !own.is_symlink(),
+            "plugins/ is a private dir"
+        );
+        assert_eq!(
+            guest_tree_snapshot(&own),
+            Vec::new(),
+            "the session gets no plugins at all"
+        );
+        assert_eq!(files_naming(&own, &op), Vec::<PathBuf>::new());
+        assert!(guest_plugin_registry_leak(&op_plugins, &own).is_none());
+        let canonical_op = op_plugins.canonicalize().expect("canonical operator tree");
+        assert!(
+            !own.canonicalize()
+                .expect("canonical own")
+                .starts_with(&canonical_op),
+            "the private dir does not resolve under the operator's tree"
+        );
+        assert!(
+            fs::read_dir(&runtime)
+                .expect("read runtime")
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".disabled.")),
+            "the set-aside copy is gone"
+        );
+        let lines = logs.snapshot();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("could not be repointed") && l.contains("NO plugins")),
+            "the fail-closed start is announced: {lines:?}"
+        );
+        drop(rt);
+
+        assert_eq!(
+            guest_tree_snapshot(&op_plugins),
+            before,
+            "the operator's registry stays byte-identical"
+        );
+    });
+}
+
+/// C1, fail closed on the check itself: a registry file the rewrite cannot
+/// parse, and so cannot repoint, that still spells the operator's tree leaves
+/// the session with no plugins (fake-link transport).
+#[cfg(unix)]
+#[test]
+fn a_guest_registry_that_still_names_the_operator_tree_after_the_rewrite_is_disabled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let op_plugins = claude_home.join("plugins");
+        let op = write_absolute_operator_registry(&op_plugins);
+        fs::write(
+            op_plugins.join("torn.json"),
+            format!("{{\"installPath\": \"{op}/cache"),
+        )
+        .expect("write torn registry");
+
+        let profile = configured_profile("guest");
+        let runtime = tmp.path().join(".tollgate/profiles/guest/runtime-9999-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let canonical = tmp.path().join(".tollgate/profiles/guest/credentials.json");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        let own = runtime.join("plugins");
+        assert!(own.is_dir() && !own.is_symlink());
+        assert_eq!(guest_tree_snapshot(&own), Vec::new());
+    });
+}
+
+/// G1: the guest placement of every top-level `~/.claude` entry. Read-mostly
+/// user content links; `plugins/` / `projects/` are placed privately; every
+/// state name Claude Code writes, and any name this build has never seen,
+/// goes to the guest store.
+#[test]
+fn guest_placement_links_only_read_mostly_content_and_defaults_to_private() {
+    use std::ffi::OsStr;
+    for linked in [
+        "CLAUDE.md",
+        "commands",
+        "agents",
+        "skills",
+        "hooks",
+        "output-styles",
+        "keybindings.json",
+    ] {
+        assert_eq!(
+            guest_placement(OsStr::new(linked)),
+            GuestPlacement::Linked,
+            "{linked}"
+        );
+    }
+    for private in ["plugins", "projects"] {
+        assert_eq!(
+            guest_placement(OsStr::new(private)),
+            GuestPlacement::Private,
+            "{private}"
+        );
+    }
+    for state in [
+        "history.jsonl",
+        "todos",
+        "shell-snapshots",
+        "statsig",
+        "session-env",
+        "file-history",
+        "sessions",
+        "ide",
+        "local",
+        "mcp-needs-auth-cache.json",
+        "daemon",
+        "backups",
+        ".last-cleanup",
+        "a-name-no-release-has-shipped-yet",
+    ] {
+        assert_eq!(
+            guest_placement(OsStr::new(state)),
+            GuestPlacement::Store,
+            "{state}"
+        );
+    }
+}
+
+/// G1, real symlinks: a guest session's Claude Code state — `history.jsonl`,
+/// `todos/`, `shell-snapshots/`, `statsig/`, an unknown dir and an unknown
+/// file — links into tollgate's guest store, not `~/.claude`, while the
+/// operator's read-mostly content still links. After the session writes
+/// through every one of them, `~/.claude` is byte-identical and the guest
+/// store holds the writes. Nothing is seeded from the operator's state.
+#[cfg(unix)]
+#[test]
+fn a_guest_real_link_session_keeps_claude_code_state_in_the_guest_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        fs::write(claude_home.join("history.jsonl"), b"{\"op\":1}\n").expect("history");
+        for dir in ["todos", "shell-snapshots", "statsig", "newthing"] {
+            fs::create_dir_all(claude_home.join(dir)).expect("mkdir state dir");
+        }
+        fs::write(claude_home.join("todos/old.json"), b"[]").expect("old todo");
+        fs::write(claude_home.join("mystery.json"), b"{}").expect("unknown file");
+        fs::create_dir_all(claude_home.join("skills/s")).expect("mkdir skill");
+        fs::write(claude_home.join("skills/s/SKILL.md"), b"skill").expect("skill");
+        fs::write(claude_home.join("keybindings.json"), b"{}").expect("keybindings");
+        let before = guest_tree_snapshot(&claude_home);
+
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+        let root = guest_claude_root().expect("guest root");
+
+        for entry in [
+            "history.jsonl",
+            "todos",
+            "shell-snapshots",
+            "statsig",
+            "newthing",
+            "mystery.json",
+        ] {
+            assert_eq!(
+                fs::read_link(runtime.join(entry)).expect("a link"),
+                root.join(entry),
+                "{entry} links into the guest store"
+            );
+        }
+        assert!(root.join("todos").is_dir(), "a dir entry gets a store dir");
+        assert!(
+            !root.join("todos/old.json").exists(),
+            "state is not seeded from the operator's"
+        );
+        for entry in ["CLAUDE.md", "skills", "keybindings.json"] {
+            assert_eq!(
+                fs::read_link(runtime.join(entry)).expect("a link"),
+                claude_home.join(entry),
+                "{entry} still links at the operator's content"
+            );
+        }
+
+        {
+            use std::io::Write as _;
+            let mut history = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(runtime.join("history.jsonl"))
+                .expect("open history through the link");
+            history.write_all(b"{\"guest\":1}\n").expect("append");
+        }
+        fs::write(runtime.join("todos/x.json"), b"[1]").expect("write todo");
+        fs::write(runtime.join("shell-snapshots/snap.sh"), b"#").expect("snapshot");
+        fs::write(runtime.join("newthing/y"), b"y").expect("unknown dir write");
+        fs::write(runtime.join("mystery.json"), b"{\"g\":1}").expect("unknown file write");
+        guest_session_writes(&runtime);
+        drop(rt);
+
+        assert_eq!(
+            guest_tree_snapshot(&claude_home),
+            before,
+            "~/.claude is byte-identical after the session's writes"
+        );
+        assert_eq!(
+            fs::read(root.join("history.jsonl")).expect("guest history"),
+            b"{\"guest\":1}\n"
+        );
+        assert_eq!(fs::read(root.join("todos/x.json")).expect("todo"), b"[1]");
+        assert!(root.join("shell-snapshots/snap.sh").exists());
+        assert_eq!(fs::read(root.join("newthing/y")).expect("unknown"), b"y");
+        assert_eq!(
+            fs::read(root.join("mystery.json")).expect("unknown file"),
+            b"{\"g\":1}"
+        );
+    });
+}
+
+/// G1, the reused-tree edge: links a pre-fix guest build left at the
+/// operator's state entries are repointed into the guest store on the next
+/// build; a read-mostly link is left as it was.
+#[cfg(unix)]
+#[test]
+fn a_guest_build_repoints_state_links_a_pre_fix_build_left_at_the_operator_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        fs::write(claude_home.join("history.jsonl"), b"").expect("history");
+        fs::create_dir_all(claude_home.join("todos")).expect("mkdir todos");
+        let profile = configured_profile("guest");
+        let runtime = tmp.path().join(".tollgate/profiles/guest/runtime-9999-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        for entry in ["history.jsonl", "todos", "CLAUDE.md"] {
+            std::os::unix::fs::symlink(claude_home.join(entry), runtime.join(entry))
+                .expect("pre-fix link");
+        }
+        let canonical = tmp.path().join(".tollgate/profiles/guest/credentials.json");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        let root = guest_claude_root().expect("guest root");
+        for entry in ["history.jsonl", "todos"] {
+            assert_eq!(
+                fs::read_link(runtime.join(entry)).expect("link"),
+                root.join(entry),
+                "{entry} now links into the guest store"
+            );
+        }
+        assert_eq!(
+            fs::read_link(runtime.join("CLAUDE.md")).expect("link"),
+            claude_home.join("CLAUDE.md")
+        );
+    });
+}
+
+/// G2: an isolated guest session's teardown rescue lands its transcripts and
+/// sidecar state in tollgate's guest store, never `~/.claude`, which stays
+/// byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_guest_isolated_rescue_lands_in_the_guest_store_not_the_operators() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let before = guest_tree_snapshot(&claude_home);
+        let iso_root = tmp
+            .path()
+            .join(".tollgate/profiles/guest/runtime-isolated-4242-0");
+        fs::create_dir_all(iso_root.join("projects/-ws")).expect("mkdir iso projects");
+        fs::write(iso_root.join("projects/-ws/iso-session.jsonl"), b"{}\n").expect("transcript");
+        fs::create_dir_all(iso_root.join("todos")).expect("mkdir iso todos");
+        fs::write(iso_root.join("todos/t.json"), b"[]").expect("todo");
+
+        let (moved, sidecars) = rescue_isolated_runtime(&iso_root, &claude_home);
+
+        assert_eq!((moved, sidecars), (1, 1));
+        assert_eq!(
+            guest_tree_snapshot(&claude_home),
+            before,
+            "the rescue wrote nothing into ~/.claude"
+        );
+        let root = guest_claude_root().expect("guest root");
+        assert_eq!(
+            fs::read(root.join("projects/-ws/iso-session.jsonl")).expect("rescued transcript"),
+            b"{}\n"
+        );
+        assert!(root.join("todos/t.json").exists(), "the sidecar rode along");
+    });
+}
+
+/// C1, fail closed on the copy: a copy of the operator's plugins that fails
+/// part-way (here on a dangling link in the operator's tree) is not trusted
+/// with whatever registry it did copy; the session starts with no plugins.
+#[cfg(unix)]
+#[test]
+fn a_guest_plugin_copy_that_fails_part_way_starts_the_session_with_no_plugins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let op_plugins = claude_home.join("plugins");
+        write_absolute_operator_registry(&op_plugins);
+        std::os::unix::fs::symlink(tmp.path().join("gone"), op_plugins.join("cache/dangling"))
+            .expect("dangling link");
+        let before = guest_tree_snapshot(&op_plugins);
+
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("the session still starts");
+        let own = rt.config_dir().join("plugins");
+        assert!(own.is_dir() && !own.is_symlink());
+        assert_eq!(guest_tree_snapshot(&own), Vec::new());
+        drop(rt);
+        assert_eq!(guest_tree_snapshot(&op_plugins), before);
+    });
+}
