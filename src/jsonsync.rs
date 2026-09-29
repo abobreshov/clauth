@@ -114,15 +114,26 @@ struct Member {
 /// operator's home rather than under `~/.tollgate`); see [`write_member`] for why
 /// it is written differently.
 ///
-/// In guest mode ([`crate::identity::upstream_active`]) the operator file is a
-/// read-only source: it still competes as the winner, so an edit there reaches
-/// every runtime copy, but it is never written back. Upstream clauth owns it
-/// until an import.
+/// In guest mode ([`crate::identity::upstream_active`]) a reconciler that names
+/// an `operator_file` does nothing at all (plan §4.0: "guest runtime copies are
+/// never sync members of the operator base"). Upstream clauth owns that file
+/// until an import, so it is not written; and it is not READ as a winner
+/// either, because upstream's active account puts its own `[env]` keys there,
+/// which tollgate's per-profile key set cannot know and would push into every
+/// runtime copy as shared. The runtime copies do not reconcile among
+/// themselves instead: with no base to write back into, the next start seeds a
+/// fresh copy from the operator's file, and as the newest member it would
+/// revert every live sibling's own edits. So each guest runtime copy is seeded
+/// once, one-way, at start (`runtime::write_merged_settings`,
+/// `runtime::seed_claude_json`) and is the session's own from then on.
 pub(crate) fn sync_paths(
     paths: &[PathBuf],
     operator_file: Option<&Path>,
     rule: impl Fn(KeyPath<'_>) -> KeyRule,
 ) -> Result<()> {
+    if operator_file.is_some() && crate::identity::upstream_active() {
+        return Ok(());
+    }
     let mut members: Vec<Member> = Vec::new();
     for path in paths {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -158,12 +169,8 @@ pub(crate) fn sync_paths(
         .map(|(i, _)| i)
         .expect("members is non-empty");
 
-    let operator_read_only = operator_file.is_some() && crate::identity::upstream_active();
     for i in 0..members.len() {
         if i == winner {
-            continue;
-        }
-        if operator_read_only && operator_file == Some(members[i].path.as_path()) {
             continue;
         }
         let merged = merge_member(&members[winner].obj, &members[i].obj, &rule);

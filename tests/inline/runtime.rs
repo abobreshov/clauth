@@ -10983,3 +10983,362 @@ fn a_guest_session_writes_only_its_runtime_and_never_syncs_back_to_the_base() {
         );
     });
 }
+
+/// Every file under `root` as `(relative path, bytes)`, sorted, without
+/// following a symlink out of the tree — the byte-identity a guest session must
+/// leave the operator's trees in. A missing root is an empty tree.
+fn guest_tree_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = path.symlink_metadata().expect("stat snapshot entry");
+            let rel = path.strip_prefix(root).expect("under root").to_path_buf();
+            if meta.is_dir() {
+                walk(root, &path, out);
+            } else if meta.file_type().is_symlink() {
+                let target = fs::read_link(&path).expect("read link");
+                out.push((rel, target.to_string_lossy().into_owned().into_bytes()));
+            } else {
+                out.push((rel, fs::read(&path).expect("read snapshot file")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Stage upstream clauth (guest mode) plus an operator `~/.claude` holding a
+/// plugin registry, a plugin cache, a transcript store and a memory file.
+/// Returns `~/.claude`.
+fn stage_guest_claude_home(root: &Path) -> PathBuf {
+    fs::create_dir_all(root.join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("fake upstream data dir");
+    let claude_home = fake_claude_home(root);
+    let plugins = claude_home.join("plugins");
+    fs::create_dir_all(plugins.join("cache/mkt/plug/1.0")).expect("mkdir plugin cache");
+    fs::write(
+        plugins.join("installed_plugins.json"),
+        br#"{"version":2,"plugins":{"plug@mkt":[{"installPath":"x"}]}}"#,
+    )
+    .expect("write registry");
+    fs::write(plugins.join("cache/mkt/plug/1.0/plugin.json"), b"{}").expect("write plugin");
+    let projects = claude_home.join("projects").join("-ws");
+    fs::create_dir_all(&projects).expect("mkdir projects");
+    fs::write(projects.join("old-session.jsonl"), b"{\"old\":1}\n").expect("write transcript");
+    fs::write(claude_home.join("CLAUDE.md"), b"operator memory").expect("write memory");
+    fs::write(claude_home.join("settings.json"), br#"{"theme":"dark"}"#).expect("write settings");
+    assert!(crate::identity::upstream_active());
+    claude_home
+}
+
+/// A guest session's own writes into its `plugins/` and `projects/`, the way
+/// Claude Code makes them: a registry rewrite, a new cache entry, a new
+/// transcript, an append to the resumed one.
+fn guest_session_writes(runtime: &Path) {
+    let later = SystemTime::now() + Duration::from_secs(120);
+    let registry = runtime.join("plugins/installed_plugins.json");
+    fs::write(&registry, br#"{"version":2,"plugins":{}}"#).expect("rewrite registry");
+    set_mtime(&registry, later);
+    fs::create_dir_all(runtime.join("plugins/cache/mkt/new/2.0")).expect("mkdir new plugin");
+    fs::write(runtime.join("plugins/cache/mkt/new/2.0/plugin.json"), b"{}").expect("install");
+    fs::create_dir_all(runtime.join("projects/-ws")).expect("mkdir projects");
+    fs::write(
+        runtime.join("projects/-ws/new-session.jsonl"),
+        b"{\"new\":1}\n",
+    )
+    .expect("write new transcript");
+}
+
+/// B1, real symlinks: a guest-mode shared session never links `plugins/` or
+/// `projects/` at the operator's trees. Its plugins are a private copy, its
+/// transcripts land in tollgate's guest store, and the operator's registry and
+/// transcript store stay byte-identical across the start and the session's
+/// writes. The rest of `~/.claude` still links, as outside guest mode.
+#[cfg(unix)]
+#[test]
+fn a_guest_session_keeps_plugins_and_projects_off_the_operator_trees_under_real_links() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let plugins_before = guest_tree_snapshot(&claude_home.join("plugins"));
+        let projects_before = guest_tree_snapshot(&claude_home.join("projects"));
+
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+        let store = guest_projects_store().expect("guest store");
+
+        let plugins = runtime.join("plugins");
+        assert!(
+            !plugins.is_symlink() && plugins.is_dir(),
+            "plugins/ is the session's own dir"
+        );
+        assert_eq!(
+            guest_tree_snapshot(&plugins),
+            plugins_before,
+            "seeded as a copy of the operator's plugins"
+        );
+        assert_eq!(
+            fs::read_link(runtime.join("projects")).expect("projects is a link"),
+            store,
+            "projects/ resolves to tollgate's guest store"
+        );
+        assert!(
+            runtime.join("CLAUDE.md").is_symlink(),
+            "every other entry still links"
+        );
+
+        guest_session_writes(&runtime);
+        drop(rt);
+
+        assert_eq!(
+            guest_tree_snapshot(&claude_home.join("plugins")),
+            plugins_before,
+            "installed_plugins.json and the plugin cache stay byte-identical"
+        );
+        assert_eq!(
+            guest_tree_snapshot(&claude_home.join("projects")),
+            projects_before,
+            "the operator's transcript store stays byte-identical"
+        );
+        assert_eq!(
+            fs::read(store.join("-ws/new-session.jsonl")).expect("guest transcript kept"),
+            b"{\"new\":1}\n",
+            "the session's transcript outlives its tree in the guest store"
+        );
+    });
+}
+
+/// B1, the reused-tree edge: a tree a pre-guest build linked at the operator's
+/// `plugins/` / `projects/` is repointed on the next guest build rather than
+/// kept by the additive walk.
+#[cfg(unix)]
+#[test]
+fn a_guest_build_drops_operator_links_a_pre_guest_build_left() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let profile = configured_profile("guest");
+        let runtime = tmp.path().join(".tollgate/profiles/guest/runtime-9999-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        std::os::unix::fs::symlink(claude_home.join("plugins"), runtime.join("plugins"))
+            .expect("pre-guest plugins link");
+        std::os::unix::fs::symlink(claude_home.join("projects"), runtime.join("projects"))
+            .expect("pre-guest projects link");
+        let canonical = tmp.path().join(".tollgate/profiles/guest/credentials.json");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        assert!(
+            !runtime.join("plugins").is_symlink(),
+            "plugins/ is a copy now"
+        );
+        assert_eq!(
+            fs::read_link(runtime.join("projects")).expect("projects link"),
+            guest_projects_store().expect("store"),
+        );
+    });
+}
+
+/// B1, fake-symlink transport: the watchdog's `mirror_tree` never writes into
+/// `~/.claude` in guest mode. A session's plugin and memory edits stay in its
+/// tree, its transcripts reach tollgate's guest store instead, and an operator
+/// edit still reaches the session one-way.
+#[cfg(unix)]
+#[test]
+fn a_guest_fake_link_mirror_never_writes_into_the_operator_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = stage_guest_claude_home(tmp.path());
+            let profile = configured_profile("guest");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+            let runtime = rt.config_dir().to_path_buf();
+            let store = guest_projects_store().expect("guest store");
+            assert!(
+                guest_tree_snapshot(&runtime.join("projects"))
+                    .iter()
+                    .all(|(rel, _)| !rel.ends_with("old-session.jsonl")),
+                "the fake tree's projects/ is not a copy of the operator's store"
+            );
+            let before = guest_tree_snapshot(&claude_home);
+
+            guest_session_writes(&runtime);
+            let later = SystemTime::now() + Duration::from_secs(120);
+            let memory = runtime.join("CLAUDE.md");
+            fs::write(&memory, b"session memory edit").expect("edit memory");
+            set_mtime(&memory, later);
+            fs::write(runtime.join("session-only-file"), b"x").expect("new runtime file");
+            mirror_tree(&claude_home, &runtime).expect("mirror");
+
+            assert_eq!(
+                guest_tree_snapshot(&claude_home),
+                before,
+                "nothing in ~/.claude changed: registry, cache, transcripts, memory"
+            );
+            assert_eq!(
+                fs::read(store.join("-ws/new-session.jsonl")).expect("guest transcript"),
+                b"{\"new\":1}\n",
+                "the session's transcript reached tollgate's guest store"
+            );
+
+            // One-way still pulls: an operator edit newer than the runtime copy.
+            let op_memory = claude_home.join("CLAUDE.md");
+            fs::write(&op_memory, b"operator edit").expect("operator edit");
+            set_mtime(&op_memory, later + Duration::from_secs(60));
+            mirror_tree(&claude_home, &runtime).expect("mirror");
+            assert_eq!(fs::read(&memory).expect("runtime memory"), b"operator edit");
+            drop(rt);
+        });
+    });
+}
+
+/// B1, resume: `tollgate resume` in guest mode copies the transcript it names
+/// into the guest store (where the resumed session looks), and the session it
+/// then starts (`Isolation::Shared`, like every resume) appends to that copy.
+/// The operator's transcript and plugin registry stay byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_guest_resume_seeds_its_transcript_privately_and_leaves_the_operator_store_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let transcript = claude_home.join("projects/-ws/old-session.jsonl");
+        fs::create_dir_all(claude_home.join("projects/-ws/old-session/subagents"))
+            .expect("mkdir sidecars");
+        fs::write(
+            claude_home.join("projects/-ws/old-session/subagents/a.jsonl"),
+            b"{}",
+        )
+        .expect("write sidecar");
+        let plugins_before = guest_tree_snapshot(&claude_home.join("plugins"));
+        let projects_before = guest_tree_snapshot(&claude_home.join("projects"));
+
+        seed_guest_resume(&transcript).expect("seed");
+        let store = guest_projects_store().expect("store");
+        assert_eq!(
+            fs::read(store.join("-ws/old-session.jsonl")).expect("seeded transcript"),
+            b"{\"old\":1}\n"
+        );
+        assert!(
+            store.join("-ws/old-session/subagents/a.jsonl").exists(),
+            "its sidecar dir rides along"
+        );
+
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+        let resumed = runtime.join("projects/-ws/old-session.jsonl");
+        let mut appended = fs::read(&resumed).expect("the resumed session finds its transcript");
+        appended.extend_from_slice(b"{\"resumed\":1}\n");
+        fs::write(&resumed, &appended).expect("append");
+        guest_session_writes(&runtime);
+        if rt.swap.mode == LinkMode::Fake {
+            mirror_tree(&claude_home, &runtime).expect("mirror");
+        }
+        drop(rt);
+
+        assert_eq!(
+            guest_tree_snapshot(&claude_home.join("projects")),
+            projects_before
+        );
+        assert_eq!(
+            guest_tree_snapshot(&claude_home.join("plugins")),
+            plugins_before
+        );
+        assert_eq!(
+            fs::read(store.join("-ws/old-session.jsonl")).expect("guest copy"),
+            appended
+        );
+
+        // A second resume keeps the guest copy's continuation.
+        seed_guest_resume(&transcript).expect("reseed");
+        assert_eq!(
+            fs::read(store.join("-ws/old-session.jsonl")).expect("guest copy"),
+            appended
+        );
+    });
+}
+
+/// Outside guest mode the resume seed is a no-op: resume runs against the
+/// operator's own store, as before.
+#[test]
+fn the_resume_seed_is_a_no_op_outside_guest_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let transcript = claude_home.join("projects/-ws/s.jsonl");
+        fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        fs::write(&transcript, b"{}").expect("write");
+        assert!(!crate::identity::upstream_active());
+        seed_guest_resume(&transcript).expect("seed");
+        assert!(!guest_projects_store().expect("store").exists());
+    });
+}
+
+/// B1, codex: a guest-mode shared codex home never links the operator's
+/// `~/.codex` surfaces. They are copies, so a session's plugin install or
+/// skill edit leaves `~/.codex` byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_guest_codex_home_copies_the_operator_entries_instead_of_linking_them() {
+    let home = crate::testutil::HomeSandbox::new();
+    fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("fake upstream data dir");
+    assert!(crate::identity::upstream_active());
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("plugins/cache/p")).expect("mkdir plugins");
+    fs::write(operator.join("plugins/cache/p/plugin.json"), b"{}").expect("write plugin");
+    fs::create_dir_all(operator.join("skills/s")).expect("mkdir skills");
+    fs::write(operator.join("skills/s/SKILL.md"), b"skill").expect("write skill");
+    fs::write(operator.join("AGENTS.md"), b"agents").expect("write agents");
+    fs::write(operator.join("hooks.json"), b"{}").expect("write hooks");
+    let before = guest_tree_snapshot(&operator);
+
+    let profile = home.home().join(".tollgate/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("config.toml"), b"hooks_json = true\n").expect("opt into hooks");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    for entry in ["plugins", "skills", "AGENTS.md", "hooks.json"] {
+        let p = session_home.join(entry);
+        assert!(p.exists() && !p.is_symlink(), "{entry} is a private copy");
+    }
+    fs::write(
+        session_home.join("plugins/cache/p/plugin.json"),
+        b"{\"v\":2}",
+    )
+    .expect("session updates a plugin");
+    fs::create_dir_all(session_home.join("plugins/cache/q")).expect("install");
+    fs::write(session_home.join("skills/s/SKILL.md"), b"edited").expect("edit skill");
+    fs::write(session_home.join("AGENTS.md"), b"edited").expect("edit agents");
+
+    assert_eq!(
+        guest_tree_snapshot(&operator),
+        before,
+        "~/.codex stays byte-identical"
+    );
+}

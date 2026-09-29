@@ -331,10 +331,12 @@ fn a_completed_import_journal_lifts_guest_mode_and_the_switch_links_again() {
     assert_eq!(settings["env"]["TOLLGATE_TEST_ENV"], "two");
 }
 
-/// The jsonsync engine's guest rule: the operator file still competes as the
-/// winner, so an edit there reaches every runtime copy, but it is never written.
+/// The jsonsync engine's guest rule (plan §4.0: "guest runtime copies are never
+/// sync members of the operator base"): a reconcile that names an operator
+/// file does nothing. The operator file is neither written nor read as a
+/// winner, and the runtime copies do not propagate between each other either.
 #[test]
-fn guest_sync_reads_the_operator_file_into_runtimes_and_never_writes_it_back() {
+fn guest_sync_keeps_runtime_copies_out_of_the_operator_member_set() {
     let home = HomeSandbox::new();
     std::fs::create_dir_all(home.home().join(UPSTREAM_DATA_DIR_NAME)).unwrap();
     let dir = home.home().join("sync");
@@ -359,16 +361,26 @@ fn guest_sync_reads_the_operator_file_into_runtimes_and_never_writes_it_back() {
             .to_string()
     };
 
-    // A runtime copy wins: its sibling follows, the operator file does not.
+    // A runtime copy is newest: neither its sibling nor the operator file follows.
     crate::jsonsync::sync_paths(&paths, Some(&base), shared).unwrap();
     assert_eq!(std::fs::read(&base).unwrap(), br#"{"theme":"base"}"#);
-    assert_eq!(theme(&b), "a");
+    assert_eq!(theme(&a), "a");
+    assert_eq!(theme(&b), "b");
 
-    // The operator file wins: both runtimes take it, and it stays unwritten.
+    // The operator file is newest: no runtime copy takes it, and it stays unwritten.
     std::fs::write(&base, br#"{"theme":"edited"}"#).unwrap();
     set_mtime(&base, now + std::time::Duration::from_secs(60));
     crate::jsonsync::sync_paths(&paths, Some(&base), shared).unwrap();
     assert_eq!(std::fs::read(&base).unwrap(), br#"{"theme":"edited"}"#);
+    assert_eq!(theme(&a), "a");
+    assert_eq!(theme(&b), "b");
+
+    // Guest mode lifted: the same members reconcile again.
+    let journal = home.home().join(DATA_DIR_NAME).join(IMPORT_JOURNAL_FILE);
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    std::fs::write(&journal, br#"{"state":"complete"}"#).unwrap();
+    assert!(!upstream_active());
+    crate::jsonsync::sync_paths(&paths, Some(&base), shared).unwrap();
     assert_eq!(theme(&a), "edited");
     assert_eq!(theme(&b), "edited");
 }
