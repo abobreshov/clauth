@@ -26,9 +26,9 @@ An account reaches tollgate one of three ways:
 | MiniMax | `minimax` | api key | yes | `provider` | Token Plan 5h interval and 7d window, per-bucket rows | 5h, 7d |
 | Alibaba Model Studio | `alibaba` | api key + console session | yes | no | 7d (and 5h when reported) with absolute allowances, tier, subscription status | 5h, 7d |
 | Any other endpoint | `generic` | api key | yes | no | whatever the best-effort scan finds | none (a best-effort window never feeds the chain) |
-| Upstream clauth | `upstream_clauth` | read only | no | no | the 5h / 7d figures upstream's feed carries | none (never a chain member) |
+| Upstream clauth | `upstream_clauth` | read only | no | no | the 5h / 7d figures upstream's feed carries | none: the JSON flags its 5h / 7d, but an upstream account is never a chain member |
 
-"Chain-eligible" is the `chain_eligible` flag on each window in the JSON: only those windows can make a fallback chain move ([Auto-switch](Auto-Switch)). A monitor is never a chain member, whatever its windows say.
+"Chain-eligible" is the `chain_eligible` flag on each window in the JSON: only those windows can make a fallback chain move ([Auto-switch](Auto-Switch)). A monitor or an upstream account is never a chain member, whatever its windows' flags say: an `ollama_cloud` monitor on a legacy plan and every `upstream:` account publish `chain_eligible: true` on their 5h / 7d windows.
 
 `GET /v1/providers` on the [local agent API](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/agent-api.md) also lists `hermes`, `grok` and `antigravity`. Those sources are named in the catalog so agents can plan for them; no reader for them ships in 0.1.0.
 

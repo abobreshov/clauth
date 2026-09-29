@@ -160,7 +160,7 @@ Agent-invoked, only when the Claude Code plugin is installed:
 
 Network-invoked, only while `tollgate daemon --listen` is running:
 
-- **`POST /api/v1/switch`.** The same relink as the `switch` MCP tool, performed for a device paired with control. It sends no inference itself, and it refuses the cases that need a human (a login tollgate has not saved, credentials a refresh has rejected, a disabled account) rather than resolving them unattended.
+- **`POST /api/v1/switch`.** The same relink as the `switch_profile` MCP tool, performed for a device paired with control. It sends no inference itself, and it refuses the cases that need a human (a login tollgate has not saved, credentials a refresh has rejected, a disabled account) rather than resolving them unattended.
 - **`POST /api/v1/pair`.** Adds the device a live pairing code names, at the tier chosen when `tollgate devices pair` minted the code, and hands it its token. The code is the only credential it takes, so while a `--control` code is live, whoever enters it first gets control.
 - **`POST /api/v1/panes/<id>/prompt` and `POST /api/v1/panes/<id>/keys`.** Hand a control device's prompt text or key presses to the agent running in a herdr pane, through `herdr agent prompt` and `herdr pane send-keys`; whatever that agent then does (inference on the account the pane runs, tool calls on this host) is the agent's own, under its own permission prompts. The daemon logs the pane and the text's length or the key count, never the text or the key names, and no log line or response carries them.
 

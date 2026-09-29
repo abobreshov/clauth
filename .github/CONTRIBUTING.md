@@ -10,7 +10,7 @@ tollgate handles live credentials. Before you paste any log, config, or output i
 
 ## Commit shape
 
-PRs merge as merge commits with every commit intact, so your commit subjects land on the default branch verbatim. Conventional Commits (`fix(tokens): …`) and code/docs in separate commits read best there.
+PRs merge as merge commits with every commit intact, so your commit subjects land on `feat/tollgate` verbatim. Conventional Commits (`fix(tokens): …`) and code/docs in separate commits read best there.
 
 ## Flag user-visible changes
 

@@ -59,7 +59,7 @@ First release of tollgate, a hard fork of [clauth](https://github.com/uwuclxdy/c
 ### herdr
 
 - The `$tollgate` pane tag carries the account's lead figure (`42%`, `23%w`, `64% mo`, `$13.67`, `$9.00 left`, `$4.08/mo`) with stale / HIGH / CRITICAL marks, capped at herdr's token limit and carrying no ids; `$tollgate_severity` publishes the class.
-- Native `hermes`, `grok` and `agy` panes are tagged when exactly one enabled account belongs to their harness.
+- Native `hermes`, `grok` and `agy` panes are tagged when exactly one enabled account belongs to their harness. Only `hermes` can be today, through a Nous monitor that reads Hermes' login; no Grok or Antigravity reader ships yet.
 - `tollgate.usage` action opens the dashboard on the Usage tab.
 - `tollgate herdr link [--path]` / `unlink` for a local checkout. `install` and the heal pick only `tollgate-v*` release tags and check the manifest id before herdr runs; a key another binding owns is never bound twice.
 

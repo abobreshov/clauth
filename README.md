@@ -110,9 +110,9 @@ Every command and flag: [Quickstart](wiki/Quickstart.md).
 | MiniMax | `minimax` | api key | Token Plan 5h and 7d | 5h, 7d |
 | Alibaba Model Studio | `alibaba` | api key + console session | 7d (5h when reported), tier | 5h, 7d |
 | any other endpoint | `generic` | api key | best-effort scan | none |
-| upstream clauth (guest mode) | `upstream_clauth` | read only | what clauth's feed carries | none |
+| upstream clauth (guest mode) | `upstream_clauth` | read only | what clauth's feed carries | none (5h / 7d are flagged, but an upstream account never joins a chain) |
 
-Only chain-eligible windows can move the fallback chain; monitors never join one. Setup, what is read, and each provider's limitations: [Providers](wiki/Providers.md).
+Only chain-eligible windows can move the fallback chain; monitors and upstream accounts never join one, whatever their windows' `chain_eligible` flag says. Setup, what is read, and each provider's limitations: [Providers](wiki/Providers.md).
 
 ## Local agent API
 
@@ -147,7 +147,7 @@ Keys, rows, knobs: [herdr plugin](wiki/Herdr-Plugin.md).
 
 ## Waybar and Omarchy
 
-`tollgate usage --waybar` prints the lead account (the active profile, else the worst-graded) as `text`, every account in `tooltip`, the severity as `class` (`ok`, `mid`, `high`, `critical`, or `none`) and the lead window's percent as `percentage`. In `~/.config/waybar/config.jsonc` (Omarchy's default location), define the module and add `"custom/tollgate"` to one of `modules-left`, `modules-center` or `modules-right`:
+`tollgate usage --waybar` prints the lead account (the active profile, else another active account such as the active codex or upstream one, else the worst-graded) as `text`, every account in `tooltip`, the severity as `class` (`ok`, `mid`, `high`, `critical`, or `none`) and the lead window's percent as `percentage`, a key left out when the lead account has no live window. In `~/.config/waybar/config.jsonc` (Omarchy's default location), define the module and add `"custom/tollgate"` to one of `modules-left`, `modules-center` or `modules-right`:
 
 ```jsonc
 "custom/tollgate": {

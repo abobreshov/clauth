@@ -113,7 +113,7 @@ The severity class rides beside it as a second token, `$tollgate_severity` (`ok`
 
 ### Native panes
 
-`hermes`, `grok` and `agy` panes run harnesses tollgate does not launch, so they have no session row. The binary tags one with the single enabled account its harness owns (for `hermes`, a Nous monitor that reads Hermes' own login) and tags nothing when there is none or more than one: an ambiguous pane is cleared rather than tagged with a guess. The pane still gets a watcher, so an account that appears later tags it on the next tick.
+`hermes`, `grok` and `agy` panes run harnesses tollgate does not launch, so they have no session row. The binary tags one with the single enabled account its harness owns (for `hermes`, a Nous monitor that reads Hermes' own login) and tags nothing when there is none or more than one: an ambiguous pane is cleared rather than tagged with a guess. No Grok or Antigravity reader ships in 0.1.0, so `grok` and `agy` panes stay untagged for now. The pane still gets a watcher, so an account that appears later tags it on the next tick.
 
 ### How it follows the pane
 

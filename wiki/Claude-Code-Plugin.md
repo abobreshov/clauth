@@ -2,7 +2,7 @@
 
 tollgate ships an MCP server that hands your profiles to a live Claude Code session: compare usage across accounts, read every provider's usage and spend, relink the active one, or hand a whole prompt to another account without spending the window you are in.
 
-The plugin is `tollgate@tollgate` and its tools are exposed as `mcp__plugin_tollgate_tollgate__*`, so it installs beside upstream clauth's `clauth@clauth`. In [guest mode](Guest-Mode) the install and the `mcpServers` wiring are refused, since the plugin registry and `~/.claude.json` are upstream's; wiring `tollgate mcp` into a single session by hand (below) still works.
+The plugin is `tollgate@tollgate` and its tools are exposed as `mcp__plugin_tollgate_tollgate__*`, so it installs beside upstream clauth's `clauth@clauth`. In [guest mode](Guest-Mode) the install and the `mcpServers` wiring are refused, since the plugin registry and `~/.claude.json` are upstream's; the by-hand `mcpServers` entry (below) is an edit you make yourself, into a file upstream clauth also writes.
 
 ## Install
 
