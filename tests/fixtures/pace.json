@@ -1,0 +1,22 @@
+{
+  "_doc": "Pace (plan v3.1 §4.1): delta = used - elapsed, in points; within +-5 (inclusive) is on pace. Labels truncate points toward zero. `window` cases derive elapsed from resets_at and window_secs at `now`.",
+  "pace": [
+    { "used": 62.0, "elapsed": 50.0, "verdict": "ahead", "label": "12 pts ahead", "glyph": "↑" },
+    { "used": 55.1, "elapsed": 50.0, "verdict": "ahead", "label": "5 pts ahead", "glyph": "↑" },
+    { "used": 55.0, "elapsed": 50.0, "verdict": "on_pace", "label": "on pace", "glyph": "→" },
+    { "used": 50.0, "elapsed": 50.0, "verdict": "on_pace", "label": "on pace", "glyph": "→" },
+    { "used": 45.0, "elapsed": 50.0, "verdict": "on_pace", "label": "on pace", "glyph": "→" },
+    { "used": 44.0, "elapsed": 50.0, "verdict": "under", "label": "6 pts under", "glyph": "↓" },
+    { "used": 0.0, "elapsed": 100.0, "verdict": "under", "label": "100 pts under", "glyph": "↓" },
+    { "used": 7.9, "elapsed": 1.5, "verdict": "ahead", "label": "6 pts ahead", "glyph": "↑" },
+    { "used": 26.0, "elapsed": 20.0, "verdict": "ahead", "label": "6 pts ahead", "glyph": "↑" },
+    { "used": 130.0, "elapsed": 99.0, "verdict": "ahead", "label": "31 pts ahead", "glyph": "↑" }
+  ],
+  "window": [
+    { "now": "2026-09-29T10:00:00+00:00", "resets_at": "2026-09-29T12:30:00+00:00", "window_secs": 18000, "used": 62.0, "elapsed": 50.0, "label": "12 pts ahead" },
+    { "now": "2026-09-29T10:00:00+00:00", "resets_at": "2026-09-29T15:00:00+00:00", "window_secs": 18000, "used": 0.0, "elapsed": 0.0, "label": "on pace" },
+    { "now": "2026-09-29T10:00:00+00:00", "resets_at": "2026-09-29T09:00:00+00:00", "window_secs": 18000, "used": 90.0, "elapsed": 100.0, "label": "10 pts under" },
+    { "now": "2026-09-29T10:00:00+00:00", "resets_at": "2026-10-06T10:00:00+00:00", "window_secs": 604800, "used": 3.0, "elapsed": 0.0, "label": "on pace" },
+    { "now": "2026-09-29T10:00:00+00:00", "resets_at": "2026-09-30T22:00:00+00:00", "window_secs": 604800, "used": 70.0, "elapsed": 78.57142857142857, "label": "8 pts under" }
+  ]
+}

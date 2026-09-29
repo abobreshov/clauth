@@ -300,6 +300,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             dump_openapi,
         ),
         Command::Devices { json, cmd } => cmd_devices(json, cmd),
+        Command::Usage {
+            json,
+            all,
+            account,
+            provider,
+        } => usage::report::run(
+            json,
+            &usage::collect::CollectOpts {
+                include_disabled: all,
+                account,
+                provider,
+            },
+        ),
         Command::Status {
             json: _,
             all,

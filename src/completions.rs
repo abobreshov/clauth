@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -72,6 +72,8 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "limit-reset" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--list --yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "usage" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json --all --account --provider" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --disabled" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
@@ -107,6 +109,7 @@ _tollgate() {
             'info[print resume command + storage path for a session]' \
             'daemon[run the headless scheduler with no TUI]' \
             'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
+            'usage[print every account'"'"'s quota windows and money meters]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
@@ -194,6 +197,9 @@ _tollgate() {
             '--cert[serve this certificate instead of the lego one; needs --key]' \
             '--key[private key for --cert]' \
             '--dump-openapi[print the OpenAPI document the REST API serves, and start nothing]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == usage ]]; then
+        _values 'flag' '--json[emit the stable JSON envelope]' '--all[also include disabled profiles]' \
+            '--account[only this account id or name]' '--provider[only this source or provider]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
@@ -230,6 +236,7 @@ complete -c tollgate -f -n __fish_is_first_token -a info -d "Print resume comman
 complete -c tollgate -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c tollgate -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
 complete -c tollgate -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
+complete -c tollgate -f -n __fish_is_first_token -a usage -d "Print every account's quota windows and money meters"
 complete -c tollgate -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c tollgate -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
@@ -271,6 +278,10 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip 
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a --list -d "Show the resets and which one would be used; spend none"
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a --yes -d "Skip the confirm prompt"
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Skip the confirm prompt"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --json -d "Emit the stable JSON envelope"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --all -d "Also include disabled profiles"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --account -d "Only this account id or name"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --provider -d "Only this source or provider"
 complete -c tollgate -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
 complete -c tollgate -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
 complete -c tollgate -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"

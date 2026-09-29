@@ -385,6 +385,30 @@ pub(crate) enum Command {
         cmd: Option<DevicesCommand>,
     },
 
+    /// Print every account's quota windows and money meters
+    ///
+    /// One observation per account across every provider — claude profiles,
+    /// codex profiles and monitoring sources — read from the on-disk usage
+    /// caches, never fetched. `--json` prints the stable envelope agents read:
+    /// `{schema_version: 1, generated_at, guest_mode, accounts: [...]}`, money
+    /// as exact decimal strings and times as RFC 3339. Without it, one line
+    /// per account.
+    Usage {
+        /// Emit the stable JSON envelope instead of one line per account.
+        #[arg(long)]
+        json: bool,
+        /// Also include disabled profiles, hidden by default.
+        #[arg(long)]
+        all: bool,
+        /// Only the account with this id (`claude:work`) or name (`work`).
+        #[arg(long, value_name = "ACCOUNT")]
+        account: Option<String>,
+        /// Only accounts from this source (`anthropic_oauth`, `codex`,
+        /// `openrouter`, …) or provider name.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
+
     /// Print the usage / auto-switch snapshot as JSON
     ///
     /// The same shape the daemon writes to ~/.tollgate/status.json.

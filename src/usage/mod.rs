@@ -7,7 +7,16 @@ mod codex_headers;
 // `tollgate limit-reset`: the list/consume pair, its selection rule and its text.
 // One caller (`main.rs`), so reached by path rather than re-exported item by item.
 pub(crate) mod codex_reset;
+// The observation core (plan v3.1 §4.1): the provider-agnostic model, its
+// read-time derivations, the projections of today's caches onto it, the
+// collector with its source hooks, and `tollgate usage`. Reached by path
+// (`crate::usage::observation::…`), not re-exported item by item.
+pub(crate) mod collect;
+pub(crate) mod derive;
 mod fetch;
+pub(crate) mod observation;
+pub(crate) mod project;
+pub(crate) mod report;
 mod scheduler;
 
 pub(crate) use burn::{

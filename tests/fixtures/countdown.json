@@ -1,0 +1,29 @@
+{
+  "_doc": "Countdown spellings shared by the CLI, TUI, JSON and herdr surfaces (plan v3.1 §4.5). `secs` is time left (null = unknown reset). Every unit truncates, never rounds up. `local_time` pins the HH:MM half at a fixed UTC offset.",
+  "countdown": [
+    { "secs": null, "want": "—" },
+    { "secs": -3600, "want": "now" },
+    { "secs": 0, "want": "now" },
+    { "secs": 59, "want": "now" },
+    { "secs": 60, "want": "1m" },
+    { "secs": 299, "want": "4m" },
+    { "secs": 300, "want": "5m" },
+    { "secs": 359, "want": "5m" },
+    { "secs": 3599, "want": "59m" },
+    { "secs": 3600, "want": "1h 00m" },
+    { "secs": 11100, "want": "3h 05m" },
+    { "secs": 11159, "want": "3h 05m" },
+    { "secs": 86399, "want": "23h 59m" },
+    { "secs": 86400, "want": "1d 0h" },
+    { "secs": 349200, "want": "4d 1h" },
+    { "secs": 352799, "want": "4d 1h" },
+    { "secs": 604800, "want": "7d 0h" }
+  ],
+  "local_time": [
+    { "at": "2026-09-29T12:32:00+00:00", "offset_secs": 0, "want": "12:32" },
+    { "at": "2026-09-29T12:32:59+00:00", "offset_secs": 7200, "want": "14:32" },
+    { "at": "2026-09-29T23:30:00+00:00", "offset_secs": 3600, "want": "00:30" },
+    { "at": "2026-09-29T00:15:00+00:00", "offset_secs": -18000, "want": "19:15" },
+    { "at": "2026-09-29T10:00:00+00:00", "offset_secs": 19800, "want": "15:30" }
+  ]
+}

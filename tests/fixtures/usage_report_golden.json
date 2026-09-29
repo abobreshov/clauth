@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-29T10:00:00+00:00",
+  "guest_mode": true,
+  "accounts": [
+    {
+      "id": "claude:or-main",
+      "source": "openrouter",
+      "auth": "api_key",
+      "label": "or-main",
+      "provider": "OpenRouter",
+      "plan": "pay-as-you-go",
+      "active": true,
+      "disabled": false,
+      "origin": "profile",
+      "endpoint": "https://openrouter.ai/api",
+      "freshness": {
+        "state": "stale",
+        "since": "2026-09-29T08:00:00+00:00"
+      },
+      "failure": {
+        "kind": "rate_limited",
+        "message": "slow down",
+        "retry_after": "2026-09-29T10:01:00+00:00"
+      },
+      "windows": [
+        {
+          "id": "session",
+          "label": "5h",
+          "used_pct": 82.5,
+          "exhausted": false,
+          "resets_at": "2026-09-29T13:05:00+00:00",
+          "window_secs": 18000,
+          "scope": {
+            "kind": "shared"
+          },
+          "chain_eligible": true,
+          "used": null,
+          "limit": null,
+          "breakdown": []
+        },
+        {
+          "id": "free_daily",
+          "label": "free requests",
+          "used_pct": null,
+          "exhausted": false,
+          "resets_at": null,
+          "window_secs": null,
+          "scope": {
+            "kind": "account"
+          },
+          "chain_eligible": false,
+          "used": 12.0,
+          "limit": 50.0,
+          "breakdown": [
+            {
+              "model": "glm-5",
+              "requests": 12
+            }
+          ]
+        },
+        {
+          "id": "weekly:opus",
+          "label": "7d opus",
+          "used_pct": null,
+          "exhausted": false,
+          "resets_at": null,
+          "window_secs": null,
+          "scope": {
+            "kind": "model",
+            "models": [
+              "opus"
+            ]
+          },
+          "chain_eligible": false,
+          "used": null,
+          "limit": null,
+          "breakdown": []
+        }
+      ],
+      "money": [
+        {
+          "meter_id": "wallet",
+          "label": "Balance",
+          "kind": "balance",
+          "amount": "-0.000123",
+          "currency": "USD",
+          "limit": null,
+          "scope": "profile",
+          "scope_id": null,
+          "scope_origin": {
+            "kind": "provider"
+          },
+          "additive": true,
+          "period": null
+        },
+        {
+          "meter_id": "key_limit",
+          "label": "Key cap",
+          "kind": "limit",
+          "amount": "9.00",
+          "currency": "USD",
+          "limit": "50",
+          "scope": "key",
+          "scope_id": "org-1",
+          "scope_origin": {
+            "kind": "monitoring_credential",
+            "bound": true
+          },
+          "additive": false,
+          "period": {
+            "kind": "monthly",
+            "start": "2026-09-28T10:00:00+00:00",
+            "end": "2026-09-30T10:00:00+00:00",
+            "derived": true
+          }
+        }
+      ],
+      "estimate": {
+        "amount": "1.5",
+        "currency": "USD",
+        "period": {
+          "kind": "daily",
+          "start": null,
+          "end": null,
+          "derived": false
+        },
+        "basis": "token ledger × ai-pricelog"
+      },
+      "banked_resets": 0,
+      "best_effort": true,
+      "observed_at": "2026-09-29T08:00:00+00:00",
+      "checked_at": "2026-09-29T09:59:00+00:00"
+    },
+    {
+      "id": "codex:cx",
+      "source": "codex",
+      "auth": "subscription",
+      "label": "cx",
+      "provider": "OpenAI",
+      "plan": null,
+      "active": false,
+      "disabled": false,
+      "origin": "codex_profile",
+      "endpoint": null,
+      "freshness": {
+        "state": "not_fetched"
+      },
+      "failure": null,
+      "windows": [],
+      "money": [],
+      "estimate": null,
+      "banked_resets": null,
+      "best_effort": false,
+      "observed_at": null,
+      "checked_at": null
+    }
+  ]
+}

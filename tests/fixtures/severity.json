@@ -1,0 +1,51 @@
+{
+  "_doc": "Severity ladder (plan v3.1 §4.5). used_pct: <50 ok, >=50 mid, >=75 high, >=90 critical (unclamped). balance (USD, exact decimal): >=20 ok, <20 mid, <5 high (word LOW), <1 or negative critical; any other currency has no ladder (null). pace: < -10 ok, >= -10 mid, > 0 high, >= +10 critical.",
+  "used_pct": [
+    { "pct": -3.0, "want": "ok" },
+    { "pct": 0.0, "want": "ok" },
+    { "pct": 49.99, "want": "ok" },
+    { "pct": 50.0, "want": "mid" },
+    { "pct": 74.99, "want": "mid" },
+    { "pct": 75.0, "want": "high" },
+    { "pct": 89.99, "want": "high" },
+    { "pct": 90.0, "want": "critical" },
+    { "pct": 100.0, "want": "critical" },
+    { "pct": 131.5, "want": "critical" }
+  ],
+  "balance": [
+    { "amount": "1000", "currency": "USD", "want": "ok" },
+    { "amount": "20", "currency": "USD", "want": "ok" },
+    { "amount": "20.00", "currency": "usd", "want": "ok" },
+    { "amount": "19.999999", "currency": "USD", "want": "mid" },
+    { "amount": "5", "currency": "USD", "want": "mid" },
+    { "amount": "4.99", "currency": "USD", "want": "high" },
+    { "amount": "1.00", "currency": "USD", "want": "high" },
+    { "amount": "0.999", "currency": "USD", "want": "critical" },
+    { "amount": "0", "currency": "USD", "want": "critical" },
+    { "amount": "-0.004", "currency": "USD", "want": "critical" },
+    { "amount": "-5.71", "currency": "USD", "want": "critical" },
+    { "amount": "3640.55", "currency": "CNY", "want": null },
+    { "amount": "0.00", "currency": "EUR", "want": null }
+  ],
+  "pace": [
+    { "delta": -40.0, "want": "ok" },
+    { "delta": -10.01, "want": "ok" },
+    { "delta": -10.0, "want": "mid" },
+    { "delta": 0.0, "want": "mid" },
+    { "delta": 0.01, "want": "high" },
+    { "delta": 9.99, "want": "high" },
+    { "delta": 10.0, "want": "critical" }
+  ],
+  "words": [
+    { "severity": "ok", "usage": "ok", "balance": "ok" },
+    { "severity": "mid", "usage": "mid", "balance": "mid" },
+    { "severity": "high", "usage": "HIGH", "balance": "LOW" },
+    { "severity": "critical", "usage": "CRITICAL", "balance": "CRITICAL" }
+  ],
+  "worst_of": [
+    { "of": [], "want": null },
+    { "of": ["ok"], "want": "ok" },
+    { "of": ["mid", "ok", "high"], "want": "high" },
+    { "of": ["critical", "ok"], "want": "critical" }
+  ]
+}
