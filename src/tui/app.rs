@@ -3833,19 +3833,14 @@ fn poll_usage_extras(app: &mut App) {
     set_usage_extras(app, extras);
 }
 
-/// The extras the Usage rail lists: every hook's observations, first id wins.
+/// The extras the Usage rail lists: the collector's hook observations
+/// ([`crate::usage::collect::hook_observations`]), first id wins.
 pub(crate) fn usage_extras_from(
     ctx: &crate::usage::collect::CollectCtx<'_>,
     monitors: &[crate::usage::collect::SourceHook],
     upstream: &[crate::usage::collect::SourceHook],
 ) -> Vec<crate::usage::observation::AccountObservation> {
-    let mut seen = std::collections::HashSet::new();
-    monitors
-        .iter()
-        .chain(upstream)
-        .flat_map(|hook| hook(ctx))
-        .filter(|o| seen.insert(o.id.clone()))
-        .collect()
+    crate::usage::collect::hook_observations(ctx, monitors, upstream)
 }
 
 /// Replace the extras, keeping the selection on the same account id when it

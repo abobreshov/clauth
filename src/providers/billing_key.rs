@@ -66,12 +66,22 @@ pub(crate) fn resolve(name: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// Every env-var name any configured profile references, sorted, de-duplicated.
+/// Every monitoring-credential env-var name tollgate references, sorted,
+/// de-duplicated: each profile's `billing_key_env`, and every monitor's
+/// `api_key_env` / `billing_key_env` (`~/.tollgate/monitors.toml`; plan §4.3:
+/// referenced monitoring vars join every scrub list). An unreadable file
+/// contributes nothing.
 pub(crate) fn referenced_env_vars() -> Vec<String> {
-    let Ok(state) = crate::profile::load_app_state() else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = state.profiles.iter().filter_map(billing_key_env).collect();
+    let mut names: Vec<String> = crate::profile::load_app_state()
+        .map(|state| state.profiles.iter().filter_map(billing_key_env).collect())
+        .unwrap_or_default();
+    if let Ok(monitors) = crate::usage::monitor::config::load() {
+        for m in monitors {
+            names.extend(m.api_key_env);
+            names.extend(m.billing_key_env);
+        }
+    }
+    names.retain(|n| valid_env_name(n));
     names.sort();
     names.dedup();
     names

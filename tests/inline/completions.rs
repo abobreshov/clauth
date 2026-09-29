@@ -1154,3 +1154,44 @@ fn codex_completion_names_are_the_codex_roster() {
         vec!["cx".to_string(), "cy".to_string()]
     );
 }
+
+/// Every visible subcommand clap knows — top level and one level down (the
+/// `monitor`, `api`, `herdr`, `devices`, … families) — is offered by every
+/// shell's script, so a new subcommand cannot ship without completions.
+#[test]
+fn every_visible_subcommand_is_completed_in_every_shell() {
+    use clap::CommandFactory as _;
+    let root = crate::cli::Cli::command();
+    let visible = |c: &clap::Command| -> Vec<String> {
+        c.get_subcommands()
+            .filter(|s| !s.is_hide_set() && s.get_name() != "help")
+            .map(|s| s.get_name().to_string())
+            .collect()
+    };
+    let bash_words: std::collections::HashSet<&str> = BASH
+        .lines()
+        .filter(|l| l.contains("compgen -W"))
+        .filter_map(|l| l.split('"').nth(1))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let mut missing = Vec::new();
+    let mut check = |path: &str, name: &str| {
+        if !bash_words.contains(name) {
+            missing.push(format!("bash: {path}{name}"));
+        }
+        if !ZSH.contains(&format!("'{name}[")) {
+            missing.push(format!("zsh: {path}{name}"));
+        }
+        if !FISH.contains(&format!("-a {name} ")) {
+            missing.push(format!("fish: {path}{name}"));
+        }
+    };
+    for top in visible(&root) {
+        check("", &top);
+        let sub = root.find_subcommand(&top).expect("listed");
+        for child in visible(sub) {
+            check(&format!("{top} "), &child);
+        }
+    }
+    assert!(missing.is_empty(), "not completed: {missing:#?}");
+}

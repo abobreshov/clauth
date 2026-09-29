@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::observation::{
     AccountObservation, Amount, FailureKind, MoneyKind, MoneyMeter, QuotaWindow, Timestamp,
-    WINDOW_SESSION,
+    WINDOW_MONTH, WINDOW_SESSION,
 };
 
 // ── Severity ───────────────────────────────────────────────────────────────────
@@ -116,11 +116,20 @@ pub(crate) fn worst_of(items: impl IntoIterator<Item = Severity>) -> Option<Seve
 
 /// A window's severity: `Critical` when exhausted, else its used share's rung;
 /// `None` when the share is unknown.
+///
+/// A calendar-month pool ([`WINDOW_MONTH`], Ollama Cloud's included credits)
+/// that is not marked exhausted grades at most `High`: past the pool, use
+/// continues on purchased credits or team billing, so a spent pool reads
+/// "included credits used up", not CRITICAL (plan §4.5 severity table).
 pub(crate) fn window_severity(w: &QuotaWindow) -> Option<Severity> {
     if w.exhausted {
         return Some(Severity::Critical);
     }
-    w.used_pct.map(severity_from_used_pct)
+    let sev = w.used_pct.map(severity_from_used_pct);
+    if w.id == WINDOW_MONTH {
+        return sev.map(|s| s.min(Severity::High));
+    }
+    sev
 }
 
 /// A money meter's severity and the basis that words it.
@@ -128,14 +137,16 @@ pub(crate) fn window_severity(w: &QuotaWindow) -> Option<Severity> {
 /// - `balance`: the USD balance ladder ([`severity_from_balance`]).
 /// - `limit` (amount = what is left under the cap): left `≤ 0` is critical;
 ///   otherwise the used share `(cap − left) / cap` on the usage ladder.
-/// - `spend` and `budget`: not graded (`None`) — "used % of lifetime
-///   purchases" is never a severity (plan §4.5).
+/// - `budget` (amount = what is left of the operator's own budget, `limit` =
+///   the budget): graded exactly like a cap — the operator set that line.
+/// - `spend`: not graded (`None`) — "used % of lifetime purchases" is never
+///   a severity (plan §4.5).
 pub(crate) fn meter_severity(m: &MoneyMeter) -> Option<(Severity, SeverityBasis)> {
     match m.kind {
         MoneyKind::Balance => {
             severity_from_balance(&m.amount, &m.currency).map(|s| (s, SeverityBasis::Balance))
         }
-        MoneyKind::Limit => {
+        MoneyKind::Limit | MoneyKind::Budget => {
             if m.amount <= Amount::zero() {
                 return Some((Severity::Critical, SeverityBasis::Usage));
             }
@@ -146,7 +157,7 @@ pub(crate) fn meter_severity(m: &MoneyMeter) -> Option<(Severity, SeverityBasis)
             let used_pct = (cap - m.amount.to_f64()) / cap * 100.0;
             Some((severity_from_used_pct(used_pct), SeverityBasis::Usage))
         }
-        MoneyKind::Spend | MoneyKind::Budget => None,
+        MoneyKind::Spend => None,
     }
 }
 

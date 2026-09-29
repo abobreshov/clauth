@@ -251,8 +251,8 @@ fn monitor_severity_folds_the_budget_in() {
     let now_secs = (NOW_MS / 1000) as i64;
     assert_eq!(
         crate::usage::derive::account_severity(&obs, now_secs, false),
-        Some(Severity::Mid),
-        "the core ladder grades the $7.90 balance, not the budget"
+        Some(Severity::Critical),
+        "the core ladder grades the blown budget too, so every surface agrees"
     );
     assert_eq!(monitor_severity(&obs, now_secs), Some(Severity::Critical));
 }
@@ -397,4 +397,136 @@ fn an_invalid_monitors_toml_yields_no_monitors() {
     std::fs::write(&path, "[[monitor]]\nid = \"Bad Id\"\nkind = \"nous\"\n").unwrap();
     let codex = CodexState::default();
     assert!(monitor_observations(&ctx(&codex, crate::usage::now_ms(), true)).is_empty());
+}
+
+/// Integration: an `ollama_cloud` monitor refreshed through the Ollama
+/// provider fetch lands on every read surface through the collector — the
+/// agent API's redacted observations and `usage --json` envelope, the text
+/// report (`tollgate usage`), and the TUI's Usage-rail extras — graded by
+/// its budget, with the spent month pool at HIGH (not CRITICAL) and no key
+/// in any output.
+#[test]
+fn an_ollama_monitor_reaches_every_surface_through_the_collector() {
+    let home = HomeSandbox::new();
+    let mut oc = MonitorConfig::new("oc", MonitorKind::OllamaCloud);
+    oc.api_key_env = Some("OLLAMA_WATCH_KEY".into());
+    oc.label = Some("Ollama main".into());
+    crate::usage::monitor::config::add(&oc).unwrap();
+
+    let now = crate::usage::now_ms();
+    let http = FakeHttp::stats(|| {
+        crate::providers::ollama_cloud::parse_usage(
+            r#"{"activity":{"cost":"4.12345"},"limits":{"monthly":{"usage":1.2}}}"#,
+        )
+    });
+    let deps = RefreshDeps {
+        http: &http,
+        notifier: None,
+        env: &|name| (name == "OLLAMA_WATCH_KEY").then(|| "sk-ollama-secret-0000".to_string()),
+        now_ms: now,
+    };
+    refresh_one(&oc, &deps, false).unwrap();
+    assert_eq!(
+        http.calls(),
+        ["PROVIDER https://ollama.com key=sk-ollama-secret-0000"]
+    );
+
+    // Upstream clauth owns this HOME: its status feed is read-only input.
+    let upstream = home.home().join(".clauth");
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("status.json"),
+        include_str!("../fixtures/upstream_status.json"),
+    )
+    .unwrap();
+    assert!(crate::identity::upstream_active(), "guest mode");
+
+    // Agent API: the same collector, redacted.
+    let accounts = crate::local_api::routes::observations(&CollectOpts::default());
+    assert!(
+        accounts.iter().any(|o| o.id.starts_with("upstream:")),
+        "upstream accounts ride the API in guest mode: {:?}",
+        accounts.iter().map(|o| &o.id).collect::<Vec<_>>()
+    );
+    let obs = accounts
+        .iter()
+        .find(|o| o.id == "monitor:oc")
+        .expect("the monitor is an API account");
+    assert_eq!(obs.source, SourceId::OllamaCloud);
+    assert_eq!(obs.origin, Origin::Monitor);
+    let now_secs = (now / 1000) as i64;
+    assert_eq!(
+        crate::usage::derive::account_severity(obs, now_secs, false),
+        Some(Severity::High),
+        "a spent month pool is HIGH, not CRITICAL"
+    );
+    let report = crate::local_api::routes::usage_report(&CollectOpts {
+        provider: Some("ollama_cloud".into()),
+        ..CollectOpts::default()
+    });
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(json.contains("monitor:oc"), "{json}");
+    assert!(!json.contains("sk-ollama-secret"), "no key in usage JSON");
+
+    // `tollgate usage` text report.
+    let ctx = crate::usage::cards::CardCtx {
+        width: 80,
+        now_secs,
+        offset_secs: 0,
+        guest_mode: true,
+    };
+    assert!(report.guest_mode);
+    let text =
+        crate::usage::pretty::render_text(&accounts, &ctx, crate::usage::pretty::TextMode::Plain);
+    assert!(text.contains("Ollama main"), "{text}");
+    assert!(!text.contains("sk-ollama-secret"));
+
+    // TUI Usage rail: the collector's hook observations (what
+    // `tui::app::usage_extras_from` returns).
+    let codex = CodexState::default();
+    let extras = crate::usage::collect::hook_observations(
+        &ctx_for(&codex, now),
+        MONITOR_SOURCES,
+        crate::usage::collect::UPSTREAM_SOURCES,
+    );
+    assert!(extras.iter().any(|o| o.id == "monitor:oc"));
+    assert!(
+        extras.iter().any(|o| o.id.starts_with("upstream:")),
+        "the TUI rail lists upstream accounts in guest mode"
+    );
+
+    // Nothing anywhere under HOME holds the key.
+    for path in walk(home.home()) {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        assert!(
+            !body.contains("sk-ollama-secret"),
+            "{} holds the key",
+            path.display()
+        );
+    }
+}
+
+fn ctx_for(codex: &CodexState, now_ms: u64) -> CollectCtx<'_> {
+    CollectCtx {
+        guest_mode: true,
+        ..ctx(codex, now_ms, false)
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
 }

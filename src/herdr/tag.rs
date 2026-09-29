@@ -30,8 +30,8 @@ use crate::out::outln;
 use crate::usage::collect::{CollectOpts, collect};
 use crate::usage::derive::{Severity, account_severity, format_money, lead_window};
 use crate::usage::observation::{
-    AccountObservation, Freshness, MoneyKind, MoneyMeter, Origin, PeriodKind, QuotaWindow,
-    SourceId, WINDOW_MONTH, WINDOW_WEEKLY, WINDOW_WEEKLY_MODEL_PREFIX, account_id,
+    AccountObservation, AuthKind, Freshness, MoneyKind, MoneyMeter, Origin, PeriodKind,
+    QuotaWindow, SourceId, WINDOW_MONTH, WINDOW_WEEKLY, WINDOW_WEEKLY_MODEL_PREFIX, account_id,
 };
 
 /// herdr caps a metadata token value at 80 characters (herdr 0.9.1 CLI
@@ -65,14 +65,16 @@ pub(crate) enum PaneAgent {
 ///
 /// A native agent maps only to the sources that ARE that harness's own
 /// account, never to a provider it may be configured to call: a Hermes pane
-/// maps to Hermes' local state, not to every Nous or OpenRouter key, since
-/// which of those it calls is Hermes' own config (H2's `HERMES_HOME` join is
-/// what can narrow further, once Hermes profiles exist).
+/// maps to Hermes' local state and to a Nous monitor that reads Hermes' own
+/// login ([`AuthKind::NativeLogin`], see [`native_match`]), not to every Nous
+/// or OpenRouter key, since which of those it calls is Hermes' own config
+/// (H2's `HERMES_HOME` join is what can narrow further, once Hermes profiles
+/// exist).
 pub(crate) fn pane_agent(agent: &str) -> PaneAgent {
     match agent {
         "claude" => PaneAgent::Claude,
         "codex" => PaneAgent::Codex,
-        "hermes" => PaneAgent::Native(&[SourceId::Hermes]),
+        "hermes" => PaneAgent::Native(&[SourceId::Hermes, SourceId::Nous]),
         "grok" => PaneAgent::Native(&[SourceId::Grok]),
         "agy" => PaneAgent::Native(&[SourceId::Antigravity]),
         _ => PaneAgent::Other,
@@ -131,13 +133,19 @@ pub(crate) fn resolve_tag(
 
 /// The one enabled observation from `sources`, or `None` when there is none
 /// or more than one (ambiguous: no tag rather than a guess).
+///
+/// A Nous observation counts only when it reads the harness's own login
+/// ([`AuthKind::NativeLogin`]: the monitor borrows Hermes' `auth.json`); a
+/// Nous API key is a provider Hermes may or may not be configured to call.
 pub(crate) fn native_match<'a>(
     accounts: &'a [AccountObservation],
     sources: &[SourceId],
 ) -> Option<&'a AccountObservation> {
-    let mut candidates = accounts
-        .iter()
-        .filter(|o| !o.disabled && sources.contains(&o.source));
+    let mut candidates = accounts.iter().filter(|o| {
+        !o.disabled
+            && sources.contains(&o.source)
+            && (o.source != SourceId::Nous || o.auth == AuthKind::NativeLogin)
+    });
     let only = candidates.next()?;
     candidates.next().is_none().then_some(only)
 }

@@ -9,7 +9,7 @@ use super::cache::{MonitorCache, STALE_RETENTION_MS};
 use super::config::MonitorConfig;
 use super::source::{MonitorTarget, resolve_target, skeleton};
 use crate::usage::collect::CollectCtx;
-use crate::usage::derive::{Severity, account_severity, severity_from_used_pct, worst_of};
+use crate::usage::derive::{Severity, account_severity};
 use crate::usage::observation::{
     AccountObservation, Amount, Freshness, MoneyKind, MoneyMeter, MoneyScope, Period, PeriodKind,
     ScopeOrigin, Timestamp,
@@ -31,7 +31,10 @@ pub(crate) fn monitor_observations(ctx: &CollectCtx<'_>) -> Vec<AccountObservati
         .filter(|m| m.enabled || ctx.include_disabled)
         .map(|m| {
             let cache = super::cache::load(&m.id).filter(|c| c.matches(m));
-            observe_monitor(m, cache.as_ref(), ctx.now_ms, |at| ctx.freshness_of(at))
+            // Judged against the monitor's own TTL, not the profile cadence.
+            observe_monitor(m, cache.as_ref(), ctx.now_ms, |at| {
+                ctx.freshness_at_cadence(at, m.ttl_ms())
+            })
         })
         .collect()
 }
@@ -133,26 +136,20 @@ pub(crate) fn budget_spent_pct(m: &MoneyMeter) -> Option<f64> {
 }
 
 /// A budget meter's severity: its spent share on the usage ladder, critical
-/// once nothing is left.
+/// once nothing is left. The core grades budgets
+/// ([`crate::usage::derive::meter_severity`]); this is that rung for a
+/// `Budget` meter only.
 pub(crate) fn budget_severity(m: &MoneyMeter) -> Option<Severity> {
     if m.kind != MoneyKind::Budget {
         return None;
     }
-    if m.amount <= Amount::zero() {
-        return Some(Severity::Critical);
-    }
-    budget_spent_pct(m).map(severity_from_used_pct)
+    crate::usage::derive::meter_severity(m).map(|(s, _)| s)
 }
 
-/// A monitor's severity: the account's own ([`account_severity`], no pace)
-/// folded with its budget's.
+/// A monitor's severity: the account's own ([`account_severity`], no pace),
+/// which folds its budget in like every other surface.
 pub(crate) fn monitor_severity(obs: &AccountObservation, now_secs: i64) -> Option<Severity> {
-    let budget = obs.money.iter().filter_map(budget_severity);
-    worst_of(
-        account_severity(obs, now_secs, false)
-            .into_iter()
-            .chain(budget),
-    )
+    account_severity(obs, now_secs, false)
 }
 
 /// `a − b`, exactly. `None` past 18 fractional digits or i64 range.

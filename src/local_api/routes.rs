@@ -281,12 +281,13 @@ pub(crate) fn auth_kinds(source: SourceId) -> &'static [AuthKind] {
         SourceId::Ollama | SourceId::Hermes => &[NativeLogin],
         SourceId::OllamaCloud => &[ApiKey, ReadOnly],
         SourceId::OpenRouter => &[ApiKey, Hybrid, ReadOnly],
-        SourceId::Nous => &[Subscription, ApiKey],
-        SourceId::DeepSeek
-        | SourceId::Zai
-        | SourceId::MiniMax
-        | SourceId::Alibaba
-        | SourceId::Generic => &[ApiKey, Hybrid],
+        // The Nous monitor reads Hermes' own login, or a Nous API key.
+        SourceId::Nous => &[NativeLogin, ApiKey],
+        // A `provider` monitor on a monitoring-only key reads as ReadOnly.
+        SourceId::DeepSeek | SourceId::Zai | SourceId::MiniMax | SourceId::Alibaba => {
+            &[ApiKey, Hybrid, ReadOnly]
+        }
+        SourceId::Generic => &[ApiKey, Hybrid],
         SourceId::UpstreamClauth => &[ReadOnly],
     }
 }

@@ -305,10 +305,41 @@ fn meter_severity_grades_balances_and_caps_but_never_spend() {
         meter_severity(&meter(MoneyKind::Spend, "900", "USD", Some("10"))),
         None
     );
+    // The operator's own budget grades like a cap: spent is critical, 82%
+    // spent is HIGH.
     assert_eq!(
         meter_severity(&meter(MoneyKind::Budget, "0", "USD", Some("10"))),
-        None
+        Some((Severity::Critical, SeverityBasis::Usage))
     );
+    assert_eq!(
+        meter_severity(&meter(MoneyKind::Budget, "9", "USD", Some("50"))),
+        Some((Severity::High, SeverityBasis::Usage))
+    );
+}
+
+/// Ollama Cloud's monthly pool past 100% is HIGH, not CRITICAL (plan §4.5):
+/// use continues on purchased credits. Only an `exhausted` window, or a
+/// rolling one, reaches CRITICAL.
+#[test]
+fn a_spent_month_pool_grades_high_not_critical() {
+    let mut month = QuotaWindow::new(
+        crate::usage::observation::WINDOW_MONTH,
+        "month",
+        crate::usage::observation::WindowScope::Account,
+    );
+    month.used_pct = Some(120.0);
+    assert_eq!(window_severity(&month), Some(Severity::High));
+    month.used_pct = Some(60.0);
+    assert_eq!(window_severity(&month), Some(Severity::Mid));
+    month.exhausted = true;
+    assert_eq!(window_severity(&month), Some(Severity::Critical));
+    let mut weekly = QuotaWindow::new(
+        crate::usage::observation::WINDOW_WEEKLY,
+        "weekly",
+        crate::usage::observation::WindowScope::Account,
+    );
+    weekly.used_pct = Some(120.0);
+    assert_eq!(window_severity(&weekly), Some(Severity::Critical));
 }
 
 #[test]

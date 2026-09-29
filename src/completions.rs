@@ -130,7 +130,7 @@ _tollgate() {
             'api[serve or locate the local agent API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
-            'herdr[install the herdr plugin and bind a key to it]' \
+            'herdr[install, link or uninstall the herdr plugin and bind a key to it]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -313,7 +313,7 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from api; and __fish_seen_sub
 complete -c tollgate -f -n "__fish_seen_subcommand_from api; and __fish_seen_subcommand_from token" -a --show -d "Print the token itself"
 complete -c tollgate -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c tollgate -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
-complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
+complete -c tollgate -f -n __fish_is_first_token -a herdr -d "Install or link the herdr plugin, read its knobs, or uninstall it"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr" -a link -d "Link a local checkout's plugin into herdr"

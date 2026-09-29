@@ -60,10 +60,20 @@ impl CollectCtx<'_> {
     /// Freshness of figures read at `observed_ms` against this context's
     /// clock and cadence (`None` = nothing read).
     pub(crate) fn freshness_of(&self, observed_ms: Option<u64>) -> Freshness {
+        self.freshness_at_cadence(observed_ms, self.interval_ms)
+    }
+
+    /// [`Self::freshness_of`] against a source's own cadence (a monitor's
+    /// `ttl_secs`) instead of the profile refresh interval.
+    pub(crate) fn freshness_at_cadence(
+        &self,
+        observed_ms: Option<u64>,
+        interval_ms: u64,
+    ) -> Freshness {
         match observed_ms {
             None => Freshness::NotFetched,
             Some(at) => match self.now_ms.checked_sub(at) {
-                Some(age) if age <= stale_after_ms(self.interval_ms) => Freshness::Fresh,
+                Some(age) if age <= stale_after_ms(interval_ms) => Freshness::Fresh,
                 // A future stamp proves the clock moved, not that it is fresh.
                 _ => Freshness::Stale {
                     since: Some(Timestamp::from_ms(at)),
@@ -153,13 +163,28 @@ pub(crate) fn collect_with(
             .iter()
             .map(|name| observe_codex(ctx, name.as_str())),
     );
-    for hook in monitors.iter().chain(upstream) {
-        all.extend(hook(ctx));
-    }
+    all.extend(hook_observations(ctx, monitors, upstream));
     let mut seen = std::collections::HashSet::new();
     all.retain(|o| seen.insert(o.id.clone()));
     all.retain(|o| matches_filters(o, opts));
     all
+}
+
+/// Every hook's observations (`monitor:` then `upstream:`), first id wins:
+/// the part of [`collect_with`] a surface that lists profiles itself (the
+/// TUI's Usage rail) reads on its own, so both see the same accounts.
+pub(crate) fn hook_observations(
+    ctx: &CollectCtx<'_>,
+    monitors: &[SourceHook],
+    upstream: &[SourceHook],
+) -> Vec<AccountObservation> {
+    let mut seen = std::collections::HashSet::new();
+    monitors
+        .iter()
+        .chain(upstream)
+        .flat_map(|hook| hook(ctx))
+        .filter(|o| seen.insert(o.id.clone()))
+        .collect()
 }
 
 fn matches_filters(o: &AccountObservation, opts: &CollectOpts) -> bool {

@@ -130,6 +130,32 @@ fn referenced_env_vars_collects_every_profile_once() {
     assert_eq!(referenced_env_vars(), ["OR_MGMT", "OTHER_ORG_MGMT"]);
 }
 
+/// Monitors name monitoring credentials too (plan §4.3): every monitor's
+/// `api_key_env` and `billing_key_env` joins the scrub list beside the
+/// profiles' names.
+#[test]
+fn referenced_env_vars_include_every_monitors_key_names() {
+    use crate::usage::monitor::config::{MonitorConfig, MonitorKind, add};
+    let _home = HomeSandbox::new();
+    seed(&[("or-a", Some(OR_URL), Some("OR_MGMT"))]);
+    let mut or = MonitorConfig::new("or-watch", MonitorKind::OpenRouter);
+    or.api_key_env = Some("OR_WATCH_KEY".to_string());
+    or.billing_key_env = Some("OR_MGMT".to_string());
+    add(&or).expect("add openrouter monitor");
+    let mut oc = MonitorConfig::new("oc-watch", MonitorKind::OllamaCloud);
+    oc.api_key_env = Some("OLLAMA_WATCH_KEY".to_string());
+    add(&oc).expect("add ollama monitor");
+    assert_eq!(
+        referenced_env_vars(),
+        ["OLLAMA_WATCH_KEY", "OR_MGMT", "OR_WATCH_KEY"]
+    );
+
+    let mut cmd = std::process::Command::new("probe");
+    cmd.env("OLLAMA_WATCH_KEY", "placeholder");
+    ClaudeEngine.scrub_env(&mut cmd, &[]);
+    assert_eq!(env_overrides(&cmd).get("OLLAMA_WATCH_KEY"), Some(&None));
+}
+
 #[test]
 fn referenced_env_vars_is_empty_without_profiles() {
     let _home = HomeSandbox::new();

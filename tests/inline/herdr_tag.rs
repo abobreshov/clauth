@@ -245,6 +245,28 @@ fn a_native_pane_is_tagged_only_when_one_account_can_be_it() {
     }
 }
 
+/// A hermes pane is Hermes' own account: a Nous monitor reading Hermes'
+/// login tags it, a Nous API-key monitor never does (Hermes may not call
+/// that key at all).
+#[test]
+fn a_hermes_pane_matches_a_nous_monitor_only_on_hermes_login() {
+    let mut login = obs(Origin::Monitor, "nous-main", SourceId::Nous);
+    login.auth = AuthKind::NativeLogin;
+    login.windows.push(window("subscription", 64.0));
+    let mut keyed = obs(Origin::Monitor, "nous-key", SourceId::Nous);
+    keyed.auth = AuthKind::ApiKey;
+
+    let tag = resolve_tag(&[login.clone(), keyed.clone()], None, "hermes", NOW).unwrap();
+    assert!(tag.text.starts_with("nous-main "), "{}", tag.text);
+    assert_eq!(resolve_tag(&[keyed], None, "hermes", NOW), None);
+    let hermes = obs(Origin::Monitor, "herm", SourceId::Hermes);
+    assert_eq!(
+        resolve_tag(&[login, hermes], None, "hermes", NOW),
+        None,
+        "Hermes state and its Nous login: two candidates, ambiguous"
+    );
+}
+
 #[test]
 fn a_tag_carries_no_account_id() {
     for o in roster() {
@@ -261,7 +283,10 @@ fn a_tag_carries_no_account_id() {
 fn herdrs_agent_ids_map_to_their_rosters() {
     assert_eq!(pane_agent("claude"), PaneAgent::Claude);
     assert_eq!(pane_agent("codex"), PaneAgent::Codex);
-    assert_eq!(pane_agent("hermes"), PaneAgent::Native(&[SourceId::Hermes]));
+    assert_eq!(
+        pane_agent("hermes"),
+        PaneAgent::Native(&[SourceId::Hermes, SourceId::Nous])
+    );
     assert_eq!(pane_agent("grok"), PaneAgent::Native(&[SourceId::Grok]));
     assert_eq!(
         pane_agent("agy"),

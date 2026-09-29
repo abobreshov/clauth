@@ -255,7 +255,7 @@ fn the_catalog_lists_every_source_once_with_its_auth_kinds() {
     assert!(ds.configured);
     assert_eq!(ds.accounts, 2);
     assert_eq!(ds.display_name, "DeepSeek");
-    assert_eq!(ds.auth_kinds, ["api_key", "hybrid"]);
+    assert_eq!(ds.auth_kinds, ["api_key", "hybrid", "read_only"]);
     assert!(
         rows.iter()
             .filter(|r| r.source != "deepseek")

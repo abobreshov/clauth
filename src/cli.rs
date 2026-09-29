@@ -25,9 +25,12 @@ pub(crate) const DEFAULT_LISTEN: &str = crate::identity::DEFAULT_LISTEN;
 #[command(
     name = "tollgate",
     version,
-    about = "launcher and account manager for claude code",
+    about = "monitor and manage AI subscriptions and spending; launcher and account manager for claude code",
     after_help = "With no command, tollgate launches the TUI; `tollgate <profile>` switches to that account and exits \
                   (deprecated, use `tollgate switch <name>`). \
+                  `tollgate usage` reports every account's windows and money (profiles, codex, monitors, upstream clauth); \
+                  `tollgate monitor` adds monitoring-only accounts; agents read the same data through `tollgate api` \
+                  or the MCP `usage` tool. \
                   The color depth can also be pinned in ~/.tollgate/profiles.toml with `theme = \"full\"`."
 )]
 pub(crate) struct Cli {

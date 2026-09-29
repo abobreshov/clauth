@@ -69,6 +69,10 @@ pub(crate) struct MonitorTarget {
     /// needs both credentials apart: the inference key reads `/api/v1/key`,
     /// and a management key may only ever reach `/api/v1/credits`.
     pub(crate) api_key: Option<Secret>,
+    /// `api_key_env` is configured (set or not): what the account's auth
+    /// kind is judged by, so an observation read without the environment
+    /// agrees with the fetch.
+    pub(crate) api_key_configured: bool,
     /// The NAME of `billing_key_env` when that variable is set. Handed to the
     /// OpenRouter fetch, which reads the value itself for the one `/credits`
     /// call ([`crate::providers::billing_key`]).
@@ -120,6 +124,7 @@ pub(crate) fn resolve_target(
         key_env,
         monitoring_key,
         api_key,
+        api_key_configured: cfg.api_key_env.is_some(),
         billing_key_env,
         hermes_home: cfg.hermes_home_in(home),
         now_secs,
@@ -135,9 +140,11 @@ impl MonitorTarget {
             .flatten()
     }
 
-    /// The credential the figures are read with is monitoring-only.
+    /// The account reads as monitoring-only: a billing key, and not an
+    /// OpenRouter monitor whose inference key runs the fetch.
     fn reads_read_only(&self) -> bool {
-        self.monitoring_key && self.openrouter_inference().is_none()
+        self.monitoring_key
+            && !(self.provider == Some(Provider::OpenRouter) && self.api_key_configured)
     }
 }
 
@@ -250,7 +257,7 @@ impl UsageSource for ProviderSource {
         );
         crate::usage::project::apply_third_party(&mut scratch, &stats, target.now_secs);
         crate::providers::ollama_cloud::refine_observation(&mut scratch, Some(&stats));
-        if target.reads_read_only() {
+        if target.monitoring_key && target.openrouter_inference().is_none() {
             for m in &mut scratch.money {
                 m.scope_origin = ScopeOrigin::MonitoringCredential { bound: false };
             }

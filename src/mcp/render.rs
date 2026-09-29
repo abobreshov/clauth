@@ -563,9 +563,9 @@ pub(crate) fn instructions_block(
     out.push_str(
         "tollgate manages multiple accounts (\"profiles\"): each an isolated credential set / \
 subscription. Use its tools to compare usage headroom across accounts, relink the active \
-account, or delegate a task to another account without spending this session's window. These \
-tools see CLAUDE CODE accounts only — tollgate also manages codex accounts, which are invisible \
-here and switch through its CLI.\n\n",
+account, or delegate a task to another account without spending this session's window. The \
+`usage` tool reads every account tollgate observes (claude, codex, other providers, monitors); \
+the other tools see CLAUDE CODE accounts only — codex accounts switch through tollgate's CLI.\n\n",
     );
     if let Some(line) = identity_line(profiles, auth) {
         out.push_str(&line);
