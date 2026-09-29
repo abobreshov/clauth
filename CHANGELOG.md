@@ -84,7 +84,7 @@ The pre-release review and how each finding was settled: [docs/tollgate-code-rev
 - **No import yet.** `tollgate import clauth` is designed but not implemented, so guest mode cannot end while clauth is installed.
 - **Old credential links survive guest mode.** A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before `~/.clauth` appeared is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - **Guest sessions still link the operator's read-mostly `~/.claude` content.** `CLAUDE.md`, `commands/`, `agents/`, `skills/`, `hooks/`, `output-styles/` and `keybindings.json` stay linked under real links, so an edit the session is asked to make there (a `#` memory note, `/agents`) lands in `~/.claude`. A passthrough `--continue` is not seeded into the guest store.
-- **macOS guest Keychain guard not built on macOS yet.** The default-item refusal is tested on Linux through its predicate; `keychain.rs` itself has not been compiled for macOS since the change.
+- **macOS guest Keychain guard not built on macOS yet.** The default-item refusal is tested on Linux through its predicate; `keychain.rs` itself has not been compiled for macOS since the change. Nor have the macOS- and Windows-only helper spawns that now scrub monitoring keys; their command builders are compiled and tested on Linux.
 - **`list` and `status --json` show `base_url` unredacted.** `usage --json` and the agent API redact it.
 - **`tollgate api serve` leaves `api.sock` behind on SIGTERM.** The next start replaces the stale socket.
 - **herdr `--display-agent` scope unverified.** Whether the `border label` knob's label is scoped to one pane is not verified against herdr 0.9.
