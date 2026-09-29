@@ -184,6 +184,8 @@ pub(crate) struct Reading {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) costs_failure: Option<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_hold_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) costs_observed_at: Option<i64>,
     pub(crate) plan: Option<String>,
     pub(crate) windows: Vec<QuotaWindow>,

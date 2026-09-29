@@ -416,3 +416,27 @@ fn antigravity_cli_configuration_is_refused_until_owner_gate_is_recorded() {
     assert!(error.contains("AGY-CLI"));
     assert!(error.contains("disabled"));
 }
+
+/// Exercise cadence without validate(): the owner gate remains false, and its
+/// refusal must not make this floor test pass for an unrelated reason.
+#[test]
+fn antigravity_cli_ttl_floor_is_900_independent_of_owner_gate() {
+    let mut cfg = MonitorConfig::new("agy-cli", MonitorKind::Antigravity);
+    cfg.via = Some("cli".into());
+    assert_eq!(cfg.ttl_floor(), 900);
+    assert_eq!(
+        cfg.ttl_ms(),
+        900_000,
+        "the implicit 600s default is raised to the CLI floor"
+    );
+    for ttl in [0, 300, 600, 899, 900] {
+        cfg.ttl_secs = Some(ttl);
+        assert_eq!(cfg.ttl_ms(), 900_000, "CLI ttl={ttl}");
+    }
+    cfg.ttl_secs = Some(1200);
+    assert_eq!(cfg.ttl_ms(), 1_200_000);
+    cfg.via = Some("keyring".into());
+    assert_eq!(cfg.ttl_floor(), 300);
+    cfg.ttl_secs = None;
+    assert_eq!(cfg.ttl_ms(), 600_000);
+}

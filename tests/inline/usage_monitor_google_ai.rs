@@ -76,3 +76,12 @@ fn gemini_other_400_keeps_health_unknown() {
     assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Unknown);
     assert_eq!(reading.verdict.unwrap().kind, FailureKind::Unavailable);
 }
+#[test]
+fn gemini_permission_denied_is_explicitly_blocked() {
+    let (reading, _) = fetch(403, r#"{"error":{"status":"PERMISSION_DENIED"}}"#);
+    assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Blocked);
+    assert_eq!(
+        reading.verdict.unwrap().message,
+        "Google AI permission denied for the API key"
+    );
+}

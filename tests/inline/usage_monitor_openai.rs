@@ -212,7 +212,10 @@ fn costs_follow_at_most_three_pages() {
         .unwrap();
     assert_eq!(http.calls().len(), 4);
     assert!(reading.money.is_empty());
-    assert_eq!(reading.verdict.unwrap().kind, FailureKind::InvalidResponse);
+    assert_eq!(
+        reading.costs_failure.unwrap().kind,
+        FailureKind::InvalidResponse
+    );
 }
 #[test]
 fn costs_run_at_most_hourly() {
@@ -290,7 +293,7 @@ fn configured_plain_key_keeps_api_auth_kind_when_missing_from_process() {
     assert_eq!(OpenaiSource.auth_kind(&target), AuthKind::ReadOnly);
 }
 #[test]
-fn costs_403_keeps_known_money_and_failed_costs_keep_verdict_until_due() {
+fn costs_403_keeps_known_money_and_failed_costs_keep_details_until_due() {
     let home = HomeSandbox::new();
     let mut target = target(home.home(), true);
     let money = MoneyMeter::new(
@@ -328,7 +331,7 @@ fn costs_403_keeps_known_money_and_failed_costs_keep_verdict_until_due() {
     };
     let reading = OpenaiSource.fetch(&target, &http).unwrap();
     assert_eq!(
-        reading.verdict.as_ref().unwrap().kind,
+        reading.costs_failure.as_ref().unwrap().kind,
         FailureKind::Unavailable
     );
     target.previous = Some(reading);
@@ -336,7 +339,11 @@ fn costs_403_keeps_known_money_and_failed_costs_keep_verdict_until_due() {
     let http = fake(200, "{}");
     let reading = OpenaiSource.fetch(&target, &http).unwrap();
     assert_eq!(http.calls().len(), 1);
-    assert_eq!(reading.verdict.unwrap().kind, FailureKind::Unavailable);
+    assert!(reading.verdict.is_none());
+    assert_eq!(
+        reading.costs_failure.as_ref().unwrap().kind,
+        FailureKind::Unavailable
+    );
     assert!(reading.note.unwrap().contains("costs unavailable"));
 }
 #[test]
@@ -376,7 +383,11 @@ fn recovered_plain_health_does_not_reuse_cached_plain_rate_limit() {
     let reading = OpenaiSource.fetch(&target, &http).unwrap();
     assert_eq!(http.calls().len(), 1);
     assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Valid);
-    assert_eq!(reading.verdict.unwrap().kind, FailureKind::Unavailable);
+    assert!(reading.verdict.is_none());
+    assert_eq!(
+        reading.costs_failure.as_ref().unwrap().kind,
+        FailureKind::Unavailable
+    );
     assert_eq!(
         reading.costs_failure.unwrap().kind,
         FailureKind::Unavailable
@@ -396,7 +407,9 @@ fn admin_costs_rate_limit_preserves_retry_timing() {
     let target = target(home.home(), true);
     let reading = OpenaiSource.fetch(&target, &http).unwrap();
     assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Valid);
-    let failure = reading.verdict.unwrap();
+    assert!(reading.verdict.is_none());
+    assert_eq!(reading.costs_hold_until, Some(target.now_secs + 3600));
+    let failure = reading.costs_failure.as_ref().unwrap();
     assert_eq!(failure.kind, FailureKind::RateLimited);
     assert_eq!(failure.retry_after.unwrap().secs(), target.now_secs + 120);
     assert_eq!(
@@ -531,4 +544,86 @@ fn costs_follow_an_opaque_base64_cursor_as_encoded_query_data() {
         .unwrap();
     assert!(reading.verdict.is_none());
     assert_eq!(http.calls().len(), 3);
+}
+#[test]
+fn costs_rate_limit_never_holds_models_and_costs_wait_for_their_retry() {
+    let home = HomeSandbox::new();
+    let mut target = target(home.home(), true);
+    let first_http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            let mut response = reply(if req.url.contains("/costs") { 429 } else { 200 }, "{}");
+            response.retry_after_secs = Some(7200);
+            Ok(response)
+        }),
+        ..FakeHttp::offline()
+    };
+    let first = OpenaiSource.fetch(&target, &first_http).unwrap();
+    assert!(first.verdict.is_none());
+    assert_eq!(first.costs_hold_until, Some(target.now_secs + 7200));
+    assert_eq!(first_http.calls().len(), 2);
+    target.previous = Some(first);
+    target.now_secs += 4000;
+    let http = fake(200, "{}");
+    let next = OpenaiSource.fetch(&target, &http).unwrap();
+    assert_eq!(http.calls().len(), 1);
+    assert!(http.calls()[0].contains("/models"));
+    assert_eq!(
+        next.key_health.as_ref().unwrap().state,
+        KeyHealthState::Valid
+    );
+    assert!(next.verdict.is_none());
+    assert_eq!(
+        next.costs_failure.as_ref().unwrap().kind,
+        FailureKind::RateLimited
+    );
+    assert_eq!(
+        next.costs_hold_until,
+        target.previous.as_ref().unwrap().costs_hold_until
+    );
+    target.previous = Some(next);
+    target.now_secs += 3200;
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            Ok(reply(
+                200,
+                if req.url.contains("/costs") {
+                    r#"{"data":[]}"#
+                } else {
+                    "{}"
+                },
+            ))
+        }),
+        ..FakeHttp::offline()
+    };
+    let refreshed = OpenaiSource.fetch(&target, &http).unwrap();
+    assert_eq!(http.calls().len(), 2);
+    assert!(refreshed.costs_failure.is_none());
+    assert!(refreshed.verdict.is_none());
+}
+#[test]
+fn legacy_costs_reading_honors_retry_beyond_hour_without_hold_field() {
+    let home = HomeSandbox::new();
+    let mut target = target(home.home(), true);
+    let attempted = target.now_secs;
+    let mut failure = Failure::new(FailureKind::RateLimited, "OpenAI costs rate limited");
+    failure.retry_after = Some(Timestamp::from_secs(attempted + 7200));
+    target.previous = Some(Reading {
+        costs_at: Some(attempted),
+        costs_failure: Some(failure),
+        note: Some("costs unavailable".into()),
+        costs_hold_until: None,
+        ..Reading::default()
+    });
+    target.now_secs += 4000;
+    let http = fake(200, "{}");
+    let reading = OpenaiSource.fetch(&target, &http).unwrap();
+    assert_eq!(http.calls().len(), 1);
+    assert!(http.calls()[0].contains("/models"));
+    assert_eq!(reading.key_health.unwrap().state, KeyHealthState::Valid);
+    assert!(reading.verdict.is_none());
+    assert_eq!(reading.costs_hold_until, Some(attempted + 7200));
+    assert_eq!(
+        reading.costs_failure.unwrap().kind,
+        FailureKind::RateLimited
+    );
 }

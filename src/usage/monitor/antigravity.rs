@@ -475,7 +475,7 @@ trait CliRunner {
     fn stamp(&self) -> Result<Option<CliBinaryStamp>, Failure> {
         Ok(None)
     }
-    fn run(&self, call: CliCall) -> Result<String, Failure>;
+    fn run(&self, call: CliCall) -> Result<Zeroizing<String>, Failure>;
 }
 struct LiveCliRunner;
 fn cli_command(program: &std::path::Path, call: CliCall) -> std::process::Command {
@@ -483,7 +483,12 @@ fn cli_command(program: &std::path::Path, call: CliCall) -> std::process::Comman
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     for name in ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"] {
         command.env_remove(name);
     }
@@ -500,10 +505,29 @@ fn cli_command(program: &std::path::Path, call: CliCall) -> std::process::Comman
     }
     command
 }
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_cli_group(child: &mut std::process::Child) {
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // SAFETY: cli_command gives this child its own process group (pgid=pid).
+        // A negative pid targets only that group, including inherited descendants.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+#[cfg(not(unix))]
+fn kill_cli_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
 fn run_cli_command(
     mut command: std::process::Command,
+    call: CliCall,
     timeout: std::time::Duration,
-) -> Result<String, Failure> {
+) -> Result<Zeroizing<String>, Failure> {
     use std::io::Read;
     let mut child = command
         .spawn()
@@ -512,48 +536,92 @@ fn run_cli_command(
         .stdout
         .take()
         .ok_or_else(|| Failure::new(FailureKind::Unavailable, "agy output unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Failure::new(FailureKind::Unavailable, "agy stderr unavailable"))?;
     let (sender, receiver) = std::sync::mpsc::channel();
+    let stderr_sender = sender.clone();
     std::thread::spawn(move || {
         let mut bytes = Zeroizing::new(Vec::new());
         let read = stdout
             .take(MAX_CLI_BYTES + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
-        let _ = sender.send(read);
+        let _ = sender.send((false, read));
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Zeroizing::new(Vec::new());
+        let read = stderr
+            .take(MAX_CLI_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = stderr_sender.send((true, read));
     });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10))
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(Failure::new(
+                kill_cli_group(&mut child);
+                return Err(Failure::new(
                     FailureKind::Unavailable,
                     "agy print mode timed out",
                 ));
             }
         }
     };
-    // A killed descendant could keep its stdout descriptor alive. Do not wait
-    // for its reader after the deadline; the read remains capped and owns no key.
-    let status = status?;
-    let bytes = receiver
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output timed out"))?
-        .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output unavailable"))?;
-    if bytes.len() as u64 > MAX_CLI_BYTES {
+    let mut stdout = Zeroizing::new(Vec::new());
+    let mut stderr = Zeroizing::new(Vec::new());
+    for _ in 0..2 {
+        let read =
+            receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        let (is_stderr, bytes) = match read {
+            Ok((is_stderr, Ok(bytes))) => (is_stderr, bytes),
+            Ok((_, Err(_))) => {
+                kill_cli_group(&mut child);
+                return Err(Failure::new(
+                    FailureKind::Unavailable,
+                    "agy output unavailable",
+                ));
+            }
+            Err(_) => {
+                kill_cli_group(&mut child);
+                return Err(Failure::new(
+                    FailureKind::Unavailable,
+                    "agy output timed out",
+                ));
+            }
+        };
+        if is_stderr {
+            stderr = bytes;
+        } else {
+            stdout = bytes;
+        }
+    }
+    if stdout.len().saturating_add(stderr.len()) as u64 > MAX_CLI_BYTES {
+        kill_cli_group(&mut child);
         return Err(Failure::new(
             FailureKind::Unavailable,
             "agy output exceeds 1 MiB",
         ));
     }
-    let output = String::from_utf8(bytes.to_vec())
-        .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output is not UTF-8"))?;
-    if sign_in_flow(&output) {
+    // Validate the zeroizing byte buffers before constructing zeroizing text:
+    // malformed UTF-8 never leaves an unwiped duplicate allocation behind.
+    let output = Zeroizing::new(
+        std::str::from_utf8(&stdout)
+            .map_err(|_| Failure::new(FailureKind::Unavailable, "agy output is not UTF-8"))?
+            .to_owned(),
+    );
+    let diagnostic = Zeroizing::new(
+        std::str::from_utf8(&stderr)
+            .map_err(|_| Failure::new(FailureKind::Unavailable, "agy stderr is not UTF-8"))?
+            .to_owned(),
+    );
+    if call == CliCall::Usage && (sign_in_flow(&output) || sign_in_flow(&diagnostic)) {
         return Err(Failure::new(
             FailureKind::AuthRequired,
             "open agy and sign in",
@@ -607,7 +675,7 @@ impl CliRunner for LiveCliRunner {
             cli_binary().map(Some)
         }
     }
-    fn run(&self, call: CliCall) -> Result<String, Failure> {
+    fn run(&self, call: CliCall) -> Result<Zeroizing<String>, Failure> {
         #[cfg(test)]
         {
             let _ = call;
@@ -618,23 +686,24 @@ impl CliRunner for LiveCliRunner {
             let stamp = cli_binary()?;
             run_cli_command(
                 cli_command(&stamp.path, call),
+                call,
                 std::time::Duration::from_secs(30),
             )
         }
     }
 }
-fn version_supported(output: &str) -> bool {
+fn detected_version(output: &str) -> Option<(String, (u64, u64, u64))> {
     output
         .split(|c: char| !c.is_ascii_digit() && c != '.')
-        .filter_map(|s| {
-            let mut parts = s.split('.');
-            Some((
-                parts.next()?.parse::<u64>().ok()?,
-                parts.next()?.parse::<u64>().ok()?,
-                parts.next()?.parse::<u64>().ok()?,
-            ))
+        .find_map(|word| {
+            let mut parts = word.split('.');
+            let tuple = (
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+            );
+            Some((word.to_string(), tuple))
         })
-        .any(|v| v >= (1, 1, 11))
 }
 fn contains_usage_command(value: &Value) -> bool {
     match value {
@@ -649,10 +718,47 @@ fn contains_usage_command(value: &Value) -> bool {
     }
 }
 fn sign_in_flow(output: &str) -> bool {
-    let lowercase = output.to_ascii_lowercase();
-    ["sign in", "sign-in", "login", "https://", "http://"]
-        .iter()
-        .any(|marker| lowercase.contains(marker))
+    let lowercase = Zeroizing::new(output.to_ascii_lowercase());
+    let prompt = [
+        "please sign in",
+        "please sign-in",
+        "sign in to continue",
+        "sign-in required",
+        "sign in required",
+        "not signed in",
+        "authentication required",
+        "login required",
+        "please log in",
+        "run agy login",
+        "open your browser to sign in",
+        "visit the following url to authenticate",
+        "open the following url to authenticate",
+        "sign in at ",
+        "sign in: ",
+        "sign-in: ",
+        "log in at ",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker));
+    // A bare official authorization URL is itself a sign-in instruction, even
+    // when the CLI emits it only on stderr. Ordinary documentation URLs and
+    // /login command names do not have this precise OAuth path.
+    let oauth = [
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "https://accounts.google.com/o/oauth2/auth",
+    ]
+    .iter()
+    .any(|prefix| {
+        lowercase.match_indices(prefix).any(|(index, _)| {
+            let suffix = &lowercase[index + prefix.len()..];
+            suffix.is_empty()
+                || suffix.starts_with('?')
+                || suffix.starts_with(|c: char| {
+                    c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ',')
+                })
+        })
+    });
+    prompt || oauth
 }
 fn fetch_cli(runner: &dyn CliRunner, now: i64) -> Result<Reading, Failure> {
     // Both probes are offline. The production caller remains behind the owner
@@ -668,10 +774,17 @@ fn fetch_cli(runner: &dyn CliRunner, now: i64) -> Result<Reading, Failure> {
     });
     if !memoized {
         let version = runner.run(CliCall::Version)?;
-        if !version_supported(&version) {
+        let detected = detected_version(&version);
+        if detected
+            .as_ref()
+            .is_none_or(|(_, tuple)| *tuple < (1, 1, 11))
+        {
+            let label = detected
+                .as_ref()
+                .map_or("unknown", |(label, _)| label.as_str());
             return Err(Failure::new(
                 FailureKind::Unavailable,
-                "agy has no print-mode /usage (requires 1.1.11)",
+                &format!("agy {label} has no print-mode /usage"),
             ));
         }
         let help: Value = serde_json::from_str(&runner.run(CliCall::Help)?).map_err(|_| {

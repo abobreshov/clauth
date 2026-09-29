@@ -204,14 +204,16 @@ struct FakeCli {
     calls: std::sync::Mutex<Vec<CliCall>>,
 }
 impl CliRunner for FakeCli {
-    fn run(&self, call: CliCall) -> Result<String, Failure> {
+    fn run(&self, call: CliCall) -> Result<Zeroizing<String>, Failure> {
         self.calls.lock().unwrap().push(call);
-        Ok(match call {
-            CliCall::Version => self.version,
-            CliCall::Help => self.help,
-            CliCall::Usage => self.usage,
-        }
-        .into())
+        Ok(Zeroizing::new(
+            match call {
+                CliCall::Version => self.version,
+                CliCall::Help => self.help,
+                CliCall::Usage => self.usage,
+            }
+            .into(),
+        ))
     }
 }
 fn cli_fixture() -> FakeCli {
@@ -226,10 +228,9 @@ fn cli_fixture() -> FakeCli {
 fn cli_path_needs_1_1_11() {
     let mut runner = cli_fixture();
     runner.version = "agy 1.1.10";
-    assert_eq!(
-        fetch_cli(&runner, 100).unwrap_err().kind,
-        FailureKind::Unavailable
-    );
+    let failure = fetch_cli(&runner, 100).unwrap_err();
+    assert_eq!(failure.kind, FailureKind::Unavailable);
+    assert_eq!(failure.message, "agy 1.1.10 has no print-mode /usage");
     assert_eq!(*runner.calls.lock().unwrap(), vec![CliCall::Version]);
 }
 #[test]
@@ -279,23 +280,127 @@ fn cli_spawn_has_no_display_or_browser() {
             .collect::<Vec<_>>(),
         vec!["-p", "/usage", "--output-format", "json"]
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let program = home.home().join("fixture-agy");
+        std::fs::write(
+            &program,
+            "#!/bin/sh
+readlink /proc/self/fd/0
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = run_cli_command(
+            cli_command(&program, CliCall::Usage),
+            CliCall::Usage,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            output.trim(),
+            "/dev/null",
+            "child stdin must be the null device"
+        );
+    }
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
-fn cli_timeout_kills_the_child() {
+#[allow(unsafe_code)]
+fn cli_timeout_kills_the_child_and_grandchild() {
     use std::os::unix::fs::PermissionsExt;
     let home = crate::testutil::HomeSandbox::new();
+    // Adopt the synthetic grandchild so this test can reap it and assert the
+    // PID is actually gone, even on a container whose init never reaps orphans.
+    struct RestoreSubreaper(libc::c_int);
+    impl Drop for RestoreSubreaper {
+        fn drop(&mut self) {
+            unsafe {
+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.0, 0, 0, 0);
+            }
+        }
+    }
+    let mut previous = 0;
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut previous, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+    let _restore = RestoreSubreaper(previous);
     let binary = home.home().join("fixture-agy");
-    std::fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+    let child_pid = home.home().join("child.pid");
+    let grandchild_pid = home.home().join("grandchild.pid");
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+echo $$ > "$FIXTURE_CHILD_PID"
+/bin/sleep 60 &
+echo $! > "$FIXTURE_GRANDCHILD_PID"
+wait
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = cli_command(&binary, CliCall::Usage);
+    command
+        .env("FIXTURE_CHILD_PID", &child_pid)
+        .env("FIXTURE_GRANDCHILD_PID", &grandchild_pid);
     let start = std::time::Instant::now();
     let failure = run_cli_command(
-        cli_command(&binary, CliCall::Usage),
-        std::time::Duration::from_millis(30),
+        command,
+        CliCall::Usage,
+        std::time::Duration::from_millis(500),
     )
     .unwrap_err();
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
     assert!(failure.message.contains("timed out"));
+    let child: libc::pid_t = std::fs::read_to_string(child_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let grandchild: libc::pid_t = std::fs::read_to_string(grandchild_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child, 0) },
+        -1,
+        "direct child must be gone"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(grandchild, &mut status, libc::WNOHANG) };
+        if reaped == grandchild {
+            assert!(libc::WIFSIGNALED(status));
+            assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grandchild survived process-group kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        unsafe { libc::kill(grandchild, 0) },
+        -1,
+        "grandchild must be gone"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 #[test]
 fn cli_path_stays_disabled_before_owner_gate() {
@@ -330,6 +435,7 @@ fn cli_nonzero_sign_in_output_is_auth_required() {
     assert_eq!(
         run_cli_command(
             cli_command(&binary, CliCall::Usage),
+            CliCall::Usage,
             std::time::Duration::from_secs(1)
         )
         .unwrap_err()
@@ -345,7 +451,7 @@ fn cli_probes_memoize_for_60_seconds_and_invalidate_on_binary_change() {
         len: std::sync::atomic::AtomicU64,
     }
     impl CliRunner for MemoCli {
-        fn run(&self, call: CliCall) -> Result<String, Failure> {
+        fn run(&self, call: CliCall) -> Result<Zeroizing<String>, Failure> {
             self.inner.run(call)
         }
         fn stamp(&self) -> Result<Option<CliBinaryStamp>, Failure> {
@@ -487,4 +593,94 @@ fn agy_falls_through_daily_host_on_5xx_and_transport_error() {
         );
         assert!(calls[2].contains("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"));
     }
+}
+// Slice-2 review: only usage prompts authenticate; documentation URLs and
+// command listings are ordinary data on both probe and usage responses.
+#[test]
+fn cli_help_and_usage_documentation_urls_are_not_sign_in_prompts() {
+    let mut runner = cli_fixture();
+    runner.help =
+        r#"{"commands":["/usage","/login"],"documentation":"https://example.invalid/help"}"#;
+    runner.usage = r#"{"groups":[{"displayName":"Login telemetry https://example.invalid/model","buckets":[{"bucketId":"fixture","window":"5h","remainingFraction":0.5}]}]}"#;
+    assert!(fetch_cli(&runner, 100).is_ok());
+    assert!(!sign_in_flow(
+        "A /login command is documented at https://example.invalid/help"
+    ));
+    assert!(sign_in_flow(
+        "Please sign in at https://example.invalid/authenticate"
+    ));
+}
+#[cfg(unix)]
+#[test]
+fn cli_stderr_sign_in_prompt_is_auth_required_only_for_usage() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let program = home.home().join("fixture-agy");
+    std::fs::write(&program,"#!/bin/sh\necho 'Please sign in at https://example.invalid/authenticate' >&2\necho 'agy 1.2.13'\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for call in [CliCall::Version, CliCall::Help] {
+        assert!(
+            run_cli_command(
+                cli_command(&program, call),
+                call,
+                std::time::Duration::from_secs(1)
+            )
+            .is_ok()
+        );
+    }
+    let failure = run_cli_command(
+        cli_command(&program, CliCall::Usage),
+        CliCall::Usage,
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(failure.kind, FailureKind::AuthRequired);
+}
+#[cfg(unix)]
+#[test]
+fn cli_stderr_exceeding_shared_output_cap_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let program = home.home().join("fixture-agy");
+    std::fs::write(&program, "#!/bin/sh\nhead -c 1048577 /dev/zero >&2\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failure = run_cli_command(
+        cli_command(&program, CliCall::Usage),
+        CliCall::Usage,
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(failure.kind, FailureKind::Unavailable);
+    assert!(failure.message.contains("exceeds 1 MiB"));
+}
+#[cfg(unix)]
+#[test]
+fn cli_bare_official_oauth_url_on_stderr_is_usage_auth_required() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let program = home.home().join("fixture-agy");
+    std::fs::write(&program,"#!/bin/sh\necho 'https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture' >&2\necho 'agy 1.2.13'\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        run_cli_command(
+            cli_command(&program, CliCall::Help),
+            CliCall::Help,
+            std::time::Duration::from_secs(1)
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        run_cli_command(
+            cli_command(&program, CliCall::Usage),
+            CliCall::Usage,
+            std::time::Duration::from_secs(1)
+        )
+        .unwrap_err()
+        .kind,
+        FailureKind::AuthRequired
+    );
+    assert!(!sign_in_flow(
+        "https://accounts.google.com/o/oauth2/v2/authentication-documentation"
+    ));
+    assert!(!sign_in_flow("https://accounts.google.com/help/login"));
 }

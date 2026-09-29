@@ -22,6 +22,9 @@ struct CaptureSink {
 impl<'a> CaptureHttp<'a> {
     pub(crate) fn new(inner: &'a dyn MonitorHttp, dir: Option<&Path>) -> Result<Self> {
         if let Some(dir) = dir {
+            // These path checks cannot exclude concurrent ancestor replacement
+            // between validation and creation/write. A race-proof guest boundary
+            // requires an fd-relative walk and writes through the pinned directory.
             if crate::identity::upstream_active() {
                 let home = crate::profile::home_dir()?;
                 let candidate = if dir.is_absolute() {

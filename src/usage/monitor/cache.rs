@@ -113,6 +113,27 @@ pub(crate) fn load(id: &str) -> Option<MonitorCache> {
     serde_json::from_slice::<MonitorCache>(&bytes)
         .ok()
         .filter(|c| c.version == CACHE_VERSION && c.id == id)
+        .map(|mut cache| {
+            // Older caches promoted a secondary costs error to the account
+            // verdict. Repair that in memory before consulting its hold.
+            if let Some(reading) = cache.reading.as_mut() {
+                if reading.costs_failure.is_some() && reading.verdict == reading.costs_failure {
+                    reading.verdict = None;
+                    if cache.failure.is_none() {
+                        cache.hold_until_ms = None;
+                    }
+                }
+                if cache.failure.is_none()
+                    && reading
+                        .verdict
+                        .as_ref()
+                        .is_some_and(|failure| failure.kind == FailureKind::QuotaExhausted)
+                {
+                    cache.hold_until_ms = None;
+                }
+            }
+            cache
+        })
 }
 
 fn save(cache: &MonitorCache) -> Result<()> {
@@ -211,6 +232,7 @@ pub(crate) fn refresh_one(
 
     let mut next = prev.unwrap_or_else(|| MonitorCache::empty(cfg));
     next.checked_at_ms = Some(now_ms);
+    let primary_failed = result.is_err();
     match result {
         Ok(reading) => {
             next.reading = Some(reading);
@@ -223,18 +245,17 @@ pub(crate) fn refresh_one(
         }
     }
 
-    // Key-health checks carry their verdict alongside the reading, so a
-    // rate-limited response can retain its health and still stop retries.
+    // A primary HTTP rate limit can accompany a health reading. Exhaustion
+    // on a successful reading is a usage fact, so it must not delay polling.
+    // Secondary costs failures have their own retry timing in the reading.
     let verdict = next.failure.as_ref().or_else(|| {
         next.reading
             .as_ref()
             .and_then(|reading| reading.verdict.as_ref())
     });
     if let Some(failure) = verdict.filter(|failure| {
-        matches!(
-            failure.kind,
-            FailureKind::RateLimited | FailureKind::QuotaExhausted
-        )
+        failure.kind == FailureKind::RateLimited
+            || (primary_failed && failure.kind == FailureKind::QuotaExhausted)
     }) {
         let retry_ms = failure
             .retry_after

@@ -54,9 +54,24 @@ impl UsageSource for OpenaiSource {
             && let Some(admin) = &target.key
         {
             let prior = target.previous.as_ref();
+            let costs_hold_until = prior.and_then(|p| {
+                p.costs_hold_until.or_else(|| {
+                    let hourly = p.costs_at.map(|at| at.saturating_add(3600));
+                    let retry = p
+                        .costs_failure
+                        .as_ref()
+                        .and_then(|failure| failure.retry_after)
+                        .map(|at| at.secs());
+                    match (hourly, retry) {
+                        (Some(hourly), Some(retry)) => Some(hourly.max(retry)),
+                        (hourly, retry) => hourly.or(retry),
+                    }
+                })
+            });
             if prior
                 .and_then(|p| p.costs_at)
                 .is_some_and(|at| target.now_secs >= at && target.now_secs - at < 3600)
+                || costs_hold_until.is_some_and(|until| target.now_secs < until)
             {
                 if let Some(prior) = prior {
                     retain_costs(&mut reading, prior, target.now_secs);
@@ -70,14 +85,7 @@ impl UsageSource for OpenaiSource {
                                 Failure::new(FailureKind::Unavailable, "OpenAI costs unavailable")
                             })
                     });
-                    if reading.verdict.is_none()
-                        || reading
-                            .costs_failure
-                            .as_ref()
-                            .is_some_and(|failure| failure.kind == FailureKind::RateLimited)
-                    {
-                        reading.verdict = reading.costs_failure.clone();
-                    }
+                    reading.costs_hold_until = costs_hold_until;
                     if prior
                         .note
                         .as_deref()
@@ -88,6 +96,7 @@ impl UsageSource for OpenaiSource {
                 }
             } else {
                 reading.costs_at = Some(target.now_secs);
+                reading.costs_hold_until = Some(target.now_secs.saturating_add(3600));
                 match costs(http, admin, target.now_secs) {
                     Ok(CostsResult::Meters(money)) => {
                         reading.money = money;
@@ -106,9 +115,12 @@ impl UsageSource for OpenaiSource {
                         reading.note = Some(format!(
                             "{NOTE}; costs unavailable; keeping the last reading"
                         ));
-                        if reading.verdict.is_none() || failure.kind == FailureKind::RateLimited {
-                            reading.verdict = Some(failure);
-                        }
+                        reading.costs_hold_until = Some(
+                            target
+                                .now_secs
+                                .saturating_add(3600)
+                                .max(failure.retry_after.map_or(target.now_secs, |at| at.secs())),
+                        );
                         if let Some(prior) = prior {
                             retain_costs(&mut reading, prior, target.now_secs);
                         }
@@ -175,6 +187,12 @@ fn classify(reply: &HttpReply, now: i64) -> (KeyHealthState, Option<Failure>) {
         });
     let (state, kind, message) = match reply.status {
         200 => return (KeyHealthState::Valid, None),
+        401 if code.as_deref() == Some("invalid_api_key") => (
+            KeyHealthState::Invalid,
+            FailureKind::AuthRequired,
+            "OpenAI rejected the API key",
+        ),
+        // Other 401 codes fail closed as invalid: no authenticated read succeeded.
         401 => (
             KeyHealthState::Invalid,
             FailureKind::AuthRequired,

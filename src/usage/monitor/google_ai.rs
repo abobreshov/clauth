@@ -53,6 +53,11 @@ impl UsageSource for GoogleAiSource {
                             })
                         })
             });
+        let permission_denied = serde_json::from_str::<serde_json::Value>(&reply.body)
+            .ok()
+            .is_some_and(|body| {
+                body.pointer("/error/status").and_then(|v| v.as_str()) == Some("PERMISSION_DENIED")
+            });
         let (state, verdict) = match reply.status {
             200 => (KeyHealthState::Valid, None),
             400 if invalid_key => (
@@ -62,6 +67,14 @@ impl UsageSource for GoogleAiSource {
                     "Google AI rejected the API key",
                 )),
             ),
+            403 if permission_denied => (
+                KeyHealthState::Blocked,
+                Some(Failure::new(
+                    FailureKind::AuthRequired,
+                    "Google AI permission denied for the API key",
+                )),
+            ),
+            // Other 403 responses remain blocked as a fail-closed fallback.
             403 => (
                 KeyHealthState::Blocked,
                 Some(Failure::new(
