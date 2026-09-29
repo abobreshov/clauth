@@ -11,6 +11,13 @@
 # they run as children of its `tollgate mcp` and their rows are keyed on their
 # own processes, so the foreground chain resolves first and the compat sweep
 # never matches through an mcp.
+#
+# What the tag SAYS is the binary's: `tollgate herdr tag` turns the resolved
+# account into its name and lead metric from tollgate's usage caches
+# (`leadtone 2%`, `or-main $13.67`, `zai-work 34% ⚠`, `⏸` when stale) plus a
+# severity class, published as the `tollgate_severity` token so a sidebar rule
+# can colour the row. A binary predating the subcommand answers nothing, and
+# the tag falls back to the bare account name.
 set -u
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
@@ -162,15 +169,22 @@ if [ -n "$pane" ]; then
 else
     agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | pane_agent)
 fi
-# A pane whose live agent is neither claude nor codex (its live read names no
-# agent, or another one) spends no tollgate account. It publishes the matching
-# clears and spawns no watcher, from every caller, like the watcher's own exit,
-# so an idle shell pane stops showing an account instead of inheriting the
-# claude-arm answer. Without a pane there is nothing to clear, and the claude
-# arm below keeps its answer.
+# A pane whose live agent is neither claude nor codex nor a native harness (its
+# live read names no agent, or another one) spends no tollgate account. It
+# publishes the matching clears and spawns no watcher, from every caller, like
+# the watcher's own exit, so an idle shell pane stops showing an account
+# instead of inheriting the claude-arm answer. Without a pane there is nothing
+# to clear, and the claude arm below keeps its answer.
+#
+# hermes, grok and agy are native panes: harnesses tollgate does not launch,
+# so no session row or `tollgate which` names their account. The binary
+# matches each to the one observation it can burn, and answers nothing when
+# that is ambiguous.
 agentless=""
+native=""
 case "$agent" in
     claude | codex) ;;
+    hermes | grok | agy) native=1 ;;
     *)
         if [ -n "$pane" ]; then
             agentless=1
@@ -179,7 +193,7 @@ case "$agent" in
 esac
 
 profile=""
-if [ -z "$agentless" ] && [ -n "$pane" ]; then
+if [ -z "$agentless" ] && [ -z "$native" ] && [ -n "$pane" ]; then
     info=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null)
     # The pane's own session is named by the foreground process group id herdr
     # reports — the `tollgate start` supervisor for every tollgate-started pane
@@ -218,8 +232,16 @@ fi
 # adopted — and `tollgate which` is never asked for it: a caller holding no
 # CODEX_HOME gets the Claude Code answer there, a different harness's account.
 definitive_empty=""
+tag_out=""
 if [ -z "$agentless" ] && [ -z "$profile" ]; then
-    if [ "$agent" = codex ]; then
+    if [ -n "$native" ]; then
+        # No match (none, or more than one candidate account) is a
+        # DEFINITIVE empty like an unadopted codex pane's: the clear is
+        # published and the watcher still spawns, so an account that appears
+        # later tags the pane on the next tick.
+        tag_out=$(tollgate herdr tag --agent "$agent" 2>/dev/null) || tag_out=""
+        [ -n "$tag_out" ] || definitive_empty=1
+    elif [ "$agent" = codex ]; then
         profile=$(adopted_codex_profile)
         # A codex pane with no adopted login is a DEFINITIVE empty resolution:
         # the pane spends no tollgate account, so the empty side publishes the
@@ -232,16 +254,21 @@ if [ -z "$agentless" ] && [ -z "$profile" ]; then
         profile=$(tollgate which 2>/dev/null) || profile=""
     fi
 fi
-[ -n "$profile" ] || { [ -n "$definitive_empty" ] && [ -n "$pane" ]; } || [ -n "$agentless" ] || exit 0
+[ -n "$profile" ] || [ -n "$tag_out" ] || { [ -n "$definitive_empty" ] && [ -n "$pane" ]; } || [ -n "$agentless" ] || exit 0
 
-[ -z "$profile" ] || printf '%s\n' "$profile"
+# The resolve prints the account: the profile name, or a native pane's tag.
+if [ -n "$profile" ]; then
+    printf '%s\n' "$profile"
+elif [ -n "$tag_out" ]; then
+    printf '%s\n' "$tag_out" | sed -n 1p
+fi
 
 [ -n "$pane" ] || exit 0
 # An agentless pane clears both artifacts in every knob combination, so publish
 # the clears directly and skip the tollgate knob reads below — the watcher's exit
 # clear (`watch-profile.sh`) does the same.
 if [ -n "$agentless" ]; then
-    "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" --clear-token tollgate --clear-display-agent
+    "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" --clear-token tollgate --clear-token tollgate_severity --clear-display-agent
     exit 0
 fi
 # Each knob owns one artifact, and its off side publishes the matching clear
@@ -249,12 +276,23 @@ fi
 # leave its stale artifact standing on the pane. pane_tag still gates the
 # watcher spawn below, while the resolve above prints either way.
 pane_tag=$(tollgate herdr config get pane_tag 2>/dev/null || printf 'on')
-if [ -n "$profile" ] && [ "$pane_tag" = on ]; then
-    token_flag="--token"
-    token_value="tollgate=$profile"
+if [ "$pane_tag" = on ] && { [ -n "$profile" ] || [ -n "$tag_out" ]; }; then
+    # Line 1 is the tag text, line 2 the severity class (absent when nothing
+    # is graded). The `--` keeps a profile name off clap's option parser.
+    if [ -z "$tag_out" ]; then
+        tag_out=$(tollgate herdr tag --agent "$agent" -- "$profile" 2>/dev/null) || tag_out=""
+    fi
+    tag_text=$(printf '%s\n' "$tag_out" | sed -n 1p)
+    tag_sev=$(printf '%s\n' "$tag_out" | sed -n 2p)
+    [ -n "$tag_text" ] || tag_text=$profile
+    set -- --token "tollgate=$tag_text"
+    if [ -n "$tag_sev" ]; then
+        set -- "$@" --token "tollgate_severity=$tag_sev"
+    else
+        set -- "$@" --clear-token tollgate_severity
+    fi
 else
-    token_flag="--clear-token"
-    token_value="tollgate"
+    set -- --clear-token tollgate --clear-token tollgate_severity
 fi
 # border_label on also names the account on the pane's border; off publishes
 # the display-agent clear instead of leaving the stale label standing.
@@ -262,7 +300,7 @@ border_label=$(tollgate herdr config get border_label 2>/dev/null || printf 'off
 # The pane id goes BEFORE the flags. `report-metadata --help` prints it last,
 # and that order answers `unknown option: <value>` at exit 2 on 0.8.0. Named
 # flags may sit in any order; only the positional-first order is load-bearing.
-set -- "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" "$token_flag" "$token_value"
+set -- "$pane" --source "${HERDR_PLUGIN_ID:-tollgate}" "$@"
 if [ -n "$profile" ] && [ "$border_label" = on ]; then
     set -- "$@" --display-agent "$profile"
 else
@@ -274,12 +312,13 @@ fi
 # A --with-fallback session moves onto another account mid-run with no herdr
 # event, so the one-shot report above goes stale until the next status change.
 # Spawn a detached per-pane watcher to re-report on a timer instead. Only
-# claude and codex panes spend a tollgate account; an agentless pane publishes
-# its clear above and is left watcher-less. The pidfile makes later invocations
-# skip the spawn while that watch lives, and the watcher removes it when it
-# exits: the pane closed, or it runs neither claude nor codex.
+# claude, codex and native panes spend a tollgate account; an agentless pane
+# publishes its clear above and is left watcher-less. The timer also keeps the
+# tag's numbers current as the usage caches refresh. The pidfile makes later
+# invocations skip the spawn while that watch lives, and the watcher removes
+# it when it exits: the pane closed, or it runs none of those agents.
 case "$agent" in
-    claude | codex) ;;
+    claude | codex | hermes | grok | agy) ;;
     *) exit 0 ;;
 esac
 [ -n "$pane" ] || exit 0

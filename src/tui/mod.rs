@@ -21,18 +21,28 @@ const TICK: Duration = Duration::from_millis(80);
 /// `herdr_mode` is decided once by `cmd_tui` from `HERDR_ENV` and applied to
 /// the constructed [`app::App`] via [`app::App::with_herdr_mode`]; nothing
 /// else here reads the environment.
-pub(crate) fn run(config: AppConfig, herdr_mode: bool) -> Result<()> {
+pub(crate) fn run(
+    config: AppConfig,
+    herdr_mode: bool,
+    open_tab: Option<crate::profile::HomeTab>,
+) -> Result<()> {
     // `try_init` owns raw mode + alt screen and installs a restore panic hook,
     // so a panic mid-draw no longer leaves the terminal corrupted.
     let mut terminal = ratatui::try_init().context("Failed to initialize the terminal")?;
-    let outcome = run_loop(&mut terminal, config, herdr_mode);
+    let outcome = run_loop(&mut terminal, config, herdr_mode, open_tab);
     ratatui::restore();
     outcome
 }
 
-fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool) -> Result<()> {
+fn run_loop(
+    terminal: &mut DefaultTerminal,
+    config: AppConfig,
+    herdr_mode: bool,
+    open_tab: Option<crate::profile::HomeTab>,
+) -> Result<()> {
     let mut application = app::App::new(config)
         .with_herdr_mode(herdr_mode)
+        .with_open_tab(open_tab)
         .with_guest_mode(crate::identity::upstream_active());
     // Non-blocking reconcile: fast path runs inline; verdict sequenced via
     // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile

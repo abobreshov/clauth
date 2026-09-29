@@ -2690,7 +2690,7 @@ fn pane_tag_off_publishes_the_token_clear_and_spawns_no_watcher() {
     );
     let line = &lines[0];
     assert!(
-        line.contains("--clear-token tollgate"),
+        line.contains("--clear-token tollgate "),
         "the token clear is published: {line}"
     );
     assert!(
@@ -2750,9 +2750,15 @@ fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
         line.contains("--display-agent fit"),
         "the display-agent publish stays: {line}"
     );
+    // The only clear on the on path is the severity token's: this shim's
+    // tollgate answers no `herdr tag`, so nothing is graded.
     assert!(
-        !line.contains("--clear-token"),
-        "no clears on the on path: {line}"
+        !line.contains("--clear-token tollgate "),
+        "no tag clear on the on path: {line}"
+    );
+    assert!(
+        line.ends_with("--clear-token tollgate_severity --display-agent fit"),
+        "an ungraded tag clears only the severity token: {line}"
     );
     assert!(
         !line.contains("--clear-display-agent"),
@@ -2771,7 +2777,7 @@ fn both_knobs_off_publish_both_clears_in_one_call() {
     assert_eq!(lines.len(), 1, "both clears ride the one call: {lines:?}");
     let line = &lines[0];
     assert!(
-        line.contains("--clear-token tollgate"),
+        line.contains("--clear-token tollgate "),
         "the token clear is published: {line}"
     );
     assert!(
@@ -3257,7 +3263,7 @@ fn an_unadopted_codex_pane_publishes_the_token_clear() {
         report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "off", info, ps, &[], None);
     let line = token_line(&lines);
     assert!(
-        line.contains("--clear-token tollgate"),
+        line.contains("--clear-token tollgate "),
         "an unadopted codex login publishes the token clear: {line}"
     );
     assert!(
@@ -3533,12 +3539,12 @@ fn the_watcher_clears_and_exits_when_the_pane_runs_another_agent() {
     std::fs::write(&setup.agent_file, "cursor").expect("agent switched");
     let lines = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token tollgate"))
+            .is_some_and(|l| l.contains("--clear-token tollgate "))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--clear-token tollgate")),
+            .is_some_and(|l| l.contains("--clear-token tollgate ")),
         "the watcher clears the tag when the pane runs another agent: {lines:?}"
     );
     join_watcher(&setup.home.home().join("state"), "p1");
@@ -3557,12 +3563,12 @@ fn an_idle_pane_with_a_persisted_codex_session_clears_and_exits() {
     std::fs::write(&setup.agent_file, "").expect("agent cleared");
     let lines = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token tollgate"))
+            .is_some_and(|l| l.contains("--clear-token tollgate "))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--clear-token tollgate")),
+            .is_some_and(|l| l.contains("--clear-token tollgate ")),
         "the idle pane clears the tag instead of answering the session's codex: {lines:?}"
     );
     join_watcher(&setup.home.home().join("state"), "p1");
@@ -3590,12 +3596,12 @@ fn an_agentless_status_event_after_the_watchers_exit_clear_leaves_the_pane_untag
     std::fs::write(&setup.agent_file, "").expect("pane goes idle");
     let cleared = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token tollgate"))
+            .is_some_and(|l| l.contains("--clear-token tollgate "))
     });
     assert!(
         cleared
             .last()
-            .is_some_and(|l| l.contains("--clear-token tollgate")),
+            .is_some_and(|l| l.contains("--clear-token tollgate ")),
         "the watcher clears the tag on the idle pane: {cleared:?}"
     );
     join_watcher(&setup.home.home().join("state"), "p1");
@@ -3609,7 +3615,7 @@ fn an_agentless_status_event_after_the_watchers_exit_clear_leaves_the_pane_untag
     assert_eq!(
         lines.last().map(String::as_str),
         Some(
-            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent"
         ),
         "the agentless event after the watcher's exit clear leaves the pane untagged: {lines:?}"
     );
@@ -3677,7 +3683,7 @@ fn the_which_action_on_an_agentless_pane_publishes_the_clears_and_prints_nothing
     assert_eq!(
         chain_lines(&setup),
         vec![
-            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent"
                 .to_string()
         ],
         "the which action clears both artifacts instead of painting the global account"
@@ -3705,7 +3711,7 @@ fn the_tui_knob_push_rerun_on_an_agentless_pane_publishes_the_clears() {
     assert_eq!(
         chain_lines(&setup),
         vec![
-            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent"
                 .to_string()
         ],
         "the knob push clears both artifacts instead of painting the global account"
@@ -3730,7 +3736,7 @@ fn a_hook_on_an_agentless_event_publishes_the_clears() {
     assert_eq!(
         chain_lines(&setup),
         vec![
-            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent"
                 .to_string()
         ],
         "an agentless event clears both artifacts, never the claude arm"
@@ -3758,7 +3764,7 @@ fn a_released_event_on_a_pane_that_now_runs_no_agent_publishes_the_clears() {
     assert_eq!(
         lines,
         vec![
-            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent"
+            "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent"
                 .to_string()
         ],
         "the released event's exited agent is not re-published: {lines:?}"
@@ -3928,7 +3934,7 @@ fn an_empty_codex_resolution_with_border_label_on_publishes_the_display_agent_cl
     let line = token_line(&lines);
     assert_eq!(
         line,
-        "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-display-agent",
+        "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent",
         "the empty resolution publishes both clears in one call: {line}"
     );
 }
@@ -3955,12 +3961,12 @@ fn a_deleted_adopted_login_clears_the_tag_on_the_watchers_next_tick() {
         .expect("detach removes the link");
     let lines = wait_until(&setup, |ls| {
         ls.last()
-            .is_some_and(|l| l.contains("--clear-token tollgate"))
+            .is_some_and(|l| l.contains("--clear-token tollgate "))
     });
     assert!(
         lines
             .last()
-            .is_some_and(|l| l.contains("--clear-token tollgate")),
+            .is_some_and(|l| l.contains("--clear-token tollgate ")),
         "the deleted adoption clears the tag on the watcher's next tick: {lines:?}"
     );
     chain_stop(&setup);
@@ -3980,7 +3986,7 @@ fn the_spawned_watcher_picks_up_a_mid_pane_adoption() {
     assert!(
         before
             .first()
-            .is_some_and(|l| l.contains("--clear-token tollgate")),
+            .is_some_and(|l| l.contains("--clear-token tollgate ")),
         "the empty resolution cleared the tag before the adoption: {before:?}"
     );
     let store = setup.home.home().join(".tollgate/profiles/work");
@@ -4064,4 +4070,139 @@ fn snapshot_rects_read_herdr_091_layouts() {
         rects[0].1.as_ref().map(|r| (r.width, r.height)),
         Some((80, 24))
     );
+}
+
+// ── the usage-aware tag and native panes, through the real scripts ──────────
+
+/// Replaces [`chain_setup`]'s tollgate shim with one that also answers
+/// `herdr tag`: it logs the argv to `tag.log` and prints `tag.answer` (empty
+/// when the file is absent — what a binary predating the subcommand prints).
+#[cfg(unix)]
+fn tag_answering_setup(initial_agent: &str, answer: Option<&str>) -> ChainSetup {
+    let setup = chain_setup(None, initial_agent);
+    write_shim(
+        setup.home.home(),
+        "tollgate",
+        "if [ \"$1\" = herdr ] && [ \"$2\" = tag ]; then echo \"$*\" >> \"$(dirname \"$0\")/tag.log\"; cat \"$(dirname \"$0\")/tag.answer\" 2>/dev/null; exit 0; fi\ncase \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+    );
+    if let Some(answer) = answer {
+        std::fs::write(setup.home.home().join("tag.answer"), answer).expect("answer written");
+    }
+    setup
+}
+
+#[cfg(unix)]
+fn tag_log(setup: &ChainSetup) -> Vec<String> {
+    std::fs::read_to_string(setup.home.home().join("tag.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A claude pane's tag is the binary's answer for the resolved profile — the
+/// name, lead metric and flag on the `tollgate` token, the severity class on
+/// `tollgate_severity` — while the resolve still prints the bare profile.
+#[cfg(unix)]
+#[test]
+fn the_claude_tag_carries_the_lead_metric_and_its_severity() {
+    let setup = tag_answering_setup("claude", Some("fit 42% ⚠\nhigh\n"));
+    let out = chain_report_out(&setup, r#"{"agent":"claude"}"#);
+    assert_eq!(out, "fit\n", "the resolve prints the profile, not the tag");
+    let lines = chain_lines(&setup);
+    assert!(
+        lines.first().is_some_and(
+            |l| l.contains("--token tollgate=fit 42% ⚠ --token tollgate_severity=high")
+        ),
+        "the tag text and severity ride one report: {lines:?}"
+    );
+    assert_eq!(
+        tag_log(&setup).first().map(String::as_str),
+        Some("herdr tag --agent claude -- fit"),
+        "the script asks for the resolved profile under its harness"
+    );
+    chain_stop(&setup);
+}
+
+/// An ungraded answer (one line) clears the severity token, and a binary
+/// predating `herdr tag` (no answer) falls back to the bare name.
+#[cfg(unix)]
+#[test]
+fn an_ungraded_or_missing_answer_clears_the_severity_token() {
+    for (answer, want) in [
+        (
+            Some("fit $4.08/mo\n"),
+            "--token tollgate=fit $4.08/mo --clear-token tollgate_severity",
+        ),
+        (None, "--token tollgate=fit --clear-token tollgate_severity"),
+    ] {
+        let setup = tag_answering_setup("claude", answer);
+        chain_report(&setup, r#"{"agent":"claude"}"#);
+        let lines = chain_lines(&setup);
+        assert!(
+            lines.first().is_some_and(|l| l.contains(want)),
+            "{answer:?}: {lines:?}"
+        );
+        chain_stop(&setup);
+    }
+}
+
+/// A hermes pane is native: no process-info join and no `tollgate which` —
+/// the binary's native match names the account, the resolve prints its tag,
+/// and the watcher keeps re-reporting it as hermes.
+#[cfg(unix)]
+#[test]
+fn a_hermes_pane_is_tagged_from_the_binarys_native_match() {
+    let setup = tag_answering_setup("hermes", Some("herm 5%\nok\n"));
+    let out = chain_report_out(&setup, r#"{"agent":"hermes"}"#);
+    assert_eq!(out, "herm 5%\n");
+    let first = chain_lines(&setup);
+    assert!(
+        first
+            .first()
+            .is_some_and(|l| l.contains("--token tollgate=herm 5% --token tollgate_severity=ok")),
+        "{first:?}"
+    );
+    assert_eq!(
+        tag_log(&setup).first().map(String::as_str),
+        Some("herdr tag --agent hermes"),
+        "a native pane asks with no profile"
+    );
+    assert!(
+        !setup.home.home().join("answered").exists(),
+        "a native pane never asks herdr for process-info"
+    );
+    let lines = wait_until(&setup, |ls| ls.len() >= 2);
+    assert!(
+        lines
+            .get(1)
+            .is_some_and(|l| l.contains("--token tollgate=herm 5%")),
+        "the watcher re-reports the hermes pane instead of clearing it: {lines:?}"
+    );
+    chain_stop(&setup);
+}
+
+/// A native pane the binary cannot match to exactly one account (it answers
+/// nothing) publishes the clears, prints nothing, and still gets a watcher so
+/// an account that appears later tags it.
+#[cfg(unix)]
+#[test]
+fn an_ambiguous_native_pane_publishes_the_clear_and_keeps_a_watcher() {
+    for agent in ["grok", "agy"] {
+        let setup = tag_answering_setup(agent, None);
+        let out = chain_report_out(&setup, &format!(r#"{{"agent":"{agent}"}}"#));
+        assert_eq!(out, "", "{agent}: nothing resolved, nothing printed");
+        assert_eq!(
+            chain_lines(&setup).first().map(String::as_str),
+            Some(
+                "pane report-metadata p1 --source tollgate --clear-token tollgate --clear-token tollgate_severity --clear-display-agent"
+            ),
+            "{agent}: the clear is published"
+        );
+        assert!(
+            setup.home.home().join("state/watch-p1.pid").exists(),
+            "{agent}: the watcher spawns for a later match"
+        );
+        chain_stop(&setup);
+    }
 }

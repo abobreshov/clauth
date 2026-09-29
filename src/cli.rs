@@ -39,8 +39,29 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "TIER", display_order = 900)]
     pub(crate) theme: Option<ThemeArg>,
 
+    /// Open the dashboard on this tab instead of the configured home tab
+    /// (TUI only). The herdr plugin's `tollgate.usage` action passes
+    /// `--tab usage`. Hidden: the Config tab's `home tab` row is the human
+    /// surface for the same choice.
+    #[arg(long, value_name = "TAB", hide = true, value_parser = parse_home_tab)]
+    pub(crate) tab: Option<crate::profile::HomeTab>,
+
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
+}
+
+/// `--tab`'s parser: a [`crate::profile::HomeTab`] by its on-disk spelling.
+pub(crate) fn parse_home_tab(raw: &str) -> Result<crate::profile::HomeTab, String> {
+    crate::profile::HomeTab::ALL
+        .into_iter()
+        .find(|tab| tab.as_str() == raw)
+        .ok_or_else(|| {
+            let valid: Vec<&str> = crate::profile::HomeTab::ALL
+                .iter()
+                .map(|t| t.as_str())
+                .collect();
+            format!("unknown tab '{raw}'; valid tabs: {}", valid.join(", "))
+        })
 }
 
 /// `--theme`'s two tiers. Auto-detection (`$COLORTERM`) picks one when the flag
@@ -702,6 +723,40 @@ pub(crate) enum HerdrCommand {
         /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+
+    /// Link a local checkout's herdr plugin into herdr (the dev install path)
+    ///
+    /// Runs `herdr plugin link <dir>` on the checkout's `herdr-plugin/`: the
+    /// `--path` given (a repo root, the plugin dir, or its manifest), else the
+    /// working directory's checkout, else the one this binary was built from.
+    /// Refuses unless that manifest's id is `tollgate`, and over a GitHub
+    /// install or a link from another tree. Writes no herdr config.
+    Link {
+        /// Repo root, `herdr-plugin/` dir, or `herdr-plugin.toml` to link.
+        #[arg(long, value_name = "DIR")]
+        path: Option<std::path::PathBuf>,
+    },
+
+    /// Unlink the locally linked herdr plugin (`herdr plugin unlink tollgate`)
+    ///
+    /// Leaves the checkout's files alone. A GitHub install is refused:
+    /// `tollgate herdr uninstall` removes that one.
+    Unlink,
+
+    /// Print a pane's tag text for the plugin scripts
+    ///
+    /// `tollgate herdr tag [--agent <kind>] [<profile>]` prints the account's
+    /// name and lead metric on one line, then its severity class. Hidden from
+    /// help: this is the scripts' read path, not a human surface.
+    #[command(hide = true)]
+    Tag {
+        /// herdr's agent id for the pane (`claude`, `codex`, `hermes`, `grok`,
+        /// `agy`).
+        #[arg(long, value_name = "KIND")]
+        agent: Option<String>,
+        /// The profile the pane burns; omitted for a native pane.
+        profile: Option<String>,
     },
 
     /// Print one herdr knob for the plugin scripts

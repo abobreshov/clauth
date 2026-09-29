@@ -14708,3 +14708,21 @@ fn a_failed_day_list_save_keeps_memory_on_the_disk_value_and_names_the_error() {
         "preferred days update failed\nfailed to write config.toml"
     );
 }
+
+/// `--tab usage` (the herdr `tollgate.usage` action's entrypoint) opens the
+/// Usage tab, over the home tab and over the first herdr landing alike; no
+/// `--tab` leaves the landing alone.
+#[test]
+fn an_explicit_tab_outranks_the_home_tab_and_the_herdr_landing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let plain = bare_app()
+        .with_herdr_mode(false)
+        .with_open_tab(Some(crate::profile::HomeTab::Usage));
+    assert_eq!(plain.tab, super::Tab::Usage);
+    let landing = bare_app()
+        .with_herdr_mode(true)
+        .with_open_tab(Some(crate::profile::HomeTab::Usage));
+    assert_eq!(landing.tab, super::Tab::Usage);
+    let untouched = bare_app().with_herdr_mode(false).with_open_tab(None);
+    assert_eq!(untouched.tab, super::Tab::Overview);
+}

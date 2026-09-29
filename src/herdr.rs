@@ -24,6 +24,11 @@ use serde_json::Value;
 
 use crate::out::{errln, out, outln};
 
+// `tollgate herdr link` / `unlink`: the dev install path from a local checkout.
+pub(crate) mod link;
+// `tollgate herdr tag`: the pane tag text built from the observation core.
+pub(crate) mod tag;
+
 /// The manifest `id`, and the prefix of every qualified action id.
 const PLUGIN_ID: &str = crate::identity::HERDR_PLUGIN_ID;
 /// The action a keybinding points at: opens the dashboard popup.
