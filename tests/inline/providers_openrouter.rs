@@ -1026,9 +1026,44 @@ fn a_persisted_hold_is_clamped_and_a_foreign_file_is_ignored() {
     std::fs::write(&path, r#"{"version":1,"until_ms":18446744073709551615}"#).unwrap();
     let fresh = WalletHolds::persistent();
     assert_eq!(fresh.remaining(INFERENCE, 0), Some(WalletHolds::cap()));
+    assert_eq!(persisted_raw(INFERENCE), Some(900_000));
 
     std::fs::write(&path, "{not json").unwrap();
     assert_eq!(WalletHolds::persistent().remaining(INFERENCE, 0), None);
+}
+
+#[test]
+fn a_skewed_persisted_hold_is_rewritten_and_credits_resume_after_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms = 1_000_000;
+    WalletHolds::persistent().hold(INFERENCE, now_ms, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    let skewed = now_ms + 30 * 24 * 60 * 60 * 1000;
+    std::fs::write(&path, format!(r#"{{"version":1,"until_ms":{skewed}}}"#)).unwrap();
+
+    let cap_ms = u64::try_from(WalletHolds::cap().as_millis()).unwrap();
+    let reader = WalletHolds::persistent();
+    assert_eq!(
+        reader.remaining(INFERENCE, now_ms),
+        Some(WalletHolds::cap())
+    );
+    assert_eq!(persisted_raw(INFERENCE), Some(now_ms + cap_ms));
+
+    let http = Recorder::new(vec![body(KEY_LIMITED)]);
+    fetch_stats_with(INFERENCE, None, &http, &reader, now_ms + cap_ms - 1).unwrap();
+    assert_eq!(http.urls(), [KEY_URL]);
+
+    let http = Recorder::new(vec![body(KEY_LIMITED), body(CREDITS_FUNDED)]);
+    fetch_stats_with(
+        INFERENCE,
+        None,
+        &http,
+        &WalletHolds::persistent(),
+        now_ms + cap_ms + 1,
+    )
+    .unwrap();
+    assert_eq!(http.urls(), [KEY_URL, CREDITS_URL]);
+    assert_eq!(persisted_raw(INFERENCE), None);
 }
 
 /// Two stores sharing one wallet key (two monitors, or a monitor and the
