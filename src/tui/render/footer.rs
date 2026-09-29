@@ -146,6 +146,17 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let q_label: &str = if has_sub_focus(app) { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
+        // A read-only row reorders nothing; ⏎ opens it on the Usage tab.
+        Tab::Overview
+            if app.harness_filter.shows_claude() && app.overview_selected_extra().is_some() =>
+        {
+            &[
+                ("↵", "usage"),
+                ("a", "actions"),
+                ("c", "harness"),
+                ("?", "help"),
+            ]
+        }
         Tab::Overview => &[
             ("⇧↑↓", "reorder"),
             ("a", "actions"),

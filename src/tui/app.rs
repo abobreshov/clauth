@@ -1901,9 +1901,11 @@ pub(crate) struct App {
     /// Usage tab's rail. Re-read from caches every
     /// [`USAGE_EXTRAS_POLL_MS`]; empty while no hook is registered.
     pub(crate) usage_extras: Vec<crate::usage::observation::AccountObservation>,
-    /// `Some(i)` while the Usage rail's selection rests on `usage_extras[i]`
-    /// rather than on `profile_cursor`'s profile. Usage-tab only: the other
-    /// tabs keep reading `profile_cursor`, which the extras never move.
+    /// `Some(i)` while the Usage rail's (or the Overview's) selection rests on
+    /// `usage_extras[i]` rather than on `profile_cursor`'s profile. Shared by
+    /// the two tabs that list the extras, so ⏎ on an Overview extra opens the
+    /// Usage tab on it; every other tab keeps reading `profile_cursor`, which
+    /// the extras never move.
     pub(crate) usage_extra_cursor: Option<usize>,
     /// When the extras were last read.
     usage_extras_polled: Option<std::time::Instant>,
@@ -3284,6 +3286,42 @@ impl App {
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
         self.main_items().get(self.profile_cursor).copied()
     }
+
+    /// The Overview's read-only rows in display order, as indices into
+    /// [`App::usage_extras`]: upstream-clauth accounts first (the
+    /// `clauth (read-only)` group), then monitors. Empty while no collect hook
+    /// yields anything, which keeps the Overview exactly as it was.
+    pub(crate) fn overview_extras(&self) -> Vec<usize> {
+        let upstream = |o: &crate::usage::observation::AccountObservation| {
+            o.origin == crate::usage::observation::Origin::Upstream
+        };
+        let (mut first, rest): (Vec<usize>, Vec<usize>) =
+            (0..self.usage_extras.len()).partition(|&i| upstream(&self.usage_extras[i]));
+        first.extend(rest);
+        first
+    }
+
+    /// The extra the Overview selection rests on: the shared
+    /// [`App::usage_extra_cursor`], else — with no profile to rest on — the
+    /// first read-only row, the same fallback the Usage rail applies.
+    pub(crate) fn overview_selected_extra(&self) -> Option<usize> {
+        match self.usage_extra_cursor {
+            Some(i) if i < self.usage_extras.len() => Some(i),
+            _ if self.profile_count() == 0 => self.overview_extras().first().copied(),
+            _ => None,
+        }
+    }
+}
+
+/// Why an Overview read-only row refuses switch / edit / delete / reorder, as
+/// the one-line hint the refusal toasts.
+pub(crate) fn read_only_hint(obs: &crate::usage::observation::AccountObservation) -> &'static str {
+    match obs.origin {
+        crate::usage::observation::Origin::Upstream => {
+            "read-only — managed by clauth; import to manage it here"
+        }
+        _ => "monitor — edit with tollgate monitor",
+    }
 }
 
 // ── Token snapshot ────────────────────────────────────────────────────────────
@@ -3499,6 +3537,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('a') => {
             app.disarm_quit();
+            // On an Overview read-only row the menu opens with its tab-global
+            // actions alone; the toast says why the account group is missing.
+            if app.tab == Tab::Overview && app.harness_filter.shows_claude() {
+                refuse_read_only(app);
+            }
             let state = build_action_menu(app);
             if !state.items.is_empty() {
                 app.modals.push(Modal::ActionMenu(state));
@@ -3893,16 +3936,66 @@ fn claude_rows_hidden(app: &mut App) -> bool {
 }
 
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
-    let count = app.profile_count();
+    let extra = app.overview_selected_extra();
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         KeyCode::Up | KeyCode::Down | KeyCode::Enter if claude_rows_hidden(app) => {}
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up => step_profile_cursor(app, -1, count),
-        KeyCode::Down => step_profile_cursor(app, 1, count),
-        KeyCode::Enter => activate_main_item(app),
+        KeyCode::Up | KeyCode::Down if shift && extra.is_some() => refuse_read_only(app),
+        KeyCode::Up if shift => reorder_main_cursor(app, -1),
+        KeyCode::Down if shift => reorder_main_cursor(app, 1),
+        KeyCode::Up => step_overview_cursor(app, -1),
+        KeyCode::Down => step_overview_cursor(app, 1),
+        KeyCode::Enter => match extra {
+            // A read-only row has nothing to switch to here: ⏎ shows its
+            // numbers instead, on the Usage tab that already lists it.
+            Some(i) => {
+                app.usage_extra_cursor = Some(i);
+                switch_tab(app, Tab::Usage);
+            }
+            None => activate_main_item(app),
+        },
         _ => {}
     }
+}
+
+/// Step the Overview cursor by `delta` over the profiles, then the read-only
+/// rows in display order ([`App::overview_extras`]), wrapping. With no extras
+/// this is the plain profile step, unchanged.
+fn step_overview_cursor(app: &mut App, delta: i32) {
+    let count = app.profile_count();
+    let order = app.overview_extras();
+    if order.is_empty() {
+        step_profile_cursor(app, delta, count);
+        return;
+    }
+    let len = count + order.len();
+    let at = match app
+        .overview_selected_extra()
+        .and_then(|i| order.iter().position(|&o| o == i))
+    {
+        Some(pos) => count + pos,
+        None => app.profile_cursor.min(count.saturating_sub(1)),
+    };
+    let next = (at as i32 + delta).rem_euclid(len as i32) as usize;
+    if next < count {
+        app.profile_cursor = next;
+        app.usage_extra_cursor = None;
+    } else {
+        app.usage_extra_cursor = Some(order[next - count]);
+    }
+}
+
+/// Toast why the Overview's selected read-only row refuses an account action.
+/// A no-op off such a row.
+fn refuse_read_only(app: &mut App) {
+    let Some(hint) = app
+        .overview_selected_extra()
+        .and_then(|i| app.usage_extras.get(i))
+        .map(read_only_hint)
+    else {
+        return;
+    };
+    app.toast(ToastKind::Info, hint);
 }
 
 /// Usage tab: up/down picks the account — the profiles, then the
@@ -7146,8 +7239,9 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
     match app.tab {
         Tab::Overview => {
             // The codex filter hides the claude rows the cursor is bound to,
-            // so nothing may act on the row under it.
-            if app.harness_filter.shows_claude() {
+            // so nothing may act on the row under it; a read-only row has no
+            // profile for the account group to act on either.
+            if app.harness_filter.shows_claude() && app.overview_selected_extra().is_none() {
                 context = push_account_scope(app, &mut scoped);
             }
             actions.push(RefreshAll);

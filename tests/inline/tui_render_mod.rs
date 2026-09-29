@@ -3235,3 +3235,35 @@ fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
         "precondition: candidates follow the note, so the content end does not pin it:\n{out}"
     );
 }
+
+/// On an Overview read-only row the footer trades `⇧↑↓ reorder` (refused
+/// there) for `↵ usage`; back on a profile it reads as before.
+#[test]
+fn the_overview_footer_names_enter_on_a_read_only_row() {
+    use crate::usage::observation::{AccountObservation, AuthKind, Origin, SourceId, account_id};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = vec![crate::testutil::blank_profile(&ProfileName::from("mine"))];
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("mine")],
+            ..AppState::default()
+        },
+        profiles,
+    });
+    crate::tui::app::set_usage_extras(
+        &mut app,
+        vec![AccountObservation::new(
+            account_id(Origin::Monitor, "oll"),
+            SourceId::OllamaCloud,
+            AuthKind::ApiKey,
+            Origin::Monitor,
+            "oll",
+        )],
+    );
+    let on_profile = dump(&app, 140, 30);
+    assert!(on_profile.contains("reorder"), "{on_profile}");
+    app.usage_extra_cursor = Some(0);
+    let on_extra = dump(&app, 140, 30);
+    assert!(on_extra.contains("↵ usage"), "{on_extra}");
+    assert!(!on_extra.contains("reorder"), "{on_extra}");
+}

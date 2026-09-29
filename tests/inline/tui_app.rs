@@ -14819,3 +14819,204 @@ fn an_explicit_tab_outranks_the_home_tab_and_the_herdr_landing() {
     let untouched = bare_app().with_herdr_mode(false).with_open_tab(None);
     assert_eq!(untouched.tab, super::Tab::Overview);
 }
+
+// ── Overview read-only rows (upstream clauth accounts, monitors) ─────────────
+
+/// The upstream status fixture as `~/.clauth/status.json` in the sandbox HOME,
+/// read back through the Usage tab's collector: `upstream:work`, `side`, `ds`,
+/// `gpt`, in feed order.
+fn overview_upstream_extras(
+    home: &crate::testutil::HomeSandbox,
+) -> Vec<crate::usage::observation::AccountObservation> {
+    let dir = home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME);
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.clauth");
+    std::fs::write(
+        dir.join("status.json"),
+        include_str!("../fixtures/upstream_status.json"),
+    )
+    .expect("write the status fixture");
+    let codex = crate::codex_profiles::CodexState::default();
+    let ctx = crate::usage::collect::CollectCtx {
+        config: None,
+        codex: &codex,
+        // 2026-09-29T12:00:00Z, just after the fixture's `generated_at`.
+        now_ms: 1_790_683_200_000,
+        interval_ms: 300_000,
+        guest_mode: true,
+        include_disabled: false,
+    };
+    let extras = super::usage_extras_from(&ctx, &[], crate::usage::collect::UPSTREAM_SOURCES);
+    assert_eq!(extras.len(), 4, "fixture control: four upstream accounts");
+    extras
+}
+
+fn overview_monitor_extra() -> crate::usage::observation::AccountObservation {
+    use crate::usage::observation::{AccountObservation, AuthKind, Origin, SourceId, account_id};
+    AccountObservation::new(
+        account_id(Origin::Monitor, "oll"),
+        SourceId::OllamaCloud,
+        AuthKind::ApiKey,
+        Origin::Monitor,
+        "oll",
+    )
+}
+
+/// `[monitor, upstream work, side, ds, gpt]` — the collector's order — over
+/// two own profiles on the Overview.
+fn overview_app_with_extras(home: &crate::testutil::HomeSandbox) -> App {
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    let mut extras = vec![overview_monitor_extra()];
+    extras.extend(overview_upstream_extras(home));
+    super::set_usage_extras(&mut app, extras);
+    app
+}
+
+/// ↑↓ walk the own profiles, then the `clauth (read-only)` group, then the
+/// monitors — the display order, not the collector's — and wrap.
+#[test]
+fn the_overview_cursor_walks_onto_the_read_only_rows() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = overview_app_with_extras(&home);
+    assert_eq!(
+        app.overview_extras(),
+        [1, 2, 3, 4, 0],
+        "clauth, then monitors"
+    );
+    let down = |app: &mut App| handle_key(app, crate::testutil::key(KeyCode::Down));
+
+    down(&mut app);
+    assert_eq!((app.profile_cursor, app.usage_extra_cursor), (1, None));
+    down(&mut app);
+    assert_eq!(app.usage_extra_cursor, Some(1), "upstream work (clauth)");
+    assert_eq!(app.profile_cursor, 1, "the profile cursor stays put");
+    for want in [2, 3, 4, 0] {
+        down(&mut app);
+        assert_eq!(app.usage_extra_cursor, Some(want));
+    }
+    down(&mut app);
+    assert_eq!(
+        (app.profile_cursor, app.usage_extra_cursor),
+        (0, None),
+        "wraps to the first profile"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.usage_extra_cursor, Some(0), "up wraps onto the monitor");
+}
+
+/// ⏎ on a read-only row opens the Usage tab on that account and switches
+/// nothing.
+#[test]
+fn enter_on_a_read_only_row_opens_usage_on_it() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = overview_app_with_extras(&home);
+    app.usage_extra_cursor = Some(2); // side (clauth)
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.tab, Tab::Usage);
+    assert_eq!(
+        app.usage_extra_cursor,
+        Some(2),
+        "the Usage rail rests on it"
+    );
+    assert!(app.modals.is_empty(), "no switch confirm");
+    assert_eq!(app.config().state.active_profile, None);
+}
+
+/// Reorder and the action menu's account group are refused on a read-only
+/// row, with the one-line hint of its origin; the profiles stay as they were.
+#[test]
+fn a_read_only_row_refuses_account_actions_with_a_hint() {
+    use super::{KeyEvent, KeyModifiers, Modal, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = overview_app_with_extras(&home);
+    let names = |app: &App| -> Vec<String> {
+        app.config()
+            .profiles
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect()
+    };
+    let last_toast = |app: &App| app.toasts.back().map(|t| t.body.clone());
+
+    app.usage_extra_cursor = Some(1); // work (clauth)
+    handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    assert_eq!(names(&app), ["a", "b"], "nothing reordered");
+    assert_eq!(app.usage_extra_cursor, Some(1), "the cursor stays");
+    assert_eq!(
+        last_toast(&app).as_deref(),
+        Some("read-only — managed by clauth; import to manage it here")
+    );
+
+    app.usage_extra_cursor = Some(0); // the monitor
+    handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+    assert_eq!(names(&app), ["a", "b"]);
+    assert_eq!(
+        last_toast(&app).as_deref(),
+        Some("monitor — edit with tollgate monitor")
+    );
+
+    app.toasts.clear();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    let Some(Modal::ActionMenu(menu)) = app.modals.last() else {
+        panic!("`a` opens the tab-global actions");
+    };
+    assert_eq!(
+        (menu.scoped_len, menu.context.as_deref()),
+        (0, None),
+        "no account action on a read-only row"
+    );
+    assert_eq!(
+        last_toast(&app).as_deref(),
+        Some("monitor — edit with tollgate monitor")
+    );
+    app.modals.clear();
+
+    // Back on a profile, everything is armed again.
+    app.usage_extra_cursor = None;
+    app.profile_cursor = 0;
+    app.toasts.clear();
+    handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    assert_eq!(names(&app), ["b", "a"], "reorder re-armed on a profile");
+    assert!(app.toasts.is_empty(), "no read-only hint on a profile");
+}
+
+/// With no own profile the first read-only row holds the selection, so ⏎
+/// opens the Usage tab on it straight away.
+#[test]
+fn with_no_profiles_the_first_read_only_row_is_selected() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Overview;
+    let mut extras = vec![overview_monitor_extra()];
+    extras.extend(overview_upstream_extras(&home));
+    super::set_usage_extras(&mut app, extras);
+    assert_eq!(app.overview_selected_extra(), Some(1), "upstream first");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_extra_cursor, Some(2));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.tab, Tab::Usage);
+    assert_eq!(app.usage_extra_cursor, Some(2));
+}
+
+/// Without read-only rows the Overview cursor is the plain profile step.
+#[test]
+fn without_read_only_rows_the_overview_cursor_is_unchanged() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    assert!(app.overview_extras().is_empty());
+    assert_eq!(app.overview_selected_extra(), None);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!((app.profile_cursor, app.usage_extra_cursor), (0, None));
+}
