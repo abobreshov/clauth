@@ -67,9 +67,10 @@ pub(crate) enum PaneAgent {
 /// account, never to a provider it may be configured to call: a Hermes pane
 /// maps to Hermes' local state and to a Nous monitor that reads Hermes' own
 /// login ([`AuthKind::NativeLogin`], see [`native_match`]), not to every Nous
-/// or OpenRouter key, since which of those it calls is Hermes' own config
-/// (H2's `HERMES_HOME` join is what can narrow further, once Hermes profiles
-/// exist).
+/// or OpenRouter key, since which of those it calls is Hermes' own config.
+/// A tollgate Hermes profile is never a native match: a tollgate-started
+/// Hermes pane resolves through its live row (`<profile>`), and a bare one
+/// through its `HERMES_HOME` (`--hermes-home`, hermes spec §6.3).
 pub(crate) fn pane_agent(agent: &str) -> PaneAgent {
     match agent {
         "claude" => PaneAgent::Claude,
@@ -93,19 +94,34 @@ pub(crate) struct PaneTag {
 /// The tag for `profile` (the account the script resolved) or, with no
 /// profile, for the one observation a native `agent` can burn. `None` means
 /// "no tag": the script publishes the clear.
+///
+/// `hermes_home` is a bare Hermes pane's `HERMES_HOME`, the one variable the
+/// script reads out of the pane's environ: a tollgate Hermes home
+/// (`profiles/<n>/hermes-home`) of a roster profile names `hermes:<n>`;
+/// anything else falls back to the native match.
 pub(crate) fn resolve_tag(
     accounts: &[AccountObservation],
     profile: Option<&str>,
     agent: &str,
+    hermes_home: Option<&std::path::Path>,
     now_secs: i64,
 ) -> Option<PaneTag> {
     let kind = pane_agent(agent);
-    match profile.map(str::trim).filter(|p| !p.is_empty()) {
+    let profile = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            (agent == "hermes")
+                .then(|| hermes_home.and_then(hermes_profile_of_home))
+                .flatten()
+        });
+    match profile.as_deref() {
         Some(name) => {
-            let origin = if kind == PaneAgent::Codex {
-                Origin::CodexProfile
-            } else {
-                Origin::Profile
+            let origin = match kind {
+                PaneAgent::Codex => Origin::CodexProfile,
+                _ if agent == "hermes" => Origin::HermesProfile,
+                _ => Origin::Profile,
             };
             let id = account_id(origin, name);
             Some(match accounts.iter().find(|o| o.id == id) {
@@ -131,8 +147,20 @@ pub(crate) fn resolve_tag(
     }
 }
 
+/// The profile a bare Hermes pane's `HERMES_HOME` names: a tollgate Hermes
+/// home of a profile the roster holds. The operator's own `~/.hermes` (or any
+/// other path) names none.
+pub(crate) fn hermes_profile_of_home(home: &std::path::Path) -> Option<String> {
+    match crate::which::hermes_session_profile_at(home) {
+        crate::which::HermesClaim::Member(name) => Some(name),
+        _ => None,
+    }
+}
+
 /// The one enabled observation from `sources`, or `None` when there is none
-/// or more than one (ambiguous: no tag rather than a guess).
+/// or more than one (ambiguous: no tag rather than a guess). A tollgate
+/// Hermes profile never counts: with one such profile it would tag the
+/// operator's own `~/.hermes` pane with the wrong account.
 ///
 /// A Nous observation counts only when it reads the harness's own login
 /// ([`AuthKind::NativeLogin`]: the monitor borrows Hermes' `auth.json`); a
@@ -143,6 +171,7 @@ pub(crate) fn native_match<'a>(
 ) -> Option<&'a AccountObservation> {
     let mut candidates = accounts.iter().filter(|o| {
         !o.disabled
+            && o.origin != Origin::HermesProfile
             && sources.contains(&o.source)
             && (o.source != SourceId::Nous || o.auth == AuthKind::NativeLogin)
     });
@@ -188,11 +217,23 @@ pub(crate) fn format_tag(label: &str, obs: &AccountObservation, now_secs: i64) -
     PaneTag { text, severity }
 }
 
-/// The lead metric alone: the lead window's share, else a money figure.
+/// The lead metric alone: the lead window's share, else a money figure, else
+/// a Hermes profile's month-to-date estimate.
 pub(crate) fn lead_metric(obs: &AccountObservation, now_secs: i64) -> Option<String> {
     lead_window(&obs.windows, now_secs)
         .and_then(window_metric)
         .or_else(|| money_metric(&obs.money))
+        .or_else(|| hermes_estimate_metric(obs))
+}
+
+/// A Hermes profile has no windows and no meters: its month-to-date estimate
+/// off `state.db` (`$0.42/mo`) is the number it has.
+fn hermes_estimate_metric(obs: &AccountObservation) -> Option<String> {
+    if obs.origin != Origin::HermesProfile {
+        return None;
+    }
+    let e = obs.estimate.as_ref()?;
+    Some(format!("{}/mo", format_money(&e.amount, &e.currency)))
 }
 
 /// A window's used share, rounded to a whole percent, with a suffix naming a
@@ -273,7 +314,8 @@ pub(crate) fn tag_lines(tag: &PaneTag) -> Vec<String> {
 /// helper runs (S1(d)). While that commit is in flight (`swapping`, or
 /// `stalled` on a helper failure) line 1 names both members and carries no
 /// severity line: `<served> → <committed> swapping…`. With no view (no row,
-/// or not a claude session) this is [`resolve_tag`] for `profile`.
+/// or not a claude session) this is [`resolve_tag`] for `profile`. A claude
+/// session has no Hermes home, so neither fallback reads one.
 pub(crate) fn session_tag(
     accounts: &[AccountObservation],
     profile: Option<&str>,
@@ -282,7 +324,7 @@ pub(crate) fn session_tag(
     now_secs: i64,
 ) -> Option<PaneTag> {
     let Some(view) = view else {
-        return resolve_tag(accounts, profile, agent, now_secs);
+        return resolve_tag(accounts, profile, agent, None, now_secs);
     };
     let served = view.served_member().or(profile);
     let committed = view.committed.as_ref().map(|p| p.member.as_str());
@@ -300,7 +342,7 @@ pub(crate) fn session_tag(
             )),
             severity: None,
         }),
-        _ => resolve_tag(accounts, served, agent, now_secs),
+        _ => resolve_tag(accounts, served, agent, None, now_secs),
     }
 }
 
@@ -318,11 +360,16 @@ fn session_view(sid: &str) -> Option<crate::hot_swap::SwapView> {
     Some(crate::hot_swap::SwapView::of(&row, ack.as_ref()))
 }
 
-/// `tollgate herdr tag [--agent <kind>] [--session <sid>] [<profile>]`: prints
-/// [`tag_lines`], or nothing when the pane gets no tag. Always exits 0: the
-/// reporter treats an empty answer as "clear", and a predating binary answers
-/// the same.
-pub(crate) fn run(profile: Option<&str>, agent: Option<&str>, session: Option<&str>) -> Result<()> {
+/// `tollgate herdr tag [--agent <kind>] [--session <sid>] [--hermes-home <path>]
+/// [<profile>]`: prints [`tag_lines`], or nothing when the pane gets no tag.
+/// Always exits 0: the reporter treats an empty answer as "clear", and a
+/// predating binary answers the same.
+pub(crate) fn run(
+    profile: Option<&str>,
+    agent: Option<&str>,
+    session: Option<&str>,
+    hermes_home: Option<&std::path::Path>,
+) -> Result<()> {
     let accounts = collect(&CollectOpts {
         // A disabled profile still burns the pane it runs in.
         include_disabled: true,
@@ -330,13 +377,23 @@ pub(crate) fn run(profile: Option<&str>, agent: Option<&str>, session: Option<&s
     });
     let now_secs = crate::usage::now_epoch_secs();
     let view = session.and_then(session_view);
-    if let Some(tag) = session_tag(
-        &accounts,
-        profile,
-        agent.unwrap_or(""),
-        view.as_ref(),
-        now_secs,
-    ) {
+    let tag = match view.as_ref() {
+        Some(view) => session_tag(
+            &accounts,
+            profile,
+            agent.unwrap_or(""),
+            Some(view),
+            now_secs,
+        ),
+        None => resolve_tag(
+            &accounts,
+            profile,
+            agent.unwrap_or(""),
+            hermes_home,
+            now_secs,
+        ),
+    };
+    if let Some(tag) = tag {
         for line in tag_lines(&tag) {
             outln!("{line}");
         }

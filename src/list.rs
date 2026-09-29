@@ -213,7 +213,8 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
         &CodexState::load().unwrap_or_default(),
         config.state.refresh_interval_ms,
     );
-    if entries.is_empty() && codex_entries.is_empty() {
+    let hermes_entries = crate::daemon::build_hermes_entries();
+    if entries.is_empty() && codex_entries.is_empty() && hermes_entries.is_empty() {
         return "no accounts yet. add one with `tollgate login <name>`.\n".to_string();
     }
 
@@ -271,6 +272,57 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
                 r.state_suffix(),
             ));
         }
+    }
+    if !hermes_entries.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_hermes_section(&hermes_entries));
+    }
+    out
+}
+
+/// The Hermes section: its own columns (a Hermes home has no 5h/7d windows),
+/// `●` on a home a session holds, and the month-to-date estimate off the
+/// usage cache the daemon writes. Reads files only.
+fn render_hermes_section(entries: &[crate::daemon::HermesProfileEntry]) -> String {
+    let month = crate::usage::hermes_local::rfc3339_z(
+        crate::usage::hermes_local::month_start_secs(crate::usage::now_epoch_secs()),
+    );
+    let estimate = |name: &str| {
+        crate::usage::hermes_local::load(name)
+            .filter(|c| c.read_at_ms > 0 && c.period_start == month)
+            .map_or_else(
+                || "-".to_string(),
+                |c| crate::usage::derive::format_money(&c.total_cost(), "USD"),
+            )
+    };
+    let rows: Vec<[String; 4]> = entries
+        .iter()
+        .map(|e| {
+            [
+                e.name.clone(),
+                e.provider.clone(),
+                e.mode.clone(),
+                estimate(&e.name),
+            ]
+        })
+        .collect();
+    let (h_name, h_provider, h_mode, h_mtd) = ("HERMES", "PROVIDER", "MODE", "THIS MONTH");
+    let w_name = col_width(h_name, rows.iter().map(|r| r[0].as_str()));
+    let w_provider = col_width(h_provider, rows.iter().map(|r| r[1].as_str()));
+    let w_mode = col_width(h_mode, rows.iter().map(|r| r[2].as_str()));
+    let mut out =
+        format!("  {h_name:<w_name$}  {h_provider:<w_provider$}  {h_mode:<w_mode$}  {h_mtd}\n");
+    for (e, r) in entries.iter().zip(&rows) {
+        out.push_str(&format!(
+            "{} {:<w_name$}  {:<w_provider$}  {:<w_mode$}  {}\n",
+            if e.live { '●' } else { ' ' },
+            r[0],
+            r[1],
+            r[2],
+            r[3]
+        ));
     }
     out
 }

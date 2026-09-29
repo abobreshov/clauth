@@ -1,0 +1,51 @@
+## audit-chat.tsv
+  ancestor-dir os.lstat           2024
+  ancestor-dir os.stat            1
+  child-home   os.lstat           272
+  child-home   os.stat            3
+  hermes-home  open               21
+  hermes-home  os.chmod           11
+  hermes-home  os.lstat           400
+  hermes-home  os.mkdir           30
+  hermes-home  os.rename          1
+  hermes-home  os.scandir         5
+  hermes-home  os.stat            757
+  via-link     os.lstat           9
+    via-link os.lstat ~/.ssh x5
+    via-link os.lstat ~/.ssh/authorized_keys x1
+    via-link os.lstat ~/.ssh/config x1
+    via-link os.lstat ~/.ssh/id_ed25519 x1
+    via-link os.lstat ~/.ssh/id_rsa x1
+## audit-config-set.tsv
+  ancestor-dir os.lstat           24
+  child-home   os.lstat           2
+  hermes-home  open               9
+  hermes-home  os.chmod           13
+  hermes-home  os.lstat           12
+  hermes-home  os.mkdir           15
+  hermes-home  os.rename          1
+  hermes-home  os.stat            41
+## audit-version.tsv
+  ancestor-dir os.lstat           24
+  child-home   os.lstat           2
+  hermes-home  open               8
+  hermes-home  os.lstat           11
+  hermes-home  os.mkdir           3
+  hermes-home  os.stat            21
+## inotify-main.log: 0 events
+## inotify-control.log: 8 events
+  1790709313 OPEN <run>/home/.claude/.credentials.json
+  1790709313 OPEN <run>/home/.claude/.credentials.json
+  1790709313 ACCESS <run>/home/.claude/.credentials.json
+  1790709313 ACCESS <run>/home/.claude/.credentials.json
+  1790709313 OPEN <run>/home/.claude/.credentials.json
+  1790709313 OPEN <run>/home/.claude/.credentials.json
+  1790709313 ACCESS <run>/home/.claude/.credentials.json
+  1790709313 ACCESS <run>/home/.claude/.credentials.json
+## 03-probe-redirect.txt
+  {"anthropic_explicitly_configured": false, "call_llm_custom_unhealthy": "raised APIStatusError: Error code: 402 - {'error': {'message': 'Insufficient credits. This account never purchased credits.", "call_llm_custom_unhealthy_reached_try_anthropic": 0, "call_llm_natural": "raised APIStatusError: Error code: 402 - {'error': {'message': 'Insufficient credits. This account never purchased credits.", "call_llm_natural_reached_try_anthropic": 0, "claude_cred_path": "<run>/home/.tollgate/profiles/s7f/child-home/.claude/.credentials.json", "claude_cred_path_exists": false, "default_hermes_root": "<run>/home/.tollgate/profiles/s7f/hermes-home", "env_HOME": "<run>/home/.tollgate/profiles/s7f/child-home", "expanduser": "<run>/home/.tollgate/profiles/s7f/child-home", "hermes_home": "<run>/home/.tollgate/profiles/s7f/hermes-home", "mode": "redirect", "path_home": "<run>/home/.tollgate/profiles/s7f/child-home", "read_claude_code_credentials_found": false, "resolve_anthropic_token_found": false, "resolve_anthropic_token_is_sentinel": false, "scrubbed_env_present": [], "try_anthropic_returned_a_client": false, "try_payment_fallback_openrouter_label": "", "try_payment_fallback_reached_try_anthropic": 0}
+## 04-probe-forcegate.txt
+  {"anthropic_explicitly_configured": false, "call_llm_custom_unhealthy": "raised APIStatusError: Error code: 402 - {'error': {'message': 'Insufficient credits. This account never purchased credits.", "call_llm_custom_unhealthy_reached_try_anthropic": 1, "call_llm_natural": "raised APIStatusError: Error code: 402 - {'error': {'message': 'Insufficient credits. This account never purchased credits.", "call_llm_natural_reached_try_anthropic": 0, "claude_cred_path": "<run>/home/.tollgate/profiles/s7f/child-home/.claude/.credentials.json", "claude_cred_path_exists": false, "default_hermes_root": "<run>/home/.tollgate/profiles/s7f/hermes-home", "env_HOME": "<run>/home/.tollgate/profiles/s7f/child-home", "expanduser": "<run>/home/.tollgate/profiles/s7f/child-home", "hermes_home": "<run>/home/.tollgate/profiles/s7f/hermes-home", "mode": "forcegate", "path_home": "<run>/home/.tollgate/profiles/s7f/child-home", "read_claude_code_credentials_found": false, "resolve_anthropic_token_found": false, "resolve_anthropic_token_is_sentinel": false, "scrubbed_env_present": [], "try_anthropic_returned_a_client": false, "try_payment_fallback_openrouter_label": "", "try_payment_fallback_reached_try_anthropic": 1}
+## 07-probe-control.txt
+  {"claude_cred_path": "<run>/home/.claude/.credentials.json", "claude_cred_path_exists": true, "default_hermes_root": "<run>/home/.tollgate/profiles/s7f/hermes-home", "env_HOME": "<run>/home", "expanduser": "<run>/home", "hermes_home": "<run>/home/.tollgate/profiles/s7f/hermes-home", "mode": "control", "path_home": "<run>/home", "read_claude_code_credentials_found": true, "resolve_anthropic_token_found": true, "resolve_anthropic_token_is_sentinel": true, "scrubbed_env_present": []}
+VERDICT PASS

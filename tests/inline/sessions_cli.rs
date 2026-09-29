@@ -940,6 +940,30 @@ fn switch_refuses_a_dead_session_row() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
+/// Test 35a: a Hermes row has no executor; the switch refuses with the shared
+/// `NON_CLAUDE_SWITCH` text.
+#[test]
+fn sessions_switch_refuses_hermes_rows() {
+    let _sb = HomeSandbox::new();
+    registry_row("4242-0", "hm", crate::harness::Harness::Hermes);
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("hm"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the marker");
+    let err = run_switch("4242-0", "spare", &SwitchFlags::default())
+        .expect_err("a hermes row must be refused");
+    assert_eq!(
+        err.to_string(),
+        "session '4242-0' is a Hermes session; switch by relaunch (tollgate start <profile>)"
+    );
+    assert_eq!(
+        NON_CLAUDE_SWITCH.replace("{sid}", "4242-0"),
+        err.to_string()
+    );
+}
+
 #[test]
 fn switch_refuses_a_codex_session_row() {
     let _sb = HomeSandbox::new();
@@ -1355,4 +1379,25 @@ mod hot_swap_switch {
             .is_ok()
         );
     }
+}
+
+/// A live claude session asked onto a Hermes profile gets M-SWITCH, not
+/// "profile not found": the name is a real account, on a harness a claude
+/// session can never run on. The row is left alone.
+#[test]
+fn a_session_switch_onto_a_hermes_profile_names_the_relaunch() {
+    let _sb = HomeSandbox::new();
+    registry_row("4242-0", "work", crate::harness::Harness::Claude);
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("work"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the marker");
+    crate::testutil::write_hermes_roster(&["herm"]);
+    let before = crate::live_sessions::get("4242-0").expect("row");
+    let err = crate::sessions_cli::request_session_switch("4242-0", "HERM", Surface::Cli)
+        .expect_err("a Hermes target must be refused");
+    assert_eq!(err.to_string(), crate::hermes::m_switch("herm"));
+    assert_eq!(crate::live_sessions::get("4242-0").expect("row"), before);
 }

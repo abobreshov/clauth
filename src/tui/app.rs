@@ -1670,22 +1670,27 @@ pub(crate) enum HarnessFilter {
     All,
     Claude,
     Codex,
+    Hermes,
 }
 
 impl HarnessFilter {
-    /// `c` cycles: both → claude → codex → both.
+    /// `c` cycles: all → claude → codex → hermes → all.
     pub(crate) fn next(self) -> Self {
         match self {
             HarnessFilter::All => HarnessFilter::Claude,
             HarnessFilter::Claude => HarnessFilter::Codex,
-            HarnessFilter::Codex => HarnessFilter::All,
+            HarnessFilter::Codex => HarnessFilter::Hermes,
+            HarnessFilter::Hermes => HarnessFilter::All,
         }
     }
     pub(crate) fn shows_claude(self) -> bool {
-        !matches!(self, HarnessFilter::Codex)
+        matches!(self, HarnessFilter::All | HarnessFilter::Claude)
     }
     pub(crate) fn shows_codex(self) -> bool {
-        !matches!(self, HarnessFilter::Claude)
+        matches!(self, HarnessFilter::All | HarnessFilter::Codex)
+    }
+    pub(crate) fn shows_hermes(self) -> bool {
+        matches!(self, HarnessFilter::All | HarnessFilter::Hermes)
     }
     /// Harness name for the accounts panel's left meta slot; `None` while both
     /// harnesses show, so the unfiltered panel renders no left slot.
@@ -1694,8 +1699,52 @@ impl HarnessFilter {
             HarnessFilter::All => None,
             HarnessFilter::Claude => Some("claude"),
             HarnessFilter::Codex => Some("codex"),
+            HarnessFilter::Hermes => Some("hermes"),
         }
     }
+}
+
+/// One Hermes profile as the Overview renders it: read-only (a Hermes home is
+/// the account, switched by relaunch), from the roster, the liveness markers
+/// and the usage cache the daemon writes. Never a Hermes, python or sqlite3
+/// run: the TUI reads files only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HermesRow {
+    pub(crate) name: String,
+    pub(crate) provider: &'static str,
+    pub(crate) mode: &'static str,
+    pub(crate) live: bool,
+    /// Month-to-date spend, as a short money string (`$0.42`).
+    pub(crate) estimate: Option<String>,
+}
+
+/// Read the Hermes roster into the [`App::hermes_rows`] snapshot.
+pub(crate) fn hermes_rows() -> Vec<HermesRow> {
+    let Ok(state) = crate::hermes::profiles::HermesState::load() else {
+        return Vec::new();
+    };
+    let now_secs = crate::usage::now_epoch_secs();
+    let month = crate::usage::hermes_local::rfc3339_z(
+        crate::usage::hermes_local::month_start_secs(now_secs),
+    );
+    state
+        .profiles()
+        .iter()
+        .map(|p| HermesRow {
+            name: p.name.clone(),
+            provider: p.provider.as_str(),
+            mode: p.mode.as_str(),
+            live: crate::runtime::has_live_session(&ProfileName::from(p.name.as_str())),
+            estimate: crate::usage::hermes_local::load(&p.name)
+                .filter(|c| c.read_at_ms > 0 && c.period_start == month)
+                .map(|c| crate::usage::derive::format_money(&c.total_cost(), "USD")),
+        })
+        .collect()
+}
+
+/// M-SWITCH, the refusal a Hermes row gives Enter and `s` (hermes spec §2.2).
+pub(crate) fn hermes_switch_toast(name: &str) -> String {
+    crate::hermes::m_switch(name)
 }
 
 /// One codex account as the Overview renders it — name, plan, the two windows
@@ -2190,6 +2239,12 @@ pub(crate) struct App {
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
+    /// The Hermes roster as the Overview lists it, re-read with the codex
+    /// rows (same throttle).
+    pub(crate) hermes_rows: Vec<HermesRow>,
+    /// The Hermes row the cursor rests on while the `Hermes` filter shows
+    /// only those rows (their only selection: Enter and `s` toast M-SWITCH).
+    pub(crate) hermes_cursor: usize,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -2552,6 +2607,8 @@ impl App {
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
             last_codex_rows_refresh: Some(Instant::now()),
+            hermes_rows: hermes_rows(),
+            hermes_cursor: 0,
         };
         app.refresh_unsaved_live_login();
         app
@@ -3333,8 +3390,14 @@ impl App {
         let upstream = |o: &crate::usage::observation::AccountObservation| {
             o.origin == crate::usage::observation::Origin::Upstream
         };
-        let (mut first, rest): (Vec<usize>, Vec<usize>) =
-            (0..self.usage_extras.len()).partition(|&i| upstream(&self.usage_extras[i]));
+        // A Hermes profile renders in the Overview's own Hermes section, not
+        // among the read-only extras (the Usage tab still lists it).
+        let hermes = |o: &crate::usage::observation::AccountObservation| {
+            o.origin == crate::usage::observation::Origin::HermesProfile
+        };
+        let (mut first, rest): (Vec<usize>, Vec<usize>) = (0..self.usage_extras.len())
+            .filter(|&i| !hermes(&self.usage_extras[i]))
+            .partition(|&i| upstream(&self.usage_extras[i]));
         first.extend(rest);
         first
     }
@@ -3357,6 +3420,9 @@ pub(crate) fn read_only_hint(obs: &crate::usage::observation::AccountObservation
     match obs.origin {
         crate::usage::observation::Origin::Upstream => {
             "read-only — managed by clauth; import to manage it here"
+        }
+        crate::usage::observation::Origin::HermesProfile => {
+            "hermes — switch by relaunch: tollgate start <name>"
         }
         _ => "monitor — edit with tollgate monitor",
     }
@@ -3974,6 +4040,9 @@ fn claude_rows_hidden(app: &mut App) -> bool {
 }
 
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
+    if app.harness_filter == HarnessFilter::Hermes && handle_hermes_rows_key(app, key) {
+        return;
+    }
     let extra = app.overview_selected_extra();
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
@@ -4155,6 +4224,28 @@ fn drain_session_moves(app: &mut App) {
             },
             Err(e) => app.toast(ToastKind::Danger, format!("session {sid}: {e}")),
         }
+    }
+}
+
+/// The Overview's `Hermes` view: ↑↓ step the Hermes rows (wrapping), and
+/// Enter and `s` raise M-SWITCH for the row under the cursor, because a Hermes
+/// home switches by relaunch. Returns whether the key was taken; the rest fall
+/// through to the claude-bound handler, which is inert here.
+fn handle_hermes_rows_key(app: &mut App, key: KeyEvent) -> bool {
+    let len = app.hermes_rows.len();
+    match key.code {
+        KeyCode::Up | KeyCode::Down if len > 0 && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            let delta: i32 = if key.code == KeyCode::Up { -1 } else { 1 };
+            app.hermes_cursor =
+                (app.hermes_cursor.min(len - 1) as i32 + delta).rem_euclid(len as i32) as usize;
+            true
+        }
+        KeyCode::Enter | KeyCode::Char('s') if len > 0 => {
+            let name = app.hermes_rows[app.hermes_cursor.min(len - 1)].name.clone();
+            app.toast(ToastKind::Info, hermes_switch_toast(&name));
+            true
+        }
+        _ => false,
     }
 }
 
@@ -11349,6 +11440,10 @@ fn poll_codex_rows(app: &mut App) {
     }
     app.last_codex_rows_refresh = Some(Instant::now());
     app.codex_rows = codex_rows();
+    app.hermes_rows = hermes_rows();
+    app.hermes_cursor = app
+        .hermes_cursor
+        .min(app.hermes_rows.len().saturating_sub(1));
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`

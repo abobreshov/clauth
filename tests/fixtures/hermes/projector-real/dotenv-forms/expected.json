@@ -1,0 +1,76 @@
+{
+  "config": {
+    "model_provider": null,
+    "model": "nous/hermes-4-405b",
+    "model_base_url_host": null,
+    "providers": [],
+    "custom_providers": [],
+    "fallback_providers": [],
+    "fallback_model": [],
+    "auxiliary": {},
+    "delegation": {
+      "provider": null,
+      "base_url_host": null
+    },
+    "credential_pool_strategies": {
+      "openrouter": "round_robin"
+    },
+    "secrets": {
+      "onepassword": {
+        "enabled": true,
+        "targets": [
+          "GITHUB_TOKEN",
+          "OPENROUTER_API_KEY"
+        ]
+      },
+      "bitwarden": {
+        "enabled": false,
+        "targets": []
+      }
+    },
+    "plugins_enabled": [
+      "memory",
+      "web"
+    ]
+  },
+  "managed_config_top_keys": [],
+  "env_keys": {
+    "home": [
+      {
+        "key": "OPENROUTER_API_KEY",
+        "nonblank": true
+      },
+      {
+        "key": "EDITOR_THEME",
+        "nonblank": true
+      },
+      {
+        "key": "QUOTED_SINGLE",
+        "nonblank": true
+      },
+      {
+        "key": "BLANK",
+        "nonblank": false
+      },
+      {
+        "key": "SPACES_ONLY",
+        "nonblank": false
+      },
+      {
+        "key": "MULTILINE",
+        "nonblank": true
+      },
+      {
+        "key": "INDENTED",
+        "nonblank": true
+      }
+    ],
+    "op_env": [
+      {
+        "key": "OP_SERVICE_ACCOUNT_TOKEN",
+        "nonblank": true
+      }
+    ],
+    "managed": []
+  }
+}

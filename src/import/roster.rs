@@ -116,13 +116,6 @@ fn roster_unreadable(paths: &Paths, path: &Path, e: &anyhow::Error) -> Finding {
     .with_path(shown)
 }
 
-fn other(h: Harness) -> Harness {
-    match h {
-        Harness::Claude => Harness::Codex,
-        Harness::Codex => Harness::Claude,
-    }
-}
-
 fn collision(harness: Harness, name: &str, src: &str) -> Finding {
     Finding::new(
         "name_collision",
@@ -140,8 +133,9 @@ pub(crate) fn check_names(
     opts: &Options,
 ) -> Vec<Finding> {
     let mut blockers = Vec::new();
-    // Both of tollgate's rosters must read, or no name can be checked
-    // against them (and a collision would be misreported).
+    // Every one of tollgate's rosters must read (claude, codex and Hermes),
+    // or no name can be checked against them (and a collision would be
+    // misreported). Hermes homes themselves are never read or moved.
     if let Err(e) = crate::profile::claude_roster_names() {
         blockers.push(Finding::new(
             "tollgate_roster_unreadable",
@@ -152,6 +146,12 @@ pub(crate) fn check_names(
         blockers.push(Finding::new(
             "tollgate_roster_unreadable",
             format!("~/.tollgate/codex-profiles.toml cannot be read ({e:#}); fix it first"),
+        ));
+    }
+    if let Err(e) = crate::hermes::profiles::HermesState::load() {
+        blockers.push(Finding::new(
+            "tollgate_roster_unreadable",
+            format!("~/.tollgate/hermes-profiles.toml cannot be read ({e:#}); fix it first"),
         ));
     }
     if !blockers.is_empty() {
@@ -190,12 +190,12 @@ pub(crate) fn check_names(
                     format!("'{dst}' is not a valid tollgate profile name ({e}); pass --rename {name}=<new>"),
                 ));
             } else {
-                let holder =
-                    if crate::actions::validate_foreign_harness_free(&dst, *harness).is_err() {
-                        other(*harness)
-                    } else {
-                        *harness
-                    };
+                // Whichever roster holds the name: a foreign one (codex,
+                // Hermes, or claude for a codex profile) first, else its own.
+                let holder = crate::actions::foreign_roster_holding(&dst, *harness)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(*harness);
                 blockers.push(collision(holder, &dst, name));
             }
             continue;

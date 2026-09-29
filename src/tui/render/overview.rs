@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
 use std::collections::HashSet;
 
-use super::super::app::{App, CodexRow, MainItemKind};
+use super::super::app::{App, CodexRow, HarnessFilter, HermesRow, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
@@ -85,6 +85,10 @@ fn harness_counts(app: &App) -> String {
     if codex_n > 0 {
         terms.push(format!("{codex_n} codex"));
     }
+    let hermes_n = app.hermes_rows.len();
+    if hermes_n > 0 {
+        terms.push(format!("{hermes_n} hermes"));
+    }
     let (upstream_n, monitor_n) = extra_counts(app);
     if upstream_n > 0 {
         terms.push(format!("{upstream_n} clauth"));
@@ -96,13 +100,19 @@ fn harness_counts(app: &App) -> String {
 }
 
 /// How many read-only rows the Overview lists: (upstream-clauth, monitors).
+/// A Hermes profile is neither: it has its own section and count.
 fn extra_counts(app: &App) -> (usize, usize) {
     let upstream = app
         .usage_extras
         .iter()
         .filter(|o| o.origin == Origin::Upstream)
         .count();
-    (upstream, app.usage_extras.len() - upstream)
+    let hermes = app
+        .usage_extras
+        .iter()
+        .filter(|o| o.origin == Origin::HermesProfile)
+        .count();
+    (upstream, app.usage_extras.len() - upstream - hermes)
 }
 
 /// The Overview's read-only rows as shown: [`App::overview_extras`]'s display
@@ -159,8 +169,13 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         &[]
     };
+    let hermes: &[HermesRow] = if app.harness_filter.shows_hermes() {
+        &app.hermes_rows
+    } else {
+        &[]
+    };
     let extras = shown_extras(app);
-    let no_own = app.config().profiles.is_empty() && codex.is_empty();
+    let no_own = app.config().profiles.is_empty() && codex.is_empty() && hermes.is_empty();
     if no_own && extras.is_empty() {
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
@@ -230,6 +245,28 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             rows.push(ListItem::new(render_codex_row(row, &widths)));
         }
     }
+    // The Hermes section: read-only like codex. Only the `Hermes` view
+    // selects a row (Enter and `s` there toast the relaunch hint), so the
+    // cursor never reaches it while the claude rows show.
+    let mut list_sel_hermes = None;
+    if !hermes.is_empty() {
+        if !rows.is_empty() {
+            rows.push(ListItem::new(Line::from("")));
+        }
+        rows.push(ListItem::new(Line::from(vec![Span::styled(
+            "  hermes — relaunch with `tollgate start <name>`",
+            theme::dim(),
+        )])));
+        let selectable = app.harness_filter == HarnessFilter::Hermes;
+        for (i, row) in hermes.iter().enumerate() {
+            let selected = selectable && i == app.hermes_cursor.min(hermes.len() - 1);
+            if selected {
+                list_sel_hermes = Some(rows.len());
+            }
+            let line = render_hermes_row(row, &widths);
+            rows.push(ListItem::new(select_line(line, selected, focused, width)));
+        }
+    }
     // The read-only rows: upstream clauth's accounts, then monitors, each
     // group under its own caption. The cursor lands on them (⏎ opens the Usage
     // tab there) but no account action does — see `read_only_hint`.
@@ -272,7 +309,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let total = rows.len();
     let list = List::new(rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(list_sel));
+    state.select(Some(list_sel_hermes.unwrap_or(list_sel)));
     frame.render_stateful_widget(list, list_area, &mut state);
 
     let viewport = list_area.height as usize;
@@ -589,6 +626,34 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
         spans.push(gap(widths));
         spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
+    Line::from(spans)
+}
+
+/// One Hermes row: the name, `provider · mode`, a live dot while a session
+/// holds the home, and the month-to-date estimate in the 5h column. Nothing
+/// here polls or selects a claude profile.
+fn render_hermes_row(row: &HermesRow, widths: &OverviewWidths) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        if row.live {
+            Span::styled("●", theme::success())
+        } else {
+            Span::raw(" ")
+        },
+        Span::raw(" "),
+        Span::styled(fixed(&row.name, widths.name), theme::base()),
+        Span::raw(" ".repeat(widths.gap)),
+        Span::styled(
+            fixed(&format!("{} · {}", row.provider, row.mode), widths.kind),
+            theme::dim(),
+        ),
+        narrow_gap(widths),
+        Span::raw(" ".repeat(TIMER_SLOT)),
+    ];
+    spans.push(match &row.estimate {
+        Some(e) => Span::styled(fixed(&format!("{e} mo"), widths.five_hour), theme::base()),
+        None => Span::styled(fixed(NO_DATA, widths.five_hour), theme::faint()),
+    });
     Line::from(spans)
 }
 

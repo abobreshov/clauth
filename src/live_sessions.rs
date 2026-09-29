@@ -48,7 +48,10 @@ pub(crate) struct LiveSession {
     /// consumers that must tell rows APART: the swap executor and the
     /// daemon's per-session decision leg skip codex rows when those sessions
     /// exist (codex reads `auth.json` once at start, so a mid-session member
-    /// change is a no-op the executor would publish as a success).
+    /// change is a no-op the executor would publish as a success). A Hermes
+    /// row (`tollgate start <hermes-profile>`) is `follows_chain = false` with
+    /// `launch_store: None`: the home is the account, switched by relaunch,
+    /// and `sessions switch` refuses it with `sessions_cli::NON_CLAUDE_SWITCH`.
     /// `serde(default)` (= claude) is the upgrade gate: a row written by a
     /// tollgate that predates the axis is a claude row, which is what it was.
     #[serde(default)]
@@ -172,12 +175,14 @@ impl LiveSession {
     }
 
     /// The executor this row runs under. A row without the field predates it:
-    /// a claude row is executor A (what every such session was), a codex row
-    /// has no in-session executor.
+    /// a claude row is executor A (what every such session was), a codex or
+    /// Hermes row has no in-session executor.
     pub(crate) fn executor(&self) -> crate::hot_swap::Executor {
         self.executor.clone().unwrap_or(match self.harness {
             crate::harness::Harness::Claude => crate::hot_swap::Executor::Oauth,
-            crate::harness::Harness::Codex => crate::hot_swap::Executor::None,
+            crate::harness::Harness::Codex | crate::harness::Harness::Hermes => {
+                crate::hot_swap::Executor::None
+            }
         })
     }
 

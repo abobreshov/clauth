@@ -1,0 +1,1 @@
+refused: .op.env sets NOUS_API_KEY

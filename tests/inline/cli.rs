@@ -1295,6 +1295,15 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete"]),
         Command::Complete {
             codex: false,
+            hermes: false,
+            live_sessions: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--hermes"]),
+        Command::Complete {
+            codex: false,
+            hermes: true,
             live_sessions: false
         }
     ));
@@ -1302,6 +1311,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete", "--codex"]),
         Command::Complete {
             codex: true,
+            hermes: false,
             live_sessions: false
         }
     ));
@@ -1309,6 +1319,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete", "--live-sessions"]),
         Command::Complete {
             codex: false,
+            hermes: false,
             live_sessions: true
         }
     ));
@@ -4462,5 +4473,113 @@ mod session_helper_hardening {
                 crate::live_sessions::helper_ack_path("4242-0").expect("ack path"),
             );
         }
+    }
+}
+
+/// The Hermes legs of the bare-name verbs (hermes spec §2.1, §4.4 step 1).
+mod hermes_resolution {
+    use super::*;
+    use crate::hermes::testkit::{Fixture, NoManagedScope, new_openrouter};
+    use crate::testutil::HomeSandbox;
+
+    fn hermes_profile(sb: &HomeSandbox, name: &str) -> Fixture {
+        let fx = Fixture::new(&sb.home().join("fx"));
+        fx.install_as_settings_bin();
+        new_openrouter(name);
+        fx.clear_rec();
+        fx
+    }
+
+    /// Test 33: `--isolated` and `--with-fallback` refuse by name on a Hermes
+    /// profile, and `--auto` never picks one (it walks the claude chain).
+    #[test]
+    fn start_refuses_isolated_with_fallback_and_auto_never_picks_hermes() {
+        let sb = HomeSandbox::new();
+        let _scope = NoManagedScope::new(&sb);
+        let fx = hermes_profile(&sb, "or-main");
+        let named = cli::StartTarget::Named("OR-MAIN".into());
+        let err = cmd_start(&named, &[], Isolation::Isolated, false, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--isolated is not available on a Hermes profile: the home is the account"
+        );
+        let err = cmd_start(&named, &[], Isolation::Shared, true, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--with-fallback is not available on a Hermes profile: Hermes fails over inside its \
+             own pool; there is no tollgate chain"
+        );
+        // --explain names the pick and spawns nothing past the resolver.
+        cmd_start(&named, &[], Isolation::Shared, false, true).unwrap();
+        assert!(fx.calls().is_empty(), "--explain runs before the projector");
+        // --auto: the claude chain is empty, so there is nothing to pick.
+        let err = cmd_start(
+            &cli::StartTarget::Auto,
+            &[],
+            Isolation::Shared,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("fallback chain and it is empty"),
+            "{err}"
+        );
+        assert!(fx.hermes_calls().is_empty());
+    }
+
+    /// Test 35b: a Hermes name given to the bare-word switch is a usage error
+    /// (exit 2) naming the relaunch.
+    #[test]
+    fn bare_name_switch_on_hermes_is_usage_error_exit_2() {
+        let sb = HomeSandbox::new();
+        let _scope = NoManagedScope::new(&sb);
+        let _fx = hermes_profile(&sb, "or-main");
+        let err = cmd_switch("or-main").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'or-main' is a Hermes profile; Hermes switches by relaunch: 'tollgate start or-main'"
+        );
+        assert_eq!(exit_code(Err(err)), 2);
+        let err = cmd_external(&["or-main".to_string()]).unwrap_err();
+        assert_eq!(exit_code(Err(err)), 2);
+        // A claude-only verb names the harness too.
+        let config = crate::profile::load_config().unwrap();
+        let err = resolve_or_bail(&config, "or-main", "disable").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'or-main' is a Hermes profile; disable is claude-only"
+        );
+        // An unknown name lists the Hermes roster.
+        let err = cmd_switch("nope").unwrap_err();
+        assert!(err.to_string().contains("hermes: or-main"), "{err}");
+    }
+
+    /// Test 36: `delete` resolves claude, then codex, then hermes, and the
+    /// Hermes leg removes the home.
+    #[test]
+    fn delete_resolves_hermes_after_codex_and_removes_home() {
+        let sb = HomeSandbox::new();
+        let _scope = NoManagedScope::new(&sb);
+        let _fx = hermes_profile(&sb, "or-main");
+        crate::testutil::write_codex_roster(&["cx"]);
+        let home = crate::hermes::home::HermesPaths::for_name("or-main").unwrap();
+        assert!(home.home.is_dir());
+        cmd_delete("OR-main", true, false).unwrap();
+        assert!(!home.profile.exists());
+        assert!(
+            !crate::hermes::profiles::HermesState::load()
+                .unwrap()
+                .holds("or-main")
+        );
+        let err = cmd_delete("or-main", true, false).unwrap_err();
+        assert_eq!(exit_code(Err(err)), 2, "gone now: an unknown profile");
+    }
+
+    /// A Hermes refusal prints bare and exits 1.
+    #[test]
+    fn a_hermes_refusal_exits_1() {
+        let err = crate::hermes::guards::refuse("tollgate: hermes 'x': nope");
+        assert_eq!(exit_code(Err(err)), 1);
     }
 }

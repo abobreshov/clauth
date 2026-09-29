@@ -611,16 +611,21 @@ fn subcommand_branch(shell: &str, script: &str, name: &str) -> Option<String> {
         // zsh pins it in `[[ "${words[2]}" == … ]]`, bare or as an alternation.
         "zsh" => guarded_arms(script, |guard| zsh_word_matches(guard, 2, name)),
         // fish pins it in a `__fish_seen_subcommand_from` condition, which may
-        // name several subcommands, and chains them with `; and `. A chained
-        // line's first group reads `devices;`, so the token compare strips the
+        // name several subcommands, and chains them with `; and `. Only a
+        // line's FIRST group names a subcommand: a chained second group names
+        // a nested verb (`hermes; and … list`), which is `verb_branch`'s. The
+        // first group of a chained line reads `devices;`, so it is cut at the
         // separator.
         "fish" => joined(script.lines().filter(|l| {
             l.split("__fish_seen_subcommand_from ")
-                .skip(1)
-                .filter_map(|rest| rest.split('"').next())
-                .any(|list| {
-                    list.split_whitespace()
-                        .any(|w| w.trim_end_matches(';') == name)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .is_some_and(|list| {
+                    list.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .any(|w| w == name)
                 })
         })),
         _ => None,
@@ -1195,4 +1200,72 @@ fn every_visible_subcommand_is_completed_in_every_shell() {
         }
     }
     assert!(missing.is_empty(), "not completed: {missing:#?}");
+}
+
+/// Test 52: every shell completes Hermes names after `start` and `delete`
+/// (beside the claude ones) and under the `hermes` verbs that take a name,
+/// offers the `hermes` verbs, and each verb's flags under its own guard;
+/// `__complete --hermes` lists the Hermes roster alone.
+#[test]
+fn completions_offer_hermes_names_for_start_delete_and_hermes_subcommands() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("hermes-profiles.toml"),
+        "schema_version = 1\n[[profiles]]\nname = \"herm\"\nprovider = \"nous\"\n\
+         mode = \"account\"\nauth = \"oauth\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n",
+    )
+    .unwrap();
+    assert_eq!(hermes_profile_names(), ["herm"]);
+
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        for verb in ["start", "delete"] {
+            let branch = subcommand_branch(shell, script, verb)
+                .unwrap_or_else(|| panic!("{shell}: no `{verb}` branch"));
+            assert!(
+                branch.contains("__complete --hermes"),
+                "{shell}: `{verb}` completes Hermes names"
+            );
+        }
+        let hermes = subcommand_branch(shell, script, "hermes")
+            .unwrap_or_else(|| panic!("{shell}: no `hermes` branch"));
+        for verb in ["new", "key", "auth", "list", "show", "pool", "delete"] {
+            assert!(offers_token(&hermes, verb), "{shell}: hermes → {verb}");
+        }
+        assert!(
+            hermes.contains("__complete --hermes"),
+            "{shell}: the hermes verbs complete Hermes names"
+        );
+        for strategy in ["fill_first", "round_robin", "random", "least_used"] {
+            assert!(offers_token(&hermes, strategy), "{shell}: {strategy}");
+        }
+        let show = verb_branch(shell, script, "hermes", "show").unwrap();
+        assert!(offers_token(&show, "--check") && offers_token(&show, "--json"));
+        let new = verb_branch(shell, script, "hermes", "new").unwrap();
+        for flag in [
+            "--provider",
+            "--model",
+            "--pool",
+            "--env-key",
+            "--stdin",
+            "--no-key",
+        ] {
+            assert!(offers_token(&new, flag), "{shell}: hermes new → {flag}");
+        }
+    }
+    // fish's lines are per verb: the claude-only verbs never get Hermes names.
+    for claude_only in ["login", "capture", "disable", "enable"] {
+        let branch = subcommand_branch("fish", &FISH, claude_only).unwrap();
+        assert!(
+            !branch.contains("__complete --hermes"),
+            "fish: `{claude_only}` never completes Hermes names"
+        );
+    }
+    // bash and zsh share the claude-roster arm: the Hermes names are gated on
+    // `start` / `delete` inside it.
+    assert!(BASH.contains(
+        r#"{ [ "$prev" = "start" ] || [ "$prev" = "delete" ]; } && profiles="${profiles} $(tollgate __complete --hermes 2>/dev/null)""#
+    ));
+    assert!(ZSH.contains(r#"[[ "${words[2]}" == (start|delete) ]] && hermes="#));
 }

@@ -1,0 +1,23 @@
+$ /home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/python <run>/auditwrap.py <run>/out/audit-chat.tsv /home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/hermes chat -q S7F say ok --provider custom -m stub-model
+# HOME=<run>/home/.tollgate/profiles/s7f/child-home
+# rc=0 elapsed=3.5s
+--- stdout
+Query: S7F say ok
+Initializing agent...
+  ⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only
+────────────────────────────────────────
+
+
+╭─ ⚕ Hermes ───────────────────────────────────────────────────────────────────╮
+    ok
+╰──────────────────────────────────────────────────────────────────────────────╯
+⚠ Auxiliary title generation failed: HTTP 402: Insufficient credits. This account never purchased credits. Make sure your key is on the correct account or org, and if so, purchase more at https://openrouter.ai/settings/credits
+
+Resume this session with:
+  hermes --resume 20260929_201508_125f93
+
+Session:        20260929_201508_125f93
+Duration:       2s
+Messages:       2 (1 user, 0 tool calls)
+
+--- stderr

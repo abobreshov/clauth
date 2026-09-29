@@ -118,7 +118,7 @@ these optional filters:
 | `GET /v1/accounts/{id}` | `{schema_version, account: AccountObservation, live_sessions: [LiveSessionView…]}` (only the sessions whose committed or served member is this account), or `404 account_not_found` |
 | `GET /v1/usage` | `{schema_version, generated_at, guest_mode, accounts}`, the same envelope as `tollgate usage --json` |
 | `GET /v1/providers` | `{schema_version, providers: [{source, display_name, auth_kinds, configured, accounts}]}` |
-| `GET /v1/status` | the `~/.tollgate/status.json` feed, parsed and redacted (never the file's raw bytes), plus `import`, with an `ETag` of the body served; built on the spot when no daemon has written a parseable one |
+| `GET /v1/status` | the `~/.tollgate/status.json` feed, parsed and redacted (never the file's raw bytes), plus `import`, with an `ETag` of the body served; built on the spot when no daemon has written a parseable one. It carries `hermes_profiles[]` (`name`, `provider`, `model`, `mode`, `live`) beside `profiles[]` |
 | `GET /v1/openapi.json` | the OpenAPI 3.1 document for all of the above |
 
 **Filters.** `/v1/accounts` and `/v1/usage` take these query parameters. Values
@@ -139,6 +139,7 @@ namespaces:
 | `codex:` | a codex profile |
 | `monitor:` | a monitoring-only key |
 | `upstream:` | upstream clauth's accounts (read-only) |
+| `hermes:` | a Hermes profile tollgate launches (`hermes-profiles.toml`): its month-to-date spend from the home's own `state.db` |
 
 In a path, the colon can be sent as is or percent-encoded
 (`/v1/accounts/claude%3Awork`). A profile name works too (`/v1/accounts/work`).
@@ -198,6 +199,17 @@ always present: an absent value is `null`, an empty list is `[]`.
   - `invalid_response`
   - `console_expired`
   - `subscription_inactive`
+- **`origin`** is where the account is defined, and the id's namespace:
+  - `profile` (`claude:`)
+  - `codex_profile` (`codex:`)
+  - `monitor` (`monitor:`)
+  - `upstream` (`upstream:`)
+  - `hermes_profile` (`hermes:`): a Hermes home tollgate launches. It carries
+    no windows or meters; `estimate` is the UTC month to date from the home's
+    own `state.db` (`basis` names it), `failure` is `rate_limited` during a
+    Nous cooldown and `unavailable` when the ledger cannot be read (for
+    example, no `sqlite3`), and `best_effort` marks an unknown `state.db`
+    schema or a Hermes outside 0.19.x.
 - **`guest_mode: true`** means upstream clauth owns `~/.claude` on this machine,
   and tollgate is only watching.
 - **`import`** is `{state, completed_at}`: where a `tollgate import clauth` of

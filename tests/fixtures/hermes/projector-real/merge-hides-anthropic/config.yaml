@@ -1,0 +1,23 @@
+# A route hidden behind a YAML merge key: `auxiliary.vision` has no
+# `provider` of its own; `<<: *anthropic_route` brings one in. The projector
+# must see it exactly as Hermes' loader does.
+x-routes:
+  openrouter_route: &or_route
+    provider: openrouter
+    base_url: https://openrouter.ai/api/v1
+  anthropic_route: &anthropic_route
+    provider: anthropic
+    base_url: https://api.anthropic.com/v1/messages
+
+model:
+  <<: *or_route
+  default: anthropic/claude-sonnet-4.5
+
+auxiliary:
+  vision:
+    <<: *anthropic_route
+    model: claude-3-haiku
+  web_extract: *or_route
+  compression:
+    <<: *or_route
+    provider: openrouter

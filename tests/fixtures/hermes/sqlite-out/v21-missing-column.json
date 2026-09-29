@@ -1,0 +1,13 @@
+[{"version":21}]
+[{"name":"session_id"},
+{"name":"model"},
+{"name":"billing_provider"},
+{"name":"api_call_count"},
+{"name":"input_tokens"},
+{"name":"output_tokens"},
+{"name":"cache_read_tokens"},
+{"name":"cache_write_tokens"},
+{"name":"estimated_cost_usd"},
+{"name":"actual_cost_usd"},
+{"name":"first_seen"},
+{"name":"last_seen"}]

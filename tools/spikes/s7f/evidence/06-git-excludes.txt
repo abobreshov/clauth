@@ -1,0 +1,7 @@
+$ git check-ignore -v x.s7f-ignored
+# HOME=<run>/home/.tollgate/profiles/s7f/child-home
+# rc=0 elapsed=0.0s
+--- stdout
+<run>/home/.tollgate/profiles/s7f/child-home/.config/git/ignore:1:*.s7f-ignored	x.s7f-ignored
+
+--- stderr

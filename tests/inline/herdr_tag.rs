@@ -201,9 +201,9 @@ fn roster() -> Vec<AccountObservation> {
 #[test]
 fn a_profile_resolves_in_its_harnesss_roster() {
     let all = roster();
-    let claude = resolve_tag(&all, Some("work"), "claude", NOW).unwrap();
+    let claude = resolve_tag(&all, Some("work"), "claude", None, NOW).unwrap();
     assert_eq!(claude.text, "work 12%");
-    let codex = resolve_tag(&all, Some("work"), "codex", NOW).unwrap();
+    let codex = resolve_tag(&all, Some("work"), "codex", None, NOW).unwrap();
     assert_eq!(
         codex.text, "work 70%w",
         "a codex pane reads the codex roster"
@@ -212,7 +212,7 @@ fn a_profile_resolves_in_its_harnesss_roster() {
 
 #[test]
 fn a_profile_with_no_observation_keeps_its_bare_name() {
-    let tag = resolve_tag(&roster(), Some("ghost"), "claude", NOW).unwrap();
+    let tag = resolve_tag(&roster(), Some("ghost"), "claude", None, NOW).unwrap();
     assert_eq!(tag.text, "ghost");
     assert_eq!(
         tag_lines(&tag),
@@ -224,21 +224,21 @@ fn a_profile_with_no_observation_keeps_its_bare_name() {
 #[test]
 fn a_native_pane_is_tagged_only_when_one_account_can_be_it() {
     let all = roster();
-    let hermes = resolve_tag(&all, None, "hermes", NOW).unwrap();
+    let hermes = resolve_tag(&all, None, "hermes", None, NOW).unwrap();
     assert_eq!(hermes.text, "herm 5%", "one Hermes account: tagged with it");
     assert_eq!(
-        resolve_tag(&all, None, "grok", NOW),
+        resolve_tag(&all, None, "grok", None, NOW),
         None,
         "two grok accounts: ambiguous, no tag"
     );
     assert_eq!(
-        resolve_tag(&all, None, "agy", NOW),
+        resolve_tag(&all, None, "agy", None, NOW),
         None,
         "the only Antigravity account is disabled: no candidate"
     );
     for agent in ["claude", "codex", "cursor", ""] {
         assert_eq!(
-            resolve_tag(&all, None, agent, NOW),
+            resolve_tag(&all, None, agent, None, NOW),
             None,
             "{agent:?} with no profile gets no tag from the binary"
         );
@@ -256,12 +256,12 @@ fn a_hermes_pane_matches_a_nous_monitor_only_on_hermes_login() {
     let mut keyed = obs(Origin::Monitor, "nous-key", SourceId::Nous);
     keyed.auth = AuthKind::ApiKey;
 
-    let tag = resolve_tag(&[login.clone(), keyed.clone()], None, "hermes", NOW).unwrap();
+    let tag = resolve_tag(&[login.clone(), keyed.clone()], None, "hermes", None, NOW).unwrap();
     assert!(tag.text.starts_with("nous-main "), "{}", tag.text);
-    assert_eq!(resolve_tag(&[keyed], None, "hermes", NOW), None);
+    assert_eq!(resolve_tag(&[keyed], None, "hermes", None, NOW), None);
     let hermes = obs(Origin::Monitor, "herm", SourceId::Hermes);
     assert_eq!(
-        resolve_tag(&[login, hermes], None, "hermes", NOW),
+        resolve_tag(&[login, hermes], None, "hermes", None, NOW),
         None,
         "Hermes state and its Nous login: two candidates, ambiguous"
     );
@@ -327,7 +327,7 @@ fn the_09_pane_list_tags_only_the_unambiguous_native_pane() {
             let agent = p.agent.as_deref().unwrap_or("");
             (
                 p.pane_id.clone(),
-                resolve_tag(&all, None, agent, NOW).map(|t| t.text),
+                resolve_tag(&all, None, agent, None, NOW).map(|t| t.text),
             )
         })
         .collect();
@@ -346,15 +346,38 @@ fn the_09_pane_list_tags_only_the_unambiguous_native_pane() {
 fn herdr_tag_parses_both_script_shapes_and_stays_out_of_help() {
     let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").command {
         Some(Command::Herdr {
-            cmd:
-                HerdrCommand::Tag {
-                    agent,
-                    session: None,
-                    profile,
-                },
+            cmd: HerdrCommand::Tag { agent, profile, .. },
         }) => (agent, profile),
         other => panic!("not the tag arm: {other:?}"),
     };
+    // The bare-Hermes-pane shape: `--hermes-home=<path>` beside the agent.
+    match Cli::try_parse_from([
+        "tollgate",
+        "herdr",
+        "tag",
+        "--agent",
+        "hermes",
+        "--hermes-home=/h/.tollgate/profiles/x/hermes-home",
+    ])
+    .expect("parses")
+    .command
+    {
+        Some(Command::Herdr {
+            cmd:
+                HerdrCommand::Tag {
+                    hermes_home,
+                    profile,
+                    ..
+                },
+        }) => {
+            assert_eq!(
+                hermes_home.as_deref(),
+                Some(std::path::Path::new("/h/.tollgate/profiles/x/hermes-home"))
+            );
+            assert_eq!(profile, None);
+        }
+        other => panic!("not the tag arm: {other:?}"),
+    }
     assert_eq!(
         parse(&["tollgate", "herdr", "tag", "--agent", "claude", "--", "fit"]),
         (Some("claude".to_string()), Some("fit".to_string()))
@@ -391,6 +414,7 @@ fn herdr_tag_parses_both_script_shapes_and_stays_out_of_help() {
                     agent,
                     session,
                     profile,
+                    ..
                 },
         }) => assert_eq!(
             (agent.as_deref(), session.as_deref(), profile.as_deref()),
@@ -535,7 +559,7 @@ fn a_swapping_session_tags_the_served_member_then_the_committed_one_swapping() {
     // No session: the profile the script resolved, as before.
     assert_eq!(
         session_tag(&accounts, Some("or-main"), "claude", None, NOW),
-        resolve_tag(&accounts, Some("or-main"), "claude", NOW)
+        resolve_tag(&accounts, Some("or-main"), "claude", None, NOW)
     );
 }
 
@@ -557,5 +581,96 @@ fn a_session_flag_without_a_claude_row_is_no_session() {
     assert_eq!(
         session_view("4242-0").and_then(|v| v.served_member().map(str::to_string)),
         Some("fit".to_string())
+    );
+}
+
+// ── Hermes profiles (hermes spec §6.3) ───────────────────────────────────────
+
+fn write_hermes_roster(names: &[&str]) {
+    crate::testutil::write_hermes_roster(names);
+}
+
+fn hermes_profile_obs(name: &str, usd: &str) -> AccountObservation {
+    let mut o = obs(Origin::HermesProfile, name, SourceId::Hermes);
+    o.auth = AuthKind::NativeLogin;
+    o.estimate = Some(crate::usage::observation::LocalEstimate {
+        amount: crate::usage::observation::Amount::parse(usd).unwrap(),
+        currency: "USD".into(),
+        period: None,
+        basis: "hermes state.db".into(),
+    });
+    o
+}
+
+/// Test 48, the binary half: a hermes pane's profile (the live row's) looks
+/// up `hermes:<name>`, never the same-named claude account; a bare pane's
+/// `--hermes-home` maps a tollgate home of a roster profile to it; any other
+/// home falls back to the native match. The tag is the name and the month's
+/// estimate, nothing else.
+#[test]
+fn herdr_tag_uses_hermes_origin_and_hermes_home_join() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_hermes_roster(&["herm"]);
+    let mut claude_twin = obs(Origin::Profile, "herm", SourceId::AnthropicOauth);
+    claude_twin.windows.push(window(WINDOW_SESSION, 50.0));
+    let all = vec![claude_twin, hermes_profile_obs("herm", "0.4212")];
+
+    let tag = resolve_tag(&all, Some("herm"), "hermes", None, NOW).unwrap();
+    assert_eq!(
+        tag.text, "herm $0.42/mo",
+        "the Hermes account, not the claude twin"
+    );
+    assert_eq!(
+        resolve_tag(&all, Some("herm"), "claude", None, NOW)
+            .unwrap()
+            .text,
+        "herm 50%",
+        "a claude pane still reads its own roster"
+    );
+
+    let tollgate = crate::profile::tollgate_dir().unwrap();
+    let member = tollgate.join("profiles/herm/hermes-home");
+    let tag = resolve_tag(&all, None, "hermes", Some(&member), NOW).unwrap();
+    assert_eq!(tag.text, "herm $0.42/mo");
+
+    let ghost = tollgate.join("profiles/ghost/hermes-home");
+    assert_eq!(
+        resolve_tag(&all, None, "hermes", Some(&ghost), NOW),
+        None,
+        "a home the roster misses names nothing, and the profile is no native match"
+    );
+    let own = crate::profile::home_dir().unwrap().join(".hermes");
+    let mut native = obs(Origin::Monitor, "hermes-local", SourceId::Hermes);
+    native.auth = AuthKind::NativeLogin;
+    let with_native = vec![hermes_profile_obs("herm", "1"), native];
+    assert_eq!(
+        resolve_tag(&with_native, None, "hermes", Some(&own), NOW)
+            .unwrap()
+            .text,
+        "hermes-local",
+        "the operator's own ~/.hermes falls back to the native match"
+    );
+    assert_eq!(
+        resolve_tag(&with_native, None, "grok", Some(&member), NOW),
+        None,
+        "only a hermes pane reads the home"
+    );
+}
+
+/// Test 49: `native_match` never picks a tollgate Hermes profile. With one
+/// such profile alone it would tag the operator's own `~/.hermes` pane with
+/// that account.
+#[test]
+fn native_match_ignores_hermes_profiles() {
+    let lone = [hermes_profile_obs("herm", "1")];
+    assert!(native_match(&lone, &[SourceId::Hermes, SourceId::Nous]).is_none());
+    assert_eq!(resolve_tag(&lone, None, "hermes", None, NOW), None);
+    let mut native = obs(Origin::Monitor, "hermes-local", SourceId::Hermes);
+    native.auth = AuthKind::NativeLogin;
+    let both = [hermes_profile_obs("herm", "1"), native];
+    assert_eq!(
+        native_match(&both, &[SourceId::Hermes, SourceId::Nous]).map(|o| o.id.as_str()),
+        Some("monitor:hermes-local"),
+        "a profile does not make the native match ambiguous either"
     );
 }

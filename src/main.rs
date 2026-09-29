@@ -14,6 +14,7 @@ mod gateway;
 mod guest_write;
 mod harness;
 mod herdr;
+mod hermes;
 mod hook_context;
 mod hook_note;
 mod hot_swap;
@@ -90,7 +91,18 @@ fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
         let names: Vec<&str> = codex.profiles().iter().map(|n| n.as_str()).collect();
         parts.push(format!("codex: {}", names.join(", ")));
     }
+    if let Ok(hermes) = hermes::profiles::HermesState::load()
+        && !hermes.profiles().is_empty()
+    {
+        parts.push(format!("hermes: {}", hermes.names().join(", ")));
+    }
     profile_not_found_error(name, &parts)
+}
+
+/// M-SWITCH: a Hermes name given to a verb that switches or configures a
+/// claude account. Hermes switches by relaunch.
+fn hermes_switch_error(name: &str) -> anyhow::Error {
+    usage_error(hermes::m_switch(name))
 }
 
 /// The claude roster as one `available:` part, or none when it is empty so the
@@ -128,6 +140,11 @@ fn resolve_or_bail(config: &AppConfig, name: &str, verb: &str) -> Result<Profile
     if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(name) {
         return Err(usage_error(format!(
             "'{codex}' is a codex profile; {verb} is claude-only"
+        )));
+    }
+    if let Some(hermes) = hermes::profiles::HermesState::load()?.canonical_name(name) {
+        return Err(usage_error(format!(
+            "'{hermes}' is a Hermes profile; {verb} is claude-only"
         )));
     }
     Err(profile_not_found_error(name, &claude_roster_part(config)))
@@ -232,6 +249,12 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             // adds nothing.
             if e.downcast_ref::<crate::identity::GuestRefusal>().is_some() {
                 errln!("{}", crate::identity::GUEST_REFUSAL);
+                return 1;
+            }
+            // A Hermes guard refusal is one exact line that already names the
+            // profile (`tollgate: hermes '<name>': …`).
+            if let Some(refusal) = e.downcast_ref::<crate::hermes::guards::Refusal>() {
+                errln!("{refusal}");
                 return 1;
             }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
@@ -469,8 +492,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::SelfHeal => plugin_host::self_heal(),
         Command::Complete {
             codex,
+            hermes,
             live_sessions,
-        } => cmd_complete(codex, live_sessions),
+        } => cmd_complete(codex, hermes, live_sessions),
         Command::ApiKey { profile, session } => match (profile, session) {
             (_, Some(sid)) => hot_swap::run_session_helper(&sid, &mut std::io::stdout().lock()),
             (Some(profile), None) => cmd_api_key(&profile),
@@ -478,6 +502,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Hermes { cmd } => cmd_hermes(cmd),
         Command::Import { cmd } => cmd_import(cmd),
         Command::Plugin { cmd } => cmd_plugin(cmd),
         Command::Run { .. } => cmd_run(),
@@ -549,9 +574,11 @@ fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     }
 }
 
-fn cmd_complete(codex: bool, live_sessions: bool) -> Result<()> {
+fn cmd_complete(codex: bool, hermes: bool, live_sessions: bool) -> Result<()> {
     if codex {
         completions::print_codex_profile_names();
+    } else if hermes {
+        completions::print_hermes_profile_names();
     } else if live_sessions {
         completions::print_session_stems();
     } else {
@@ -587,8 +614,14 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
         cli::HerdrCommand::Tag {
             agent,
             session,
+            hermes_home,
             profile,
-        } => herdr::tag::run(profile.as_deref(), agent.as_deref(), session.as_deref()),
+        } => herdr::tag::run(
+            profile.as_deref(),
+            agent.as_deref(),
+            session.as_deref(),
+            hermes_home.as_deref(),
+        ),
         cli::HerdrCommand::Config { cmd } => match cmd {
             cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },
@@ -665,6 +698,17 @@ fn cmd_start(
                         return Ok(());
                     }
                     return start::run_codex(&config, &canonical, rest, isolation);
+                }
+                // Then a Hermes profile: a whole home with its own child HOME.
+                if let Some(canonical) = hermes::profiles::HermesState::load()?.canonical_name(raw)
+                {
+                    return cmd_start_hermes(
+                        &canonical,
+                        rest,
+                        isolation,
+                        follows_chain,
+                        explain_only,
+                    );
                 }
                 return Err(unknown_profile_error(&config, raw));
             };
@@ -1750,6 +1794,139 @@ fn clear_backup_postscript(target: &str) -> String {
     )
 }
 
+/// The Hermes leg of `start` (spec §4.4 step 1): the claude-only flags refuse
+/// by name, `--explain` runs G1–G6 and prints the pick line, and a real start
+/// is `start::run_hermes`. `--auto` never reaches here: it walks the claude
+/// fallback chain, which holds no Hermes profile.
+fn cmd_start_hermes(
+    name: &str,
+    rest: &[String],
+    isolation: Isolation,
+    follows_chain: bool,
+    explain_only: bool,
+) -> Result<()> {
+    if isolation == Isolation::Isolated {
+        anyhow::bail!("--isolated is not available on a Hermes profile: the home is the account");
+    }
+    if follows_chain {
+        anyhow::bail!(
+            "--with-fallback is not available on a Hermes profile: Hermes fails over inside its \
+             own pool; there is no tollgate chain"
+        );
+    }
+    if explain_only {
+        let profile = hermes::find_profile(name)?;
+        hermes::preflight_explain(name, &profile, rest)?;
+        outln!("{}", format::start_pick_line(name, &[]));
+        return Ok(());
+    }
+    start::run_hermes(name, rest)
+}
+
+/// `tollgate hermes <cmd>`.
+fn cmd_hermes(cmd: cli::HermesCommand) -> Result<()> {
+    use cli::{HermesAuthAction, HermesCommand, HermesProviderArg};
+    use hermes::profiles::{HermesState, Provider};
+    hermes::refuse_on_windows()?;
+    let resolve = |name: &str| -> Result<String> {
+        HermesState::load()?
+            .canonical_name(name)
+            .ok_or_else(|| usage_error(format!("Hermes profile '{name}' not found")))
+    };
+    match cmd {
+        HermesCommand::New {
+            name,
+            provider,
+            model,
+            pool,
+            env_key,
+            stdin,
+            no_key,
+        } => {
+            let provider = match provider {
+                HermesProviderArg::Nous => Provider::Nous,
+                HermesProviderArg::Openrouter => Provider::Openrouter,
+                HermesProviderArg::OllamaCloud => Provider::OllamaCloud,
+            };
+            let opts = hermes::NewOpts {
+                name,
+                provider,
+                model,
+                pool,
+                env_key,
+                no_key,
+            };
+            hermes::new_profile(&opts, &mut |p| hermes::read_key_interactive(stdin, p))
+        }
+        HermesCommand::Key { name, stdin } => {
+            let name = resolve(&name)?;
+            hermes::set_key(&name, &mut |p| hermes::read_key_interactive(stdin, p))
+        }
+        HermesCommand::Auth { name, action } => {
+            let name = resolve(&name)?;
+            let action = match action {
+                HermesAuthAction::Add {
+                    provider,
+                    auth_type,
+                    label,
+                    no_browser,
+                    timeout,
+                } => hermes::AuthAction::Add {
+                    provider,
+                    auth_type,
+                    label,
+                    no_browser,
+                    timeout,
+                },
+                HermesAuthAction::Remove { provider, target } => {
+                    hermes::AuthAction::Remove { provider, target }
+                }
+                HermesAuthAction::Reset { provider } => hermes::AuthAction::Reset { provider },
+            };
+            let code = hermes::run_auth(&name, &action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        HermesCommand::List { json } => hermes::list(json),
+        HermesCommand::Show { name, json, check } => {
+            let name = resolve(&name)?;
+            let code = hermes::show::show(&name, json, check)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        HermesCommand::Pool { name, action } => {
+            let name = resolve(&name)?;
+            let cli::HermesPoolAction::Strategy { strategy } = action;
+            let code = hermes::show::pool_strategy(&name, strategy.as_str())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        HermesCommand::Delete { name, yes, force } => {
+            let name = resolve(&name)?;
+            cmd_delete_hermes(&name, yes, force)
+        }
+    }
+}
+
+/// The Hermes delete: the shared confirm gate without locks, then the body.
+fn cmd_delete_hermes(canonical: &str, yes: bool, force: bool) -> Result<()> {
+    if !confirm_profile_delete(canonical, yes)? {
+        return Ok(());
+    }
+    let was_live = hermes::delete_profile(canonical, force)?;
+    outln!("tollgate: removed Hermes profile '{canonical}'.");
+    if was_live {
+        outln!("tollgate: the running Hermes keeps its open files; its home is gone");
+    }
+    Ok(())
+}
+
 /// `tollgate delete <name> [--yes] [--force]` — remove a profile and all its
 /// credentials (the whole on-disk profile dir + state + caches), OAuth or
 /// API-key. Prompts `[y/N]` on a TTY unless `--yes`. Delete is an irreversible
@@ -1772,6 +1949,11 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
         outln!(
             "tollgate: note — '{canonical}' also names a codex profile; deleting the CLAUDE one"
+        );
+    }
+    if hermes::profiles::HermesState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!(
+            "tollgate: note — '{canonical}' also names a Hermes profile; deleting the CLAUDE one"
         );
     }
     if !confirm_profile_delete(&canonical, yes)? {
@@ -1818,6 +2000,10 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
 /// since the operator's own codex is logged out from that moment.
 fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> Result<()> {
     let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
+        // Not codex either — a Hermes profile deletes through its own roster.
+        if let Some(canonical) = hermes::profiles::HermesState::load()?.canonical_name(name) {
+            return cmd_delete_hermes(&canonical, yes, force);
+        }
         return Err(unknown_profile_error(config, name));
     };
     if !confirm_profile_delete(&canonical, yes)? {
@@ -1925,6 +2111,9 @@ fn cmd_switch(name: &str) -> Result<()> {
             }
             return Ok(());
         }
+        if let Some(canonical) = hermes::profiles::HermesState::load()?.canonical_name(name) {
+            return Err(hermes_switch_error(&canonical));
+        }
         return Err(unknown_profile_error(&config, name));
     };
     let canonical = ProfileName::from(canonical);
@@ -1934,6 +2123,11 @@ fn cmd_switch(name: &str) -> Result<()> {
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
         outln!(
             "tollgate: note — '{canonical}' also names a codex profile; switching the CLAUDE one"
+        );
+    }
+    if hermes::profiles::HermesState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!(
+            "tollgate: note — '{canonical}' also names a Hermes profile; switching the CLAUDE one"
         );
     }
     refuse_if_disabled(&config, &canonical)?;

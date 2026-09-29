@@ -488,6 +488,7 @@ pub(crate) fn failure_hint(obs: &AccountObservation) -> Option<String> {
             Origin::CodexProfile => format!("run `tollgate login {} --codex`", obs.label),
             Origin::Monitor => "replace the monitoring key".to_string(),
             Origin::Upstream => "log in again with clauth".to_string(),
+            Origin::HermesProfile => format!("run `tollgate hermes show {} --check`", obs.label),
         },
         FailureKind::RateLimited => "backing off, retries on its own".to_string(),
         FailureKind::QuotaExhausted => "wait for the reset or top up".to_string(),
@@ -525,6 +526,7 @@ pub(crate) fn header_line(obs: &AccountObservation, ctx: &CardCtx) -> CardLine {
     match obs.origin {
         Origin::Upstream => line.push(Seg::new(" (clauth)", Ink::Faint)),
         Origin::Monitor => line.push(Seg::new(" (monitor)", Ink::Faint)),
+        Origin::HermesProfile => line.push(Seg::new(" (hermes)", Ink::Faint)),
         Origin::Profile | Origin::CodexProfile => {}
     }
     if obs.best_effort {
@@ -588,6 +590,9 @@ pub(crate) fn account_body(obs: &AccountObservation, ctx: &CardCtx) -> Vec<CardL
         rows.extend(window_card(w, ctx));
     }
     rows.extend(money_cards(obs, ctx));
+    if let Some(e) = &obs.estimate {
+        rows.push(estimate_line(e));
+    }
     if let Some(n) = obs.banked_resets.filter(|n| *n > 0) {
         let unit = if n == 1 { "reset" } else { "resets" };
         rows.push(indented(vec![Seg::new(
@@ -597,12 +602,33 @@ pub(crate) fn account_body(obs: &AccountObservation, ctx: &CardCtx) -> Vec<CardL
     }
     if obs.windows.is_empty()
         && obs.money.is_empty()
+        && obs.estimate.is_none()
         && obs.failure.is_none()
         && obs.freshness != Freshness::NotFetched
     {
         rows.push(indented(vec![Seg::new("no figures published", Ink::Faint)]));
     }
     rows
+}
+
+/// A local estimate (a Hermes home's month off its own `state.db`):
+/// `estimate $4.12 this month · <basis>`. An estimate, never a meter: it is
+/// what the account's own ledger adds up to, not a provider's figure.
+fn estimate_line(e: &super::observation::LocalEstimate) -> CardLine {
+    let period = match e.period.as_ref().map(|p| p.kind) {
+        Some(PeriodKind::Daily) => " today",
+        Some(PeriodKind::Weekly) => " this week",
+        Some(PeriodKind::Monthly) => " this month",
+        _ => "",
+    };
+    indented(vec![
+        Seg::new("estimate ", Ink::Dim),
+        Seg::bold(
+            format!("{}{period}", format_money(&e.amount, &e.currency)),
+            Ink::Text,
+        ),
+        Seg::new(format!(" · {}", e.basis), Ink::Faint),
+    ])
 }
 
 /// `── Anthropic ───────…` across the width.

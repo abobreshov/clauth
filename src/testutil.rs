@@ -1324,6 +1324,22 @@ pub(crate) fn api_key_profile(name: &str, base_url: &str, key: &str) -> crate::p
     )
 }
 
+/// Write `~/.tollgate/hermes-profiles.toml` naming `names` (openrouter,
+/// account mode, env auth), and nothing else: no Hermes home, no key. Call
+/// under a [`HomeSandbox`].
+pub(crate) fn write_hermes_roster(names: &[&str]) {
+    let path = crate::hermes::profiles::hermes_state_path().expect("hermes roster path");
+    std::fs::create_dir_all(path.parent().expect("tollgate dir")).expect("tollgate dir");
+    let mut toml = String::from("schema_version = 1\n");
+    for n in names {
+        toml.push_str(&format!(
+            "[[profiles]]\nname = \"{n}\"\nprovider = \"openrouter\"\nmode = \"account\"\n\
+             auth = \"env\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n"
+        ));
+    }
+    std::fs::write(path, toml).expect("hermes roster");
+}
+
 /// Put `profile` on disk (its `config.toml`) and into the roster — the
 /// `ApiKeyProfile::write` fixture of the hot-swap spec. Call under a
 /// [`HomeSandbox`].
@@ -1471,7 +1487,10 @@ pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
     // Mirror of `enforce_tollgate_perms`: a codex home's contents are codex's
     // own (exec-bit helper binaries included), so the invariant covers the
     // home NODE and stops at its threshold.
-    if is_dir && crate::runtime::is_codex_home_path(root) {
+    if is_dir
+        && (crate::runtime::is_codex_home_path(root)
+            || crate::hermes::home::is_perms_threshold(root))
+    {
         return out;
     }
     if is_dir && let Ok(entries) = std::fs::read_dir(root) {

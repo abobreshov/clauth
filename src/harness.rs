@@ -2,7 +2,9 @@
 //!
 //! A profile's harness is implied by WHICH STATE FILE it lives in — claude
 //! profiles in `profiles.toml` ([`crate::profile::AppState`]), codex profiles
-//! in `codex-profiles.toml` ([`crate::codex_profiles::CodexState`]) — never by
+//! in `codex-profiles.toml` ([`crate::codex_profiles::CodexState`]), Hermes
+//! profiles in `hermes-profiles.toml`
+//! ([`crate::hermes::profiles::HermesState`]) — never by
 //! a field inside `AppState`, a dir-name suffix, or a load-order handshake.
 //! File membership is what an old binary cannot misread: it never opens the
 //! codex file, so it cannot drop or corrupt codex state, and `profiles.toml`
@@ -24,15 +26,23 @@ pub(crate) enum Harness {
     Claude,
     /// OpenAI codex — `codex-profiles.toml`, `auth.json`, `CODEX_HOME`.
     Codex,
+    /// Hermes Agent — `hermes-profiles.toml`, a whole home per profile,
+    /// `HERMES_HOME` plus a redirected child `HOME` (see [`crate::hermes`]).
+    Hermes,
 }
 
 impl Harness {
+    /// Every harness, in the order the bare-name verbs resolve a name
+    /// (claude, then codex, then hermes).
+    pub(crate) const ALL: [Harness; 3] = [Harness::Claude, Harness::Codex, Harness::Hermes];
+
     /// The user-facing spelling, for refusals that must name which harness
     /// holds a name.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
+            Harness::Hermes => "hermes",
         }
     }
 
@@ -42,6 +52,7 @@ impl Harness {
         match self {
             Harness::Claude => &ClaudeEngine,
             Harness::Codex => &CodexEngine,
+            Harness::Hermes => &HermesEngine,
         }
     }
 }
@@ -182,6 +193,53 @@ impl HarnessEngine for CodexEngine {
         // The CLAUDE_CONFIG_DIR half matters here: `tollgate which` in the codex
         // session would answer as the ancestor claude session (the runtime
         // claim deliberately outranks the codex arm).
+        crate::runtime::scrub_tollgate_homes(command);
+        crate::providers::billing_key::scrub_billing_env(command);
+    }
+}
+
+/// Hermes Agent behind the seams. Like codex, the install half REFUSES: a
+/// Hermes profile is a whole home bound at launch through `HERMES_HOME`, with
+/// no live slot to install into. The spawn half is the resolved entrypoint
+/// (spec §4.5: re-resolved at every launch, never the Omarchy shim) and the
+/// static §4.3 `SCRUB`. The launch adds the dynamic half of the scrub (the
+/// provider-plugin scan) and the `HOME` redirect itself, in
+/// `start::hermes_spawn_command`.
+pub(crate) struct HermesEngine;
+
+impl HarnessEngine for HermesEngine {
+    fn install_credentials(&self, name: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Hermes profile '{name}' installs nothing at switch: Hermes switches by relaunch \
+             ('tollgate start {name}')"
+        )
+    }
+
+    fn force_install_credentials(&self, name: &str) -> anyhow::Result<()> {
+        self.install_credentials(name)
+    }
+
+    /// The resolved entrypoint. A failed resolution yields a command that
+    /// cannot spawn rather than a bare `hermes` PATH lookup, which on an
+    /// Omarchy machine is the self-installing shim.
+    fn command(&self) -> std::process::Command {
+        match crate::hermes::resolve::resolve_entrypoint(
+            &crate::hermes::resolve::ResolveEnv::from_process(None),
+        ) {
+            Ok(install) => std::process::Command::new(install.entry),
+            Err(_) => std::process::Command::new(crate::hermes::resolve::UNRESOLVED_ENTRYPOINT),
+        }
+    }
+
+    fn home_env_key(&self) -> &'static str {
+        "HERMES_HOME"
+    }
+
+    fn scrub_env(&self, command: &mut std::process::Command, active_env_keys: &[String]) {
+        crate::hermes::guards::scrub_static(command);
+        for key in active_env_keys {
+            command.env_remove(key);
+        }
         crate::runtime::scrub_tollgate_homes(command);
         crate::providers::billing_key::scrub_billing_env(command);
     }

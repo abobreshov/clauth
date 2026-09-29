@@ -73,6 +73,7 @@ fn build_status_top_level_shape_and_active() {
             "codex_wrap_off",
             "gateway",
             "generated_at",
+            "hermes_profiles",
             "pending_switch",
             "profiles",
             "refresh_interval_ms",
@@ -1821,6 +1822,7 @@ fn status_body_matches_legacy_json_bytes() {
                 third_party: None,
             },
         ],
+        hermes_profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
@@ -1845,7 +1847,8 @@ fn status_body_matches_legacy_json_bytes() {
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
-        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}]}"#,
+        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}],"#,
+        r#""hermes_profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -1862,12 +1865,13 @@ fn status_body_matches_legacy_json_bytes() {
         tollgate_version: "9.9.9".to_string(),
         gateway: None,
         profiles: vec![],
+        hermes_profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""tollgate_version":"9.9.9","gateway":null,"profiles":[]}"#,
+        r#""tollgate_version":"9.9.9","gateway":null,"profiles":[],"hermes_profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2772,4 +2776,53 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         false,
         "a hybrid's OAuth Cached reading outranks its third-party stuck reading"
     );
+}
+
+/// Test 51, the status half: `hermes_profiles[]` carries `{name, provider,
+/// model, mode, live}` per Hermes roster profile, never in `profiles[]` and
+/// with no active slot; the schema documents it; the local API's redacted
+/// `/v1/status` keeps the names.
+#[test]
+fn status_json_lists_hermes_profiles() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::create_dir_all(dir.join("profiles/herm/hermes-home")).unwrap();
+    std::fs::write(
+        dir.join("hermes-profiles.toml"),
+        "schema_version = 1\n[[profiles]]\nname = \"herm\"\nprovider = \"openrouter\"\n\
+         model = \"anthropic/claude-sonnet-4.5\"\nmode = \"account\"\nauth = \"env\"\n\
+         key_env = \"OPENROUTER_API_KEY\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n",
+    )
+    .unwrap();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        v["hermes_profiles"],
+        serde_json::json!([{
+            "name": "herm",
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.5",
+            "mode": "account",
+            "live": false,
+        }])
+    );
+    assert_eq!(
+        v["profiles"],
+        serde_json::json!([]),
+        "never a profiles[] entry"
+    );
+    assert!(v.get("active_hermes_profile").is_none());
+
+    let schema = serde_json::to_value(StatusBody::schema()).unwrap();
+    assert!(
+        schema.to_string().contains("hermes_profiles"),
+        "the OpenAPI schema documents the field"
+    );
+    let mut redacted = v;
+    crate::local_api::routes::redact_status(&mut redacted);
+    assert_eq!(redacted["hermes_profiles"][0]["name"], "herm");
+    assert_eq!(redacted["hermes_profiles"][0]["provider"], "openrouter");
 }

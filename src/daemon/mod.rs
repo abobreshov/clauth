@@ -65,7 +65,8 @@ use status_json::LiveSignals;
 // `tollgate list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
 pub(crate) use status_json::{
-    ProfileEntry, build_codex_entries, build_profile_entries, build_status,
+    HermesProfileEntry, ProfileEntry, build_codex_entries, build_hermes_entries,
+    build_profile_entries, build_status,
 };
 // The local agent API documents `/v1/status` with the feed's own schema.
 pub(crate) use status_json::StatusBody;

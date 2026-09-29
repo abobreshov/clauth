@@ -364,9 +364,30 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
             .is_some_and(crate::profile::is_own_profile_dir)
 }
 
+/// Whether `path` is a Hermes home by POSITION as well as name:
+/// `~/.tollgate/profiles/<name>/hermes-home` (hermes spec §3). The twin of
+/// [`is_codex_home_path`]: `which`'s Hermes arm, the herdr `--hermes-home`
+/// join and the scrub below all ask this one predicate.
+pub(crate) fn is_hermes_home_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n == crate::hermes::home::HERMES_HOME_DIR)
+        && path
+            .parent()
+            .is_some_and(crate::profile::is_own_profile_dir)
+}
+
+/// The profile a tollgate Hermes home belongs to, by position alone (the
+/// caller checks the roster).
+pub(crate) fn hermes_home_profile(path: &Path) -> Option<String> {
+    if !is_hermes_home_path(path) {
+        return None;
+    }
+    Some(path.parent()?.file_name()?.to_str()?.to_string())
+}
+
 /// Drop from `command` each session home it would inherit that names a tree
 /// tollgate built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
-/// codex home. A process spawned from inside a tollgate session otherwise
+/// codex home, `HERMES_HOME` onto a Hermes home. A process spawned from inside a tollgate session otherwise
 /// answers as that session (`tollgate which`, a `codex` run landing in another
 /// profile's home) and keeps pointing at its tree after teardown. The user's
 /// own custom dirs are theirs and stay.
@@ -383,6 +404,9 @@ pub(crate) fn scrub_tollgate_homes(command: &mut std::process::Command) {
     // child (and a nested start from its Bash tool) never inherits it.
     for key in crate::relaunch::RELAUNCH_ENV_KEYS {
         command.env_remove(key);
+    }
+    if std::env::var_os("HERMES_HOME").is_some_and(|v| is_hermes_home_path(Path::new(&v))) {
+        command.env_remove("HERMES_HOME");
     }
 }
 
@@ -2177,6 +2201,7 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
         return Vec::new();
     };
     let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let hermes = crate::hermes::profiles::HermesState::load().unwrap_or_default();
     let claude_roster: Vec<String> = crate::profile::claude_roster_names()
         .unwrap_or_default()
         .into_iter()
@@ -2188,8 +2213,11 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
         let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
-        // Claude-first for a dual-claimed name, like every other site.
-        if codex.holds(profile_name) && !claude_roster.iter().any(|p| p == profile_name) {
+        // Claude-first for a dual-claimed name, like every other site. A
+        // Hermes home holds Hermes' own tree, never a Claude Code store.
+        if (codex.holds(profile_name) || hermes.holds(profile_name))
+            && !claude_roster.iter().any(|p| p == profile_name)
+        {
             continue;
         }
         let profile_path = profile.path();
@@ -8114,6 +8142,115 @@ impl Drop for CodexRuntime {
             Ok::<_, anyhow::Error>(())
         }) {
             logline!("tollgate: codex session teardown failed: {e:#}");
+        }
+    }
+}
+
+/// A claimed Hermes liveness marker: `profiles/<name>/sessions-<sid>/<sid>`,
+/// flock-held for the guard's lifetime, with an optional live-session row
+/// (`harness = hermes`, `launch_store: None`). `tollgate start` registers the
+/// row. `hermes auth` and the pool strategy writer claim the marker alone:
+/// they hold the home as busy without being a session (spec §4.4 step 3,
+/// §4.8).
+///
+/// The marker sits where [`session_row_is_live`] probes a shared real-mode
+/// row (`sessions-<sid>/<sid>`), so GC keeps a live Hermes row and collects a
+/// dead one exactly as it does a claude row. [`has_live_session`] sees it
+/// through the `sessions*` scan, which is what G14 and every destructive
+/// guard read.
+pub(crate) struct HermesMarker {
+    session: SessionId,
+    sessions: PathBuf,
+    pid_file: PathBuf,
+    registered: bool,
+    _pid_lock: File,
+}
+
+impl HermesMarker {
+    /// Claim under the caller's RotationGuard (the witness): inside the state
+    /// lock, re-check [`has_live_session`] (refusing with `on_live`), mint the
+    /// sid, create `sessions-<sid>/`, flock the marker, and register the row
+    /// when asked. The row never exists without its held marker.
+    pub(crate) fn claim(
+        name: &str,
+        register_row: bool,
+        _rotation: &RotationGuard,
+        on_live: impl FnOnce() -> anyhow::Error,
+    ) -> Result<Self> {
+        let owned = ProfileName::from(name);
+        with_state_lock(|_held| {
+            if has_live_session(&owned) {
+                return Err(on_live());
+            }
+            let mut session = SessionId::mint();
+            let sessions_for = |sid: &SessionId| -> Result<PathBuf> {
+                profile_subpath(&owned, &format!("{SESSIONS_STEM}-{}", sid.as_str()))
+            };
+            for _ in 0..SID_COLLISION_REMINTS {
+                if !is_session_alive(&sessions_for(&session)?.join(session.as_str())) {
+                    break;
+                }
+                session = SessionId::mint();
+            }
+            let sessions = sessions_for(&session)?;
+            crate::profile::mkdir_700(&sessions)
+                .with_context(|| format!("failed to create {}", sessions.display()))?;
+            let pid_file = sessions.join(session.as_str());
+            let file = open_pid_file(&pid_file)
+                .with_context(|| format!("failed to open {}", pid_file.display()))?;
+            if let Err(e) = file.try_lock() {
+                anyhow::bail!(
+                    "failed to claim session marker {}: {e}. Another live process holds this \
+                     session id",
+                    pid_file.display()
+                );
+            }
+            if register_row {
+                let row = crate::live_sessions::LiveSession::starting(
+                    &session,
+                    name,
+                    crate::harness::Harness::Hermes,
+                    false,
+                    false,
+                    None,
+                );
+                if let Err(e) = crate::live_sessions::register(&row) {
+                    logline!("tollgate: registering the live Hermes session failed: {e}");
+                }
+            }
+            Ok(Self {
+                session,
+                sessions,
+                pid_file,
+                registered: register_row,
+                _pid_lock: file,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
+        self.session.as_str()
+    }
+}
+
+impl Drop for HermesMarker {
+    fn drop(&mut self) {
+        if let Err(e) = with_state_lock(|_held| {
+            if self.registered
+                && let Err(e) = crate::live_sessions::unregister(self.session.as_str())
+            {
+                logline!("tollgate: unregistering the live Hermes session failed: {e}");
+            }
+            if let Err(e) = std::fs::remove_file(&self.pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                logline!("tollgate: remove pid file failed: {e}");
+            }
+            let _ = std::fs::remove_dir(&self.sessions);
+            Ok::<_, anyhow::Error>(())
+        }) {
+            logline!("tollgate: Hermes session teardown failed: {e:#}");
         }
     }
 }

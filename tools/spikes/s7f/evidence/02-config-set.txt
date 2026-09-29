@@ -1,0 +1,7 @@
+$ /home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/python <run>/auditwrap.py <run>/out/audit-config-set.tsv /home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/hermes config set auxiliary.curator.provider custom
+# HOME=<run>/home/.tollgate/profiles/s7f/child-home
+# rc=0 elapsed=0.2s
+--- stdout
+✓ Set auxiliary.curator.provider = custom in <run>/home/.tollgate/profiles/s7f/hermes-home/config.yaml
+
+--- stderr

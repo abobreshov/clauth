@@ -1085,3 +1085,89 @@ fn list_table_reads_no_claude_cancellation_off_a_codex_rows_cache() {
         ])
     );
 }
+
+/// Write a Hermes roster (`(name, provider, mode)`) with bare homes, and a
+/// this-month usage cache of `usd` for each profile that names one.
+pub(crate) fn hermes_fixture(profiles: &[(&str, &str, &str, Option<&str>)]) {
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut toml = String::from("schema_version = 1\n");
+    for (name, provider, mode, usd) in profiles {
+        let auth = if *mode == "pool" { "pool" } else { "env" };
+        toml.push_str(&format!(
+            "[[profiles]]\nname = \"{name}\"\nprovider = \"{provider}\"\nmode = \"{mode}\"\n\
+             auth = \"{auth}\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n"
+        ));
+        let profile = dir.join("profiles").join(name);
+        std::fs::create_dir_all(profile.join("hermes-home")).unwrap();
+        if let Some(usd) = usd {
+            let now = crate::usage::now_epoch_secs();
+            let cache = crate::usage::hermes_local::HermesUsageCache {
+                schema_version: 1,
+                read_at_ms: crate::usage::now_ms(),
+                db_schema_version: Some(22),
+                period_start: crate::usage::hermes_local::rfc3339_z(
+                    crate::usage::hermes_local::month_start_secs(now),
+                ),
+                rows: vec![crate::usage::hermes_local::UsageRow {
+                    billing_provider: (*provider).into(),
+                    model: "m".into(),
+                    api_calls: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    cost_usd: crate::usage::observation::Amount::parse(usd).unwrap(),
+                }],
+                anthropic_since_ms: None,
+                nous_reset_at: None,
+                error: None,
+                hermes_version: None,
+            };
+            std::fs::write(
+                profile.join(crate::usage::hermes_local::CACHE_FILE),
+                serde_json::to_vec(&cache).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(dir.join("hermes-profiles.toml"), toml).unwrap();
+}
+
+/// Test 51, the list half: the Hermes roster renders as its own section under
+/// the claude and codex ones, with the month-to-date estimate off the usage
+/// cache, and alone it is not "no accounts yet".
+#[test]
+fn list_prints_hermes_section() {
+    let _home = crate::testutil::HomeSandbox::new();
+    hermes_fixture(&[
+        ("herm", "nous", "pool", None),
+        ("or-main", "openrouter", "account", Some("1.25")),
+    ]);
+    let config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    assert_eq!(
+        render_table(&config, &[]),
+        table_of(&[
+            "  HERMES   PROVIDER    MODE     THIS MONTH",
+            "  herm     nous        pool     -",
+            "  or-main  openrouter  account  $1.25",
+        ])
+    );
+
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    config.state.profiles = vec!["work".into()];
+    let entries = build_profile_entries(&config, 300_000, None, false);
+    let out = render_table(&config, &entries);
+    assert!(
+        out.contains("\n\n  HERMES   PROVIDER"),
+        "a blank line separates the sections: {out}"
+    );
+}

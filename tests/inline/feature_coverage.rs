@@ -231,6 +231,28 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "a_quarantined_codex_row_renders_the_broken_marker",
         ],
     ),
+    (
+        // the Hermes harness: the home and its child HOME, the launch
+        // guards and the projector, the verbs, the local usage ledger, the
+        // surfaces (show, list, status, TUI, herdr, completions, MCP).
+        "Hermes profiles",
+        &[
+            "new_creates_home_env_0600",
+            "the_child_home_has_no_claude",
+            "anthropic_refused_on_every_config_route",
+            "start_registers_hermes_row_and_marker",
+            "hermes_local_parses_sqlite_json_streams",
+            "collect_emits_hermes_origin_ids",
+            "pool_view_holds_no_secret_fields",
+            "strategy_writer_runs_hermes_config_set",
+            "show_check_reports_each_guard",
+            "tui_filter_cycles_four_states",
+            "herdr_tag_uses_hermes_origin",
+            "status_json_lists_hermes_profiles",
+            "completions_offer_hermes_names",
+            "a_hermes_name_is_refused_with_the_relaunch_hint",
+        ],
+    ),
 ];
 
 #[test]

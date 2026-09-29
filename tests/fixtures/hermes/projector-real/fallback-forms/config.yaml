@@ -1,0 +1,26 @@
+# Every fallback shape Hermes reads (`fallback_providers` as strings and
+# dicts, `fallback_model` as one dict), plus a delegation route whose base
+# URL is Anthropic's host: the projector keeps the host, never the path.
+model:
+  provider: openrouter
+  default: openai/gpt-5
+fallback_providers:
+  - nous
+  - provider: ollama-cloud
+    model: gpt-oss:120b
+  - provider: claude-code
+fallback_model:
+  provider: nous
+  model: hermes-4
+delegation:
+  provider: custom
+  base_url: https://api.anthropic.com/v1?key=never-printed
+providers:
+  local:
+    name: Local LLM
+    base_url: http://127.0.0.1:8080/v1/chat
+    api_key: sk-never-printed
+custom_providers:
+  - name: corp
+    base_url: https://llm.corp.example/v1
+    api_key: sk-never-printed-either

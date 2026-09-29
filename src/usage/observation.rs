@@ -390,7 +390,8 @@ pub(crate) struct AccountObservation {
     /// `codex:<profile>` (a `codex-profiles.toml` profile),
     /// `monitor:<id>` (a monitoring-only account with no profile — an
     /// unbound management key, an Ollama monitor key),
-    /// `upstream:<profile>` (an account upstream clauth owns, read-only).
+    /// `upstream:<profile>` (an account upstream clauth owns, read-only),
+    /// `hermes:<profile>` (a `hermes-profiles.toml` Hermes home).
     /// Build it with [`account_id`].
     pub(crate) id: String,
     /// Which integration produced the figures.
@@ -612,6 +613,9 @@ pub(crate) enum Origin {
     Monitor,
     /// Upstream clauth's state, read-only (`upstream:`).
     Upstream,
+    /// `~/.tollgate/hermes-profiles.toml`, a Hermes home tollgate launches
+    /// (`hermes:`). Read-only here: Hermes owns its own credentials.
+    HermesProfile,
 }
 
 impl Origin {
@@ -622,6 +626,7 @@ impl Origin {
             Self::CodexProfile => "codex",
             Self::Monitor => "monitor",
             Self::Upstream => "upstream",
+            Self::HermesProfile => "hermes",
         }
     }
 }

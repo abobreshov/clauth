@@ -13504,7 +13504,7 @@ fn c_on_the_tokens_tab_flips_count_cache() {
     );
 }
 
-/// On the Overview `c` cycles the filter both → claude → codex → both and
+/// On the Overview `c` cycles the filter all → claude → codex → hermes → all and
 /// leaves the Tokens flag alone; on a tab with no `c` binding it is a no-op.
 #[test]
 fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
@@ -13517,7 +13517,7 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
     let count_cache = app.config().state.count_cache;
 
     let mut seen = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
         seen.push(app.harness_filter);
     }
@@ -13526,6 +13526,7 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
         [
             HarnessFilter::Claude,
             HarnessFilter::Codex,
+            HarnessFilter::Hermes,
             HarnessFilter::All
         ]
     );
@@ -15187,5 +15188,87 @@ fn m_moves_a_live_session_through_the_request_core() {
             .starts_with("session 4242-0: no live session '4242-0'"),
         "{}",
         toast.body
+    );
+}
+
+// ── the Hermes view (hermes spec §2.2) ───────────────────────────────────────
+
+/// A two-profile Hermes roster with bare homes, written directly.
+fn write_hermes_roster_for_tui(names: &[&str]) {
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut toml = String::from("schema_version = 1\n");
+    for n in names {
+        toml.push_str(&format!(
+            "[[profiles]]\nname = \"{n}\"\nprovider = \"openrouter\"\nmode = \"account\"\n\
+             auth = \"env\"\ncreated_at = \"2026-09-29T00:00:00Z\"\n"
+        ));
+        std::fs::create_dir_all(dir.join("profiles").join(n).join("hermes-home")).unwrap();
+    }
+    std::fs::write(dir.join("hermes-profiles.toml"), toml).unwrap();
+}
+
+/// Test 50: `c` cycles the four filters, and in the Hermes view ↑↓ step the
+/// Hermes rows while Enter and `s` raise M-SWITCH for the row under the
+/// cursor, switching nothing; outside the Hermes view the keys act on the
+/// claude selection as before.
+#[test]
+fn tui_filter_cycles_four_states_and_hermes_rows_toast_relaunch() {
+    use super::{HarnessFilter, Modal, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    write_hermes_roster_for_tui(&["herm-a", "herm-b"]);
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Overview;
+    assert_eq!(
+        app.hermes_rows
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["herm-a", "herm-b"]
+    );
+    assert!(
+        app.hermes_rows
+            .iter()
+            .all(|r| !r.live && r.estimate.is_none())
+    );
+
+    for want in [
+        HarnessFilter::Claude,
+        HarnessFilter::Codex,
+        HarnessFilter::Hermes,
+    ] {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+        assert_eq!(app.harness_filter, want);
+    }
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.hermes_cursor, 1, "↓ steps the Hermes rows");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("'herm-b' is a Hermes profile; Hermes switches by relaunch: 'tollgate start herm-b'")
+    );
+    assert!(app.modals.is_empty(), "enter pushes no switch confirm");
+    assert_eq!(app.config().state.active_profile, None);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.hermes_cursor, 0, "the step wraps");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('s')));
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("'herm-a' is a Hermes profile; Hermes switches by relaunch: 'tollgate start herm-a'")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        app.harness_filter,
+        HarnessFilter::All,
+        "four states, then back"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "outside the Hermes view Enter is the claude switch again"
     );
 }

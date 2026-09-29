@@ -12,6 +12,7 @@
 - [Configuration](Configuration)
 - [Auto-switch](Auto-Switch)
 - [Codex](Codex)
+- [Hermes](Hermes)
 - [Tokens and cost](Tokens-And-Cost)
 - [Security](Security)
 

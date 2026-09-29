@@ -270,3 +270,45 @@ fn a_zero_period_spend_group_keeps_its_three_rows_distinct() {
     }
     let _ = PeriodKind::Daily;
 }
+
+/// A Hermes profile's card (hermes spec §10 `cards.rs`): the header says
+/// `(hermes)`, the body renders the month's local estimate with its basis
+/// instead of "no figures published", and its failures carry their own hint.
+#[test]
+fn a_hermes_profile_card_renders_its_estimate_and_origin() {
+    use crate::usage::observation::{
+        AccountObservation, AuthKind, LocalEstimate, Origin, Period, SourceId,
+    };
+    let mut o = AccountObservation::new(
+        "hermes:or-main".into(),
+        SourceId::Hermes,
+        AuthKind::NativeLogin,
+        Origin::HermesProfile,
+        "or-main",
+    );
+    o.plan = Some("openrouter · account home".into());
+    o.freshness = Freshness::Fresh;
+    o.estimate = Some(LocalEstimate {
+        amount: Amount::parse("4.123456").unwrap(),
+        currency: "USD".into(),
+        period: Some(Period::of(PeriodKind::Monthly)),
+        basis: "hermes state.db (billed where known, else estimated)".into(),
+    });
+    assert_eq!(
+        plain_text(&header_line(&o, &ctx(80))),
+        "or-main · Hermes · openrouter · account home (hermes)"
+    );
+    let body: Vec<String> = account_body(&o, &ctx(80))
+        .iter()
+        .map(|l| plain_text(l))
+        .collect();
+    assert_eq!(
+        body,
+        vec!["  estimate $4.12 this month · hermes state.db (billed where known, else estimated)"]
+    );
+    o.failure = Some(Failure::new(FailureKind::AuthRequired, "x"));
+    assert_eq!(
+        failure_hint(&o).unwrap(),
+        "run `tollgate hermes show or-main --check`"
+    );
+}

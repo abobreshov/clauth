@@ -48,32 +48,49 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-/// Refuse a name the OTHER harness's roster holds, naming the holder. Profile
-/// names are one namespace across both state files — `profiles/<name>/` is one
-/// dir set, and every name-keyed subsystem (the live tally, the pending-switch
-/// set, the per-profile caches) carries one key per name. The half of
-/// [`validate_profile_name`] a creation flow can take alone when it
-/// deliberately tolerates an own-roster collision (the capture-name prompt
-/// routes that case into capture-into-existing) but must still refuse to
-/// shadow the other harness, which no flow can adopt across.
+/// Refuse a name another harness's roster holds, naming the holder. Profile
+/// names are one namespace across every state file (claude, codex, Hermes) —
+/// `profiles/<name>/` is one dir set, and every name-keyed subsystem (the live
+/// tally, the pending-switch set, the per-profile caches) carries one key per
+/// name. The half of [`validate_profile_name`] a creation flow can take alone
+/// when it deliberately tolerates an own-roster collision (the capture-name
+/// prompt routes that case into capture-into-existing) but must still refuse
+/// to shadow another harness, which no flow can adopt across.
 pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
-    let foreign = match harness {
-        Harness::Claude => Harness::Codex,
-        Harness::Codex => Harness::Claude,
-    };
-    let held = match foreign {
+    if let Some(foreign) = foreign_roster_holding(name, harness)? {
+        bail!("'{name}' is a {foreign} profile — profile names span every harness, pick another");
+    }
+    Ok(())
+}
+
+/// The first harness other than `harness` whose roster holds `name`
+/// (case-insensitively), in [`Harness::ALL`] order. Plain file reads, no lock.
+pub(crate) fn foreign_roster_holding(name: &str, harness: Harness) -> Result<Option<Harness>> {
+    for foreign in Harness::ALL.into_iter().filter(|h| *h != harness) {
+        if roster_names(foreign)?
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name))
+        {
+            return Ok(Some(foreign));
+        }
+    }
+    Ok(None)
+}
+
+/// One harness's roster, as names, read from its own state file.
+fn roster_names(harness: Harness) -> Result<Vec<String>> {
+    Ok(match harness {
         Harness::Claude => crate::profile::claude_roster_names()?
             .iter()
-            .any(|n| n.eq_ignore_ascii_case(name)),
+            .map(|n| n.as_str().to_string())
+            .collect(),
         Harness::Codex => crate::codex_profiles::CodexState::load()?
             .profiles()
             .iter()
-            .any(|n| n.eq_ignore_ascii_case(name)),
-    };
-    if held {
-        bail!("'{name}' is a {foreign} profile — profile names span both harnesses, pick another");
-    }
-    Ok(())
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        Harness::Hermes => crate::hermes::profiles::HermesState::load()?.names(),
+    })
 }
 
 /// The full gate for creating or renaming a profile on `harness`: charset,
@@ -91,17 +108,7 @@ pub(crate) fn validate_profile_name(
 ) -> Result<()> {
     let trimmed = validate_name_chars(name)?;
     validate_foreign_harness_free(trimmed, harness)?;
-    let own: Vec<String> = match harness {
-        Harness::Claude => crate::profile::claude_roster_names()?
-            .iter()
-            .map(|n| n.as_str().to_string())
-            .collect(),
-        Harness::Codex => crate::codex_profiles::CodexState::load()?
-            .profiles()
-            .iter()
-            .map(|n| n.as_str().to_string())
-            .collect(),
-    };
+    let own = roster_names(harness)?;
     if own
         .iter()
         .any(|n| n.eq_ignore_ascii_case(trimmed) && Some(n.as_str()) != exclude)

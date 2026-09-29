@@ -96,6 +96,7 @@ pub(crate) type SourceHook = fn(&CollectCtx<'_>) -> Vec<AccountObservation>;
 /// order — it is the output order.
 pub(crate) static MONITOR_SOURCES: &[SourceHook] = &[
     crate::usage::monitor::monitor_observations,
+    crate::usage::hermes_local::hermes_observations,
     // append monitor hooks here
 ];
 

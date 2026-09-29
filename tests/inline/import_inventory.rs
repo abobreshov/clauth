@@ -556,3 +556,65 @@ fn install_source_in_follows_the_content_aware_rule() {
         assert_eq!(got.file_name().and_then(|n| n.to_str()), Some(want), "{p}");
     }
 }
+
+/// Import spec §6 lane 3 / Hermes spec §6.2: the M2 uniqueness check spans
+/// the Hermes roster too, through the same `validate_profile_name`. An
+/// upstream claude or codex profile whose name `hermes-profiles.toml` holds
+/// (any case) refuses naming the Hermes roster, `--rename` clears it, and an
+/// unreadable Hermes roster blocks the whole check.
+#[test]
+fn import_refuses_a_name_held_by_a_hermes_profile() {
+    let env = Env::new();
+    env.tree.roster(&["herm"], Some("herm")).oauth("herm");
+    env.tree.codex_roster(&["hx"], Some("hx")).codex("hx");
+    crate::testutil::write_hermes_roster(&["Herm", "HX"]);
+    let s = survey(&Options::default());
+    let mut msgs: Vec<_> = s
+        .blockers
+        .iter()
+        .filter(|b| b.code == "name_collision")
+        .map(|b| b.message.clone())
+        .collect();
+    msgs.sort();
+    assert_eq!(
+        msgs,
+        [
+            "a tollgate hermes profile named 'herm' already exists; pass --rename herm=<new>",
+            "a tollgate hermes profile named 'hx' already exists; pass --rename hx=<new>",
+        ],
+        "{:?}",
+        s.blockers
+    );
+
+    let opts = Options {
+        renames: [("herm", "herm-claude"), ("hx", "hx-codex")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect(),
+        adopt_live: false,
+    };
+    let s = survey(&opts);
+    assert!(
+        !s.blockers
+            .iter()
+            .any(|b| b.code == "name_collision" || b.code == "destination_exists"),
+        "{:?}",
+        s.blockers
+    );
+
+    std::fs::write(
+        crate::hermes::profiles::hermes_state_path().unwrap(),
+        "schema_version = [\n",
+    )
+    .unwrap();
+    let s = survey(&opts);
+    assert!(
+        s.blockers
+            .iter()
+            .any(|b| b.code == "tollgate_roster_unreadable"
+                && b.message
+                    .starts_with("~/.tollgate/hermes-profiles.toml cannot be read")),
+        "{:?}",
+        s.blockers
+    );
+}

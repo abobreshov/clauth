@@ -1,0 +1,13 @@
+$ ssh -F <run>/home/.tollgate/profiles/s7f/child-home/.ssh/config -v -o BatchMode=yes -o ConnectTimeout=2 s7f-git true
+# HOME=<run>/home/.tollgate/profiles/s7f/child-home
+# rc=255 elapsed=0.0s
+--- stdout
+
+--- stderr
+debug1: OpenSSH_10.5p1, OpenSSL 3.6.4 25 Aug 2026
+debug1: Reading configuration data <run>/home/.tollgate/profiles/s7f/child-home/.ssh/config
+debug1: <run>/home/.tollgate/profiles/s7f/child-home/.ssh/config line 1: Applying options for s7f-git
+debug1: no pubkey loaded from /home/abobreshov/.ssh/id_ed25519
+debug1: identity file /home/abobreshov/.ssh/id_ed25519 type -1
+debug1: no identity pubkey loaded from /home/abobreshov/.ssh/id_ed25519
+ssh: Could not resolve hostname git.example.invalid: Temporary failure in name resolution

@@ -987,6 +987,172 @@ pub(crate) fn run_codex(
     Ok(())
 }
 
+/// The spawn command for a Hermes session, split from [`run_hermes`] so the
+/// wire facts are pinned without spawning anything (the twin of
+/// [`codex_spawn_command`]): the child env of spec §4.4 step 4 (the scrub,
+/// `HERMES_HOME`, `HERMES_SHARED_AUTH_DIR`, and `HOME` = the child home),
+/// then `--provider <p>`, `-m <model>` when the roster sets one, and the user
+/// args verbatim. `--provider` and `-m` are top-level flags, and the CLI flag
+/// beats `config.yaml`, so the roster is the authority (D-H7). G5 already
+/// refused a user `--provider`, `-p` or an anthropic `-m`.
+pub(crate) fn hermes_spawn_command(
+    launch: &crate::hermes::Launch,
+    hermes_args: &[String],
+    active_env_keys: &[String],
+) -> std::process::Command {
+    let mut command = crate::hermes::child_command(
+        &launch.install.entry,
+        &launch.paths,
+        &launch.dynamic_scrub,
+        active_env_keys,
+    );
+    command
+        .arg("--provider")
+        .arg(launch.profile.provider.as_str());
+    if let Some(model) = &launch.profile.model {
+        command.arg("-m").arg(model);
+    }
+    command.args(hermes_args);
+    command
+}
+
+/// The orphan guard of spec §4.4 step 4, run in the child between `fork` and
+/// `exec`: `PR_SET_PDEATHSIG(SIGTERM)`, then `_exit(1)` unless the parent is
+/// still `supervisor`. The `getppid` check closes the window where the
+/// supervisor died between `fork` and `prctl`, which PDEATHSIG alone cannot
+/// see. Only async-signal-safe calls.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub(crate) fn install_pdeathsig(command: &mut std::process::Command, supervisor: libc::pid_t) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // prctl, getppid and _exit, all async-signal-safe; it touches no heap,
+    // lock or Rust state.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGTERM as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                libc::_exit(1);
+            }
+            if libc::getppid() != supervisor {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// `tollgate start <hermes-profile>` (spec §4.4). The lock-free preflight
+/// (G1–G6, G15, P), then the RotationGuard with the re-stat and the in-guard
+/// audit, then the marker and the live row inside the state lock. Both locks
+/// are released before the spawn, and the marker flock excludes every other
+/// tollgate writer for the session's lifetime. The spawn runs from this, the
+/// main, thread: PDEATHSIG fires when the forking THREAD exits.
+pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
+    crate::hermes::refuse_on_windows()?;
+    let profile = crate::hermes::find_profile(name)?;
+    let launch = crate::hermes::preflight(name, &profile, crate::hermes::Verb::Start(hermes_args))?;
+    for w in &launch.warnings {
+        errln!("{w}");
+    }
+    let owned = crate::profile::ProfileName::from(name);
+    let rotation =
+        crate::runtime::RotationGuard::acquire_with_timeout(&owned, crate::hermes::ROTATION_WAIT)?;
+    let notes = crate::hermes::audit_in_guard(&launch, &rotation)?;
+    let marker = crate::runtime::HermesMarker::claim(name, true, &rotation, || {
+        crate::hermes::guards::m_live_for(name, &launch.paths)
+    })?;
+    drop(rotation);
+    for n in &notes {
+        errln!("{n}");
+    }
+
+    let active_env_keys = crate::hermes::active_claude_env_keys();
+    #[allow(unused_mut)]
+    let mut command = hermes_spawn_command(&launch, hermes_args, &active_env_keys);
+    #[cfg(target_os = "linux")]
+    install_pdeathsig(&mut command, std::process::id() as libc::pid_t);
+
+    // §4.4 step 6.3's before-image: tollgate only ever stats this path.
+    let creds = crate::profile::claude_dir().map(|d| d.join(".credentials.json"));
+    let creds_before = creds
+        .as_ref()
+        .ok()
+        .and_then(|p| p.symlink_metadata().ok())
+        .map(|m| m.file_type().is_symlink());
+
+    let run_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    #[cfg(unix)]
+    let signal_watcher = SignalWatcher::new()?;
+    crate::hermes::unlocked_point("the Hermes session");
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch Hermes ({})",
+            launch.install.entry.display()
+        )
+    })?;
+    #[cfg(unix)]
+    let (outcome, _) = wait_for_child(&mut child, signal_watcher.receiver(), &mut || None)?;
+    #[cfg(not(unix))]
+    let outcome = ChildOutcome {
+        status: child
+            .wait()
+            .context("failed to wait for the session child")?,
+        signal: None,
+    };
+
+    // Teardown (§4.4 step 6): the usage cache first (best effort, `sqlite3`
+    // only, recording the version this session ran); then the anthropic
+    // billing check, the child-home audit and the credentials-link compare,
+    // which are evidence printed as warnings; then the marker goes.
+    if let Err(e) = crate::usage::hermes_local::refresh(name, Some(&launch.install.version)) {
+        logline!("tollgate: hermes '{name}': usage read at teardown failed: {e:#}");
+    }
+    if crate::hermes::post_session_anthropic_rows(
+        &launch.paths.home,
+        run_start,
+        std::env::var_os("PATH").as_deref(),
+    ) {
+        errln!("{}", crate::hermes::ANTHROPIC_SESSION_WARNING);
+        logline!("tollgate: Hermes session on '{name}' billed a call to anthropic");
+    }
+    match crate::hermes::home::audit_child_home(&launch.paths.child_home) {
+        Ok(crate::hermes::home::ChildHomeVerdict::Foreign(entry)) => errln!(
+            "tollgate: WARNING — this Hermes session left '{entry}' in {}; tollgate did not put \
+             it there",
+            launch.paths.child_home.display()
+        ),
+        Ok(_) => {}
+        Err(e) => logline!("tollgate: auditing the Hermes child home failed: {e:#}"),
+    }
+    let creds_after = creds
+        .as_ref()
+        .ok()
+        .and_then(|p| p.symlink_metadata().ok())
+        .map(|m| m.file_type().is_symlink());
+    if creds_before == Some(true) && creds_after == Some(false) {
+        errln!(
+            "tollgate: WARNING — ~/.claude/.credentials.json changed during this Hermes session \
+             (the credentials link was replaced by a regular file)"
+        );
+    }
+    drop(marker);
+
+    let code = status_code(outcome.status, outcome.signal);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/start.rs"]
 mod tests;
