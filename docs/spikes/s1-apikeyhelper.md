@@ -566,3 +566,13 @@ Not covered here: the real-endpoint half of S1(g) (owner-run) and the gateway / 
 precondition.
 
 S1 RESULT: PASS
+
+<!-- tollgate:s1-gate
+result = "PASS"                     # PASS | FAIL | PENDING
+claude_code = ["2.1.283"]           # exact versions the harness passed on
+date = "2026-09-29"
+commit = "60e4aee5"                 # the spike commit whose evidence this block summarises
+g_real_endpoints = "not_run"        # S1(g) owner-run half; gates the P4-OR preset only
+gateway_precondition = "not_run"    # forceLogin* / apps-gateway precondition
+ttl_tested_ms = [3000, 300000]      # TTLs the harness exercised (a_ttl, a_default)
+-->
