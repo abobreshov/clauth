@@ -1896,6 +1896,20 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    /// Monitoring-only and upstream-clauth accounts (`monitor:` / `upstream:`
+    /// observations from the collect hooks), listed below the profiles on the
+    /// Usage tab's rail. Re-read from caches every
+    /// [`USAGE_EXTRAS_POLL_MS`]; empty while no hook is registered.
+    pub(crate) usage_extras: Vec<crate::usage::observation::AccountObservation>,
+    /// `Some(i)` while the Usage rail's selection rests on `usage_extras[i]`
+    /// rather than on `profile_cursor`'s profile. Usage-tab only: the other
+    /// tabs keep reading `profile_cursor`, which the extras never move.
+    pub(crate) usage_extra_cursor: Option<usize>,
+    /// When the extras were last read.
+    usage_extras_polled: Option<std::time::Instant>,
+    /// The live palette reloader (plan §4.5), set by `tui::run` only — tests
+    /// and headless constructions never touch the operator's theme files.
+    palette_watch: Option<super::theme::PaletteWatch>,
     /// Which harness the Overview lists (`c` cycles). A view filter only — see
     /// [`HarnessFilter`].
     pub(crate) harness_filter: HarnessFilter,
@@ -2418,6 +2432,10 @@ impl App {
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
             profile_cursor: 0,
+            usage_extras: Vec::new(),
+            usage_extra_cursor: None,
+            usage_extras_polled: None,
+            palette_watch: None,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
             fallback_focus: FallbackFocus::Chain,
@@ -2539,6 +2557,12 @@ impl App {
     /// Set the guest-mode flag the header's `[ guest ]` pill reads.
     pub(crate) fn with_guest_mode(mut self, guest_mode: bool) -> Self {
         self.guest_mode = guest_mode;
+        self
+    }
+
+    /// Hand the live palette reloader to the tick (`tui::run`).
+    pub(crate) fn with_palette_watch(mut self, watch: super::theme::PaletteWatch) -> Self {
+        self.palette_watch = Some(watch);
         self
     }
 
@@ -3744,6 +3768,104 @@ fn switch_tab(app: &mut App, tab: Tab) {
     }
 }
 
+/// Step the Usage rail by `delta` over profiles followed by
+/// [`App::usage_extras`], wrapping. Landing on a profile moves
+/// `profile_cursor`; landing on an extra sets `usage_extra_cursor` and leaves
+/// `profile_cursor` where it was for the other tabs.
+pub(crate) fn step_usage_cursor(app: &mut App, delta: i32) {
+    let profiles = app.profile_count();
+    let len = profiles + app.usage_extras.len();
+    if len == 0 {
+        return;
+    }
+    let at = match app.usage_extra_cursor {
+        Some(i) if i < app.usage_extras.len() => profiles + i,
+        _ => app.profile_cursor.min(profiles.saturating_sub(1)),
+    };
+    let next = (at as i32 + delta).rem_euclid(len as i32) as usize;
+    if next < profiles {
+        app.profile_cursor = next;
+        app.usage_extra_cursor = None;
+    } else {
+        app.usage_extra_cursor = Some(next - profiles);
+    }
+}
+
+/// How often the TUI re-reads the monitoring / upstream observations.
+pub(crate) const USAGE_EXTRAS_POLL_MS: u64 = 2_000;
+
+/// Re-read the `monitor:` / `upstream:` observations from their caches (the
+/// collect hooks never fetch), at most every [`USAGE_EXTRAS_POLL_MS`].
+fn poll_usage_extras(app: &mut App) {
+    use crate::usage::collect::{MONITOR_SOURCES, UPSTREAM_SOURCES};
+    if MONITOR_SOURCES.is_empty() && UPSTREAM_SOURCES.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if app.usage_extras_polled.is_some_and(|t| {
+        now.duration_since(t) < std::time::Duration::from_millis(USAGE_EXTRAS_POLL_MS)
+    }) {
+        return;
+    }
+    app.usage_extras_polled = Some(now);
+    let config = (*app.config()).clone();
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let ctx = crate::usage::collect::CollectCtx {
+        config: Some(&config),
+        codex: &codex,
+        now_ms: crate::usage::now_ms(),
+        interval_ms: config.state.refresh_interval_ms,
+        guest_mode: app.guest_mode,
+        include_disabled: false,
+    };
+    let extras = usage_extras_from(&ctx, MONITOR_SOURCES, UPSTREAM_SOURCES);
+    set_usage_extras(app, extras);
+}
+
+/// The extras the Usage rail lists: every hook's observations, first id wins.
+pub(crate) fn usage_extras_from(
+    ctx: &crate::usage::collect::CollectCtx<'_>,
+    monitors: &[crate::usage::collect::SourceHook],
+    upstream: &[crate::usage::collect::SourceHook],
+) -> Vec<crate::usage::observation::AccountObservation> {
+    let mut seen = std::collections::HashSet::new();
+    monitors
+        .iter()
+        .chain(upstream)
+        .flat_map(|hook| hook(ctx))
+        .filter(|o| seen.insert(o.id.clone()))
+        .collect()
+}
+
+/// Replace the extras, keeping the selection on the same account id when it
+/// is still listed, else falling back to the profile rail.
+pub(crate) fn set_usage_extras(
+    app: &mut App,
+    extras: Vec<crate::usage::observation::AccountObservation>,
+) {
+    let selected = app
+        .usage_extra_cursor
+        .and_then(|i| app.usage_extras.get(i))
+        .map(|o| o.id.clone());
+    app.usage_extras = extras;
+    app.usage_extra_cursor =
+        selected.and_then(|id| app.usage_extras.iter().position(|o| o.id == id));
+}
+
+/// Live palette reload: a changed Omarchy theme repaints on the next frame;
+/// a malformed one keeps the last palette and toasts once.
+fn poll_palette(app: &mut App) {
+    let Some(watch) = app.palette_watch.as_mut() else {
+        return;
+    };
+    if let super::theme::PaletteChange::Malformed(why) = watch.tick() {
+        app.toast(
+            ToastKind::Warning,
+            format!("omarchy theme colours unreadable, keeping the last palette\n{why}"),
+        );
+    }
+}
+
 /// Move `profile_cursor` by `delta`, wrapping in `0..len`.
 fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     if len == 0 {
@@ -3777,12 +3899,12 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Usage tab: up/down picks the account. Read-only pane.
+/// Usage tab: up/down picks the account — the profiles, then the
+/// monitoring / upstream extras below them. Read-only pane.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
-    let count = app.profile_count();
     match key.code {
-        KeyCode::Up => step_profile_cursor(app, -1, count),
-        KeyCode::Down => step_profile_cursor(app, 1, count),
+        KeyCode::Up => step_usage_cursor(app, -1),
+        KeyCode::Down => step_usage_cursor(app, 1),
         KeyCode::Char('e') => toggle_show_estimates(app),
         KeyCode::Char('p') => toggle_show_pace(app),
         _ => {}
@@ -10873,6 +10995,8 @@ pub(crate) fn on_tick(app: &mut App) {
 
     warn_day_claim_notices(app);
     update_banner(app);
+    poll_palette(app);
+    poll_usage_extras(app);
     app.prune_toasts();
 }
 

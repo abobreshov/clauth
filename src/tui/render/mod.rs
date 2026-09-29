@@ -9,6 +9,7 @@
 //!   - shared formatters → `format.rs`; shared widgets → `panes.rs`
 
 mod banner;
+mod cards;
 mod chain;
 mod config;
 mod footer;

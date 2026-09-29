@@ -81,7 +81,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "refresh" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "usage" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--json --all --account --provider" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --plain --waybar --watch --all --account --provider" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "api" ]; then
         COMPREPLY=( $(compgen -W "serve token url" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "api" ] && [ "${COMP_WORDS[2]}" = "serve" ] && [ "${cur:0:2}" = "--" ]; then
@@ -233,7 +233,9 @@ _tollgate() {
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == refresh ]]; then
         _values 'flag' '--json[emit JSON]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == usage ]]; then
-        _values 'flag' '--json[emit the stable JSON envelope]' '--all[also include disabled profiles]' \
+        _values 'flag' '--json[emit the stable JSON envelope]' '--plain[the text report without colour]' \
+            '--waybar[one JSON line for a Waybar module]' '--watch[repeat every N seconds]' \
+            '--all[also include disabled profiles]' \
             '--account[only this account id or name]' '--provider[only this source or provider]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == api ]]; then
         _values 'subcommand' 'serve[serve the local agent API in the foreground]' \
@@ -345,6 +347,9 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a --list -
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a --yes -d "Skip the confirm prompt"
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Skip the confirm prompt"
 complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --json -d "Emit the stable JSON envelope"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --plain -d "The text report without colour"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --waybar -d "One JSON line for a Waybar module"
+complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --watch -d "Repeat every N seconds"
 complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --all -d "Also include disabled profiles"
 complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --account -d "Only this account id or name"
 complete -c tollgate -f -n "__fish_seen_subcommand_from usage" -a --provider -d "Only this source or provider"

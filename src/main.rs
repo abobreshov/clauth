@@ -303,17 +303,23 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Usage {
             json,
+            plain,
+            waybar,
+            watch,
             all,
             account,
             provider,
-        } => usage::report::run(
+        } => usage::pretty::run(&usage::pretty::UsageArgs {
             json,
-            &usage::collect::CollectOpts {
+            plain,
+            waybar,
+            watch,
+            opts: usage::collect::CollectOpts {
                 include_disabled: all,
                 account,
                 provider,
             },
-        ),
+        }),
         Command::Monitor { json, cmd } => usage::monitor::cli::dispatch(json, cmd),
         Command::Api { cmd } => match cmd {
             cli::ApiCommand::Serve { listen } => local_api::cmd_serve(listen),
