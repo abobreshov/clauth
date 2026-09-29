@@ -894,3 +894,35 @@ fn an_unreadable_lock_stands_down() {
         "an unopenable lock file stands down rather than fetching"
     );
 }
+
+/// A live upstream clauth refresher (its daemon, standby, or fetch lease)
+/// parks tollgate's lease, a lease tollgate already holds included; a lock
+/// file nobody holds, or none at all, does not.
+#[test]
+fn an_upstream_refresher_parks_the_fetch_lease() {
+    let home = HomeSandbox::new();
+    let upstream = home.home().join(".clauth");
+    std::fs::create_dir_all(&upstream).expect("mkdir");
+    assert!(
+        !upstream_refresher_active(),
+        "no lock files: nothing upstream"
+    );
+
+    let lease = FetchLease::new();
+    assert!(lease.acquire(), "free: tollgate fetches");
+
+    for name in UPSTREAM_REFRESHER_LOCKS {
+        let path = upstream.join(name);
+        let file = std::fs::File::create(&path).expect("create");
+        assert!(
+            !upstream_refresher_active(),
+            "{name} unheld: nothing upstream"
+        );
+        file.lock().expect("hold");
+        assert!(upstream_refresher_active(), "{name} held: upstream is live");
+        assert!(!lease.acquire(), "{name} held: tollgate stands down");
+        drop(file);
+        assert!(lease.acquire(), "{name} released: tollgate fetches again");
+        std::fs::remove_file(&path).expect("rm");
+    }
+}

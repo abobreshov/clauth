@@ -10842,3 +10842,74 @@ fn seed_degrade_disposition_retries_only_the_classified_transient() {
         SeedDegradeDisposition::LogAndDegrade
     );
 }
+
+// ── coexistence with upstream clauth ─────────────────────────────────────────
+
+/// A runtime copy turns upstream clauth's plugin off when the base enables it,
+/// and leaves a base that never names it byte-for-byte alone.
+#[test]
+fn runtime_settings_turn_upstreams_plugin_off() {
+    let merged = serde_json::to_string_pretty(&serde_json::json!({
+        "enabledPlugins": {"clauth@clauth": true, "tollgate@tollgate": true},
+        "env": {}
+    }))
+    .expect("json");
+    let out: serde_json::Value =
+        serde_json::from_str(&disable_upstream_plugin(merged).expect("rewrite")).expect("json");
+    assert_eq!(
+        out["enabledPlugins"]["clauth@clauth"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        out["enabledPlugins"]["tollgate@tollgate"],
+        serde_json::json!(true)
+    );
+
+    let untouched = "{\n  \"env\": {}\n}".to_string();
+    assert_eq!(
+        disable_upstream_plugin(untouched.clone()).expect("no-op"),
+        untouched
+    );
+}
+
+/// A seeded `.claude.json` drops upstream clauth's manual MCP wire along with
+/// the account identity; other servers ride along.
+#[test]
+fn the_seed_drops_upstreams_mcp_server() {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "mcpServers": {"clauth": {"command": "clauth"}, "other": {"command": "x"}},
+        "numStartups": 3
+    }))
+    .expect("json");
+    let out: serde_json::Value =
+        serde_json::from_slice(&strip_oauth_account_on_seed(bytes)).expect("json");
+    assert!(out["mcpServers"].get("clauth").is_none(), "{out}");
+    assert_eq!(
+        out["mcpServers"]["other"],
+        serde_json::json!({"command": "x"})
+    );
+    assert_eq!(out["numStartups"], serde_json::json!(3));
+}
+
+/// Only tollgate's own profiles root holds tollgate runtimes and codex homes:
+/// upstream clauth's same-shaped trees are not scrubbed or claimed.
+#[test]
+fn session_home_predicates_are_anchored_to_tollgates_root() {
+    let sandbox = HomeSandbox::new();
+    let home = sandbox.home();
+    assert!(is_tollgate_runtime_path(
+        &home.join(".tollgate/profiles/work/runtime-4242-0")
+    ));
+    assert!(is_codex_home_path(
+        &home.join(".tollgate/profiles/work/codex-home-4242-0")
+    ));
+    assert!(!is_tollgate_runtime_path(
+        &home.join(".clauth/profiles/work/runtime-4242-0")
+    ));
+    assert!(!is_codex_home_path(
+        &home.join(".clauth/profiles/work/codex-home-4242-0")
+    ));
+    assert!(!is_tollgate_runtime_path(
+        &home.join("elsewhere/profiles/work/runtime")
+    ));
+}

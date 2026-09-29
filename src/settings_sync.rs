@@ -113,6 +113,8 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// - inside `env`, key by key rather than skipping the whole object (the block
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
 ///   every key any profile declares in its own `config.toml` `[env]`.
+/// - inside `enabledPlugins`, only upstream clauth's plugin key, which every
+///   runtime copy turns off (plan §4.0 coexistence); every other plugin syncs.
 ///
 /// `custom_env` is the union across ALL profiles, not just the member's own
 /// owner, and that is REQUIRED — not merely the conservative choice.
@@ -126,16 +128,23 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// simply stays put in each member, and the next start re-derives it.
 fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
     match path {
-        KeyPath::Top("env") => KeyRule::Nested,
+        KeyPath::Top("env" | "enabledPlugins") => KeyRule::Nested,
         KeyPath::Top(key) if PER_PROFILE_TOP_FIELDS.contains(&key) => KeyRule::PerProfile,
         KeyPath::Top(_) => KeyRule::Shared,
-        KeyPath::Nested(key) => {
+        KeyPath::Nested("env", key) => {
             if MANAGED_ENV_KEYS.contains(&key) || custom_env.contains(key) {
                 KeyRule::PerProfile
             } else {
                 KeyRule::Shared
             }
         }
+        // Upstream clauth's plugin is forced off in every runtime copy
+        // (`runtime::disable_upstream_plugin`) and stays as the operator set
+        // it in the base: neither side's value may cross.
+        KeyPath::Nested("enabledPlugins", key) if key == crate::identity::UPSTREAM_CC_PLUGIN => {
+            KeyRule::PerProfile
+        }
+        KeyPath::Nested(_, _) => KeyRule::Shared,
     }
 }
 

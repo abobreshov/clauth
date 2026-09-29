@@ -3,6 +3,10 @@ set -euo pipefail
 
 REPO="abobreshov/clauth"
 BINARY="tollgate"
+# The branch holding the `tollgate` package. The fork's default branch still
+# carries upstream's `clauth` package, so an unpinned `--git` install fails.
+# Becomes `--tag tollgate-v<version>` once the fork publishes a release tag.
+CARGO_REF=(--branch feat/tollgate)
 NOCARGO=0
 
 for arg in "$@"; do
@@ -17,10 +21,9 @@ if [[ "${NOCARGO}" -eq 0 ]] && command -v cargo &>/dev/null; then
     echo "cargo detected, installing via cargo..."
     # From the fork's own repo, never crates.io: a `tollgate` crate there is
     # not this tool.
-    cargo install --locked --git "https://github.com/${REPO}" tollgate
-    echo ""
-    # Best-effort: converge plugin installPaths a dead session tree left behind.
-    tollgate self-heal || echo "note: plugin path heal skipped" >&2
+    cargo install --locked --git "https://github.com/${REPO}" "${CARGO_REF[@]}" tollgate
+    # No post-install `tollgate self-heal`: it writes Claude Code's plugin
+    # registry, which upstream clauth owns until an import (plan §4.0).
     echo ""
     echo "To uninstall, run: cargo uninstall tollgate"
     exit 0
@@ -126,8 +129,8 @@ mv "${TMP}" "${INSTALL_DIR}/${BINARY}"
 
 echo "Installed to ${INSTALL_DIR}/${BINARY}"
 
-# Best-effort: converge plugin installPaths a dead session tree left behind.
-"${INSTALL_DIR}/${BINARY}" self-heal || echo "note: plugin path heal skipped" >&2
+# No post-install `self-heal`: it writes Claude Code's plugin registry, which
+# upstream clauth owns until an import (plan §4.0).
 
 # Warn if install dir is not in PATH
 if ! printf '%s' "${PATH}" | grep -q "${INSTALL_DIR}"; then

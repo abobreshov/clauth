@@ -285,7 +285,9 @@ fn is_runtime_dir_name(name: &str) -> bool {
 }
 
 /// Whether `path` is a tollgate CLAUDE runtime tree by position as well as name
-/// — `…/profiles/<name>/runtime*`, either flavor. The claude twin of
+/// — `~/.tollgate/profiles/<name>/runtime*`, either flavor. The position is
+/// tollgate's own profiles root, never any dir named `profiles`: upstream
+/// clauth's runtimes have the same shape under `~/.clauth`. The claude twin of
 /// [`is_codex_home_path`], for the cross-harness env hygiene a codex spawn
 /// performs: an inherited `CLAUDE_CONFIG_DIR` is scrubbed only when it names
 /// a tree tollgate built, never the operator's own custom dir.
@@ -295,9 +297,7 @@ pub(crate) fn is_tollgate_runtime_path(path: &Path) -> bool {
         .is_some_and(is_runtime_dir_name)
         && path
             .parent()
-            .and_then(std::path::Path::parent)
-            .and_then(std::path::Path::file_name)
-            == Some(std::ffi::OsStr::new("profiles"))
+            .is_some_and(crate::profile::is_own_profile_dir)
 }
 
 /// Sibling of [`is_runtime_dir_name`] for marker dirs.
@@ -349,7 +349,8 @@ pub(crate) fn is_codex_home_dir_name(name: &str) -> bool {
 }
 
 /// Whether `path` is a codex session home by POSITION as well as name:
-/// `…/profiles/<name>/codex-home*`. The positional half matters — the profile
+/// `~/.tollgate/profiles/<name>/codex-home*` (tollgate's own profiles root,
+/// never upstream clauth's same-shaped `~/.clauth/profiles`). The positional half matters — the profile
 /// charset allows a profile literally named `codex-home`, and
 /// `profiles/codex-home` is a profile dir, not a home. The ONE spelling of
 /// that rule: the perms sweep asks it as a bool, `which`'s codex arm extracts
@@ -360,9 +361,7 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
         .is_some_and(is_codex_home_dir_name)
         && path
             .parent()
-            .and_then(std::path::Path::parent)
-            .and_then(std::path::Path::file_name)
-            == Some(std::ffi::OsStr::new("profiles"))
+            .is_some_and(crate::profile::is_own_profile_dir)
 }
 
 /// Drop from `command` each session home it would inherit that names a tree
@@ -4867,7 +4866,8 @@ fn write_merged_settings(
         Isolation::Shared => Some(settings_src.as_path()),
         Isolation::Isolated => None,
     };
-    let merged = build_claude_settings_json(base, profile, stale_env_keys)?;
+    let merged =
+        disable_upstream_plugin(build_claude_settings_json(base, profile, stale_env_keys)?)?;
     let settings_dst = runtime.join("settings.json");
     // This file carries the api-key profile's top-level `apiKeyHelper` command
     // string (plus the base_url/model env keys), so it must land 0o600 like
@@ -4884,6 +4884,30 @@ fn write_merged_settings(
         atomic_write_600(&settings_dst, merged).context("failed to write runtime settings.json")?;
     }
     Ok(())
+}
+
+/// Turn upstream clauth's Claude Code plugin off in a runtime `settings.json`
+/// when the base enables it. A shared runtime copies the operator's base, and
+/// upstream's plugin inside a tollgate session runs upstream's MCP server
+/// (`switch_profile`, `delegate` against `~/.clauth`) and its SessionStart
+/// hooks. Only a key the base carries is flipped, so a base without it keeps
+/// its bytes. The key is per-profile in the settings syncer
+/// (`settings_sync::key_role`), so the `false` never syncs back into the base.
+fn disable_upstream_plugin(merged: String) -> Result<String> {
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&merged).context("runtime settings.json does not parse")?;
+    let Some(entry) = settings
+        .get_mut("enabledPlugins")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|plugins| plugins.get_mut(crate::identity::UPSTREAM_CC_PLUGIN))
+    else {
+        return Ok(merged);
+    };
+    if *entry == serde_json::Value::Bool(false) {
+        return Ok(merged);
+    }
+    *entry = serde_json::Value::Bool(false);
+    serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")
 }
 
 /// True when `path`'s mode is exactly 0o600 on Unix. Always true on non-Unix
@@ -4942,16 +4966,26 @@ fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove `oauthAccount` from freshly seeded `.claude.json` bytes. A no-op
-/// (returns the bytes unchanged) when the key is already absent or the source
-/// doesn't parse as a JSON object, so the common case stays a plain byte copy.
+/// Remove `oauthAccount` from freshly seeded `.claude.json` bytes, and
+/// upstream clauth's manually wired `mcpServers.clauth` entry: its server
+/// inside a tollgate session drives `~/.clauth` (see
+/// `disable_upstream_plugin` for the `settings.json` twin). The entry is
+/// per-profile in the `.claude.json` syncer, so its absence here never syncs
+/// back into the operator's file. A no-op (returns the bytes unchanged) when
+/// neither key is present or the source doesn't parse as a JSON object, so
+/// the common case stays a plain byte copy.
 fn strip_oauth_account_on_seed(bytes: Vec<u8>) -> Vec<u8> {
     let Ok(serde_json::Value::Object(mut obj)) =
         serde_json::from_slice::<serde_json::Value>(&bytes)
     else {
         return bytes;
     };
-    if obj.remove("oauthAccount").is_none() {
+    let dropped_identity = obj.remove("oauthAccount").is_some();
+    let dropped_server = obj
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(crate::identity::UPSTREAM_NAME).is_some());
+    if !dropped_identity && !dropped_server {
         return bytes;
     }
     serde_json::to_vec_pretty(&serde_json::Value::Object(obj)).unwrap_or(bytes)

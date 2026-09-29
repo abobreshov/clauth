@@ -570,7 +570,7 @@ fn build_settings_writes_api_key_helper_not_env_token() {
         "helper ({helper}) must carry the quoted current exe path ({exe_str})"
     );
     assert!(
-        helper.contains("__api-key"),
+        helper.contains("__tollgate-api-key"),
         "helper ({helper}) must carry the hidden subcommand name"
     );
     assert!(
@@ -640,7 +640,7 @@ fn build_settings_switch_away_from_api_key_clears_helper() {
     let base = tmp.path().join("settings.json");
     fs::write(
         &base,
-        r#"{"apiKeyHelper":"/old/tollgate __api-key oldacct","env":{"ANTHROPIC_AUTH_TOKEN":"sk-old","ANTHROPIC_BASE_URL":"https://old.example.com"}}"#,
+        r#"{"apiKeyHelper":"/old/tollgate __tollgate-api-key oldacct","env":{"ANTHROPIC_AUTH_TOKEN":"sk-old","ANTHROPIC_BASE_URL":"https://old.example.com"}}"#,
     )
     .expect("seed api-key base settings");
     let profile = crate::profile::Profile::new(
@@ -692,7 +692,7 @@ fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
     let cmd =
         build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme_corp-1.0+@"));
     assert_eq!(
-        cmd, "/usr/local/bin/tollgate __api-key acme_corp-1.0+@",
+        cmd, "/usr/local/bin/tollgate __tollgate-api-key acme_corp-1.0+@",
         "validated profile names must not be over-quoted"
     );
 }
@@ -705,14 +705,17 @@ fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
 fn build_settings_api_key_helper_strips_deleted_exe_marker() {
     let exe = std::path::Path::new("/home/uwuclxdy/.cargo/bin/tollgate (deleted)");
     let cmd = build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme"));
-    assert_eq!(cmd, "/home/uwuclxdy/.cargo/bin/tollgate __api-key acme");
+    assert_eq!(
+        cmd,
+        "/home/uwuclxdy/.cargo/bin/tollgate __tollgate-api-key acme"
+    );
 }
 
 // ── profile_name_from_helper: structural parse of the helper command string ──
 //
 // `read_claude_endpoint_config` derives the live api_key by parsing the
 // `apiKeyHelper` string the runtime settings.json carries. The parser must
-// reject anything that isn't exactly `<exe> __api-key <profile>` — a
+// reject anything that isn't exactly `<exe> __tollgate-api-key <profile>` — a
 // hand-edited helper or a different command shape must NOT trigger a profile
 // lookup, or `capture_snapshot` could pull the wrong account's key.
 
@@ -720,18 +723,18 @@ fn build_settings_api_key_helper_strips_deleted_exe_marker() {
 fn profile_name_from_helper_parses_our_shape() {
     // The shape `build_api_key_helper_command` emits.
     assert_eq!(
-        profile_name_from_helper("/usr/local/bin/tollgate __api-key acme"),
+        profile_name_from_helper("/usr/local/bin/tollgate __tollgate-api-key acme"),
         Some("acme".to_string()),
     );
     // Exe path with spaces is shell-quoted; split_whitespace still yields
     // three tokens.
     assert_eq!(
-        profile_name_from_helper("'/home/uwu clxdy/bin/tollgate' __api-key acme"),
+        profile_name_from_helper("'/home/uwu clxdy/bin/tollgate' __tollgate-api-key acme"),
         Some("acme".to_string()),
     );
     // Profile name with every validated charset char round-trips.
     assert_eq!(
-        profile_name_from_helper("/x/tollgate __api-key a_b.c@d+e-f"),
+        profile_name_from_helper("/x/tollgate __tollgate-api-key a_b.c@d+e-f"),
         Some("a_b.c@d+e-f".to_string()),
     );
 }
@@ -740,11 +743,14 @@ fn profile_name_from_helper_parses_our_shape() {
 fn profile_name_from_helper_rejects_wrong_shape() {
     // Not enough tokens.
     assert_eq!(profile_name_from_helper("/x/tollgate"), None);
-    assert_eq!(profile_name_from_helper("/x/tollgate __api-key"), None);
+    assert_eq!(
+        profile_name_from_helper("/x/tollgate __tollgate-api-key"),
+        None
+    );
     assert_eq!(profile_name_from_helper(""), None);
     // Too many tokens — a future shape with flags after the name is NOT ours.
     assert_eq!(
-        profile_name_from_helper("/x/tollgate __api-key acme --flag"),
+        profile_name_from_helper("/x/tollgate __tollgate-api-key acme --flag"),
         None,
     );
     // Middle token isn't our subcommand name.
@@ -759,19 +765,46 @@ fn profile_name_from_helper_rejects_wrong_shape() {
     );
     // Profile name fails `validate_profile_name`'s charset.
     assert_eq!(
-        profile_name_from_helper("/x/tollgate __api-key bad/name"),
+        profile_name_from_helper("/x/tollgate __tollgate-api-key bad/name"),
         None,
         "a path-shaped third token must not parse as a profile name"
     );
     assert_eq!(
-        profile_name_from_helper("/x/tollgate __api-key .hidden"),
+        profile_name_from_helper("/x/tollgate __tollgate-api-key .hidden"),
         None,
         "a leading-dot profile name is rejected by validate_profile_name"
     );
     assert_eq!(
-        profile_name_from_helper("/x/tollgate __api-key 'quoted'"),
+        profile_name_from_helper("/x/tollgate __tollgate-api-key 'quoted'"),
         None,
         "a quoted profile name means it failed validate_profile_name's charset"
+    );
+}
+
+/// Upstream clauth writes `<exe> __api-key <profile>` into the same
+/// `settings.json`. Neither its token nor another exe carrying this tool's
+/// token may resolve to a tollgate profile: its `acme` is not tollgate's.
+#[test]
+fn profile_name_from_helper_rejects_upstreams_helper() {
+    assert_eq!(
+        profile_name_from_helper("/home/u/.cargo/bin/clauth __api-key acme"),
+        None,
+        "upstream's token never parses"
+    );
+    assert_eq!(
+        profile_name_from_helper("/home/u/.cargo/bin/clauth __tollgate-api-key acme"),
+        None,
+        "the token behind a foreign exe never parses"
+    );
+    assert_eq!(
+        profile_name_from_helper("__tollgate-api-key acme"),
+        None,
+        "no exe at all is not ours"
+    );
+    assert_eq!(
+        profile_name_from_helper("'C:\\Program Files\\tollgate.exe' __tollgate-api-key acme"),
+        Some("acme".to_string()),
+        "a windows exe name is ours"
     );
 }
 
@@ -4537,4 +4570,95 @@ fn claude_settings_models_reads_model_fallbacks_and_the_subagent_key() {
 
     fs::write(dir.join("settings.json"), r#"{"fallbackModel":"sonnet"}"#).unwrap();
     assert!(claude_settings_models().unwrap().is_empty());
+}
+
+// ── coexistence with upstream clauth: the live slot links into its store ──
+
+/// Point `~/.claude/.credentials.json` at a store under upstream clauth's
+/// `~/.clauth/profiles/work/`, the link upstream keeps while it owns the slot.
+#[cfg(unix)]
+fn link_slot_into_upstream(home: &std::path::Path) -> std::path::PathBuf {
+    let store = home.join(".clauth/profiles/work/credentials.json");
+    std::fs::create_dir_all(store.parent().expect("dir")).expect("mkdir");
+    std::fs::write(
+        &store,
+        serde_json::to_vec(&creds("upstream-at", Some("upstream-rt"))).expect("json"),
+    )
+    .expect("write upstream store");
+    let slot = claude_credentials_path().expect("slot");
+    std::fs::create_dir_all(slot.parent().expect("dir")).expect("mkdir");
+    std::os::unix::fs::symlink(&store, &slot).expect("link slot");
+    store
+}
+
+/// A tollgate TUI exit never turns upstream's link into a regular-file copy
+/// of upstream's refresh chain: the detach leaves a foreign link alone.
+#[cfg(unix)]
+#[test]
+fn detach_leaves_a_link_into_upstreams_store_alone() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = link_slot_into_upstream(home.home());
+    detach_credentials_link().expect("detach is a no-op");
+    let slot = claude_credentials_path().expect("slot");
+    assert_eq!(
+        std::fs::read_link(&slot).expect("still a link"),
+        store,
+        "the slot still links into upstream's store"
+    );
+}
+
+/// Every tollgate write to the slot (relink, forced relink, sign-out) refuses
+/// a link into a store tollgate does not own, and the capture refuses to read
+/// through it.
+#[cfg(unix)]
+#[test]
+fn slot_writers_refuse_a_link_into_upstreams_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = link_slot_into_upstream(home.home());
+    let mut mine = crate::profile::Profile::new("work".to_string(), None, None);
+    mine.credentials = Some(creds("tollgate-at", Some("tollgate-rt")));
+    crate::profile::save_profile(&mine).expect("save");
+    let name = crate::profile::ProfileName::from("work");
+
+    for (what, result) in [
+        ("link", link_profile_credentials(&name)),
+        ("force link", force_link_profile_credentials(&name)),
+        ("clear", clear_claude_credentials()),
+        ("capture", crate::actions::capture_snapshot().map(|_| ())),
+    ] {
+        let err = format!("{:#}", result.expect_err(what));
+        assert!(
+            err.contains("does not own"),
+            "{what} names the foreign owner: {err}"
+        );
+    }
+    let slot = claude_credentials_path().expect("slot");
+    assert_eq!(std::fs::read_link(&slot).expect("still a link"), store);
+}
+
+/// A link into tollgate's OWN store is still tollgate's to detach.
+#[cfg(unix)]
+#[test]
+fn detach_still_detaches_a_link_into_tollgates_own_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut mine = crate::profile::Profile::new("work".to_string(), None, None);
+    mine.credentials = Some(creds("tollgate-at", Some("tollgate-rt")));
+    crate::profile::save_profile(&mine).expect("save");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("work")).expect("link");
+    let slot = claude_credentials_path().expect("slot");
+    assert!(
+        slot.symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink()
+    );
+    detach_credentials_link().expect("detach");
+    assert!(
+        !slot
+            .symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "tollgate's own link is detached into a regular file"
+    );
 }

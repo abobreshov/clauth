@@ -154,6 +154,28 @@ fn wire_mcp_server_replaces_non_object_mcpservers() {
     assert_eq!(root.get("userID").and_then(Value::as_str), Some("keep"));
 }
 
+/// A `~/.claude.json` that does not parse (Claude Code caught mid-write) or
+/// is not an object is left byte-for-byte alone: a fresh map there would
+/// replace every other server and the account identity.
+#[test]
+fn wire_mcp_server_refuses_an_unparseable_file() {
+    let _home = HomeSandbox::new();
+    let path = home_dir().expect("home").join(".claude.json");
+    for body in [&b"{\"mcpServers\": {\"clauth\": {"[..], &b"[1, 2]"[..]] {
+        fs::write(&path, body).expect("write");
+        let err = wire_mcp_server().expect_err("an unreadable file refuses");
+        assert!(
+            format!("{err:#}").contains("left it alone"),
+            "the refusal says the file was kept: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read"),
+            body,
+            "the file is untouched"
+        );
+    }
+}
+
 #[test]
 fn wire_mcp_server_creates_file_when_absent() {
     let _home = HomeSandbox::new();

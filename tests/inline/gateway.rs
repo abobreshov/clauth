@@ -3649,3 +3649,21 @@ fn the_move_refuses_a_silent_proof_from_another_address() {
     }
     assert!(!home.home().join(".tollgate").join("shunt").exists());
 }
+
+/// A store under upstream clauth's `~/.clauth` is upstream's, however it is
+/// named: the store move keeps it where it is.
+#[test]
+fn a_store_under_upstreams_data_dir_is_kept() {
+    let home = HomeSandbox::new();
+    let store = home.home().join(".clauth/shunt/codex-auth.json");
+    fs::create_dir_all(store.parent().expect("dir")).expect("mkdir");
+    fs::write(&store, "upstream-owned").expect("write");
+    let codex = CodexOwnership {
+        homes: Vec::new(),
+        logins: Vec::new(),
+    };
+    assert_eq!(
+        another_owners_login(&store, false, &codex).expect("probe"),
+        Some(KeptReason::UpstreamOwned)
+    );
+}

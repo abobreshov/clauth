@@ -153,7 +153,7 @@ fn an_api_key_target_keeps_its_routing_when_the_winner_has_none() {
         &apikey,
         &json!({
             "theme": "light",
-            "apiKeyHelper": "tollgate __api-key p2",
+            "apiKeyHelper": "tollgate __tollgate-api-key p2",
             "model": "deepseek-chat",
             "env": {
                 "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
@@ -168,7 +168,7 @@ fn an_api_key_target_keeps_its_routing_when_the_winner_has_none() {
     let after = read_json(&apikey);
     assert_eq!(
         after["apiKeyHelper"],
-        json!("tollgate __api-key p2"),
+        json!("tollgate __tollgate-api-key p2"),
         "the winner has no apiKeyHelper; the target must not lose its own"
     );
     assert_eq!(after["model"], json!("deepseek-chat"));
@@ -205,13 +205,13 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     // `claude::apply_profile_to_claude_settings` on every switch.
     write_json(
         &base,
-        &json!({"apiKeyHelper": "tollgate __api-key active", "model": "opus", "env": {}}),
+        &json!({"apiKeyHelper": "tollgate __tollgate-api-key active", "model": "opus", "env": {}}),
         t(1),
     );
     write_json(
         &p1,
         &json!({
-            "apiKeyHelper": "tollgate __api-key p1",
+            "apiKeyHelper": "tollgate __tollgate-api-key p1",
             "model": "sonnet",
             "theme": "dark",
             "env": {}
@@ -220,14 +220,14 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     );
     write_json(
         &p2,
-        &json!({"apiKeyHelper": "tollgate __api-key p2", "model": "haiku", "env": {}}),
+        &json!({"apiKeyHelper": "tollgate __tollgate-api-key p2", "model": "haiku", "env": {}}),
         t(5),
     );
 
     let expected = [
-        (&base, "tollgate __api-key active", "opus"),
-        (&p1, "tollgate __api-key p1", "sonnet"),
-        (&p2, "tollgate __api-key p2", "haiku"),
+        (&base, "tollgate __tollgate-api-key active", "opus"),
+        (&p1, "tollgate __tollgate-api-key p1", "sonnet"),
+        (&p2, "tollgate __tollgate-api-key p2", "haiku"),
     ];
     for (path, helper, model) in expected {
         let before = read_json(path);
@@ -447,13 +447,13 @@ fn every_managed_env_key_is_per_profile() {
     let custom_env = BTreeSet::new();
     for key in MANAGED_ENV_KEYS {
         assert_eq!(
-            key_role(KeyPath::Nested(key), &custom_env),
+            key_role(KeyPath::Nested("env", key), &custom_env),
             KeyRule::PerProfile,
             "{key} routes or authenticates one account and must never propagate"
         );
     }
     assert_eq!(
-        key_role(KeyPath::Nested("EDITOR"), &custom_env),
+        key_role(KeyPath::Nested("env", "EDITOR"), &custom_env),
         KeyRule::Shared
     );
 }
@@ -692,5 +692,40 @@ fn the_pause_warning_latches_and_clears_on_recovery() {
     assert!(
         !ENV_KEYS_WARNED.load(Ordering::Relaxed),
         "a clean read must clear the latch so a recurrence is reported again"
+    );
+}
+
+/// Upstream clauth's plugin key is the one per-profile entry of
+/// `enabledPlugins`: every runtime turns it off and the base keeps the
+/// operator's value; every other plugin syncs.
+#[test]
+fn only_upstreams_plugin_is_per_profile_in_enabled_plugins() {
+    let custom_env = BTreeSet::new();
+    assert_eq!(
+        key_role(KeyPath::Top("enabledPlugins"), &custom_env),
+        KeyRule::Nested
+    );
+    assert_eq!(
+        key_role(
+            KeyPath::Nested("enabledPlugins", crate::identity::UPSTREAM_CC_PLUGIN),
+            &custom_env
+        ),
+        KeyRule::PerProfile
+    );
+    assert_eq!(
+        key_role(
+            KeyPath::Nested("enabledPlugins", crate::identity::CC_PLUGIN),
+            &custom_env
+        ),
+        KeyRule::Shared
+    );
+    // The parent is part of the rule: an env var named like the plugin key is
+    // judged as an env var.
+    assert_eq!(
+        key_role(
+            KeyPath::Nested("env", crate::identity::UPSTREAM_CC_PLUGIN),
+            &custom_env
+        ),
+        KeyRule::Shared
     );
 }

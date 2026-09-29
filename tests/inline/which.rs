@@ -873,18 +873,37 @@ fn source_maps_to_wire_strings() {
 /// unsuffixed path must keep resolving alongside it.
 #[test]
 fn session_profile_extracted_from_runtime_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profiles = home.home().join(".tollgate").join("profiles");
     assert_eq!(
-        session_profile_from_config_dir(std::path::Path::new(
-            "/home/u/.tollgate/profiles/work/runtime"
-        )),
+        session_profile_from_config_dir(&profiles.join("work").join("runtime")),
         Some("work".to_string())
     );
     assert_eq!(
-        session_profile_from_config_dir(std::path::Path::new(
-            "/home/u/.tollgate/profiles/work/runtime-4242-0"
-        )),
+        session_profile_from_config_dir(&profiles.join("work").join("runtime-4242-0")),
         Some("work".to_string())
     );
+}
+
+/// Upstream clauth's `clauth start work` runs under
+/// `~/.clauth/profiles/work/runtime-<sid>`, the same shape under another
+/// root: that session is not tollgate's profile `work`, nor is any other dir
+/// that merely happens to be named `profiles`.
+#[test]
+fn session_profile_none_for_upstreams_runtime_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    for foreign in [
+        home.home().join(".clauth/profiles/work/runtime-4242-0"),
+        home.home().join(".clauth/profiles/work/runtime"),
+        std::path::PathBuf::from("/home/u/.tollgate/profiles/work/runtime-4242-0"),
+    ] {
+        assert_eq!(
+            session_profile_from_config_dir(&foreign),
+            None,
+            "{} is not tollgate's session",
+            foreign.display()
+        );
+    }
 }
 
 #[test]
@@ -1076,25 +1095,28 @@ fn json_view_doc_names_the_managed_half_and_points_at_the_routing_answer() {
 /// runtime, a codex-home dir parked outside a profiles tree — names nothing.
 #[test]
 fn codex_home_parse_accepts_the_tollgate_shape_only() {
-    use std::path::Path;
+    let home = crate::testutil::HomeSandbox::new();
+    let root = home.home();
     for good in [
-        "/home/u/.tollgate/profiles/cx/codex-home-4242-0",
-        "/home/u/.tollgate/profiles/cx/codex-home",
+        ".tollgate/profiles/cx/codex-home-4242-0",
+        ".tollgate/profiles/cx/codex-home",
     ] {
         assert_eq!(
-            session_profile_from_codex_home(Path::new(good)).as_deref(),
+            session_profile_from_codex_home(&root.join(good)).as_deref(),
             Some("cx"),
             "{good}"
         );
     }
     for bad in [
-        "/home/u/.codex",
-        "/home/u/.tollgate/profiles/cx/runtime-4242-0",
-        "/home/u/codex-home-4242-0",
-        "/home/u/.tollgate/cx/codex-home-4242-0",
+        ".codex",
+        ".tollgate/profiles/cx/runtime-4242-0",
+        "codex-home-4242-0",
+        ".tollgate/cx/codex-home-4242-0",
+        // Upstream clauth's codex session home: the same shape, its own root.
+        ".clauth/profiles/cx/codex-home-4242-0",
     ] {
         assert_eq!(
-            session_profile_from_codex_home(Path::new(bad)),
+            session_profile_from_codex_home(&root.join(bad)),
             None,
             "{bad}"
         );

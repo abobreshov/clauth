@@ -2096,6 +2096,9 @@ pub(crate) enum KeptReason {
     CodexLogin,
     /// It lies under `~/.tollgate`, which tollgate owns.
     TollgateOwned,
+    /// It lies under `~/.clauth`, which upstream clauth owns: moving it takes
+    /// a live store (possibly a token chain) from the tool that serves it.
+    UpstreamOwned,
     /// The file has more than one hard link, so another name may be another
     /// owner's login.
     HardLink,
@@ -2561,6 +2564,10 @@ fn another_owners_login(
     }
     if canonical(&tollgate_dir()?)?.is_some_and(|tollgate| source.starts_with(tollgate)) {
         return Ok(Some(KeptReason::TollgateOwned));
+    }
+    let upstream = crate::profile::home_dir()?.join(crate::identity::UPSTREAM_DATA_DIR_NAME);
+    if canonical(&upstream)?.is_some_and(|upstream| source.starts_with(upstream)) {
+        return Ok(Some(KeptReason::UpstreamOwned));
     }
     if !is_dir {
         match has_another_name(&source) {

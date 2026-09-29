@@ -8,6 +8,29 @@ fn the_fork_never_shares_a_global_name_with_upstream() {
     assert_ne!(CC_PLUGIN, UPSTREAM_CC_PLUGIN);
     assert_ne!(DEFAULT_LISTEN, "0.0.0.0:8443", "upstream's port");
     assert!(!ENV_PREFIX.starts_with("CLAUTH"));
+    assert_ne!(
+        API_KEY_HELPER_SUBCMD, "__api-key",
+        "upstream's helper token"
+    );
+    assert!(
+        !RELEASE_TAG_PREFIX.starts_with('v'),
+        "upstream's tags are bare `v*`"
+    );
+}
+
+#[test]
+fn the_herdr_names_derive_from_the_plugin_id() {
+    assert_eq!(HERDR_OPEN_ACTION, format!("{HERDR_PLUGIN_ID}.open"));
+    assert_eq!(HERDR_TOKEN, format!("${HERDR_PLUGIN_ID}"));
+    assert_eq!(
+        HERDR_DELEGATE_TOKEN_KEY,
+        format!("{HERDR_PLUGIN_ID}_delegate")
+    );
+    assert_eq!(HERDR_DELEGATE_TOKEN, format!("${HERDR_DELEGATE_TOKEN_KEY}"));
+    assert_eq!(HERDR_CONFIG_MARKER, format!("# {NAME} herdr plugin"));
+    assert_eq!(REPO_GIT_URL, format!("https://github.com/{REPO_SLUG}.git"));
+    assert_eq!(RELEASE_TAG_PREFIX, format!("{NAME}-v"));
+    assert_eq!(API_KEY_HELPER_SUBCMD, format!("__{NAME}-api-key"));
 }
 
 #[test]

@@ -228,7 +228,7 @@ fn tick_herdr_heal_is_a_noop_in_this_build() {
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let tags = lightweight_tag("tollgate-v0.15.1", "bbbbbbbbbbbbbbbb");
     let _env = heal_env(
         &home,
         &shim,

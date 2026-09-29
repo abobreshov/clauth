@@ -81,12 +81,19 @@ pub(crate) fn sync_once() -> Result<()> {
 }
 
 /// Reconcile the given `.claude.json` copies. Every field is shared except
-/// [`PER_PROFILE_FIELDS`], which is a flat top-level set — no `env`-style nested
-/// rule, unlike the `settings.json` reconciler.
+/// [`PER_PROFILE_FIELDS`], a flat top-level set, and upstream clauth's
+/// `mcpServers` entry, the one nested per-profile key.
 fn sync_paths(paths: &[PathBuf]) -> Result<()> {
     let operator_file = home_dir().ok().map(|h| h.join(".claude.json"));
     crate::jsonsync::sync_paths(paths, operator_file.as_deref(), |path| match path {
         KeyPath::Top(key) if PER_PROFILE_FIELDS.contains(&key) => KeyRule::PerProfile,
+        KeyPath::Top("mcpServers") => KeyRule::Nested,
+        // Upstream clauth's manual wire: the operator's file keeps it, a
+        // runtime copy is seeded without it (`runtime::seed_claude_json`), and
+        // neither side's state crosses.
+        KeyPath::Nested("mcpServers", key) if key == crate::identity::UPSTREAM_NAME => {
+            KeyRule::PerProfile
+        }
         _ => KeyRule::Shared,
     })
 }

@@ -3502,8 +3502,8 @@ fn tick(state: &SchedulerState) {
     if !state.fetch_lease.acquire() {
         if !state.standdown_active.swap(true, Ordering::Relaxed) {
             standdown_transition_log(
-                "tollgate: another instance holds the usage-fetch lease: standing \
-                 down (rendering from the shared cache)",
+                "tollgate: another instance (or upstream clauth's refresher) holds \
+                 the usage-fetch lease: standing down (rendering from the shared cache)",
             );
         }
         standdown_tick(state, interval_ms);

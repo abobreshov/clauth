@@ -333,7 +333,10 @@ fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
         return None;
     }
     let profile_dir = dir.parent()?;
-    if profile_dir.parent()?.file_name()? != "profiles" {
+    // By location, not by the `profiles` name: upstream clauth's
+    // `~/.clauth/profiles/<p>/runtime-<sid>` has the same shape, and its
+    // session is not tollgate's profile `<p>`.
+    if !crate::profile::is_own_profile_dir(profile_dir) {
         return None;
     }
     Some(profile_dir.file_name()?.to_str()?.to_string())

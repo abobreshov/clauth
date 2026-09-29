@@ -16,7 +16,7 @@ Run it a second time and it adds nothing. `--key` picks the keybinding, and a re
 
 | Flag | Effect |
 |------|--------|
-| `--key <spec>` | the key that opens the dashboard, in herdr's own binding syntax; default `prefix+a` |
+| `--key <spec>` | the key that opens the dashboard, in herdr's own binding syntax; default `prefix+t` |
 | `--no-config` | install the plugin, leave `config.toml` alone, and print the blocks to paste |
 | `--yes` | skip both prompts, herdr's install preview included; required on a non-TTY stdin |
 
@@ -55,7 +55,7 @@ A herdr plugin cannot declare a keybinding, so that line lives in your own herdr
 
 ```toml
 [[keys.command]]
-key = "prefix+a"
+key = "prefix+t"
 type = "plugin_action"
 command = "clauth.open"
 description = "clauth accounts"

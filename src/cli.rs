@@ -449,7 +449,7 @@ pub(crate) enum Command {
     /// `config.toml` until a re-login or the divergence adopt re-captures it,
     /// so a copied value keeps working across any number of child sessions —
     /// it is not single-use.
-    #[command(name = "__api-key", hide = true)]
+    #[command(name = crate::identity::API_KEY_HELPER_SUBCMD, hide = true)]
     ApiKey {
         /// Profile whose stored key to print.
         profile: String,
@@ -656,7 +656,7 @@ pub(crate) enum HerdrCommand {
     /// refuses the install: it names the tree and the two ways out.
     Install {
         /// Key that opens the dashboard, in herdr's own binding syntax
-        /// (`prefix+a`, `ctrl+alt+c`). Prompted for when omitted.
+        /// (`prefix+t`, `ctrl+alt+c`). Prompted for when omitted.
         #[arg(long, value_name = "SPEC")]
         key: Option<String>,
         /// Install the plugin and leave herdr's config.toml untouched.

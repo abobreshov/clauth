@@ -2127,7 +2127,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
     }
 }
 
-/// `tollgate __api-key <profile>` — the body CC's `apiKeyHelper` invokes for
+/// `tollgate __tollgate-api-key <profile>` — the body CC's `apiKeyHelper` invokes for
 /// an api-key profile. Loads the key from the profile's
 /// `config.toml` (0o600) and prints it to stdout. The key is static: this
 /// path never mints or rotates it, every call prints the same stored value

@@ -35,7 +35,7 @@ Seven knobs tune the plugin. Six live in `~/.tollgate/profiles.toml` under `[her
 
 ```toml
 [[keys.command]]
-key = "prefix+a"
+key = "prefix+t"
 type = "plugin_action"
 command = "tollgate.open"
 description = "tollgate accounts"

@@ -1379,6 +1379,21 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
     }
     let auth_path = operator.join("auth.json");
 
+    // A link into a store tollgate does not own (upstream clauth's codex
+    // profile, or the operator's own arrangement): reading through it copies
+    // that store's refresh chain into a second carrier, and the adoption below
+    // would take the operator slot from its owner.
+    if let Some(target) = crate::profile::symlink_target(&auth_path)
+        && tollgate_auth_store_owner(&target).is_none()
+    {
+        bail!(
+            "{} links to {}, which tollgate does not own — capturing through it would \
+             copy that store's token chain; nothing was captured",
+            auth_path.display(),
+            target.display()
+        );
+    }
+
     // A slot tollgate already adopted: the chain belongs to exactly one profile.
     if let Ok(target) = std::fs::read_link(&auth_path)
         && let Some(holder) = tollgate_auth_store_owner(&target)
@@ -1658,13 +1673,16 @@ fn default_codex_operator_home() -> Result<std::path::PathBuf> {
 }
 
 /// The codex profile owning a tollgate auth store path
-/// (`…/profiles/<name>/auth.json`), or `None` for any other shape.
+/// (`~/.tollgate/profiles/<name>/auth.json`), or `None` for any other path.
+/// The profile dir must be tollgate's OWN, by location: upstream clauth's
+/// stores sit at the same shape under `~/.clauth/profiles`, and a name-only
+/// match would relink or delete upstream's operator link.
 fn tollgate_auth_store_owner(target: &std::path::Path) -> Option<String> {
     if target.file_name()? != "auth.json" {
         return None;
     }
     let dir = target.parent()?;
-    if dir.parent()?.file_name()? != "profiles" {
+    if !crate::profile::is_own_profile_dir(dir) {
         return None;
     }
     Some(dir.file_name()?.to_str()?.to_string())
@@ -1960,6 +1978,9 @@ pub(crate) struct CaptureSnapshot {
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
+    // A live slot linked into another tool's store (upstream clauth's) holds
+    // that tool's refresh chain: a capture copies it into a second carrier.
+    crate::claude::refuse_foreign_slot_link(&crate::claude::claude_credentials_path()?)?;
     let credentials = read_claude_credentials()?;
     let ClaudeEndpoint { base_url, api_key } = read_claude_endpoint_config()?;
     Ok(CaptureSnapshot {

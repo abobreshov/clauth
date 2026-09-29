@@ -1317,9 +1317,9 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::HookProfileChangedNote
     ));
     assert!(matches!(command(&["self-heal"]), Command::SelfHeal));
-    match command(&["__api-key", "acme"]) {
+    match command(&["__tollgate-api-key", "acme"]) {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
-        other => panic!("__api-key must parse, got {other:?}"),
+        other => panic!("__tollgate-api-key must parse, got {other:?}"),
     }
     assert!(matches!(command(&["run"]), Command::Run { .. }));
 
@@ -1327,7 +1327,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     let long = Cli::command().render_long_help().to_string();
     for hidden in [
         "__complete",
-        "__api-key",
+        "__tollgate-api-key",
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",
@@ -2020,7 +2020,7 @@ fn reauth_confirmed_only_on_explicit_yes() {
     }
 }
 
-// ── hidden `tollgate __api-key <profile>` (CC's apiKeyHelper body) ──────────────
+// ── hidden `tollgate __tollgate-api-key <profile>` (CC's apiKeyHelper body) ──────────────
 //
 // The hidden subcommand is what CC's `apiKeyHelper` runs to obtain an auth
 // value for an api-key profile (see `src/claude.rs`
@@ -2045,10 +2045,11 @@ mod api_key_helper_tests {
         save_profile(&profile).expect("save_profile");
     }
 
-    /// Dispatch a hidden `__api-key <profile>` the way `main` would.
+    /// Dispatch a hidden `__tollgate-api-key <profile>` the way `main` would.
     fn dispatch_api_key(profile: &str) -> Result<()> {
         dispatch(
-            Cli::try_parse_from(["tollgate", "__api-key", profile]).expect("hidden arm must parse"),
+            Cli::try_parse_from(["tollgate", "__tollgate-api-key", profile])
+                .expect("hidden arm must parse"),
         )
     }
 

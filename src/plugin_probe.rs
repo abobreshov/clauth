@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serde_json::{Map, Value};
 
 use crate::profile::{atomic_write, claude_dir, home_dir};
@@ -162,13 +162,28 @@ pub(crate) enum McpProbe {
 /// gates it behind `r` only. Drains stdout on a thread so a chatty server can't
 /// deadlock the pipe; 3s budget, then kill.
 fn probe_command() -> Command {
-    let mut cmd = Command::new(crate::identity::NAME);
+    let mut cmd = Command::new(probe_exe());
     cmd.arg("mcp")
         .env(crate::mcp::MCP_PROBE_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     cmd
+}
+
+/// The binary the probe spawns: the running executable (a replaced binary's
+/// `(deleted)` suffix stripped), never a `PATH` lookup, so the probe can only
+/// ever start this tool's own server. Test builds keep the bare name: the
+/// running executable there is the test harness, which must not be re-run as
+/// a probe child.
+fn probe_exe() -> std::path::PathBuf {
+    if cfg!(test) {
+        return std::path::PathBuf::from(crate::identity::NAME);
+    }
+    std::env::current_exe().map_or_else(
+        |_| std::path::PathBuf::from(crate::identity::NAME),
+        |exe| crate::platform::installed_exe_path(&exe),
+    )
 }
 
 pub(crate) fn mcp_boots() -> McpProbe {
@@ -290,15 +305,29 @@ pub(crate) fn global_claude_json_path() -> Option<PathBuf> {
 /// Write `mcpServers.tollgate` into `~/.claude.json`, preserving every other field
 /// (key order is kept via serde_json's `preserve_order`). The entry mirrors the
 /// plugin manifest so a manual wire matches a plugin install. Creates the file
-/// when absent.
+/// when absent. Any other read failure, and a file that does not parse as a
+/// JSON object (Claude Code caught mid-write, a hand edit), is an error: a
+/// fresh map there would replace the whole file, every other server and the
+/// account identity included.
 pub(crate) fn wire_mcp_server() -> Result<()> {
     let path = home_dir()?.join(".claude.json");
     let mut root: Map<String, Value> = match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(Value::Object(map)) => map,
-            _ => Map::new(),
+            Ok(_) => anyhow::bail!("{} is not a JSON object; left it alone", path.display()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "{} does not parse (Claude Code may be writing it); left it alone, retry",
+                        path.display()
+                    )
+                });
+            }
         },
-        Err(_) => Map::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", path.display()));
+        }
     };
     let entry = tollgate_mcp_entry();
     match root

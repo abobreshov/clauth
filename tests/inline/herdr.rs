@@ -453,8 +453,8 @@ fn install_refuses_a_local_link_before_running_herdrs_installer() {
 #[test]
 fn the_installing_line_names_the_pinned_tag() {
     assert_eq!(
-        installing_line(Some("v0.15.1")),
-        "tollgate: installing abobreshov/clauth/herdr-plugin at v0.15.1 into herdr"
+        installing_line(Some("tollgate-v0.15.1")),
+        "tollgate: installing abobreshov/clauth/herdr-plugin at tollgate-v0.15.1 into herdr"
     );
     assert_eq!(
         installing_line(None),
@@ -478,17 +478,20 @@ fn the_unpinned_release_note_names_the_error_and_the_fallback() {
 }
 
 /// The picked tag is the numeric-component maximum, never the string maximum:
-/// `v0.15.10` outranks `v0.15.9`.
+/// `tollgate-v0.15.10` outranks `tollgate-v0.15.9`.
 #[test]
 fn pick_release_prefers_the_numeric_maximum_version() {
     let text = concat!(
-        "cccccccccccccccc\trefs/tags/v0.15.9\n",
-        "bbbbbbbbbbbbbbbb\trefs/tags/v0.15.10\n",
-        "aaaaaaaaaaaaaaaa\trefs/tags/v0.14.5\n",
+        "cccccccccccccccc\trefs/tags/tollgate-v0.15.9\n",
+        "bbbbbbbbbbbbbbbb\trefs/tags/tollgate-v0.15.10\n",
+        "aaaaaaaaaaaaaaaa\trefs/tags/tollgate-v0.14.5\n",
     );
     assert_eq!(
         pick_release(text),
-        Some(("v0.15.10".to_string(), "bbbbbbbbbbbbbbbb".to_string()))
+        Some((
+            "tollgate-v0.15.10".to_string(),
+            "bbbbbbbbbbbbbbbb".to_string()
+        ))
     );
 }
 
@@ -498,22 +501,28 @@ fn pick_release_prefers_the_numeric_maximum_version() {
 #[test]
 fn pick_release_prefers_the_peeled_commit_of_an_annotated_tag() {
     let text = concat!(
-        "feedfeedfeedfeedfeedfeedfeedfeed\trefs/tags/v0.15.1\n",
-        "bbbbbbbbbbbbbbbb\trefs/tags/v0.15.1^{}\n",
+        "feedfeedfeedfeedfeedfeedfeedfeed\trefs/tags/tollgate-v0.15.1\n",
+        "bbbbbbbbbbbbbbbb\trefs/tags/tollgate-v0.15.1^{}\n",
     );
     assert_eq!(
         pick_release(text),
-        Some(("v0.15.1".to_string(), "bbbbbbbbbbbbbbbb".to_string()))
+        Some((
+            "tollgate-v0.15.1".to_string(),
+            "bbbbbbbbbbbbbbbb".to_string()
+        ))
     );
 }
 
 /// A lightweight tag prints only the plain line; it is still a release target.
 #[test]
 fn pick_release_accepts_a_lightweight_tag_line() {
-    let text = "bbbbbbbbbbbbbbbb\trefs/tags/v0.15.1\n";
+    let text = "bbbbbbbbbbbbbbbb\trefs/tags/tollgate-v0.15.1\n";
     assert_eq!(
         pick_release(text),
-        Some(("v0.15.1".to_string(), "bbbbbbbbbbbbbbbb".to_string()))
+        Some((
+            "tollgate-v0.15.1".to_string(),
+            "bbbbbbbbbbbbbbbb".to_string()
+        ))
     );
 }
 
@@ -525,14 +534,120 @@ fn pick_release_skips_unparseable_lines_and_non_release_tags() {
         "noise\n",
         "cccccccccccccccc\trefs/tags/not-a-version\n",
         "bbbbbbbbbbbbbbbb\trefs/tags/x1.2.3\n",
-        "1111111111111111\trefs/tags/v+1.2.3\n",
-        "aaaaaaaaaaaaaaaa\trefs/tags/v1.2\n",
-        "dddddddddddddddd\trefs/tags/v1.2.3.4\n",
-        "eeeeeeeeeeeeeeee\trefs/tags/v1.2.3^{}extra\n",
-        "zzzzzzzzzzzzzzzz\trefs/tags/v9.9.9\n",
+        "1111111111111111\trefs/tags/tollgate-v+1.2.3\n",
+        "aaaaaaaaaaaaaaaa\trefs/tags/tollgate-v1.2\n",
+        "dddddddddddddddd\trefs/tags/tollgate-v1.2.3.4\n",
+        "eeeeeeeeeeeeeeee\trefs/tags/tollgate-v1.2.3^{}extra\n",
+        "zzzzzzzzzzzzzzzz\trefs/tags/tollgate-v9.9.9\n",
     );
     assert_eq!(pick_release(text), None);
     assert_eq!(pick_release(""), None);
+}
+
+/// Upstream's bare `v*` tags ride along in the fork's history, and each names
+/// upstream's tree (herdr plugin id `clauth`): the probe never picks one, even
+/// when it outranks every fork tag.
+#[test]
+fn pick_release_ignores_upstream_tags() {
+    let upstream_only = concat!(
+        "aaaaaaaaaaaaaaaa\trefs/tags/v0.16.0\n",
+        "bbbbbbbbbbbbbbbb\trefs/tags/v0.16.0^{}\n",
+    );
+    assert_eq!(pick_release(upstream_only), None);
+    let mixed = concat!(
+        "aaaaaaaaaaaaaaaa\trefs/tags/v9.0.0\n",
+        "cccccccccccccccc\trefs/tags/tollgate-v0.1.0\n",
+    );
+    assert_eq!(
+        pick_release(mixed),
+        Some((
+            "tollgate-v0.1.0".to_string(),
+            "cccccccccccccccc".to_string()
+        ))
+    );
+}
+
+/// The manifest id check accepts only this tool's plugin id, and names the
+/// foreign id and the ref when it refuses.
+#[test]
+fn the_manifest_check_refuses_a_foreign_plugin_id() {
+    assert_eq!(
+        manifest_id("id = \"clauth\"\nname = \"clauth\"\n").as_deref(),
+        Some("clauth")
+    );
+    assert_eq!(manifest_id("not toml ["), None);
+    assert!(check_manifest_id(PLUGIN_ID, "HEAD").is_ok());
+    let err = format!(
+        "{:#}",
+        check_manifest_id("clauth", "tollgate-v0.1.0").expect_err("a foreign id refuses")
+    );
+    assert!(
+        err.contains("has id `clauth`, not `tollgate`") && err.contains("tollgate-v0.1.0"),
+        "the refusal names both ids and the ref: {err}"
+    );
+}
+
+/// A remote whose manifest at the picked tag is upstream's (`id = "clauth"`)
+/// never reaches herdr: the install refuses before `plugin install` runs.
+#[cfg(unix)]
+#[test]
+fn install_refuses_when_the_manifest_is_upstreams() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = install_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("tollgate-v0.15.1", "bbbbbbbbbbbbbbbb");
+    let answer = plugin_list_json(r#"{"plugin_id":"other"}"#);
+    let _env = install_env(&home, &shim, &answer, &tags);
+    let _manifest = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "MANIFEST_OUTPUT",
+            Some(std::ffi::OsStr::new("id = \"clauth\"\n")),
+        )],
+    );
+
+    let err = install(None, true, true, false).expect_err("a foreign manifest refuses");
+    assert!(
+        format!("{err:#}").contains("has id `clauth`"),
+        "the refusal names the foreign id: {err:#}"
+    );
+    assert!(
+        !home.home().join("install.log").exists(),
+        "herdr's plugin install never ran"
+    );
+    let checked = std::fs::read_to_string(home.home().join("git-manifest.log")).unwrap_or_default();
+    assert!(
+        checked.contains("refs/tags/tollgate-v0.15.1")
+            && checked.contains("show FETCH_HEAD:herdr-plugin/herdr-plugin.toml"),
+        "the check fetched the picked tag and read its manifest: {checked}"
+    );
+}
+
+/// A key another `[[keys.command]]` entry already binds (upstream clauth's
+/// `prefix+a -> clauth.open`) is never bound twice: the plan names the clash
+/// and appends no keybinding.
+#[test]
+fn plan_config_leaves_a_key_bound_to_another_action_alone() {
+    let existing = "# clauth herdr plugin\n[[keys.command]]\nkey = \"prefix+a\"\ntype = \"plugin_action\"\ncommand = \"clauth.open\"\n";
+    let plan = plan_config(existing, "Prefix+A", false).expect("plan");
+    assert!(
+        !plan.append.contains("[[keys.command]]"),
+        "no second binding on the same key: {}",
+        plan.append
+    );
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains("already bound to `clauth.open`")),
+        "the clash is named: {:?}",
+        plan.notes
+    );
+    let free = plan_config(existing, DEFAULT_KEY, false).expect("plan");
+    assert!(
+        free.append.contains(&format!("key = \"{DEFAULT_KEY}\"")),
+        "the default key is free beside upstream's: {}",
+        free.append
+    );
 }
 
 /// One annotated release tag's `ls-remote --tags` pair, the real git's shape:
@@ -545,7 +660,7 @@ fn annotated_tag(tag: &str, tag_object: &str, commit: &str) -> String {
 /// A stale github install (installed commit differs from the newest release
 /// tag's commit) reinstalls pinned to that tag, and the success line names
 /// the tag and both commits. The numeric-component maximum is the picked tag:
-/// `v0.15.10` outranks `v0.15.9`, which a string compare gets backwards. The
+/// `tollgate-v0.15.10` outranks `tollgate-v0.15.9`, which a string compare gets backwards. The
 /// landed commit is the fresh registry probe's — it wins over the tag's.
 #[cfg(unix)]
 #[test]
@@ -561,9 +676,9 @@ fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
     git_shim(home.home());
     let tags = format!(
         "{}{}",
-        lightweight_tag("v0.15.9", "cccccccccccccccc"),
+        lightweight_tag("tollgate-v0.15.9", "cccccccccccccccc"),
         annotated_tag(
-            "v0.15.10",
+            "tollgate-v0.15.10",
             "feedfeedfeedfeedfeedfeedfeedfeed",
             "bbbbbbbbbbbbbbbb"
         ),
@@ -575,7 +690,7 @@ fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
         .expect("update lands");
     assert!(
         line.contains(
-            "reinstalled the herdr plugin from abobreshov/clauth/herdr-plugin at v0.15.10"
+            "reinstalled the herdr plugin from abobreshov/clauth/herdr-plugin at tollgate-v0.15.10"
         ),
         "the line names the release the update landed at: {line}"
     );
@@ -587,7 +702,7 @@ fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.10 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref tollgate-v0.15.10 --yes",
         "the update is a reinstall pinned to the release tag, preview skipped"
     );
     let git_log = std::fs::read_to_string(home.home().join("git.log")).unwrap_or_default();
@@ -612,7 +727,7 @@ fn plugin_heal_skips_an_install_at_the_latest_release() {
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
     let tags = annotated_tag(
-        "v0.15.1",
+        "tollgate-v0.15.1",
         "feedfeedfeedfeedfeedfeedfeedfeed",
         "bbbbbbbbbbbbbbbb",
     );
@@ -644,7 +759,7 @@ fn plugin_heal_reports_the_tag_commit_when_the_fresh_probe_has_no_commit() {
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "cccccccccccccccc");
+    let tags = lightweight_tag("tollgate-v0.15.1", "cccccccccccccccc");
     let _env = heal_env(&home, &shim, &before, &after, &tags, &[]);
 
     let line = plugin_heal_line()
@@ -655,7 +770,7 @@ fn plugin_heal_reports_the_tag_commit_when_the_fresh_probe_has_no_commit() {
         "the fallback names the tag's commit: {line}"
     );
     assert!(
-        line.contains("at v0.15.1"),
+        line.contains("at tollgate-v0.15.1"),
         "the line still names the tag: {line}"
     );
 }
@@ -796,7 +911,7 @@ fn plugin_heal_fails_loud_when_the_install_fails() {
         "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$ANSWER_BEFORE\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; echo 'install broke'; echo 'more stderr' >&2; exit 1",
     );
     git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let tags = lightweight_tag("tollgate-v0.15.1", "bbbbbbbbbbbbbbbb");
     let _env = heal_env(&home, &shim, &entry, &entry, &tags, &[]);
 
     let err = plugin_heal_line().expect_err("a failed install must fail the heal");
@@ -810,13 +925,13 @@ fn plugin_heal_fails_loud_when_the_install_fails() {
         "the error carries stderr: {shown}"
     );
     assert!(
-        shown.contains("--ref v0.15.1"),
+        shown.contains("--ref tollgate-v0.15.1"),
         "the failure names the pinned install: {shown}"
     );
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref tollgate-v0.15.1 --yes",
         "the failed install was pinned to the tag"
     );
 }
@@ -837,7 +952,7 @@ fn plugin_heal_bounds_a_stalled_install() {
         "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$ANSWER_BEFORE\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exec sleep 10",
     );
     git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let tags = lightweight_tag("tollgate-v0.15.1", "bbbbbbbbbbbbbbbb");
     let _env = heal_env(&home, &shim, &entry, &entry, &tags, &[]);
 
     let start = std::time::Instant::now();
@@ -849,13 +964,13 @@ fn plugin_heal_bounds_a_stalled_install() {
         "the error names the bound: {shown}"
     );
     assert!(
-        shown.contains("--ref v0.15.1"),
+        shown.contains("--ref tollgate-v0.15.1"),
         "the timeout names the pinned install: {shown}"
     );
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref tollgate-v0.15.1 --yes",
         "the stalled install was pinned to the tag"
     );
     assert!(
@@ -879,7 +994,7 @@ fn heal_detached_is_a_noop_in_this_build() {
     );
     let shim = stateful_heal_shim(home.home());
     git_shim(home.home());
-    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let tags = lightweight_tag("tollgate-v0.15.1", "bbbbbbbbbbbbbbbb");
     let _env = heal_env(
         &home,
         &shim,
@@ -946,7 +1061,7 @@ fn install_pins_the_latest_release_tag() {
     let shim = install_shim(home.home());
     git_shim(home.home());
     let tags = annotated_tag(
-        "v0.15.1",
+        "tollgate-v0.15.1",
         "feedfeedfeedfeedfeedfeedfeedfeed",
         "bbbbbbbbbbbbbbbb",
     );
@@ -959,7 +1074,7 @@ fn install_pins_the_latest_release_tag() {
     let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
-        "plugin install abobreshov/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "plugin install abobreshov/clauth/herdr-plugin --ref tollgate-v0.15.1 --yes",
         "the install is pinned to the release tag"
     );
     let git_log = std::fs::read_to_string(home.home().join("git.log")).unwrap_or_default();
@@ -971,19 +1086,24 @@ fn install_pins_the_latest_release_tag() {
     let printed = capture.snapshot();
     assert_eq!(
         printed,
-        ["tollgate: installing abobreshov/clauth/herdr-plugin at v0.15.1 into herdr"],
+        ["tollgate: installing abobreshov/clauth/herdr-plugin at tollgate-v0.15.1 into herdr"],
         "the printed line names the tag the argv pins"
     );
 }
 
-/// A failed release probe never fails the install: it prints the one-line
-/// note and proceeds unpinned.
+/// A failed release probe alone never fails the install: it prints the
+/// one-line note and proceeds unpinned, once the manifest at the remote's HEAD
+/// passed the id check.
 #[cfg(unix)]
 #[test]
 fn install_proceeds_unpinned_when_the_release_probe_fails() {
     let home = crate::testutil::HomeSandbox::new();
     let shim = install_shim(home.home());
-    write_shim(home.home(), "git", "exit 1");
+    write_shim(
+        home.home(),
+        "git",
+        "if [ \"$1\" = \"-C\" ]; then [ \"$3\" = \"show\" ] && printf 'id = \"tollgate\"\\n'; exit 0; fi; exit 1",
+    );
     let answer = plugin_list_json(r#"{"plugin_id":"other"}"#);
     let _env = install_env(&home, &shim, &answer, "");
     let capture = InstallLines::new();
@@ -1013,6 +1133,30 @@ fn install_proceeds_unpinned_when_the_release_probe_fails() {
     assert_eq!(
         printed[1], "tollgate: installing abobreshov/clauth/herdr-plugin into herdr",
         "the unpinned line follows the note: {printed:?}"
+    );
+}
+
+/// A manifest check that cannot run (git failing outright, no network) fails
+/// closed: nothing reaches herdr.
+#[cfg(unix)]
+#[test]
+fn install_refuses_when_the_manifest_check_cannot_run() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = install_shim(home.home());
+    write_shim(home.home(), "git", "exit 1");
+    let answer = plugin_list_json(r#"{"plugin_id":"other"}"#);
+    let _env = install_env(&home, &shim, &answer, "");
+    let capture = InstallLines::new();
+    let _capture = capture.capture_here();
+
+    let err = install(None, true, true, false).expect_err("an unchecked manifest refuses");
+    assert!(
+        format!("{err:#}").contains("could not check the herdr plugin manifest"),
+        "the refusal names the check: {err:#}"
+    );
+    assert!(
+        !home.home().join("install.log").exists(),
+        "herdr's plugin install never ran"
     );
 }
 
@@ -1477,10 +1621,11 @@ fn an_edited_binding_block_survives_the_resync_byte_for_byte() {
 
 /// An edit that moves the command off `tollgate.open` (say `tollgate.open
 /// --now`) keeps the whole block too, and `bound_key` matches the exact
-/// command, so `tollgate.open` now reads as unbound: no already-bound note
-/// fires, and tollgate appends its own binding beside the user's.
+/// command, so `tollgate.open` now reads as unbound. The user's edited entry
+/// still owns the key, though, so a resync on that same key names the clash
+/// instead of binding it twice; a resync on a free key wires tollgate's own.
 #[test]
-fn a_binding_edited_off_tollgate_open_keeps_the_edit_and_rewires_tollgates_own() {
+fn a_binding_edited_off_tollgate_open_keeps_the_edit_and_never_doubles_its_key() {
     let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
@@ -1489,7 +1634,7 @@ fn a_binding_edited_off_tollgate_open_keeps_the_edit_and_rewires_tollgates_own()
         r#"command = "tollgate.open --now""#,
     );
     assert_ne!(edited, wired, "the fixture edit landed");
-    let (text, plan, removed, noop) = install_resync(&edited, "prefix+a", false).expect("resync");
+    let (text, plan, removed, _) = install_resync(&edited, "prefix+a", false).expect("resync");
     assert!(
         !removed.iter().any(|line| line.starts_with("command = ")),
         "the edited binding is not in the removal diff: {removed:?}"
@@ -1498,6 +1643,20 @@ fn a_binding_edited_off_tollgate_open_keeps_the_edit_and_rewires_tollgates_own()
         text.contains(r#"command = "tollgate.open --now""#),
         "the user's command edit survives: {text}"
     );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        1,
+        "the key the edit owns is never bound twice: {text}"
+    );
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains("`prefix+a` is already bound to `tollgate.open --now`")),
+        "the clash is named: {:?}",
+        plan.notes
+    );
+
+    let (text, plan, _, noop) = install_resync(&edited, "prefix+b", false).expect("resync");
     assert!(
         text.contains(r#"command = "tollgate.open""#),
         "`tollgate.open` reads as unbound, so tollgate wires its own binding"
@@ -1509,7 +1668,7 @@ fn a_binding_edited_off_tollgate_open_keeps_the_edit_and_rewires_tollgates_own()
     );
     assert!(
         plan.notes.iter().all(|n| !n.contains("already bound")),
-        "no already-bound note: the edited command no longer binds `tollgate.open`: {:?}",
+        "no already-bound note on a free key: {:?}",
         plan.notes
     );
     assert!(!noop, "tollgate's own binding is added, so the write fires");

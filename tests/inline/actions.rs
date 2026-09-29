@@ -6603,3 +6603,23 @@ fn a_link_that_cannot_follow_fails_the_switch_whole() {
         "marker unmoved — the switch failed whole, not half"
     );
 }
+
+/// The codex operator-slot owner is read off tollgate's OWN profiles root:
+/// upstream clauth's same-shaped `~/.clauth/profiles/<p>/auth.json` names no
+/// tollgate profile, so tollgate never relinks or deletes upstream's link.
+#[test]
+fn the_codex_store_owner_is_anchored_to_tollgates_root() {
+    let home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        tollgate_auth_store_owner(&home.home().join(".tollgate/profiles/cx/auth.json")).as_deref(),
+        Some("cx")
+    );
+    assert_eq!(
+        tollgate_auth_store_owner(&home.home().join(".clauth/profiles/cx/auth.json")),
+        None
+    );
+    assert_eq!(
+        tollgate_auth_store_owner(&home.home().join("x/profiles/cx/auth.json")),
+        None
+    );
+}

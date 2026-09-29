@@ -1941,13 +1941,16 @@ pub(crate) fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 /// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real
-/// git's output shape) and recording every argv into `git.log`.
+/// git's output shape) and recording that argv into `git.log`. The herdr
+/// install's manifest check (`git -C <scratch> init|fetch|show`) is logged to
+/// `git-manifest.log` instead, and its `show` answers `$MANIFEST_OUTPUT`, or a
+/// manifest carrying this tool's plugin id when that is unset.
 #[cfg(unix)]
 pub(crate) fn git_shim(dir: &Path) -> PathBuf {
     write_shim(
         dir,
         "git",
-        "echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
+        "if [ \"$1\" = \"-C\" ]; then shift 2; echo \"$@\" >> \"$(dirname \"$0\")/git-manifest.log\"; if [ \"$1\" = \"show\" ]; then if [ -n \"$MANIFEST_OUTPUT\" ]; then printf '%s' \"$MANIFEST_OUTPUT\"; else printf 'id = \"tollgate\"\\n'; fi; fi; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
     )
 }
 

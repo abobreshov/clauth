@@ -1856,6 +1856,60 @@ fn profiles_root() -> Result<PathBuf> {
     Ok(tollgate_dir()?.join("profiles"))
 }
 
+/// `path` with every existing leading part resolved: the whole path when it
+/// exists, else its resolved parent plus the last component, else `path` as
+/// given. A torn-down runtime or a dangling link target still compares by
+/// where it WOULD be, and a symlinked `$HOME` matches either spelling.
+fn resolve_existing(path: &Path) -> PathBuf {
+    if let Ok(resolved) = path.canonicalize() {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(parent) => parent.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Whether `dir` is a direct child of tollgate's OWN profiles root
+/// (`~/.tollgate/profiles/<name>`), by location rather than by the `profiles`
+/// directory name. Upstream clauth lays its tree out the same way under
+/// `~/.clauth/profiles`, so a name-only check claims upstream's sessions,
+/// links and stores as tollgate's (plan §4.0, coexistence).
+pub(crate) fn is_own_profile_dir(dir: &Path) -> bool {
+    let (Some(parent), Ok(root)) = (dir.parent(), profiles_root()) else {
+        return false;
+    };
+    parent == root || resolve_existing(parent) == resolve_existing(&root)
+}
+
+/// Whether `path` lies anywhere under tollgate's own profiles root, resolved
+/// the way [`is_own_profile_dir`] resolves: the ownership test for a link
+/// target (`~/.claude/.credentials.json`, `~/.codex/auth.json`) before
+/// tollgate replaces, deletes or reads through the link.
+pub(crate) fn is_under_own_profiles_root(path: &Path) -> bool {
+    let Ok(root) = profiles_root() else {
+        return false;
+    };
+    let lexical = path.starts_with(&root)
+        && !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir);
+    lexical || resolve_existing(path).starts_with(resolve_existing(&root))
+}
+
+/// Where the symlink at `link` points, relative targets resolved against the
+/// link's own dir; `None` when `link` is not a symlink.
+pub(crate) fn symlink_target(link: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(link).ok()?;
+    Some(match link.parent() {
+        Some(parent) if target.is_relative() => parent.join(target),
+        _ => target,
+    })
+}
+
 fn app_state_path() -> Result<PathBuf> {
     Ok(tollgate_dir()?.join("profiles.toml"))
 }

@@ -819,21 +819,26 @@ fn detached_repoint_reports_skips_once_per_process() {
     assert!(third.is_some(), "the reset re-arms the report");
 }
 
-/// The committed install script runs the heal after both install legs, so a
-/// binary install converges dangling plugin paths without waiting for the
-/// next session start. A drift here silently drops the fix.
+/// The committed install script runs no `self-heal` on either install leg:
+/// the heal writes Claude Code's plugin registry, which upstream clauth owns
+/// until an import (plan §4.0). The cargo leg installs from a ref that holds
+/// the `tollgate` package, never the fork's default branch (upstream's
+/// `clauth` package).
 #[test]
-fn install_sh_runs_self_heal_after_both_install_legs() {
+fn install_sh_runs_no_registry_heal_and_pins_the_cargo_ref() {
     let script = include_str!("../../install.sh");
-    assert_eq!(
-        script.matches("self-heal").count(),
-        2,
-        "install.sh must run `tollgate self-heal` after the cargo leg and after the download leg: {script}"
+    assert!(
+        !script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.contains("self-heal")),
+        "install.sh must not run `tollgate self-heal`: {script}"
     );
     assert!(
-        script.contains("cargo install --locked --git \"https://github.com/${REPO}\" tollgate")
-            && script.contains("\"${INSTALL_DIR}/${BINARY}\" self-heal"),
-        "both legs carry the heal call"
+        script.contains(
+            "cargo install --locked --git \"https://github.com/${REPO}\" \"${CARGO_REF[@]}\" tollgate"
+        ) && script.contains("CARGO_REF=(--branch feat/tollgate)"),
+        "the cargo leg is pinned to the tollgate ref: {script}"
     );
 }
 

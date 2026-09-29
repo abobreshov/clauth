@@ -716,8 +716,9 @@ impl FetchLease {
 
     /// Become — or confirm we already are — the single fetcher. Returns `true`
     /// when THIS instance holds the lease (fetch this tick), `false` when another
-    /// instance holds it or the lock is unreadable (stand down and hydrate from
-    /// the shared cache). Idempotent once held: a held lease short-circuits to
+    /// instance holds it, the lock is unreadable, or upstream clauth's
+    /// refresher is live ([`upstream_refresher_active`]) (stand down and hydrate
+    /// from the shared cache). Idempotent once held: a held lease short-circuits to
     /// `true`, so the flock is never re-taken. Both error arms of the try-lock
     /// stand down — an io error is never a licence to dup-fetch.
     pub(crate) fn acquire(&self) -> bool {
@@ -725,6 +726,14 @@ impl FetchLease {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // Upstream clauth runs its own refresher (daemon or TUI) against the
+        // same `~/.claude/.credentials.json`: two fetchers rotate and
+        // auto-switch that one slot against each other. Re-checked every call,
+        // a held lease included, so an upstream instance starting later still
+        // parks this one.
+        if upstream_refresher_active() {
+            return false;
+        }
         if held.is_some() {
             return true;
         }
@@ -748,6 +757,34 @@ impl FetchLease {
             Err(std::fs::TryLockError::Error(_)) => false,
         }
     }
+}
+
+/// Upstream clauth's lock files whose holder fetches usage, rotates tokens or
+/// decides switches, or stands by to become that holder (plan §4.0): its
+/// daemon singleton, its standby slot, and its single-fetcher lease. The
+/// names are upstream 0.16.0's and live in `~/.clauth`, outside this tool's
+/// data dir on purpose.
+const UPSTREAM_REFRESHER_LOCKS: [&str; 3] =
+    ["clauthd.lock", "clauthd-standby.lock", "usage-fetch.lock"];
+
+/// Whether an upstream clauth process holds any of
+/// [`UPSTREAM_REFRESHER_LOCKS`]. Each existing file is opened read-only (never
+/// created) and probed with a shared try-lock released at once; a held
+/// exclusive lock answers `WouldBlock`. A probe that errors counts as held:
+/// not knowing is never a licence to rotate beside upstream.
+pub(crate) fn upstream_refresher_active() -> bool {
+    let Ok(home) = crate::profile::home_dir() else {
+        return false;
+    };
+    let dir = home.join(crate::identity::UPSTREAM_DATA_DIR_NAME);
+    UPSTREAM_REFRESHER_LOCKS.iter().any(|name| {
+        let file = match OpenOptions::new().read(true).open(dir.join(name)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        !matches!(file.try_lock_shared(), Ok(()))
+    })
 }
 
 /// Where the daemon singleton's flock lives. Test-only, so a module outside

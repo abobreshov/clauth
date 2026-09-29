@@ -463,3 +463,43 @@ fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
     );
     assert_eq!(paths.len(), 4, "no member beyond those four: {paths:#?}");
 }
+
+/// Upstream clauth's manual `mcpServers.clauth` wire stays in the operator's
+/// file only: a runtime copy seeded without it never syncs the removal back,
+/// and every other server still syncs both ways.
+#[test]
+fn upstreams_mcp_server_never_crosses_between_members() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("base.json");
+    let runtime = tmp.path().join("runtime.json");
+    write_json(
+        &base,
+        &json!({"mcpServers": {"clauth": {"command": "clauth"}, "old": {"command": "x"}}}),
+    );
+    write_json(
+        &runtime,
+        &json!({"mcpServers": {"tollgate": {"command": "tollgate"}}}),
+    );
+    set_mtime(&base, t(5));
+    set_mtime(&runtime, t(10));
+
+    sync_paths(&[base.clone(), runtime.clone()]).expect("sync");
+
+    let bj = read_json(&base);
+    assert_eq!(
+        bj["mcpServers"]["clauth"],
+        json!({"command": "clauth"}),
+        "the operator's upstream wire survives a newer runtime copy lacking it: {bj}"
+    );
+    assert_eq!(bj["mcpServers"]["tollgate"], json!({"command": "tollgate"}));
+    assert!(
+        bj["mcpServers"].get("old").is_none(),
+        "shared servers still sync"
+    );
+    let rj = read_json(&runtime);
+    assert!(
+        rj["mcpServers"].get("clauth").is_none(),
+        "the runtime copy never gains upstream's server: {rj}"
+    );
+}

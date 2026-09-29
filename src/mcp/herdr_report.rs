@@ -114,7 +114,7 @@ const _: () = assert!(STATE_TTL_MS >= REFRESH_INTERVAL.as_millis() as u64 * 4);
 /// the herdr-plugin's profile tag owns (`report-profile.sh`); herdr merges
 /// tokens per key within one source, so a shared `--source tollgate` lets the
 /// state read beside the profile tag instead of replacing it.
-const TOKEN_KEY: &str = "tollgate_delegate";
+const TOKEN_KEY: &str = crate::identity::HERDR_DELEGATE_TOKEN_KEY;
 
 /// Process-local delegate tracking for one herdr pane. Cheap to clone: every
 /// handle shares the same counters.

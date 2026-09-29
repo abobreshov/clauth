@@ -27,22 +27,26 @@ use crate::out::{errln, out, outln};
 /// The manifest `id`, and the prefix of every qualified action id.
 const PLUGIN_ID: &str = crate::identity::HERDR_PLUGIN_ID;
 /// The action a keybinding points at: opens the dashboard popup.
-const OPEN_ACTION: &str = "tollgate.open";
+const OPEN_ACTION: &str = crate::identity::HERDR_OPEN_ACTION;
 /// `owner/repo/subdir`, the only source shape `herdr plugin install` accepts.
 const GITHUB_SOURCE: &str = crate::identity::HERDR_GITHUB_SOURCE;
 /// The fetch URL behind `GITHUB_SOURCE`: the release probe's `git ls-remote
 /// --tags` reads the repo's release tags without a checkout.
-const GITHUB_REMOTE: &str = "https://github.com/abobreshov/clauth.git";
-/// Offered when `--key` is absent. `prefix+` is herdr's own leader.
-pub(crate) const DEFAULT_KEY: &str = "prefix+a";
+const GITHUB_REMOTE: &str = crate::identity::REPO_GIT_URL;
+/// Where the plugin manifest sits in the repo, for the pre-install id check.
+const MANIFEST_PATH: &str = "herdr-plugin/herdr-plugin.toml";
+/// Offered when `--key` is absent. `prefix+` is herdr's own leader. Not
+/// `prefix+a`: upstream clauth's plugin binds that one to `clauth.open`, and
+/// both plugins may be installed at once.
+pub(crate) const DEFAULT_KEY: &str = "prefix+t";
 /// The pane-metadata name `report-profile.sh` publishes the account under.
-const TOKEN: &str = "$tollgate";
+const TOKEN: &str = crate::identity::HERDR_TOKEN;
 /// The pane-metadata name the MCP server publishes delegate state under. The
 /// sidebar row `install` writes is the only template that renders it, so the
 /// row names it only while the `delegate_row_text` knob is on.
-const DELEGATE_TOKEN: &str = "$tollgate_delegate";
+const DELEGATE_TOKEN: &str = crate::identity::HERDR_DELEGATE_TOKEN;
 /// Marks this crate's additions inside a file tollgate does not own.
-const MARKER: &str = "# tollgate herdr plugin";
+const MARKER: &str = crate::identity::HERDR_CONFIG_MARKER;
 
 pub(crate) fn install(
     key: Option<&str>,
@@ -82,6 +86,11 @@ pub(crate) fn install(
             None
         }
     };
+    // The manifest at the ref herdr is about to fetch must be the fork's own:
+    // the fork's history carries upstream's tree (id `clauth`), and installing
+    // that registers or replaces upstream's live `clauth` plugin. Checked
+    // before herdr runs, and a check that cannot run refuses the install.
+    verify_manifest_id(release.as_ref().map(|(tag, _)| tag.as_str()))?;
     install_out(&installing_line(
         release.as_ref().map(|(tag, _)| tag.as_str()),
     ));
@@ -874,6 +883,7 @@ pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<
     if installed == target {
         return Ok(None);
     }
+    verify_manifest_id(Some(&tag))?;
 
     // `--ref` pins the reinstall to the release tag the probe picked — the
     // heal never installs a HEAD it did not compare against. `--yes` skips
@@ -923,12 +933,95 @@ pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<
     )))
 }
 
+/// How long the pre-install manifest check's shallow fetch may take.
+const MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Refuse unless the herdr plugin manifest at `reference` (a release tag, or
+/// the remote's HEAD when `None`) carries this tool's plugin id. One shallow
+/// fetch into a throwaway repo, then `git show` of the manifest: no checkout of
+/// the user's, and nothing herdr sees.
+fn verify_manifest_id(reference: Option<&str>) -> Result<()> {
+    let at = reference.unwrap_or("the default branch");
+    let id = fetch_manifest_id(reference).with_context(|| {
+        format!("could not check the herdr plugin manifest at {at} of {GITHUB_REMOTE}; refusing to install")
+    })?;
+    check_manifest_id(&id, at)
+}
+
+/// The pure half of [`verify_manifest_id`]: `id` must be this tool's plugin id.
+fn check_manifest_id(id: &str, at: &str) -> Result<()> {
+    if id == PLUGIN_ID {
+        return Ok(());
+    }
+    bail!(
+        "the herdr plugin at {at} of {GITHUB_REMOTE} has id `{id}`, not `{PLUGIN_ID}`: \
+         the fork has not published a {PLUGIN_ID} herdr plugin there yet, and installing \
+         it would register over the `{id}` plugin; nothing was installed"
+    )
+}
+
+/// The manifest's `id` at `reference`, read with a shallow fetch.
+fn fetch_manifest_id(reference: Option<&str>) -> Result<String> {
+    let dir = tempfile::tempdir().context("could not create a scratch dir")?;
+    let refspec = reference.map_or_else(|| "HEAD".to_string(), |tag| format!("refs/tags/{tag}"));
+    let blob = format!("FETCH_HEAD:{MANIFEST_PATH}");
+    git_in(dir.path(), &["init", "--quiet"])?;
+    git_in(
+        dir.path(),
+        &[
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "--no-tags",
+            GITHUB_REMOTE,
+            &refspec,
+        ],
+    )?;
+    let text = git_in(dir.path(), &["show", &blob])?;
+    manifest_id(&text).with_context(|| format!("{MANIFEST_PATH} names no plugin id"))
+}
+
+/// The `id` of a herdr plugin manifest's text.
+fn manifest_id(text: &str) -> Option<String> {
+    toml::from_str::<toml::Value>(text)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// One bounded `git -C <dir> <args>`, stdout on success.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .with_context(|| "could not run `git`; is git installed?")?;
+    let out = run_bounded(child, MANIFEST_FETCH_TIMEOUT)
+        .with_context(|| format!("`git {}` timed out", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// The newest release tag on `GITHUB_REMOTE` and the commit it resolves to,
 /// read with `git ls-remote --tags`: one network round trip and no checkout,
 /// which is all the staleness check and the pinned install need. Bounded like
 /// a probe, so a stalled remote costs one failed attempt rather than a wedged
 /// claim. `Ok(None)` when the remote carries no conforming
-/// `v<digits>.<digits>.<digits>` tag.
+/// `tollgate-v<digits>.<digits>.<digits>` tag.
 fn latest_release_target() -> Result<Option<(String, String)>> {
     let mut cmd = Command::new("git");
     cmd.args(["ls-remote", "--tags", GITHUB_REMOTE])
@@ -983,10 +1076,12 @@ fn pick_release(text: &str) -> Option<(String, String)> {
         .map(|(_, tag, sha)| (tag, sha))
 }
 
-/// `v1.2.3` -> `(1, 2, 3)`; a conforming tag is exactly
-/// `v<digits>.<digits>.<digits>`, and anything else is not a release tag.
+/// `tollgate-v1.2.3` -> `(1, 2, 3)`; a conforming tag is exactly
+/// [`crate::identity::RELEASE_TAG_PREFIX`] then `<digits>.<digits>.<digits>`,
+/// and anything else is not one of the fork's release tags. A bare `v1.2.3` is
+/// upstream's, carried in the fork's history, and names upstream's plugin.
 fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
-    let rest = tag.strip_prefix('v')?;
+    let rest = tag.strip_prefix(crate::identity::RELEASE_TAG_PREFIX)?;
     // "Exactly digits" lets only the separators through: `+1` would otherwise
     // parse as a leading sign, which is not a conforming tag name.
     if !rest.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
@@ -1235,6 +1330,29 @@ fn bound_key(doc: &toml::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The command of a `[[keys.command]]` entry other than [`OPEN_ACTION`] that
+/// already binds `key`, compared case-insensitively with surrounding blanks
+/// ignored.
+fn key_taken_by(doc: &toml::Value, key: &str) -> Option<String> {
+    let wanted = key.trim().to_ascii_lowercase();
+    doc.get("keys")?
+        .get("command")?
+        .as_array()?
+        .iter()
+        .filter(|e| e.get("command").and_then(toml::Value::as_str) != Some(OPEN_ACTION))
+        .find(|e| {
+            e.get("key")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|k| k.trim().to_ascii_lowercase() == wanted)
+        })
+        .map(|e| {
+            e.get("command")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("another action")
+                .to_string()
+        })
+}
+
 fn sidebar_state(doc: &toml::Value) -> SidebarState {
     let Some(table) = doc
         .get("ui")
@@ -1275,6 +1393,13 @@ fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<Con
     if bound_key(&doc).is_some() {
         plan.notes.push(format!(
             "`{OPEN_ACTION}` is already bound, so the keybinding is left alone"
+        ));
+    } else if let Some(other) = key_taken_by(&doc, key) {
+        // Another binding owns the key (upstream clauth's `prefix+a ->
+        // clauth.open`, say): a second entry on the same key is ambiguous at
+        // best, so name the clash and leave the file alone.
+        plan.notes.push(format!(
+            "`{key}` is already bound to `{other}`, so the keybinding is left alone; rerun with `--key <another>` to bind `{OPEN_ACTION}`"
         ));
     } else {
         plan.try_append(

@@ -1978,6 +1978,7 @@ fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) 
 pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
+        refuse_foreign_slot_link(&link)?;
         let target = install_source_path(name)?;
 
         if let Ok(meta) = link.symlink_metadata() {
@@ -2037,6 +2038,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
 pub(crate) fn clear_claude_credentials() -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
+        refuse_foreign_slot_link(&link)?;
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
@@ -2094,26 +2096,31 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
 }
 
 /// Extract the profile name from a `apiKeyHelper` command string of the form
-/// `<exe> __api-key <profile>` (each token shell-quoted). The exe may itself
-/// be shell-quoted with internal spaces (`'/home/uwu clxdy/bin/tollgate'`), so
-/// `split_whitespace` can yield more than three tokens — the parser locates
-/// the literal `__api-key` subcommand token and takes the NEXT token as the
-/// profile name, requiring it to be the LAST token (no trailing flags) and
-/// to pass `validate_profile_name`'s charset (`[A-Za-z0-9_.@+-]+`, no leading
-/// dot). A foreign helper that happens to contain `__api-key` followed by a
-/// profile-shaped token still parses — acceptable because tollgate only writes
-/// this string itself, and the subcommand name is unusual enough not to
-/// collide in practice. A hand-edited or corrupted helper that fails any of
-/// the above yields `None` rather than risk a phantom profile lookup that
+/// `<exe> __tollgate-api-key <profile>` (each token shell-quoted). The exe may
+/// itself be shell-quoted with internal spaces
+/// (`'/home/uwu clxdy/bin/tollgate'`), so `split_whitespace` can yield more
+/// than three tokens — the parser locates the literal subcommand token and
+/// takes the NEXT token as the profile name, requiring it to be the LAST token
+/// (no trailing flags) and to pass `validate_profile_name`'s charset
+/// (`[A-Za-z0-9_.@+-]+`, no leading dot). The tokens before the subcommand
+/// must name THIS tool ([`helper_exe_is_ours`]): upstream clauth writes the
+/// same shape into the same `settings.json`, and its profile `X` is not
+/// tollgate's `X`. A hand-edited, foreign or corrupted helper that fails any
+/// of the above yields `None` rather than risk a phantom profile lookup that
 /// returns the wrong account's key into [`capture_snapshot`].
 fn profile_name_from_helper(helper: &str) -> Option<String> {
     let mut tokens = helper.split_whitespace();
+    let mut exe_tokens: Vec<&str> = Vec::new();
     while let Some(tok) = tokens.next() {
         if tok != API_KEY_HELPER_SUBCMD {
+            exe_tokens.push(tok);
             continue;
         }
-        // The token immediately after `__api-key` is the profile name; a
-        // following token means the shape is `<exe> __api-key <profile>
+        if !helper_exe_is_ours(&exe_tokens.join(" ")) {
+            return None;
+        }
+        // The token immediately after the subcommand is the profile name; a
+        // following token means the shape is `<exe> <subcommand> <profile>
         // <extra>` (a future flag, a typo), which is not ours.
         let name = tokens.next()?;
         if tokens.next().is_some() {
@@ -2127,6 +2134,42 @@ fn profile_name_from_helper(helper: &str) -> Option<String> {
         return valid.then(|| name.to_string());
     }
     None
+}
+
+/// Whether the exe half of an `apiKeyHelper` string (shell-quoted as
+/// [`shell_quote`] writes it) is this tool: its file name is
+/// [`crate::identity::NAME`] (`.exe` allowed), or it resolves to the running
+/// executable (the `(deleted)` suffix of a replaced binary stripped).
+fn helper_exe_is_ours(quoted: &str) -> bool {
+    let unquoted = quoted
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .map(|s| s.replace("'\\''", "'"))
+        .or_else(|| {
+            quoted
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| quoted.to_string());
+    if unquoted.is_empty() {
+        return false;
+    }
+    // Both separators, whatever the host: the helper may name a Windows path.
+    let file_name = unquoted.rsplit(['/', '\\']).next().unwrap_or_default();
+    if file_name == crate::identity::NAME
+        || file_name
+            .strip_suffix(".exe")
+            .is_some_and(|stem| stem == crate::identity::NAME)
+    {
+        return true;
+    }
+    let path = Path::new(&unquoted);
+    let (Ok(exe), Ok(named)) = (env::current_exe(), path.canonicalize()) else {
+        return false;
+    };
+    let exe = crate::platform::installed_exe_path(&exe);
+    exe.canonicalize().is_ok_and(|exe| exe == named)
 }
 
 /// The Setup-tab field that owns a tollgate-managed env key, phrased for the
@@ -2222,12 +2265,14 @@ fn apply_profile_to_claude_settings_inner(
     atomic_write(&path, content).context("failed to write settings.json")
 }
 
-/// The hidden `tollgate __api-key <profile>` subcommand name embedded in CC's
-/// `apiKeyHelper`. The helper string is rebuilt from `env::current_exe()` on
-/// every `build_claude_settings_json` run; a long-lived process (daemon/TUI)
-/// that rebuilds after an in-place self-update sees Linux's `<path> (deleted)`
+/// The hidden `tollgate __tollgate-api-key <profile>` subcommand name embedded
+/// in CC's `apiKeyHelper` ([`crate::identity::API_KEY_HELPER_SUBCMD`]; upstream
+/// clauth's is `__api-key`, which this parser never matches). The helper
+/// string is rebuilt from `env::current_exe()` on every
+/// `build_claude_settings_json` run; a long-lived process (daemon/TUI) that
+/// rebuilds after an in-place self-update sees Linux's `<path> (deleted)`
 /// form, which `build_api_key_helper_command` strips back to the installed path.
-const API_KEY_HELPER_SUBCMD: &str = "__api-key";
+const API_KEY_HELPER_SUBCMD: &str = crate::identity::API_KEY_HELPER_SUBCMD;
 
 /// Build the `apiKeyHelper` command string CC runs per request to obtain an
 /// auth value for an api-key profile. The hidden subcommand reads
@@ -2591,6 +2636,7 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
 pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
+        refuse_foreign_slot_link(&link)?;
         let target = install_source_path(name)?;
         if link.symlink_metadata().is_ok() {
             // Preserve the live MCP-server logins onto the incoming profile
@@ -2631,9 +2677,36 @@ pub(crate) fn credentials_diverged(
     stored.access_token != live.access_token || stored.refresh_token != live.refresh_token
 }
 
+/// `Err` when the live slot is a symlink whose target lies outside tollgate's
+/// own profiles root: another tool's store (upstream clauth links the same
+/// slot into `~/.clauth/profiles/<p>/`), or a link the operator made. Replacing
+/// or deleting that link takes the slot from its owner, and reading through it
+/// copies that owner's refresh chain, a second carrier that dies with the
+/// first rotation of either copy. The import transaction (plan §4.0) is the
+/// one sanctioned way to take the slot over.
+pub(crate) fn refuse_foreign_slot_link(link: &Path) -> Result<()> {
+    if let Some(target) = crate::profile::symlink_target(link)
+        && !crate::profile::is_under_own_profiles_root(&target)
+    {
+        anyhow::bail!(
+            "refusing to touch {}: it links to {}, which {} does not own (another tool's \
+             profile store, such as upstream {}'s); only an import takes that login over",
+            link.display(),
+            target.display(),
+            crate::identity::NAME,
+            crate::identity::UPSTREAM_NAME,
+        );
+    }
+    Ok(())
+}
+
 /// Replace the symlink at `.credentials.json` with a regular file (same bytes).
 /// No-op if already a regular file or absent. Prevents CC writes from bleeding
 /// into the profile's storage after the user disowns the active profile.
+///
+/// Also a no-op for a link into a store tollgate does not own: detaching
+/// upstream clauth's link would copy its refresh chain into a regular file, a
+/// second carrier of one single-use chain.
 pub(crate) fn detach_credentials_link() -> Result<()> {
     with_state_lock(|_held| {
         let path = claude_credentials_path()?;
@@ -2641,6 +2714,9 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
             return Ok(());
         };
         if !meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        if refuse_foreign_slot_link(&path).is_err() {
             return Ok(());
         }
         // No unlink first: `atomic_write_600` publishes through a staging
