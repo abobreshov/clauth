@@ -1622,6 +1622,7 @@ fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
             path: "/api/v1/health".to_string(),
             query: String::new(),
             bearer: Some(bearer.to_string()),
+            host: None,
             if_none_match: None,
             body: Vec::new(),
             keep_alive: false,

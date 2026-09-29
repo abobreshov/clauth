@@ -4258,3 +4258,81 @@ fn uninstall_in_guest_mode_leaves_herdrs_config_alone() {
         "the config writer itself refuses in guest mode"
     );
 }
+
+// ── Untrusted ids and names in the plugin scripts ────────────────────────────
+
+/// A `focused_pane_id` that is not a pane id never reaches the fit arm's sed
+/// program. Spliced in raw, `x/x/;e touch … #` closes the `s` command and
+/// runs GNU sed's `e` (a shell command); the id is refused instead, which
+/// reads as no focused pane: no sizing flags, the plain open still made.
+#[cfg(unix)]
+#[test]
+fn a_focused_pane_id_that_is_not_a_pane_id_never_reaches_sed() {
+    let home = crate::testutil::HomeSandbox::new();
+    let marker = home.home().join("INJECTED");
+    // `#` comments out the rest of the spliced program for the shell `e` runs.
+    let id = format!("x/x/;e touch {} #", marker.display());
+    let snap = format!(
+        r#"{{"focused_pane_id":"{id}","layouts":[{{"pane_id":"{id}","rect":{{"height":57,"width":206}}}}]}}"#
+    );
+    let (code, log) = run_open_pane(
+        home.home(),
+        &format!(
+            "case \"$1\" in\n  api) printf '%s\\n' '{snap}' ;;\n  *) echo \"$@\" >> \"$(dirname \"$0\")/open.log\" ;;\nesac\n"
+        ),
+        "fit",
+    );
+    assert!(!marker.exists(), "the pane id ran as a sed command");
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        log.lines().last(),
+        Some("plugin pane open --plugin tollgate --entrypoint tui"),
+        "no sizing flags from a refused id: {log}"
+    );
+}
+
+/// The same rule for `neighbor_pane_id` on split-top: a value that is not a
+/// pane id is dropped and the focused pane is split instead.
+#[cfg(unix)]
+#[test]
+fn a_neighbor_pane_id_that_is_not_a_pane_id_is_dropped() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        concat!(
+            "case \"$1\" in\n",
+            "  api) echo '{\"focused_pane_id\":\"wP:p68\"}' ;;\n",
+            "  pane) echo '{\"result\":{\"neighbor\":{\"neighbor_pane_id\":\"wP:p70 --plugin x\"}}}' ;;\n",
+            "  *)   echo \"$@\" >> \"$(dirname \"$0\")/open.log\" ;;\n",
+            "esac\n",
+        ),
+        "split-top",
+    );
+    assert_eq!(code, Some(0));
+    let open_line = log
+        .lines()
+        .find(|l| l.contains("plugin pane open"))
+        .expect("the open attempt ran");
+    assert!(
+        open_line.contains("--target-pane wP:p68 --placement split --direction down"),
+        "the refused neighbor falls back to the focused pane: {open_line}"
+    );
+}
+
+/// A session row whose path carries a blank and a quote (here the row name;
+/// a `$HOME` with a space is the same shape) still resolves: the matches reach
+/// `ls` as separate arguments, not through `xargs`, which splits on the blank
+/// and rejects the unmatched quote.
+#[cfg(unix)]
+#[test]
+fn a_session_row_path_with_a_blank_and_a_quote_still_resolves() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"claude"}]}}"#;
+    let ps =
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(info, ps, &[("1000 it's", "spaced", 1000)], None);
+    assert!(
+        token_line(&lines).contains("--token tollgate=spaced"),
+        "the spaced row resolves: {}",
+        lines[0]
+    );
+}

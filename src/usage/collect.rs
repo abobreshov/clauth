@@ -2,9 +2,11 @@
 //!
 //! [`collect`] reads the same on-disk caches `tollgate list` and
 //! `tollgate status --json` read — the per-profile `usage_cache.json` /
-//! `third_party_cache.json` — and NEVER fetches. It is safe in guest mode:
-//! beyond the `~/.tollgate` directory `load_config` ensures on every entry
-//! point, it writes nothing, and it never touches `~/.claude` or `~/.clauth`.
+//! `third_party_cache.json` — and NEVER fetches. It writes nothing at all: the
+//! roster comes through [`crate::profile::load_config_read_only`], which
+//! creates no directory, tightens no mode and adopts no staged rotation, so a
+//! poll of the local agent API leaves the data dir byte-identical. It never
+//! touches `~/.claude` or `~/.clauth`.
 //!
 //! Order of the result: claude profiles (config order), codex profiles (roster
 //! order), then every [`MONITOR_SOURCES`] hook in slice order, then every
@@ -123,7 +125,7 @@ pub(crate) struct CollectOpts {
 /// unreadable config yields no claude profiles, an unreadable codex roster no
 /// codex profiles.
 pub(crate) fn collect(opts: &CollectOpts) -> Vec<AccountObservation> {
-    let config = crate::profile::load_config().ok();
+    let config = crate::profile::load_config_read_only().ok();
     let codex = CodexState::load().unwrap_or_default();
     let interval_ms = config
         .as_ref()

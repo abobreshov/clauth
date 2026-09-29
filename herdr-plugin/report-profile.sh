@@ -81,7 +81,18 @@ session_row() {
                 # and the stale one sorts first alphabetically.
                 _matches=$(grep -lE "\"pid\":$_pid(,|})" "$sessions_dir"/*.json 2>/dev/null)
                 if [ -n "$_matches" ]; then
-                    _row=$(printf '%s\n' "$_matches" | xargs ls -td 2>/dev/null | head -n 1)
+                    # Each name reaches ls as its own argument, never through
+                    # xargs, which splits on blanks and chokes on quotes: a
+                    # $HOME with a space or an apostrophe in it would lose
+                    # the row. grep -l prints one name per line and tollgate
+                    # names rows `<session>.json`, so a line is a name.
+                    set --
+                    while IFS= read -r _f; do
+                        if [ -n "$_f" ]; then set -- "$@" "$_f"; fi
+                    done <<EOF
+$_matches
+EOF
+                    _row=$(ls -td -- "$@" 2>/dev/null | head -n 1)
                     printf '%s\n' "$_row"
                     return 0
                 fi

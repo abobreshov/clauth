@@ -1889,6 +1889,7 @@ mod route_harness {
             path: path.to_string(),
             query: query.to_string(),
             bearer: bearer.map(str::to_string),
+            host: None,
             if_none_match: None,
             body: body.as_bytes().to_vec(),
             // Routing does not depend on this; the connection loop owns it.

@@ -9,12 +9,19 @@
 //!     bearer on the wire; the TLS REST API (`daemon --listen`) is the remote
 //!     surface.
 //!   * **Two doors.** TCP needs `Authorization: Bearer <token>`, the token
-//!     living in `~/.tollgate/api-token` (0600, generated on first use). The
-//!     unix socket `~/.tollgate/api.sock` (0600, inside the 0700 data dir) needs
-//!     no token: reaching it already proves the caller is this user.
+//!     living in `~/.tollgate/api-token` (0600, generated on first use), and a
+//!     loopback `Host` (`localhost`, `127.0.0.1`, `[::1]`, any port): a
+//!     DNS-rebound browser page carries its own name and is refused 421 before
+//!     the token is looked at. The unix socket `~/.tollgate/api.sock` (0600,
+//!     inside the data dir, which is verified ours and tightened to 0700
+//!     before the bind) needs no token: reaching it already proves the caller
+//!     is this user.
 //!   * **Read-only.** Every route is a `GET`; anything else answers 405. The
 //!     handlers read caches through [`crate::usage::collect::collect`] and never
-//!     fetch, so an agent polling this spends no provider quota.
+//!     fetch, so an agent polling this spends no provider quota, and they write
+//!     nothing: the roster loads through
+//!     [`crate::profile::load_config_read_only`], so a poll leaves the data dir
+//!     byte-identical.
 //!   * **No framework.** The daemon's own HTTP/1.1 reader and writer
 //!     ([`crate::daemon::api::http`]) are generic over the stream, so they run
 //!     here over a plain `TcpStream` / `UnixStream` with every size cap and
@@ -382,15 +389,69 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
     Ok(server)
 }
 
+/// This process's effective uid.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Make `dir` a directory only this uid can enter, or refuse: created 0700
+/// when absent; a symlink, a non-directory or another uid's directory is an
+/// error (the socket inside would live where someone else decides); an owned
+/// directory with group/other bits is tightened to 0700.
+///
+/// This is what makes the bind below safe without touching the process-wide
+/// umask (which another thread could be relying on): between `bind` and the
+/// `chmod` the node carries umask bits, and a connect needs search permission
+/// on every directory above it, which a 0700 dir owned by this uid gives no one
+/// else.
+#[cfg(unix)]
+pub(crate) fn secure_socket_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    crate::profile::mkdir_700(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    let meta = dir
+        .symlink_metadata()
+        .with_context(|| format!("failed to inspect {}", dir.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to serve the local API socket: {} is a symlink",
+            dir.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "refusing to serve the local API socket: {} is not a directory",
+            dir.display()
+        );
+    }
+    if meta.uid() != effective_uid() {
+        bail!(
+            "refusing to serve the local API socket: {} is owned by uid {}, not this user",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to restrict {} to 0700", dir.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn bind_unix(path: &Path) -> Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    if let Some(dir) = path.parent() {
-        crate::profile::mkdir_700(dir).context("failed to create ~/.tollgate")?;
-    }
-    if path.exists() {
+    let dir = path.parent().context("the socket path has no parent")?;
+    secure_socket_dir(dir)?;
+    // `symlink_metadata`, not `exists`: a dangling link at the node is still a
+    // node `bind` would trip over, so it is replaced like a stale socket.
+    if path.symlink_metadata().is_ok() {
         if UnixStream::connect(path).is_ok() {
             bail!(
                 "another local API already answers on {} (is `tollgate daemon` running?)",
@@ -402,7 +463,8 @@ fn bind_unix(path: &Path) -> Result<std::os::unix::net::UnixListener> {
     }
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind the local API socket {}", path.display()))?;
-    // The data dir is 0700 already; this keeps the node itself owner-only too.
+    // The data dir is verified 0700 and ours above; this keeps the node itself
+    // owner-only too.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to restrict {}", path.display()))?;
     Ok(listener)
