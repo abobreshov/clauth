@@ -119,7 +119,7 @@ tollgate list           # account table with cached usage, no network
 | `tollgate which` | `--json` | print the profile owning the loaded credentials; inside a `tollgate start` codex session, that codex profile |
 | `tollgate list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
 | `tollgate jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
-| `tollgate switch <name>` / `tollgate switch <sid> <profile>` | | one name switches the global account (the bare `tollgate <name>` form, deprecated); two names move a live session, picked up at its next request |
+| `tollgate switch <name>` / `tollgate switch <sid> <profile>` | | one name switches the global account (the bare `tollgate <name>` form, deprecated); two names move a live session: an OAuth one at its next request, an API-key one by hot swap within its endpoint class; `--relaunch` resumes it under the profile instead ([Auto-switch](Auto-Switch#moving-a-live-session-by-hand)) |
 | `tollgate sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
 | `tollgate resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
 | `tollgate info <id\|latest>` | | print a session's resume command, workspace, and storage path |

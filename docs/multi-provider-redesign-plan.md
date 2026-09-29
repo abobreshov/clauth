@@ -872,17 +872,20 @@ The tool shipped as **tollgate** 0.1.0 on `feat/tollgate` (D8). The user-facing 
 | Monitors / P4-NOUS (part) | `monitors.toml`, `tollgate monitor`, per-monitor cache (TTL, 429 hold, 7-day stale, single flight, fingerprint), budgets and `notify-send` alerts, daemon polling; Nous via Hermes' unexpired access token (D10 reader); `provider` monitors; upstream read-only view from `~/.clauth/status.json` | No own Nous device login (S5(a)); the monitor layer is new relative to §5's rows |
 | Agent API | Read-only loopback HTTP (`127.0.0.1:8454`, bearer `~/.tollgate/api-token`) + unix socket, seven routes, OpenAPI, redaction, `tollgate api serve\|token\|url`, MCP `usage` | New relative to §5; documented in `docs/agent-api.md` |
 | herdr H1 / H2 / H4-lite | Usage-aware `$tollgate` tag + `$tollgate_severity`; native `hermes` / `grok` / `agy` panes matched to a single owning account; `tollgate.usage` action (`--tab usage`); `tollgate herdr link` / `unlink` | H4-lite is the usage action only: no `tollgate.swap`. No H2h, H3 narrow popup layout or H5 compat suite |
+| S1 (a)–(f), (h), (i) | Spike run against Claude Code 2.1.283 with a local stub (`docs/spikes/s1-apikeyhelper.md`, `S1 RESULT: PASS`); machine gate block appended, compiled in by `src/hot_swap.rs` | S1(g) against real endpoints and the gateway precondition stay owner-run (`not_run` in the block); they gate the P4-OR helper preset, not B |
+| P6a executor B | `src/hot_swap.rs` (transport key, `LaunchClass`, gate + `cc-version.json` cache, executor choice at spawn, `SwapView`); per-session helper `__tollgate-api-key --session <sid>` with its ack sidecar and row-missing fallback; `SessionSwap::poll_api_key` dispatched before `poll_converge` (commit in one State hold: revalidate, runtime-settings drift check, marker claim, row write, settings touch, publish); request core shared by `tollgate switch <sid> <p> [--wait]`, the TUI `m` modal and MCP `switch_profile({session})`; served-member attribution (panes + `state`, `LiveTally` + `…`, herdr tag `--session`, `which`); local API `live_sessions` | Manual switches only (P6c is not built, and the decision leg skips B rows). Settings touch at commit, with the 30 s TTL as backstop, per S1(c). Stall is reported on a recorded helper failure, not after 2 × TTL (S1(a)). No `Harness::Hermes` / `NON_CLAUDE_SWITCH` yet (the shared prep PR has not landed) |
+| P6b relaunch in place | `src/relaunch.rs`: `tollgate switch <sid> <p> --relaunch [--yes] [--conversation <id>]`, claim by rename, nonce-verified hand-off env scrubbed from every child, SIGTERM then SIGKILL at 20 s, transcript flush wait, termios restore, exec of the resume form with a one-shot fallback to the original profile; conversation from `runtime_sid` hook records, then the transcript window | Ships before R3b: imported `conversations/` records would only add a faster lookup. Unix only (other platforms refuse with the manual resume line). No TUI / MCP relaunch |
 
 **Not yet**
 
 | Item | Phase |
 |---|---|
 | `tollgate import clauth [--dry-run]`, `import rollback`, the retire checklist (§4.0 migration) | R3a–R3d |
-| Executor B (API-key hot swap within a class), relaunch in place, class-aware chain rotation | S1, P6a–P6c |
+| Class-aware chain rotation of API-key sessions (the daemon moving a B session on its own) | P6c |
 | Hermes as a harness: `Harness::Hermes`, homes and guards, `tollgate hermes new\|auth`, `hermes_local` estimate, pool view, relaunch-to-switch | H-1a–H-4 |
 | TUI restyle of all tabs and consolidation 8 → 6 with the `HomeTab` alias map | P5 (only the Usage tab's monitor cards landed), P5b |
 | Fork-signed self-update: new minisign key, release workflow, mandatory verification in `install.sh` | R1 |
 | Grok / Antigravity legs, `tollgate providers`, Anthropic Admin and other management sources, a local estimate for Claude Code | P4b, P4c, P4d |
-| The spikes S1–S8 | — |
+| The spikes S2–S8, and S1(g) against real endpoints | — |
 
 **Known gaps found in review** (also in `CHANGELOG.md`): `tollgate login` still runs the Claude OAuth flow in guest mode; `list` and `status --json` print `base_url` unredacted; `tollgate api serve` leaves `api.sock` on SIGTERM; the herdr `--display-agent` scope is unverified.

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Moving a live session: API-key hot swap and relaunch in place
+
+- `tollgate switch <sid> <profile>` now moves a running API-key session onto another account without a restart, when the target has the same endpoint, model routing and custom env and stores no OAuth login. The session gets a per-session key helper (`__tollgate-api-key --session <sid>`), and a switch changes only the key that helper prints. The commit touches the session's runtime `settings.json`, so Claude Code runs the helper before its next request (the S1 spike showed any change to that file drops its cached key); a 30 s helper TTL is the backstop.
+- Every surface separates requested, committed and served. Until the helper has printed the new key the session is **swapping…**, and pane attribution, the TUI's live count, the herdr tag and `tollgate which` all name the account whose key it still sends. A helper failure shows as `stalled` with its code; an idle session never warns.
+- `switch` prints `committed to '<p>' (api-key hot swap, key generation <N>)`; `--wait` blocks until the new key is served (exit 3 if it is not within 65 s, or the helper failed). A target of another class, and a session that cannot hot-swap, are refused with the reason and the relaunch command.
+- Hot swap is on only for the Claude Code versions the S1 spike passed on, which are listed in the gate block appended to `docs/spikes/s1-apikeyhelper.md` (2.1.283 today). Other versions, isolated sessions, delegates, hosts that copy runtime trees, local or daemon endpoints, cloud-provider env and `forceLogin*` policies register relaunch-only. `TOLLGATE_HOT_SWAP=off` turns it off.
+- `tollgate switch <sid> <profile> --relaunch [--yes] [--conversation <id>]` stops the session gracefully and resumes the same conversation under the profile, in the same terminal. It asks first on a terminal. The supervisor restores the terminal state, and if the new start fails it falls back to the original profile. The relaunch request carries no claude arguments, and a relaunched session honours its hand-off variables only with a matching one-time nonce.
+- New surfaces: the TUI's Overview `m` key (move a live session onto the selected account) and a `…` live-cell marker for a session mid swap; the MCP `switch_profile` tool's `session` argument (`"self"` or a session id; it never relaunches); `live_sessions` on the local API's `/v1/accounts` and `/v1/accounts/{id}`; `state` on each `GET /api/v1/panes` session; `tollgate herdr tag --session <sid>`, which the reporter passes, and a `<served> → <committed> swapping…` tag while a swap is in flight.
+- All of it works in guest mode: it writes only under `~/.tollgate`.
+
 ### Guest mode
 
 - The Plugin tab's Claude Code plugin install and `mcpServers` wiring, `tollgate herdr install` / `uninstall` and the Plugin tab's herdr config fix now run in guest mode instead of refusing. They add, change or remove only tollgate's own entries: `tollgate@tollgate` in the plugin registry and `enabledPlugins`, the `tollgate` marketplace declaration in `settings.json`'s `extraKnownMarketplaces`, `mcpServers.tollgate` in `~/.claude.json`, the herdr plugin `tollgate` and the herdr config blocks under tollgate's marker (the keybinding conflict check still applies).

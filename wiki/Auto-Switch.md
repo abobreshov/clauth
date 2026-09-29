@@ -131,6 +131,25 @@ would start on 'work' for opus + sonnet
 
 The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on. This never moves a running session. `--with-fallback` moves one on its own as the account runs out, and `tollgate switch <sid> <profile>` moves one by hand; `--auto` and `--with-fallback` compose: pick the entry point, then let the chain rescue it if that account runs out.
 
+## Moving a live session by hand
+
+`tollgate switch <sid> <profile>` moves one running `tollgate start` session. `<sid>` is the live session's `<pid>-<seq>` id from `tollgate sessions`. How the session moves depends on how it authenticates, which it records when it starts:
+
+- **An OAuth session** records the request, and the session repoints its credential link at its next request (the same path `--with-fallback` uses). A move the session cannot make is logged, and the session stays where it is.
+- **An API-key session** changes account without a restart when the target has the same *class*: the same endpoint (scheme, host, port and path, compared after normalising), the same model routing, the same custom env, and no OAuth login stored beside the key. The session answers within a tick: `committed to '<p>' (api-key hot swap, key generation <N>)`. Claude Code picks up the new key when its key helper runs next. The commit touches the session's runtime `settings.json`, which makes Claude Code run the helper before its next request. Until that request, the session is **swapping…**: its requests still carry the previous key, so every surface still counts it on the previous account. `--wait` blocks until the helper has served the new key (up to 65 s, exit 3 if it has not).
+- **Everything else** needs `--relaunch`: a target of another class, an isolated session, a host that copies runtime trees, a session whose Claude Code version has not passed the S1 key-helper spike, and a session started with `TOLLGATE_HOT_SWAP=off`. The refusal names the reason and prints the command.
+
+`tollgate switch <sid> <profile> --relaunch` stops the session gracefully and resumes the same conversation under `<profile>` in the same terminal. On a terminal it asks first; from a script, pass `--yes`. It finds the conversation from the session's hook records, and falls back to the transcripts written since the session started. `--conversation <id>` picks one when several match. If the new start fails, the session restarts on its original profile. A session started by a tollgate that predates relaunch cannot do this; exit it and run `tollgate start <profile> -- --resume <conversation>`.
+
+| Exit | Meaning |
+|---|---|
+| `0` | done: committed, served (`--wait`), relaunched, already on the profile, or an OAuth request recorded |
+| `1` | refused or failed (the reason is on stderr) |
+| `2` | usage error: a flag without the two names, `--yes`/`--conversation` without `--relaunch`, or `--relaunch` off a terminal without `--yes` |
+| `3` | `--wait` only: committed, but the key helper had not served the new key when the wait ran out, or it failed |
+
+The chain never moves an API-key session: hot swaps happen only when you ask for one, from the CLI, the TUI's `m` key ([Interface and keys](Interface-And-Keys)) or the MCP `switch_profile` tool with `session` ([Claude Code plugin](Claude-Code-Plugin)). Only the CLI relaunches.
+
 ## Mixing account types
 
 A chain holding both OAuth and API-key accounts raises a confirm before it is saved. Switching away from an API-key member does not unset the environment variables a running bare `claude` already read, so that session can keep using the old endpoint until it restarts. `tollgate start` sessions are unaffected.
