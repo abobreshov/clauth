@@ -113,6 +113,27 @@ Evidence that nothing leaked (`evidence/summary.txt`):
 5. `hermes config set` (the `new` step 7 pin) writes `HERMES_HOME/config.yaml` by atomic rename, and
    touches nothing outside the home.
 
+## Re-run before Part 2 (2026-09-29, branch `tg/hermes-p2` @ `85edc959`)
+
+The same harness was run again, unchanged, before the Part 2 surfaces were built:
+`tools/spikes/s7f/run.sh <scratch dir outside the repo>`, then `summarize.py`. Same bubblewrap
+isolation (tmpfs over the real home, `--unshare-all`, `--clearenv`), the same real 0.19.0
+entrypoint resolved through the mise glob and the shebang check; the `~/.local/bin/hermes` shim was
+not bound and never ran. **Result: PASS again.**
+
+- inotify, main phase: 0 events on the sentinels; control phase: 4 OPEN / 4 ACCESS on
+  `.credentials.json` (the instruments still see an open route).
+- The outer home listing before and after the main phase is identical (`HERMES_HOME` excluded).
+- No `OUTSIDE` path in any audit log; the only outer-home paths are `lstat`s through the `.ssh` link
+  (9 in the chat run: `.ssh`, `authorized_keys`, `config`, `id_ed25519`, `id_rsa`).
+- Probe `redirect`: `Path.home()` = the child home, no credential found, `_try_anthropic` not
+  reached. Probe `forcegate`: `_try_anthropic` reached once from `call_llm` and once from
+  `_try_payment_fallback`, and returned no client both times.
+- The chat turn answered `ok` (rc 0); the child home still holds only the three links.
+
+The evidence in `tools/spikes/s7f/evidence/` is from the first run; this run's output matched it
+line for line in the verdict-bearing sections and was not re-exported.
+
 ## Machine block
 
 tollgate compiles this block in (`src/hermes/resolve.rs`). `tollgate start <hermes-profile>` refuses
