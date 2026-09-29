@@ -278,6 +278,8 @@ pub(crate) struct StartOpts {
 pub(crate) struct Server {
     tcp: Option<SocketAddr>,
     socket: Option<PathBuf>,
+    #[cfg(unix)]
+    socket_identity: Option<(u64, u64)>,
     socket_error: Option<String>,
     stop: Arc<AtomicBool>,
 }
@@ -297,6 +299,22 @@ impl Server {
     pub(crate) fn socket_error(&self) -> Option<&str> {
         self.socket_error.as_deref()
     }
+
+    #[cfg(unix)]
+    pub(crate) fn cleanup_socket(&self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let (Some(path), Some(identity)) = (&self.socket, self.socket_identity) else {
+            return;
+        };
+        let Ok(metadata) = path.symlink_metadata() else {
+            return;
+        };
+        if metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity {
+            let _ = std::os::unix::net::UnixStream::connect(path);
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl Drop for Server {
@@ -307,10 +325,7 @@ impl Drop for Server {
             let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
         }
         #[cfg(unix)]
-        if let Some(path) = &self.socket {
-            let _ = std::os::unix::net::UnixStream::connect(path);
-            let _ = std::fs::remove_file(path);
-        }
+        self.cleanup_socket();
     }
 }
 
@@ -350,7 +365,11 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
     let unix_listener = if opts.unix_socket {
         let path = socket_path()?;
         match bind_unix(&path) {
-            Ok(listener) => Some((listener, path)),
+            Ok(listener) => {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = path.symlink_metadata()?;
+                Some((listener, path, (metadata.dev(), metadata.ino())))
+            }
             Err(e) if tcp_listener.is_some() => {
                 socket_error = Some(format!("{e:#}"));
                 None
@@ -365,6 +384,8 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
     let mut server = Server {
         tcp: None,
         socket: None,
+        #[cfg(unix)]
+        socket_identity: None,
         socket_error,
         stop: Arc::clone(&stop),
     };
@@ -377,9 +398,10 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
             .context("failed to spawn the local API accept thread")?;
     }
     #[cfg(unix)]
-    if let Some((listener, path)) = unix_listener {
+    if let Some((listener, path, identity)) = unix_listener {
         // Recorded before the spawn so a failed spawn's drop removes the node.
         server.socket = Some(path);
+        server.socket_identity = Some(identity);
         let (ctx, stop) = (Arc::clone(&ctx), Arc::clone(&stop));
         std::thread::Builder::new()
             .name("tollgate-local-api-unix".into())
@@ -651,8 +673,14 @@ fn status_path() -> Result<PathBuf> {
     Ok(crate::profile::tollgate_dir()?.join(crate::daemon::STATUS_FILE))
 }
 
-/// `tollgate api serve [--listen ADDR]`: serve in the foreground until killed.
+/// `tollgate api serve [--listen ADDR]`: serve until a stop signal.
 pub(crate) fn cmd_serve(listen: Option<String>) -> Result<()> {
+    #[cfg(unix)]
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::signal::SIGINT,
+        signal_hook::consts::signal::SIGTERM,
+    ])
+    .context("failed to install local API stop signals")?;
     let raw = listen.unwrap_or_else(|| saved_settings().listen);
     let addr = parse_listen(&raw)?;
     let server = start(StartOpts {
@@ -665,6 +693,13 @@ pub(crate) fn cmd_serve(listen: Option<String>) -> Result<()> {
         errln!("tollgate: unix socket not served: {e}");
     }
     outln!("token: {}", token_path()?.display());
+    #[cfg(unix)]
+    {
+        let _ = signals.forever().next();
+        drop(server);
+        Ok(())
+    }
+    #[cfg(not(unix))]
     loop {
         std::thread::park();
     }

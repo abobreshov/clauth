@@ -465,20 +465,23 @@ pub(crate) fn serve(
     // singleton claim like the TLS listener, so only the running daemon holds
     // its port and socket; never fatal, so a taken port costs only this API.
     // Held for the process's life: `run` below never returns.
-    let _local_api = crate::local_api::start_in_daemon(&local_api, daemon.status_path.clone());
+    let local_api =
+        crate::local_api::start_in_daemon(&local_api, daemon.status_path.clone()).map(Arc::new);
 
     // After the listener, the last start step that can fail, so a start that
     // dies leaves no gateway behind; before `run`, which never returns, so
     // the supervisor (or the signal watcher holding it) lives as long as the
     // process. A standby reaches this only once promoted: the gateway runs
     // under the singleton's holder alone.
-    let _supervisor = match gateway::start(Arc::clone(&daemon.gateway), &lock) {
-        Ok(supervisor) => gateway::stop_on_signal(supervisor),
+    let supervisor = match gateway::start(Arc::clone(&daemon.gateway), &lock) {
+        Ok(supervisor) => Some(supervisor),
         Err(e) => {
             logline!("tollgate daemon: {e:#}; the shunt gateway is not supervised");
             None
         }
     };
+    let _supervisor = gateway::stop_on_signal(supervisor, local_api.clone());
+    let _local_api = local_api;
 
     logline!(
         "tollgate daemon: running (status → {})",

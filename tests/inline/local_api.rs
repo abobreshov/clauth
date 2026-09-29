@@ -328,6 +328,32 @@ fn the_unix_socket_answers_without_a_token_and_is_owner_only() {
 
 #[cfg(unix)]
 #[test]
+fn signal_cleanup_removes_the_bound_socket() {
+    let _home = HomeSandbox::new();
+    let server = serve(true);
+    let path = server.socket().unwrap().to_path_buf();
+    server.cleanup_socket();
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_a_server_leaves_a_rebound_foreign_socket_alone() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let _home = HomeSandbox::new();
+    let server = serve(true);
+    let path = server.socket().unwrap().to_path_buf();
+    std::fs::remove_file(&path).unwrap();
+    let foreign = UnixListener::bind(&path).unwrap();
+    drop(server);
+    assert!(path.exists());
+    assert!(UnixStream::connect(&path).is_ok());
+    drop(foreign);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_live_socket_is_never_stolen_but_a_stale_one_is_replaced() {
     let _home = HomeSandbox::new();
     let live = serve(true);
