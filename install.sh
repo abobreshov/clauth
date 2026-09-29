@@ -54,7 +54,7 @@ case "${OS}" in
         ;;
     *)
         echo "Unsupported OS: ${OS}" >&2
-        echo "Install via cargo: cargo install --locked --git https://github.com/${REPO} tollgate"
+        echo "Install via cargo: cargo install --locked --git https://github.com/${REPO} --branch feat/tollgate tollgate"
         exit 1
         ;;
 esac

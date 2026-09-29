@@ -57,8 +57,8 @@ pub(crate) struct MonitorAddArgs {
     /// What it reads.
     #[arg(long, value_enum)]
     pub(crate) kind: MonitorKind,
-    /// With `--kind provider`: the typed provider (DeepSeek, Zai, MiniMax,
-    /// OpenRouter).
+    /// With `--kind provider`: the typed provider (DeepSeek, Zai, Alibaba,
+    /// MiniMax, OpenRouter, OllamaCloud).
     #[arg(long, value_name = "NAME")]
     pub(crate) provider: Option<String>,
     /// Human name.
