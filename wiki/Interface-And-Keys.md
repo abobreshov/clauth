@@ -1,13 +1,17 @@
 # Interface and keys
 
-`clauth` opens on the Overview tab. <kbd>←</kbd> <kbd>→</kbd> move between tabs, <kbd>?</kbd> lists every binding for the tab you are on, <kbd>q</kbd> twice quits.
+`tollgate` opens on the Overview tab (or the `home_tab` you set). <kbd>←</kbd> <kbd>→</kbd> move between tabs, <kbd>?</kbd> lists every binding for the tab you are on, <kbd>q</kbd> twice quits.
+
+The header's first row reads `tollgate vX.Y.Z`, then a `[ guest ]` pill while upstream clauth owns `~/.claude` ([Guest mode](Guest-Mode)), then a dim `[ herdr ]` tag inside a herdr pane, and the `[ daemon ]` chip on the right. In guest mode every switch, capture, plugin install and herdr config fix answers with a toast naming guest mode instead of acting.
+
+Colours follow the `palette` key: the running Omarchy theme when there is one, else Catppuccin Mocha, reloaded live when the theme changes ([Configuration](Configuration#palette)). There is no Config tab row for it.
 
 ## Tabs
 
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / 7d bars, chain position, a read-only section of codex accounts | switch accounts, reorder them, pick which harness shows |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker |
+| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state; below the profiles, every monitor and (in guest mode) every upstream clauth account, as metric cards | refresh one account, toggle estimates and the pace marker |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
@@ -15,9 +19,11 @@
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
-The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint clauth doesn't recognize shows none. A codex account's banked usage-limit resets show as `↺ N` on its Overview row while one is available — `clauth limit-reset` spends one ([Codex](Codex#use-a-usage-limit-reset)). Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together. On the fallback chain panel below the accounts, `↲ ~40m` beside a member names the account the chain switches to next, and roughly when.
+The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint tollgate doesn't recognize shows none. A codex account's banked usage-limit resets show as `↺ N` on its Overview row while one is available — `tollgate limit-reset` spends one ([Codex](Codex#use-a-usage-limit-reset)). Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together. On the fallback chain panel below the accounts, `↲ ~40m` beside a member names the account the chain switches to next, and roughly when.
 
-Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section headed ``codex — switch with `clauth <name>` ``, in the same columns: name (bold, in the blue accent, when it is the active codex profile), plan, 5h and 7d, with `—` where nothing is cached, and a dim `↺ N` after the columns while the account holds a banked usage-limit reset ([Codex](Codex#use-a-usage-limit-reset)). The section is read-only: no cursor reaches it, <kbd>⏎</kbd> and <kbd>a</kbd> never act on a codex row, and there is no live or timer cell. A codex row shows the same `×` marker when its chain is quarantined, and its plan cell falls back to the plan the account's login claims while no poll has cached one. The accounts panel title carries the active filter — plain `ACCOUNTS` unfiltered, `ACCOUNTS ─ claude` / `ACCOUNTS ─ codex` filtered, the harness name in dim text (the border rule supplies the dashes) — and its right edge shows the by-harness counts (`52 claude · 1 codex`, an empty roster's harness omitted), the first thing to go on a narrow terminal. The header's line 2 holds the gauge and the status dot.
+**Monitors and upstream accounts on the Usage tab.** The Usage tab's account rail lists the profiles first, then each `monitor:<id>` from `monitors.toml`, then, in guest mode, each `upstream:<name>` read from upstream clauth's status feed. <kbd>↑</kbd> <kbd>↓</kbd> walk the whole rail and wrap. Selecting one of those extra rows shows it as metric cards: a header with the provider and plan, a stale or failure line when there is one, then one card per window (label, reset countdown with local time, a full-width bar with an elapsed marker `│`, the value with a pace glyph `↑ → ↓` and a severity word, a dim footnote) and one per money meter (balance, a folded spend row, caps and budgets). They are read-only and have no Setup tab row; `tollgate monitor refresh` fetches a monitor. The list is re-read from disk every 2 seconds, so a monitor added from the shell appears without a restart.
+
+Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section headed ``codex — switch with `tollgate <name>` ``, in the same columns: name (bold, in the blue accent, when it is the active codex profile), plan, 5h and 7d, with `—` where nothing is cached, and a dim `↺ N` after the columns while the account holds a banked usage-limit reset ([Codex](Codex#use-a-usage-limit-reset)). The section is read-only: no cursor reaches it, <kbd>⏎</kbd> and <kbd>a</kbd> never act on a codex row, and there is no live or timer cell. A codex row shows the same `×` marker when its chain is quarantined, and its plan cell falls back to the plan the account's login claims while no poll has cached one. The accounts panel title carries the active filter — plain `ACCOUNTS` unfiltered, `ACCOUNTS ─ claude` / `ACCOUNTS ─ codex` filtered, the harness name in dim text (the border rule supplies the dashes) — and its right edge shows the by-harness counts (`52 claude · 1 codex`, an empty roster's harness omitted), the first thing to go on a narrow terminal. The header's line 2 holds the gauge and the status dot.
 
 ## Keys
 
@@ -54,7 +60,7 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 
 The day picker on a Fallback card's `preferred days` row shows each weekday as `[x]` or `[ ]`: <kbd>←</kbd> <kbd>→</kbd> walk the days (and do not switch tabs while it is open), <kbd>space</kbd> toggles the day and saves at once, <kbd>⏎</kbd>, <kbd>esc</kbd> or <kbd>q</kbd> leave it, and <kbd>↑</kbd> <kbd>↓</kbd> leave it and move to the row above or below. <kbd>?</kbd> and <kbd>x</kbd> keep working while it is open; every other key does nothing until you leave.
 
-On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out.
+On macOS, <kbd>t</kbd> skips any account holding a live `tollgate start` session: that session's login lives in a Keychain item tollgate cannot write, so rotating it would sign the session out.
 
 The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, the keys bound to the Claude Code selection (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd>, <kbd>⏎</kbd>) do nothing and a toast says `claude rows are hidden, press c`; <kbd>a</kbd> opens the tab-wide entries alone. <kbd>n</kbd>, <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
 
@@ -73,9 +79,9 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Status | none | `refresh status`, `open in browser` |
 | every tab | none | `start daemon` / `stop daemon`, last |
 
-`start daemon` shows while no daemon runs and starts `clauth daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.clauth/daemon.log`. It starts the plain daemon, so it serves no REST API; for the clauth app, run `clauth daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `clauth daemon --replace` does, taking the shunt gateway down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
+`start daemon` shows while no daemon runs and starts `tollgate daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.tollgate/daemon.log`. It starts the plain daemon, so it serves no REST API; for a remote client, run `tollgate daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `tollgate daemon --replace` does, taking the shunt gateway down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
 
-The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint clauth knows a key page for, so an OAuth account's menu is one entry shorter.
+The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint tollgate knows a key page for, so an OAuth account's menu is one entry shorter.
 
 The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is what works on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account to duplicate or save, so its account entry is `apply preset` alone, stamping the draft's endpoint and model fields.
 
@@ -84,11 +90,11 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
 | `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
 | `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
-| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
+| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax, Ollama Cloud (and the local Ollama daemon, whose usage key is minted on the same page) and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint tollgate does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
 There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
 
-`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
+`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `tollgate start` session; the pick names whichever is in the way.
 
 ## Setup tab rows
 
@@ -98,16 +104,16 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 |-----|------|
 | `status` | read-only, and present only while the account is disabled |
 | `type` | read-only `api` or `oauth`, off the base-url row and tracking what you type into it |
-| `provider` | read-only, present only for an endpoint clauth recognises: which provider it typed the account as |
+| `provider` | read-only, present only for an endpoint tollgate recognises: which provider it typed the account as |
 | `token` | read-only state of a stored long-lived setup token, above the editable rows, in one of eight states. Static: `long-lived · ~Nd left`, `expires in ~Nd` inside a month, `long-lived · no recorded expiry`, and `expired`. Rolling: `rolling · re-stamps in ~Nh`, `rolling · re-stamp due` inside the last hour, `rolling · no recorded expiry`, and `rolling token stalled` once nothing re-stamped it in time. `mis-filled` is neither: the sidecar holds a rotating pair the split cannot use. The charged states carry the fix beneath them ([Configuration](Configuration#account-types)) |
 | `name` | the profile name |
-| `auto-start` | whether clauth opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
+| `auto-start` | whether tollgate opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
 | `base url` | the API endpoint; blank means an OAuth account |
 | `api key` | the key for that endpoint |
 | `model` | the account's default model; <kbd>space</kbd> cycles presets, <kbd>⏎</kbd> types a full id |
 | `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
 | env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one removes the key |
-| `+ login` / `re-login` | what it runs depends on the account, the same three-way split `clauth login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone. While a browser login runs its modal offers <kbd>r</kbd> to open the browser again, <kbd>c</kbd> to copy the sign-in link for another device to your local clipboard through the terminal (OSC 52: kitty, WezTerm, Windows Terminal, tmux with `set-clipboard on`, and iTerm2 once `General > Selection > Applications in terminal may access clipboard` is on), and <kbd>p</kbd> to turn that row into a code field: type or paste the code the link's page shows, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back; a bad paste clears the field and says why |
+| `+ login` / `re-login` | what it runs depends on the account, the same three-way split `tollgate login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone. While a browser login runs its modal offers <kbd>r</kbd> to open the browser again, <kbd>c</kbd> to copy the sign-in link for another device to your local clipboard through the terminal (OSC 52: kitty, WezTerm, Windows Terminal, tmux with `set-clipboard on`, and iTerm2 once `General > Selection > Applications in terminal may access clipboard` is on), and <kbd>p</kbd> to turn that row into a code field: type or paste the code the link's page shows, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back; a bad paste clears the field and says why |
 | `log out` | drops the stored credentials, keeps the profile |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again, or signs Claude Code out when the account has only an api key behind it; the row's hint names which. Appears while ANY long-lived piece exists — the token, the preserved mint backup, or a set `rolling_token` flag — arms on the first press, clears on the second (the full exit: flag, sidecar, and backup together). Faint and inert when clearing would strip the account's last credential; a flag-only account disarms regardless, since no credential is touched |
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
@@ -127,7 +133,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
-| `auto-update` | checks for updates at launch, unless `CLAUTH_NO_UPDATE=1` | on |
+| `auto-update` | always off and dimmed: self-update is compiled out of this build, and the row's key only toasts `self-update is disabled in this build; reinstall from source` | off |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
 | `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |
@@ -141,7 +147,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 
 ## Plugin tab
 
-Each row is a check on your Claude Code wiring: `clauth` on `PATH` and `claude --version`, the `mcpServers` entry and whether `clauth mcp` boots, the plugin install record, and each profile's runtime state. A `herdr` row joins them when [herdr](Herdr-Plugin) is installed. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
+Each row is a check on your Claude Code wiring: `tollgate` on `PATH` and `claude --version`, the `mcpServers` entry and whether `tollgate mcp` boots, the plugin install record, and each profile's runtime state. A `herdr` row joins them when [herdr](Herdr-Plugin) is installed. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
 
 | Fix | When it appears |
 |-----|-----------------|
@@ -149,7 +155,7 @@ Each row is a check on your Claude Code wiring: `clauth` on `PATH` and `claude -
 | `repair credentials` | the active profile's stored login disagrees with the live one |
 | `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
 | `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
-| `install the clauth plugin` / `install globally (user scope)` | the first spelling when the plugin row reads not installed, the second when it is installed for this project only. Either confirms into the real `claude plugin` installer at user scope |
+| `install the tollgate plugin` / `install globally (user scope)` | the first spelling when the plugin row reads not installed, the second when it is installed for this project only. Either confirms into the real `claude plugin` installer at user scope. Refused in guest mode, like `wire mcpServers` and the herdr fix |
 
 The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel.
 

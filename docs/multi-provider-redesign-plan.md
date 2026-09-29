@@ -852,3 +852,37 @@ against source before applying)
 | `/credits` 403 would only lose the wallet today | CITES (part) | Code shows `/credits` is fatal (`?`) and fails the whole fetch, `/key` rows included; the plan's degrade rule stands with corrected cites |
 | Hermes clamps `used_pct` to [0,100], so the tool should too | Codex I6 (part) | The tool's `used_pct` is unclamped by design (§4.1) so debt stays visible; only the ×100 and the guard are copied |
 | Ollama overage "continues at per-token rates" | plan v3 (Codex I7) | Continuation depends on purchased credits or Team auto-billing (https://ollama.com/pricing FAQ); neither is visible in `/api/usage` |
+
+## 10. Implementation status (0.1.0, 2026-09-29)
+
+The tool shipped as **tollgate** 0.1.0 on `feat/tollgate` (D8). The user-facing summary is `CHANGELOG.md`; this maps the phases of §5 onto what landed.
+
+**Shipped**
+
+| Phase | What landed | Deviations from this plan |
+|---|---|---|
+| R0 identity | `src/identity.rs` (name, data dir `~/.tollgate`, `TOLLGATE_` prefix, repo slug, herdr ids and tokens, CC plugin `tollgate@tollgate`, helper subcommand `__tollgate-api-key`, default listen `0.0.0.0:8453`); mechanical rename; executable-name matches through `identity`; Windows exact image-name match | The updater is removed outright (every path a no-op, no URL, no key) rather than put behind a `self-update` cargo feature. No `TOLLGATE_HOME` override |
+| R2 coexistence (part) | Guest mode (§4.0 row) with `GUEST_REFUSAL`; helper token + exe check; herdr H0 (fork-owned `tollgate-v*` tags only, manifest id check, scripts call the binary); CC plugin rename; fetch lease stands down while upstream's `clauthd.lock` / `clauthd-standby.lock` / `usage-fetch.lock` is held; ownership by location for credential links | No `update = off\|notify\|auto` key (the old `[update] auto_update` is inert). The `import-journal.json` escape hatch exists, but nothing writes it |
+| P1a observation | `usage/observation.rs`, `derive.rs`, `project.rs`, `collect.rs`; `tollgate usage --json` envelope, byte-for-byte golden; countdown / severity / pace fixtures | `status.json` gained no `accounts[]`; agents read observations through the local API and the MCP `usage` tool instead (D17 realised as a new tool, `profiles` unchanged) |
+| P1b credential slots (part) | Monitoring keys by env var name only (`monitors.toml`, `billing_key_env`), refused secret-shaped keys and process variables, scrub from every child and from the gateway; monitor HTTP on an allowlist with no redirects | No general `ProviderHttp` policy layer; no Monitoring-login store |
+| P2 palette | `palette = auto\|omarchy\|catppuccin`, live Omarchy reload, Catppuccin verbatim | — |
+| P3 CLI | `usage` text cards, `--plain`, `--watch`, `--waybar` | `list` is not coloured and has no plain-format golden |
+| P4-OLL | `Provider::OllamaCloud` + `OllamaDaemon`, `/api/usage` source for both body shapes, `Ollama-Cloud` preset with the env allowlist | No catalog refresh, no plan / `account` label from config |
+| P4-OR | `/key` first, per-meter `/credits`, raw-number exact meters (a)–(f), preset v2, `billing_key_env` | No management-key binding by `organization_id ?? creator_user_id`, no org de-dup; S1(g) and S6 not run |
+| Monitors / P4-NOUS (part) | `monitors.toml`, `tollgate monitor`, per-monitor cache (TTL, 429 hold, 7-day stale, single flight, fingerprint), budgets and `notify-send` alerts, daemon polling; Nous via Hermes' unexpired access token (D10 reader); `provider` monitors; upstream read-only view from `~/.clauth/status.json` | No own Nous device login (S5(a)); the monitor layer is new relative to §5's rows |
+| Agent API | Read-only loopback HTTP (`127.0.0.1:8454`, bearer `~/.tollgate/api-token`) + unix socket, seven routes, OpenAPI, redaction, `tollgate api serve\|token\|url`, MCP `usage` | New relative to §5; documented in `docs/agent-api.md` |
+| herdr H1 / H2 / H4-lite | Usage-aware `$tollgate` tag + `$tollgate_severity`; native `hermes` / `grok` / `agy` panes matched to a single owning account; `tollgate.usage` action (`--tab usage`); `tollgate herdr link` / `unlink` | H4-lite is the usage action only: no `tollgate.swap`. No H2h, H3 narrow popup layout or H5 compat suite |
+
+**Not yet**
+
+| Item | Phase |
+|---|---|
+| `tollgate import clauth [--dry-run]`, `import rollback`, the retire checklist (§4.0 migration) | R3a–R3d |
+| Executor B (API-key hot swap within a class), relaunch in place, class-aware chain rotation | S1, P6a–P6c |
+| Hermes as a harness: `Harness::Hermes`, homes and guards, `tollgate hermes new\|auth`, `hermes_local` estimate, pool view, relaunch-to-switch | H-1a–H-4 |
+| TUI restyle of all tabs and consolidation 8 → 6 with the `HomeTab` alias map | P5 (only the Usage tab's monitor cards landed), P5b |
+| Fork-signed self-update: new minisign key, release workflow, mandatory verification in `install.sh` | R1 |
+| Grok / Antigravity legs, `tollgate providers`, Anthropic Admin and other management sources, a local estimate for Claude Code | P4b, P4c, P4d |
+| The spikes S1–S8 | — |
+
+**Known gaps found in review** (also in `CHANGELOG.md`): `tollgate login` still runs the Claude OAuth flow in guest mode; `list` and `status --json` print `base_url` unredacted; `tollgate api serve` leaves `api.sock` on SIGTERM; the herdr `--display-agent` scope is unverified.

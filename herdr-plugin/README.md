@@ -2,7 +2,7 @@
 
 Opens [tollgate](https://github.com/abobreshov/clauth) in a [herdr](https://herdr.dev) popup: the account table, the usage windows, and the auto-switch chain, over whatever you were doing, without a pane of its own. It labels every herdr pane with the account that pane is spending, and it shows when a delegate runs inside a pane. The popup width, the pane tag, and the delegate state all tune from the dashboard's Plugin tab.
 
-**The manual for all of it lives in the wiki: [herdr plugin](https://github.com/abobreshov/clauth/wiki/Herdr-Plugin).** This file covers what the plugin itself is, for anyone reading it before letting herdr run it.
+**The manual for all of it lives in the wiki: [herdr plugin](https://github.com/abobreshov/clauth/blob/feat/tollgate/wiki/Herdr-Plugin.md).** This file covers what the plugin itself is, for anyone reading it before letting herdr run it.
 
 ## Requires
 
@@ -16,13 +16,13 @@ Opens [tollgate](https://github.com/abobreshov/clauth) in a [herdr](https://herd
 tollgate herdr install
 ```
 
-That runs herdr's installer, then writes the two things a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row that renders the pane tag. `tollgate herdr uninstall` reverses both. Flags, the by-hand route, and everything the plugin does once installed are in the wiki page linked above.
+Once the fork publishes a `tollgate-v*` release, that runs herdr's installer at the newest one, then writes the two things a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row that renders the pane tag. `tollgate herdr uninstall` reverses both. Flags, the by-hand route, and everything the plugin does once installed are in the wiki page linked above.
 
 While upstream clauth owns `~/.claude` on the machine (guest mode), `tollgate herdr install` refuses: herdr's `config.toml` is shared with upstream's own plugin until an import.
 
 ### From a local checkout (dev install)
 
-The fork has published no `tollgate-v*` release tag yet, so `install` has nothing of the fork's to fetch. Link the checkout instead:
+The fork has published no `tollgate-v*` release tag yet, and its default branch still carries upstream's plugin, so `install` refuses rather than fetch it. Link the checkout instead:
 
 ```sh
 tollgate herdr link                 # the working directory's checkout, else the one this binary was built from

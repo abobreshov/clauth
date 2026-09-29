@@ -1,11 +1,13 @@
-**[clauth wiki](Home)**
+**[tollgate wiki](Home)**
 
 **Start here**
 - [Install](Install)
 - [Quickstart](Quickstart)
+- [Guest mode](Guest-Mode)
 - [Interface and keys](Interface-And-Keys)
 
 **Reference**
+- [Providers](Providers)
 - [Configuration](Configuration)
 - [Auto-switch](Auto-Switch)
 - [Codex](Codex)
@@ -16,8 +18,10 @@
 - [Daemon](Daemon)
 - [Claude Code plugin](Claude-Code-Plugin)
 - [herdr plugin](Herdr-Plugin)
+- [Local agent API](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/agent-api.md)
 
 **Help**
 - [FAQ](FAQ)
-- [README](https://github.com/uwuclxdy/clauth#readme)
-- [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md)
+- [README](https://github.com/abobreshov/clauth/blob/feat/tollgate/README.md)
+- [SECURITY.md](https://github.com/abobreshov/clauth/blob/feat/tollgate/SECURITY.md)
+- [CHANGELOG](https://github.com/abobreshov/clauth/blob/feat/tollgate/CHANGELOG.md)

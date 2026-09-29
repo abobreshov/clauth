@@ -1,6 +1,6 @@
 # Contributing
 
-Issues and PRs are welcome. File an issue through the [chooser](https://github.com/abobreshov/clauth/issues/new/choose), or open a PR against the default branch.
+Issues and PRs are welcome. File an issue through the [chooser](https://github.com/abobreshov/clauth/issues/new/choose), or open a PR against the `feat/tollgate` branch (the default branch still carries upstream clauth).
 
 Found a security issue? Report it privately through the [security policy](https://github.com/abobreshov/clauth/security/policy). Don't file a public issue.
 

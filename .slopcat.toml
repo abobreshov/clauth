@@ -1,4 +1,4 @@
-# clauth prose gate (README, wiki, model/user-facing strings).
+# tollgate prose gate (README, wiki, model/user-facing strings).
 # punct.em-dash stays ON: house prose avoids em-dash asides, and the code +
 # docs were swept to match. Only the two words below are exempted — both read
 # concretely in place ("every desktop platform (Linux, macOS, Windows)",

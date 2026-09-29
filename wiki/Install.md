@@ -1,64 +1,67 @@
 # Install
 
-Linux, macOS, and Windows (Git Bash / MSYS2). clauth needs `claude` on `PATH` for `clauth start`, `resume`, the MCP `delegate` tool, and the Claude Code plugin's install and self-heal, both of which drive the `claude plugin` CLI. Everything else works without it.
+Linux, macOS, and Windows (Git Bash / MSYS2). tollgate needs `claude` on `PATH` for `tollgate start`, `resume`, the MCP `delegate` tool, and the Claude Code plugin's install and self-heal, both of which drive the `claude plugin` CLI. Everything else works without it, including `tollgate usage`, the monitors and the local agent API.
 
-## Cargo
+tollgate is a fork of [clauth](https://github.com/uwuclxdy/clauth) and installs beside it: a different binary (`tollgate`), a different data dir (`~/.tollgate`). If upstream clauth is installed, read [Guest mode](Guest-Mode) before you start.
+
+## From source with cargo
+
+The `tollgate` package lives on the `feat/tollgate` branch of the fork. The fork's default branch still carries upstream's `clauth` package, so an unpinned `--git` install fails.
 
 ```bash
-cargo install clauth
+cargo install --locked --git https://github.com/abobreshov/clauth --branch feat/tollgate tollgate
 ```
 
-Upgrade the same way. A cargo-installed binary is never self-replaced: it reports that a newer release exists and leaves the swap to you.
+From a checkout:
+
+```bash
+git clone --branch feat/tollgate https://github.com/abobreshov/clauth tollgate
+cd tollgate
+cargo install --locked --path .
+# or build without installing: cargo build --release  (binary at ./target/release/tollgate)
+```
+
+Do not run `cargo install tollgate` (crates.io): a crate by that name there is not this tool.
 
 ## Install script
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
-```
-
-The script uses `cargo` when it finds it. Pass `--nocargo` to force a prebuilt binary instead:
+`install.sh` on the `feat/tollgate` branch runs the same `cargo install --git … --branch feat/tollgate` when `cargo` is on `PATH`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash -s -- --nocargo
+curl -fsSL https://raw.githubusercontent.com/abobreshov/clauth/feat/tollgate/install.sh | bash
 ```
 
-The binary lands in `~/.local/bin` (or `/usr/local/bin` when that is writable). The script prints a `PATH` hint when the install dir is not on your `PATH`, and it never edits your shell profile. Uninstall by deleting the binary it names.
-
-## From source
-
-```bash
-git clone https://github.com/uwuclxdy/clauth
-cd clauth
-cargo build --release
-# binary at ./target/release/clauth
-```
+`--nocargo` asks for a prebuilt binary instead. The fork has published no release yet, so that path has nothing to download today; use cargo. Unlike upstream's script, this one runs no post-install `self-heal`, because that writes Claude Code's plugin registry, which upstream clauth owns until an import.
 
 ## Updates
 
-A binary install checks GitHub for a newer release in the background on launch and replaces itself once every check passes:
+Self-update is compiled out of this build. Nothing checks GitHub, downloads or replaces the binary, and the herdr plugin is never reinstalled over the network either. The Config tab's `auto-update` row renders off and dimmed, and pressing it says `self-update is disabled in this build; reinstall from source`. A saved `[update] auto_update` value is kept in `profiles.toml` but has no effect.
 
-1. the release tag is newer than the running build
-2. `sha256sums.txt` downloads
-3. its minisign signature verifies against a public key compiled into the binary
-4. the platform asset's SHA-256 matches that sums file
-5. the new binary is written, fsynced, and swapped in atomically
-
-Any failing step skips the update and leaves the running binary alone. The check runs at launch, so turning auto-update off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) takes effect the next time clauth starts. `CLAUTH_NO_UPDATE=1` turns the whole thing off even when the toggle is on. Full chain: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md#auto-update-verification).
+To upgrade, re-run the cargo command above. A fork-signed updater (its own release API, its own minisign key) is planned; see [the plan](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/multi-provider-redesign-plan.md).
 
 ## Shell completions
 
-The first TUI launch offers to install completions for your shell. bash and zsh get a `source` line appended to the rc file, asked for with `[Y/n]` first; fish writes straight into `~/.config/fish/completions/`. The answer is remembered in `~/.clauth/.completions_installed`.
+The first TUI launch offers to install completions for your shell. bash and zsh get a `source` line appended to the rc file, asked for with `[Y/n]` first; fish writes straight into `~/.config/fish/completions/`. The answer is remembered in `~/.tollgate/.completions_installed`. The completion functions are tollgate's own, so they do not replace upstream clauth's.
 
 Install or refresh them any time:
 
 ```bash
-clauth completions install          # detects your shell from $SHELL
-clauth completions install zsh      # or name it
-clauth completions bash             # print the script to stdout instead
+tollgate completions install          # detects your shell from $SHELL
+tollgate completions install zsh      # or name it
+tollgate completions bash             # print the script to stdout instead
 ```
 
-`CLAUTH_NO_COMPLETIONS=1` skips the first-run prompt entirely.
+`TOLLGATE_NO_COMPLETIONS=1` skips the first-run prompt entirely.
 
 ## Claude Code plugin
 
-The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.
+The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants. In guest mode the install is refused, since the plugin registry is upstream's until an import.
+
+## Uninstall
+
+```bash
+cargo uninstall tollgate
+rm -rf ~/.tollgate          # profiles, monitors, caches, the API token
+```
+
+`~/.tollgate` holds live credentials for any profile you created; delete it only when you mean to. Nothing under `~/.clauth` is touched by either command.
