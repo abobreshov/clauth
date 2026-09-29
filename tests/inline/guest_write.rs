@@ -172,6 +172,57 @@ fn rebase_keeps_the_childs_owned_keys_and_additions_and_undoes_the_rest() {
     );
 }
 
+/// Claude Code 2.1.283's `plugin marketplace add --scope user` also declares
+/// the marketplace in `settings.json`'s `extraKnownMarketplaces`, where
+/// upstream's `clauth` entry already sits. tollgate's entry there is its own:
+/// the guard keeps it and still puts back any upstream entry the child moved.
+#[test]
+fn rebase_keeps_tollgates_marketplace_declaration_beside_upstreams() {
+    let before = obj(json!({
+        "enabledPlugins": {"clauth@clauth": true},
+        "extraKnownMarketplaces": {"clauth": {"source": {"source": "directory", "path": "/u"}}},
+        "model": "opus"
+    }));
+    let tollgate_mkt = json!({"source": {"source": "directory", "path": "/t"}});
+    let after = obj(json!({
+        "enabledPlugins": {"clauth@clauth": true, "tollgate@tollgate": true},
+        "extraKnownMarketplaces": {
+            "clauth": {"source": {"source": "directory", "path": "/u"}},
+            "tollgate": tollgate_mkt.clone()
+        },
+        "model": "opus"
+    }));
+    assert!(
+        lost_foreign_keys(&before, &after, SETTINGS_KEYS).is_empty(),
+        "adding tollgate's own declaration moves no upstream key"
+    );
+    assert_eq!(
+        Value::Object(rebase(&before, &after, SETTINGS_KEYS)),
+        Value::Object(after.clone())
+    );
+
+    // A child that also dropped upstream's declaration: that entry comes
+    // back, tollgate's stays.
+    let hostile = obj(json!({
+        "enabledPlugins": {"clauth@clauth": true, "tollgate@tollgate": true},
+        "extraKnownMarketplaces": {"tollgate": tollgate_mkt.clone()},
+        "model": "opus"
+    }));
+    assert_eq!(
+        lost_foreign_keys(&before, &hostile, SETTINGS_KEYS),
+        vec!["extraKnownMarketplaces.clauth"]
+    );
+    let rebased = rebase(&before, &hostile, SETTINGS_KEYS);
+    assert_eq!(
+        rebased["extraKnownMarketplaces"],
+        json!({
+            "clauth": {"source": {"source": "directory", "path": "/u"}},
+            "tollgate": tollgate_mkt
+        })
+    );
+    assert!(lost_foreign_keys(&before, &rebased, SETTINGS_KEYS).is_empty());
+}
+
 // ── the writer ───────────────────────────────────────────────────────────
 
 #[test]

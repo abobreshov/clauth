@@ -60,8 +60,13 @@ pub(crate) enum OwnedKey {
 
 /// `~/.claude.json`: the manual MCP wiring.
 pub(crate) const CLAUDE_JSON_KEYS: &[OwnedKey] = &[OwnedKey::Entry("mcpServers", NAME)];
-/// `settings.json`: the plugin's enable flag.
-pub(crate) const SETTINGS_KEYS: &[OwnedKey] = &[OwnedKey::Entry("enabledPlugins", CC_PLUGIN)];
+/// `settings.json`: the plugin's enable flag, and the marketplace declaration
+/// `claude plugin marketplace add --scope user` writes beside upstream's own
+/// `extraKnownMarketplaces.clauth` (Claude Code 2.1.283).
+pub(crate) const SETTINGS_KEYS: &[OwnedKey] = &[
+    OwnedKey::Entry("enabledPlugins", CC_PLUGIN),
+    OwnedKey::Entry("extraKnownMarketplaces", NAME),
+];
 /// `plugins/installed_plugins.json`: the plugin's install rows.
 pub(crate) const INSTALLED_PLUGINS_KEYS: &[OwnedKey] = &[OwnedKey::Entry("plugins", CC_PLUGIN)];
 /// `plugins/known_marketplaces.json`: the marketplace registration.

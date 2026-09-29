@@ -31,7 +31,7 @@ Some of the shared files hold keys that only tollgate uses, under its own names.
 |------|--------------------|
 | `~/.claude/plugins/installed_plugins.json` | `plugins["tollgate@tollgate"]` |
 | `~/.claude/plugins/known_marketplaces.json` | `tollgate` |
-| `~/.claude/settings.json` | `enabledPlugins["tollgate@tollgate"]` |
+| `~/.claude/settings.json` | `enabledPlugins["tollgate@tollgate"]`, `extraKnownMarketplaces.tollgate` (Claude Code declares the marketplace there on a user-scope add) |
 | `~/.claude.json` | `mcpServers.tollgate` |
 | herdr's plugin registry | the plugin id `tollgate` |
 | herdr's `config.toml` | the blocks under `# tollgate herdr plugin` |
