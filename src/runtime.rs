@@ -4869,15 +4869,15 @@ fn place_guest_private_entries(
 
     let plugins_src = claude_home.join("plugins");
     let plugins_dst = runtime.join("plugins");
-    if plugins_dst.symlink_metadata().is_err()
-        && plugins_src.exists()
-        && let Err(e) = copy_tree(&plugins_src, &plugins_dst)
-    {
-        logline!(
-            "tollgate: guest mode: the private copy of {} is incomplete ({e:#}); \
-             the session starts on what was copied",
-            plugins_src.display()
-        );
+    if plugins_dst.symlink_metadata().is_err() && plugins_src.exists() {
+        if let Err(e) = copy_tree(&plugins_src, &plugins_dst) {
+            logline!(
+                "tollgate: guest mode: the private copy of {} is incomplete ({e:#}); \
+                 the session starts on what was copied",
+                plugins_src.display()
+            );
+        }
+        repoint_guest_plugin_registry(&plugins_src, &plugins_dst);
     }
 
     crate::profile::mkdir_700(&store)
@@ -4887,6 +4887,90 @@ fn place_guest_private_entries(
         return Ok(vec![(store, projects_dst)]);
     }
     Ok(Vec::new())
+}
+
+/// Repoint the absolute paths a guest session's private `plugins/` copy
+/// carries from the operator's tree to the copy itself.
+///
+/// Claude Code records each marketplace clone (`known_marketplaces.json`'s
+/// `installLocation`) and each installed plugin (`installed_plugins.json`'s
+/// `installPath`) as an ABSOLUTE path under the config dir it ran with, so a
+/// byte copy of the registry still names `~/.claude/plugins/...`: the guest
+/// session would load its plugins from the operator's tree and run its
+/// marketplace auto-update (a `git pull` in `installLocation`) there, the
+/// write into upstream's tree this copy exists to prevent. Every top-level
+/// `*.json` in the copy is rewritten so a string that is `src` or under it
+/// names the same place under `dst` instead, which is the path Claude Code
+/// would itself record with `dst`'s config dir. Best-effort: a file that does
+/// not parse, names nothing under `src`, or fails to write is left as copied.
+fn repoint_guest_plugin_registry(src: &Path, dst: &Path) {
+    fn repoint(value: &mut serde_json::Value, from: &[String], to: &str) -> bool {
+        match value {
+            serde_json::Value::String(s) => {
+                for prefix in from {
+                    let Some(rest) = s.strip_prefix(prefix.as_str()) else {
+                        continue;
+                    };
+                    if rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR) {
+                        *s = format!("{to}{rest}");
+                        return true;
+                    }
+                }
+                false
+            }
+            serde_json::Value::Array(items) => items
+                .iter_mut()
+                .fold(false, |changed, v| repoint(v, from, to) | changed),
+            serde_json::Value::Object(map) => map
+                .values_mut()
+                .fold(false, |changed, v| repoint(v, from, to) | changed),
+            _ => false,
+        }
+    }
+
+    let (Some(from_raw), Some(to)) = (src.to_str(), dst.to_str()) else {
+        return;
+    };
+    // The spelling the operator's Claude Code recorded is the one its config
+    // dir resolved to, which a symlinked `~/.claude` makes differ from `src`.
+    let mut from = vec![from_raw.to_string()];
+    if let Some(real) = src
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        && real != from_raw
+    {
+        from.push(real);
+    }
+    let Ok(entries) = std::fs::read_dir(dst) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json")
+            || !entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if !repoint(&mut value, &from, to) {
+            continue;
+        }
+        let written = serde_json::to_vec_pretty(&value)
+            .map_err(anyhow::Error::from)
+            .and_then(|body| atomic_write_600(&path, body).map_err(Into::into));
+        if let Err(e) = written {
+            logline!(
+                "tollgate: guest mode: {} still names the operator's plugin tree ({e:#})",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Guest mode: give `tollgate resume` the transcript it names inside the guest

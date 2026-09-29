@@ -841,9 +841,12 @@ pub(crate) fn newest_session() -> Option<SessionRef> {
 }
 
 /// The workspace one session was recorded in, located by transcript filename —
-/// [`find_session`] plus [`SessionRef::workspace`] in one call, which is all the
-/// `delegate` resume path needs. `None` covers both dead ends it reports as one:
-/// no transcript of that id, and a transcript recording no workspace.
+/// [`find_session`] plus [`SessionRef::workspace`] in one call. `None` covers
+/// both dead ends as one: no transcript of that id, and a transcript recording
+/// no workspace. Test-only: the `delegate` resume path calls the two halves
+/// itself, because it also needs the transcript's path (a guest-mode resume
+/// seeds it into the guest store, `runtime::seed_guest_resume`).
+#[cfg(test)]
 pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
     find_session(session_id)?.workspace()
 }

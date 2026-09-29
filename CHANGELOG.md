@@ -18,7 +18,7 @@ First release of tollgate, a hard fork of [clauth](https://github.com/uwuclxdy/c
 - Claude Code switches (CLI, TUI, MCP `switch_profile`, REST `POST /api/v1/switch` with a 409), switch-off, `capture`, codex adoption, the plugin install, `mcpServers` wiring and `herdr install` refuse with one line; auto-switch, the credential detach and snapshot, settings apply, the identity strip and the plugin self-heal skip silently. Settings sync is off: each runtime's copy is seeded from the operator file at start, and nothing is written back.
 - `tollgate start`, API-key logins (never auto-activated), monitors, `usage` and the agent API keep working. Claude OAuth and `--setup-token` logins, both codex logins and the TUI login refuse.
 - No Claude or codex OAuth leg runs: no refresh-token spend (polls use the held access token), no rolling re-stamp, no codex standby rotation, no live-rotation adopt, and no write to the default macOS Keychain item.
-- Session runtimes get a private copy of `~/.claude/plugins`, keep transcripts in `~/.tollgate/guest-claude/projects`, and copy rather than link the shared `~/.codex` entries.
+- Session runtimes get a private copy of `~/.claude/plugins` (its registry's absolute paths repointed at the copy, so plugin loads and marketplace updates stay inside it), keep transcripts in `~/.tollgate/guest-claude/projects`, and copy rather than link the shared `~/.codex` entries.
 - Upstream's accounts appear read-only as `upstream:<name>`, projected from `~/.clauth/status.json` alone.
 - The TUI shows a `[ guest ]` pill; `usage --json`, the agent API and `status --json` carry `guest_mode`.
 - Independently of guest mode, tollgate's usage fetcher stands down while upstream's daemon, standby or fetch lock is held, and nothing claims a credentials symlink into a store tollgate does not own.
@@ -75,6 +75,7 @@ The pre-release review and how each finding was settled: [docs/tollgate-code-rev
 - Credential redaction also catches keys embedded in punctuation, such as JSON strings.
 - The local agent API's GETs no longer repair anything on disk, `/v1/status` is always parsed and fully redacted, TCP requests must carry a loopback `Host` (421 otherwise), and the socket's directory is checked and tightened before bind.
 - The herdr plugin scripts no longer pass a pane id into `sed` or session paths through `xargs`.
+- A guest-mode `delegate` resume copies the operator's transcript into the guest store first, as `tollgate resume` does, so Claude Code finds the conversation.
 
 ### Known gaps
 

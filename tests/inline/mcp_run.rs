@@ -6376,6 +6376,48 @@ fn a_resume_with_the_delivered_id_resolves_the_transcript() {
     );
 }
 
+/// B1 follow-up: in guest mode a shared delegate's `projects/` is tollgate's
+/// guest store, so a `delegate` resume copies the operator's transcript there
+/// the way `tollgate resume` does. Without it Claude Code answers "No
+/// conversation found" for every operator session. The operator's file stays
+/// byte-identical.
+#[test]
+fn a_guest_delegate_resume_seeds_the_transcript_into_the_guest_store() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("fake upstream data dir");
+    assert!(crate::identity::upstream_active(), "guest mode is on");
+    let projects = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("projects");
+    let slug = projects.join("-w-guest");
+    std::fs::create_dir_all(&slug).expect("projects dir");
+    let workspace = home.home().join("w-guest");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let body = format!(
+        "{{\"type\":\"user\",\"cwd\":{},\"message\":{{\"content\":\"hi\"}}}}\n",
+        serde_json::Value::String(workspace.to_string_lossy().into_owned())
+    );
+    let transcript = slug.join("sess-guest-1.jsonl");
+    std::fs::write(&transcript, &body).expect("transcript fixture");
+
+    let resolved = super::resolve_resume_workspace("sess-guest-1").expect("resolves");
+    assert_eq!(resolved, workspace);
+    let seeded = crate::runtime::guest_projects_store()
+        .expect("guest store")
+        .join("-w-guest/sess-guest-1.jsonl");
+    assert_eq!(
+        std::fs::read_to_string(&seeded).expect("the guest store holds the transcript"),
+        body,
+        "the delegate's shared runtime finds the transcript it resumes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&transcript).expect("operator transcript"),
+        body,
+        "the operator's transcript is copied, never moved or rewritten"
+    );
+}
+
 /// The registry is a direct handle rather than a flag in the job file: the
 /// detached task runs in this same process. An entry lives exactly as long as
 /// the run does, so a stale id can never stop a later job that reuses it.

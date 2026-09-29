@@ -104,6 +104,13 @@ The two reviews overlap, so their findings were merged into one numbering: **B**
 | M4 | G Minor 3 | `Amount::from_f64` may print scientific notation | Refuted: Rust's `Display` for `f64` never uses exponent notation (checked for `1e300`, `f64::MAX`, `5e-324`, `1e-300`, `1.5e-7` on rustc 1.98.1); no change | none | none |
 | M5 | G Minor 4 | herdr scripts: `xargs ls` without `-0`; pane id interpolated into `sed` | Confirmed (`sed` `e` command injection reproduced); fixed | `c140e7b6` | `herdr.rs`: `a_focused_pane_id_that_is_not_a_pane_id_never_reaches_sed`, `a_neighbor_pane_id_that_is_not_a_pane_id_is_dropped`, `a_session_row_path_with_a_blank_and_a_quote_still_resolves` |
 
+### Adversarial recheck
+
+A second pass over the merged fixes found two B1 defects, both fixed in one follow-up commit on `feat/tollgate`:
+
+- **The private `plugins/` copy still pointed at the operator's tree.** Claude Code records `installLocation` (`known_marketplaces.json`) and `installPath` (`installed_plugins.json`) as absolute paths, so a byte copy still sent a guest session's plugin loads and marketplace `git pull` into `~/.claude/plugins`. The copy's top-level JSON files are now repointed at the copy. Test: `runtime.rs`: `a_guest_plugin_copy_repoints_the_registrys_absolute_paths_at_itself`.
+- **A guest `delegate` resume could not find its transcript.** The fix made a shared guest runtime's `projects/` the guest store, but only `tollgate resume` seeded the transcript there, so the MCP `delegate` resume got "No conversation found". It now seeds the same way. Test: `mcp_run.rs`: `a_guest_delegate_resume_seeds_the_transcript_into_the_guest_store`.
+
 ### Left partial
 
 These are also listed under Known gaps in `CHANGELOG.md`.

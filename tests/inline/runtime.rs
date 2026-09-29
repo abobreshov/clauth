@@ -11117,6 +11117,93 @@ fn a_guest_session_keeps_plugins_and_projects_off_the_operator_trees_under_real_
     });
 }
 
+/// B1 follow-up: Claude Code records marketplace clones and installed plugins
+/// by ABSOLUTE path under the config dir it ran with, so a byte copy of the
+/// registry would still send a guest session's plugin loads and marketplace
+/// `git pull` into the operator's `~/.claude/plugins`. The private copy's
+/// registry names the copy instead; a path outside the operator's plugin tree,
+/// a prefix look-alike and a non-JSON file are left alone; and the operator's
+/// registry stays byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_guest_plugin_copy_repoints_the_registrys_absolute_paths_at_itself() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let op_plugins = claude_home.join("plugins");
+        let op = op_plugins.to_str().expect("utf-8 path").to_string();
+        fs::write(
+            op_plugins.join("installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {"plug@mkt": [{
+                    "installPath": format!("{op}/cache/mkt/plug/1.0"),
+                    "projectPath": "/elsewhere/ws",
+                }]},
+            })
+            .to_string(),
+        )
+        .expect("write registry");
+        fs::write(
+            op_plugins.join("known_marketplaces.json"),
+            serde_json::json!({
+                "mkt": {"installLocation": format!("{op}/marketplaces/mkt")},
+                "lookalike": {"installLocation": format!("{op}-other/mkt")},
+            })
+            .to_string(),
+        )
+        .expect("write marketplaces");
+        fs::write(op_plugins.join("notes.txt"), format!("{op}/cache")).expect("write text");
+        let before = guest_tree_snapshot(&op_plugins);
+
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let own = rt.config_dir().join("plugins");
+        let own_str = own.to_str().expect("utf-8 path").to_string();
+
+        let registry: serde_json::Value = serde_json::from_slice(
+            &fs::read(own.join("installed_plugins.json")).expect("read copy registry"),
+        )
+        .expect("parse copy registry");
+        let entry = &registry["plugins"]["plug@mkt"][0];
+        assert_eq!(
+            entry["installPath"],
+            format!("{own_str}/cache/mkt/plug/1.0"),
+            "an installed plugin loads from the private copy"
+        );
+        assert_eq!(entry["projectPath"], "/elsewhere/ws", "other paths kept");
+        let markets: serde_json::Value = serde_json::from_slice(
+            &fs::read(own.join("known_marketplaces.json")).expect("read copy marketplaces"),
+        )
+        .expect("parse copy marketplaces");
+        assert_eq!(
+            markets["mkt"]["installLocation"],
+            format!("{own_str}/marketplaces/mkt"),
+            "the marketplace auto-update runs in the private copy"
+        );
+        assert_eq!(
+            markets["lookalike"]["installLocation"],
+            format!("{op}-other/mkt"),
+            "a sibling that only shares the prefix is not the plugin tree"
+        );
+        assert_eq!(
+            fs::read_to_string(own.join("notes.txt")).expect("read text"),
+            format!("{op}/cache"),
+            "a non-JSON file is copied as-is"
+        );
+        drop(rt);
+
+        assert_eq!(
+            guest_tree_snapshot(&op_plugins),
+            before,
+            "the operator's registry stays byte-identical"
+        );
+    });
+}
+
 /// B1, the reused-tree edge: a tree a pre-guest build linked at the operator's
 /// `plugins/` / `projects/` is repointed on the next guest build rather than
 /// kept by the additive walk.

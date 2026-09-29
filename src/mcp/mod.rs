@@ -3484,15 +3484,24 @@ fn resolve_resume_workspace(session_id: &str) -> std::result::Result<std::path::
                 .to_string(),
         );
     }
-    let workspace = crate::sessions::workspace_of(session_id).ok_or_else(|| {
+    let no_transcript = || {
         format!("can't resume '{session_id}': no transcript for it, or none recording a workspace")
-    })?;
+    };
+    let session = crate::sessions::find_session(session_id).ok_or_else(no_transcript)?;
+    let workspace = session.workspace().ok_or_else(no_transcript)?;
     if !workspace.is_dir() {
         return Err(format!(
             "can't resume '{session_id}': workspace '{}' no longer exists",
             workspace.display()
         ));
     }
+    // Guest mode: a shared delegate's `projects/` is tollgate's guest store,
+    // never the operator's, so the transcript is copied there for `--resume`
+    // to find, as `tollgate resume` does (`runtime::seed_guest_resume`; a
+    // no-op outside guest mode).
+    crate::runtime::seed_guest_resume(&session.path).map_err(|e| {
+        format!("can't resume '{session_id}': seeding the guest transcript store failed: {e:#}")
+    })?;
     Ok(workspace)
 }
 
