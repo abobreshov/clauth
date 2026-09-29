@@ -1601,7 +1601,7 @@ impl Drop for SupervisorThread {
 /// must keep surviving it rather than have the watcher turn it into a death.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn inherited_ignored(signal: libc::c_int) -> bool {
+pub(crate) fn inherited_ignored(signal: libc::c_int) -> bool {
     // SAFETY: `signal` is one of `SIGTERM`/`SIGINT`/`SIGHUP`; a null `act`
     // asks the kernel to fill `old` with the current disposition and install
     // nothing. `old` is an owned, zeroed `sigaction`.

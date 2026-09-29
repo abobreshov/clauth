@@ -1026,7 +1026,8 @@ fn a_persisted_hold_is_clamped_and_a_foreign_file_is_ignored() {
     std::fs::write(&path, r#"{"version":1,"until_ms":18446744073709551615}"#).unwrap();
     let fresh = WalletHolds::persistent();
     assert_eq!(fresh.remaining(INFERENCE, 0), Some(WalletHolds::cap()));
-    assert_eq!(persisted_raw(INFERENCE), Some(900_000));
+    let cap_ms = u64::try_from(WalletHolds::cap().as_millis()).unwrap();
+    assert_eq!(persisted_raw(INFERENCE), Some(cap_ms));
 
     std::fs::write(&path, "{not json").unwrap();
     assert_eq!(WalletHolds::persistent().remaining(INFERENCE, 0), None);
@@ -1064,6 +1065,87 @@ fn a_skewed_persisted_hold_is_rewritten_and_credits_resume_after_the_cap() {
     .unwrap();
     assert_eq!(http.urls(), [KEY_URL, CREDITS_URL]);
     assert_eq!(persisted_raw(INFERENCE), None);
+}
+
+#[test]
+fn reading_an_in_cap_hold_preserves_its_bytes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms = 1_000_000;
+    let until_ms = now_ms + 600_000;
+    WalletHolds::persistent().hold(INFERENCE, now_ms, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    let bytes = format!("{{\n  \"version\": 1, \"until_ms\": {until_ms}\n}}\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert_eq!(
+        WalletHolds::persistent().remaining(INFERENCE, now_ms),
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+}
+
+#[test]
+fn a_skewed_read_preserves_an_in_cap_renewal_under_the_lock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms = 1_000_000;
+    let cap_ms = u64::try_from(WalletHolds::cap().as_millis()).unwrap();
+    let cap_until = now_ms + cap_ms;
+    WalletHolds::persistent().hold(INFERENCE, now_ms, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    let skewed = now_ms + 30 * 24 * 60 * 60 * 1000;
+    std::fs::write(&path, format!(r#"{{"version":1,"until_ms":{skewed}}}"#)).unwrap();
+    let seen_until = WalletHolds::read_until(&path).unwrap();
+    let lock = WalletHolds::lock_hold(&path).unwrap();
+    let renewed_until = now_ms + cap_ms / 2;
+    let renewed = format!("{{\n  \"version\": 1, \"until_ms\": {renewed_until}\n}}\n");
+
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| WalletHolds::clamp_skewed(&path, seen_until, cap_until));
+        crate::profile::atomic_write_600(&path, renewed.as_bytes()).unwrap();
+        drop(lock);
+        assert_eq!(reader.join().unwrap(), renewed_until);
+    });
+    assert_eq!(std::fs::read(&path).unwrap(), renewed.as_bytes());
+}
+
+#[test]
+fn a_missing_hold_after_the_unlocked_read_keeps_the_seen_deadline() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms = 1_000_000;
+    let cap_ms = u64::try_from(WalletHolds::cap().as_millis()).unwrap();
+    WalletHolds::persistent().hold(INFERENCE, now_ms, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    let skewed = now_ms + 30 * 24 * 60 * 60 * 1000;
+    std::fs::write(&path, format!(r#"{{"version":1,"until_ms":{skewed}}}"#)).unwrap();
+    let seen_until = WalletHolds::read_until(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    assert_eq!(
+        WalletHolds::clamp_skewed(&path, seen_until, now_ms + cap_ms),
+        seen_until
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_clamp_write_keeps_the_disk_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms = 1_000_000;
+    let cap_ms = u64::try_from(WalletHolds::cap().as_millis()).unwrap();
+    WalletHolds::persistent().hold(INFERENCE, now_ms, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    let skewed = now_ms + 30 * 24 * 60 * 60 * 1000;
+    std::fs::write(&path, format!(r#"{{"version":1,"until_ms":{skewed}}}"#)).unwrap();
+    let dir = path.parent().unwrap();
+    let permissions = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = WalletHolds::clamp_skewed(&path, skewed, now_ms + cap_ms);
+    std::fs::set_permissions(dir, permissions).unwrap();
+
+    assert_eq!(result, skewed);
+    assert_eq!(persisted_raw(INFERENCE), Some(skewed));
 }
 
 /// Two stores sharing one wallet key (two monitors, or a monitor and the

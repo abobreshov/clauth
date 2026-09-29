@@ -53,6 +53,44 @@ fn api_serve_removes_its_socket_on_sigterm() {
 }
 
 #[test]
+fn api_serve_preserves_inherited_sigterm_ignore() {
+    let home = tempfile::tempdir().expect("sandbox home");
+    let socket = home.path().join(".tollgate/api.sock");
+    let child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' TERM; exec \"$1\" api serve --listen 127.0.0.1:0",
+            "sh",
+            env!("CARGO_BIN_EXE_tollgate"),
+        ])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start local API with SIGTERM ignored");
+    let mut server = RunningServer(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() && Instant::now() < deadline {
+        assert_eq!(server.0.try_wait().expect("poll server"), None);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(socket.exists(), "local API socket did not appear");
+
+    let signal = Command::new("kill")
+        .arg("-TERM")
+        .arg(server.0.id().to_string())
+        .status()
+        .expect("signal local API");
+    assert!(signal.success());
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.0.try_wait().expect("poll ignored signal"), None);
+    assert!(socket.exists());
+}
+
+#[test]
 fn embedded_local_api_removes_its_socket_on_sigterm() {
     let home = tempfile::tempdir().expect("sandbox home");
     let data_dir = home.path().join(".tollgate");

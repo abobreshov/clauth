@@ -297,7 +297,9 @@ fn list_redacts_credentials_in_endpoints() {
             state: AppState::default(),
             profiles: vec![profile],
         };
-        let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+        let mut entries =
+            build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+        entries[0].base_url = Some(raw.to_string());
         let table = render_table(&config, &entries);
         assert!(table.contains(safe), "{table}");
         assert!(!table.contains("sk-"), "{table}");

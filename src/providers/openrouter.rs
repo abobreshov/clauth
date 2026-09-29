@@ -567,7 +567,7 @@ impl WalletHolds {
         let cap_ms = u64::try_from(Self::cap().as_millis()).unwrap_or(u64::MAX);
         let cap_until = now_ms.saturating_add(cap_ms);
         let until = if until > cap_until {
-            Self::clamp_skewed(&path, until, now_ms, cap_until)
+            Self::clamp_skewed(&path, until, cap_until)
         } else {
             until
         };
@@ -580,12 +580,12 @@ impl WalletHolds {
         Self::read_until(&path).filter(|&t| t > now_ms)
     }
 
-    fn clamp_skewed(path: &std::path::Path, seen_until: u64, now_ms: u64, cap_until: u64) -> u64 {
+    fn clamp_skewed(path: &std::path::Path, seen_until: u64, cap_until: u64) -> u64 {
         let Some(_lock) = Self::lock_hold(path) else {
             return seen_until;
         };
         let Some(current) = Self::read_until(path) else {
-            return now_ms;
+            return seen_until;
         };
         if current <= cap_until {
             return current;
@@ -594,8 +594,15 @@ impl WalletHolds {
             version: WALLET_HOLD_VERSION,
             until_ms: cap_until,
         };
-        if let Ok(bytes) = serde_json::to_vec(&hold) {
-            let _ = crate::profile::atomic_write_600(path, bytes);
+        let written = serde_json::to_vec(&hold)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::profile::atomic_write_600(path, bytes));
+        if let Err(error) = written {
+            crate::logline::logline!(
+                "tollgate openrouter: failed to clamp wallet hold {}: {error}",
+                path.display()
+            );
+            return current;
         }
         cap_until
     }
