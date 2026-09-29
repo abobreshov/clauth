@@ -2462,6 +2462,11 @@ pub(crate) fn enforce_tollgate_perms(root: &Path) {
         if is_dir && crate::runtime::is_codex_home_path(root) {
             return;
         }
+        // The same threshold for a Hermes home (its contents are Hermes') and
+        // a Hermes child home (its entries are links into the operator's home).
+        if is_dir && crate::hermes::home::is_perms_threshold(root) {
+            return;
+        }
         if is_dir && let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 enforce_tollgate_perms(&entry.path());

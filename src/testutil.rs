@@ -1404,7 +1404,10 @@ pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
     // Mirror of `enforce_tollgate_perms`: a codex home's contents are codex's
     // own (exec-bit helper binaries included), so the invariant covers the
     // home NODE and stops at its threshold.
-    if is_dir && crate::runtime::is_codex_home_path(root) {
+    if is_dir
+        && (crate::runtime::is_codex_home_path(root)
+            || crate::hermes::home::is_perms_threshold(root))
+    {
         return out;
     }
     if is_dir && let Ok(entries) = std::fs::read_dir(root) {

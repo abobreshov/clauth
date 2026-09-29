@@ -155,3 +155,53 @@ fn the_claude_scrub_strips_only_a_tollgate_codex_home() {
         );
     }
 }
+
+/// Test 1: the Hermes tag is the lowercase `"hermes"` on the wire, and a row
+/// written before the axis existed (no `harness` key) still reads as claude.
+#[test]
+fn harness_hermes_roundtrips_lowercase_and_old_rows_stay_readable() {
+    assert_eq!(
+        serde_json::to_string(&Harness::Hermes).unwrap(),
+        "\"hermes\""
+    );
+    assert_eq!(
+        serde_json::from_str::<Harness>("\"hermes\"").unwrap(),
+        Harness::Hermes
+    );
+    assert_eq!(Harness::Hermes.as_str(), "hermes");
+    assert_eq!(
+        Harness::ALL,
+        [Harness::Claude, Harness::Codex, Harness::Hermes],
+        "the bare-name resolution order"
+    );
+    let old = serde_json::json!({
+        "session_id": "4242-0",
+        "start_profile": "work",
+        "pid": 4242,
+        "started_at": 0,
+        "isolated": false,
+    });
+    let row: crate::live_sessions::LiveSession =
+        serde_json::from_value(old).expect("a pre-axis row parses");
+    assert_eq!(row.harness, Harness::Claude);
+    let mut hermes = serde_json::to_value(&row).unwrap();
+    hermes["harness"] = serde_json::json!("hermes");
+    let back: crate::live_sessions::LiveSession = serde_json::from_value(hermes).unwrap();
+    assert_eq!(back.harness, Harness::Hermes);
+}
+
+/// Test 2: a Hermes profile installs nothing at switch, by contract; both
+/// install methods refuse and name Hermes.
+#[test]
+fn hermes_engine_install_credentials_bails() {
+    let engine: &dyn HarnessEngine = Harness::Hermes.engine();
+    assert_eq!(engine.home_env_key(), "HERMES_HOME");
+    for err in [
+        engine.install_credentials("or-main").unwrap_err(),
+        engine.force_install_credentials("or-main").unwrap_err(),
+    ] {
+        let text = err.to_string();
+        assert!(text.contains("Hermes profile 'or-main'"), "{text}");
+        assert!(text.contains("relaunch"), "{text}");
+    }
+}

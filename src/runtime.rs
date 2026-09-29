@@ -7555,6 +7555,115 @@ impl Drop for CodexRuntime {
     }
 }
 
+/// A claimed Hermes liveness marker: `profiles/<name>/sessions-<sid>/<sid>`,
+/// flock-held for the guard's lifetime, with an optional live-session row
+/// (`harness = hermes`, `launch_store: None`). `tollgate start` registers the
+/// row. `hermes auth` and the pool strategy writer claim the marker alone:
+/// they hold the home as busy without being a session (spec §4.4 step 3,
+/// §4.8).
+///
+/// The marker sits where [`session_row_is_live`] probes a shared real-mode
+/// row (`sessions-<sid>/<sid>`), so GC keeps a live Hermes row and collects a
+/// dead one exactly as it does a claude row. [`has_live_session`] sees it
+/// through the `sessions*` scan, which is what G14 and every destructive
+/// guard read.
+pub(crate) struct HermesMarker {
+    session: SessionId,
+    sessions: PathBuf,
+    pid_file: PathBuf,
+    registered: bool,
+    _pid_lock: File,
+}
+
+impl HermesMarker {
+    /// Claim under the caller's RotationGuard (the witness): inside the state
+    /// lock, re-check [`has_live_session`] (refusing with `on_live`), mint the
+    /// sid, create `sessions-<sid>/`, flock the marker, and register the row
+    /// when asked. The row never exists without its held marker.
+    pub(crate) fn claim(
+        name: &str,
+        register_row: bool,
+        _rotation: &RotationGuard,
+        on_live: impl FnOnce() -> anyhow::Error,
+    ) -> Result<Self> {
+        let owned = ProfileName::from(name);
+        with_state_lock(|_held| {
+            if has_live_session(&owned) {
+                return Err(on_live());
+            }
+            let mut session = SessionId::mint();
+            let sessions_for = |sid: &SessionId| -> Result<PathBuf> {
+                profile_subpath(&owned, &format!("{SESSIONS_STEM}-{}", sid.as_str()))
+            };
+            for _ in 0..SID_COLLISION_REMINTS {
+                if !is_session_alive(&sessions_for(&session)?.join(session.as_str())) {
+                    break;
+                }
+                session = SessionId::mint();
+            }
+            let sessions = sessions_for(&session)?;
+            crate::profile::mkdir_700(&sessions)
+                .with_context(|| format!("failed to create {}", sessions.display()))?;
+            let pid_file = sessions.join(session.as_str());
+            let file = open_pid_file(&pid_file)
+                .with_context(|| format!("failed to open {}", pid_file.display()))?;
+            if let Err(e) = file.try_lock() {
+                anyhow::bail!(
+                    "failed to claim session marker {}: {e}. Another live process holds this \
+                     session id",
+                    pid_file.display()
+                );
+            }
+            if register_row {
+                let row = crate::live_sessions::LiveSession::starting(
+                    &session,
+                    name,
+                    crate::harness::Harness::Hermes,
+                    false,
+                    false,
+                    None,
+                );
+                if let Err(e) = crate::live_sessions::register(&row) {
+                    logline!("tollgate: registering the live Hermes session failed: {e}");
+                }
+            }
+            Ok(Self {
+                session,
+                sessions,
+                pid_file,
+                registered: register_row,
+                _pid_lock: file,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
+        self.session.as_str()
+    }
+}
+
+impl Drop for HermesMarker {
+    fn drop(&mut self) {
+        if let Err(e) = with_state_lock(|_held| {
+            if self.registered
+                && let Err(e) = crate::live_sessions::unregister(self.session.as_str())
+            {
+                logline!("tollgate: unregistering the live Hermes session failed: {e}");
+            }
+            if let Err(e) = std::fs::remove_file(&self.pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                logline!("tollgate: remove pid file failed: {e}");
+            }
+            let _ = std::fs::remove_dir(&self.sessions);
+            Ok::<_, anyhow::Error>(())
+        }) {
+            logline!("tollgate: Hermes session teardown failed: {e:#}");
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/runtime.rs"]
 mod tests;

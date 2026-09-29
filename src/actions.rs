@@ -57,23 +57,33 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
 /// routes that case into capture-into-existing) but must still refuse to
 /// shadow the other harness, which no flow can adopt across.
 pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
-    let foreign = match harness {
-        Harness::Claude => Harness::Codex,
-        Harness::Codex => Harness::Claude,
-    };
-    let held = match foreign {
+    for foreign in Harness::ALL.into_iter().filter(|h| *h != harness) {
+        if roster_names(foreign)?
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name))
+        {
+            bail!(
+                "'{name}' is a {foreign} profile — profile names span every harness, pick another"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One harness's roster, as names, read from its own state file.
+fn roster_names(harness: Harness) -> Result<Vec<String>> {
+    Ok(match harness {
         Harness::Claude => crate::profile::claude_roster_names()?
             .iter()
-            .any(|n| n.eq_ignore_ascii_case(name)),
+            .map(|n| n.as_str().to_string())
+            .collect(),
         Harness::Codex => crate::codex_profiles::CodexState::load()?
             .profiles()
             .iter()
-            .any(|n| n.eq_ignore_ascii_case(name)),
-    };
-    if held {
-        bail!("'{name}' is a {foreign} profile — profile names span both harnesses, pick another");
-    }
-    Ok(())
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        Harness::Hermes => crate::hermes::profiles::HermesState::load()?.names(),
+    })
 }
 
 /// The full gate for creating or renaming a profile on `harness`: charset,
@@ -91,17 +101,7 @@ pub(crate) fn validate_profile_name(
 ) -> Result<()> {
     let trimmed = validate_name_chars(name)?;
     validate_foreign_harness_free(trimmed, harness)?;
-    let own: Vec<String> = match harness {
-        Harness::Claude => crate::profile::claude_roster_names()?
-            .iter()
-            .map(|n| n.as_str().to_string())
-            .collect(),
-        Harness::Codex => crate::codex_profiles::CodexState::load()?
-            .profiles()
-            .iter()
-            .map(|n| n.as_str().to_string())
-            .collect(),
-    };
+    let own = roster_names(harness)?;
     if own
         .iter()
         .any(|n| n.eq_ignore_ascii_case(trimmed) && Some(n.as_str()) != exclude)

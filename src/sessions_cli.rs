@@ -43,6 +43,12 @@ use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
 use crate::sessions::{IsolatedHold, SessionInfo, SessionRef, WorkspaceGroup};
 
+/// The shared refusal for a session switch on a row no executor serves
+/// (M-SESSION-SWITCH, hermes spec §2.1): `{sid}` is substituted. The hot-swap
+/// spec references this constant rather than carrying its own text.
+pub(crate) const NON_CLAUDE_SWITCH: &str =
+    "session '{sid}' is a Hermes session; switch by relaunch (tollgate start <profile>)";
+
 /// `tollgate sessions [--json] [--tokens]` — the full inventory, newest-first.
 /// Both a TTY and a pipe print a table (the `--json` flag, not the tty, selects
 /// machine output; this is deliberately NOT showagent's pipe-prints-different
@@ -206,6 +212,9 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
             .is_some_and(|config| config.canonical_name(sid).is_some())
             || crate::codex_profiles::CodexState::load()
                 .ok()
+                .is_some_and(|state| state.canonical_name(sid).is_some())
+            || crate::hermes::profiles::HermesState::load()
+                .ok()
                 .is_some_and(|state| state.canonical_name(sid).is_some());
         let hint = if resolves_anywhere {
             format!("\nto switch the global account: `tollgate switch {sid}`")
@@ -215,9 +224,16 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
         anyhow::bail!("no live session '{sid}'\nsee `tollgate sessions`{hint}");
     };
     // A codex row has no executor: codex reads auth.json once at start, so a
-    // mid-session intent would stand forever as a silent no-op.
-    if row.harness == crate::harness::Harness::Codex {
-        anyhow::bail!("session '{sid}' is a codex session; switch is claude-only");
+    // mid-session intent would stand forever as a silent no-op. A Hermes row
+    // has none either: a Hermes home is the account, switched by relaunch.
+    match row.harness {
+        crate::harness::Harness::Claude => {}
+        crate::harness::Harness::Codex => {
+            anyhow::bail!("session '{sid}' is a codex session; switch is claude-only")
+        }
+        crate::harness::Harness::Hermes => {
+            anyhow::bail!("{}", NON_CLAUDE_SWITCH.replace("{sid}", sid))
+        }
     }
     // The same liveness probe the tally and the decision leg use, current
     // member first: a row whose flock is gone is a stale row awaiting GC, not

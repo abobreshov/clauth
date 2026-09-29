@@ -935,6 +935,29 @@ fn switch_refuses_a_dead_session_row() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
+/// Test 35a: a Hermes row has no executor; the switch refuses with the shared
+/// `NON_CLAUDE_SWITCH` text.
+#[test]
+fn sessions_switch_refuses_hermes_rows() {
+    let _sb = HomeSandbox::new();
+    registry_row("4242-0", "hm", crate::harness::Harness::Hermes);
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("hm"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the marker");
+    let err = run_switch("4242-0", "spare").expect_err("a hermes row must be refused");
+    assert_eq!(
+        err.to_string(),
+        "session '4242-0' is a Hermes session; switch by relaunch (tollgate start <profile>)"
+    );
+    assert_eq!(
+        NON_CLAUDE_SWITCH.replace("{sid}", "4242-0"),
+        err.to_string()
+    );
+}
+
 #[test]
 fn switch_refuses_a_codex_session_row() {
     let _sb = HomeSandbox::new();

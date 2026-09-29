@@ -503,6 +503,20 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
+    /// Manage Hermes Agent profiles: one isolated Hermes home per account
+    ///
+    /// Each profile is a whole HERMES_HOME under ~/.tollgate/profiles/<name>,
+    /// started with its own child HOME, so the Hermes it launches cannot reach
+    /// ~/.hermes, ~/.claude, ~/.clauth or ~/.codex. `tollgate start <name>`
+    /// launches one. Hermes owns its own credentials; tollgate writes only the
+    /// bound key line of the home's .env.
+    // Hidden until the part 2 surfaces (completions, `show`, `pool`) land.
+    #[command(hide = true)]
+    Hermes {
+        #[command(subcommand)]
+        cmd: HermesCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `tollgate completions <bash|zsh|fish>` prints the script to stdout.
@@ -753,6 +767,117 @@ pub(crate) enum ApiCommand {
     },
     /// Print the API's base URL and a curl example for each door
     Url,
+}
+
+/// The providers a Hermes profile binds (`--provider`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum HermesProviderArg {
+    Nous,
+    Openrouter,
+    #[value(name = "ollama-cloud")]
+    OllamaCloud,
+}
+
+/// `tollgate hermes <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HermesCommand {
+    /// Create a Hermes profile and its home
+    ///
+    /// Env-mode providers (openrouter, ollama-cloud, nous with --env-key)
+    /// prompt for the key with the input hidden, or read one line from stdin
+    /// with --stdin. The key is never taken on argv.
+    New {
+        /// Profile name (unique across the claude, codex and Hermes rosters).
+        name: String,
+        /// The provider this home is bound to.
+        #[arg(long, value_enum, default_value = "nous")]
+        provider: HermesProviderArg,
+        /// Model passed as `-m` at every launch.
+        #[arg(long)]
+        model: Option<String>,
+        /// A credential-pool home instead of a one-account home.
+        #[arg(long, conflicts_with_all = ["env_key", "stdin", "no_key"])]
+        pool: bool,
+        /// Nous only: bind NOUS_API_KEY instead of the OAuth login.
+        #[arg(long)]
+        env_key: bool,
+        /// Read the key as one line from stdin instead of prompting.
+        #[arg(long, conflicts_with = "no_key")]
+        stdin: bool,
+        /// Create the home without a key; set it later with `hermes key`.
+        #[arg(long)]
+        no_key: bool,
+    },
+
+    /// Set or replace the env-mode key of a Hermes profile
+    Key {
+        /// Profile name.
+        name: String,
+        /// Read the key as one line from stdin instead of prompting.
+        #[arg(long)]
+        stdin: bool,
+    },
+
+    /// Hand off to `hermes auth` on a Hermes profile's home
+    Auth {
+        /// Profile name.
+        name: String,
+        #[command(subcommand)]
+        action: HermesAuthAction,
+    },
+
+    /// List the Hermes profiles
+    List {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a Hermes profile and its home
+    Delete {
+        /// Profile name.
+        name: String,
+        /// Skip the confirm prompt. Required on a non-TTY stdin.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Delete even while a live session holds the home.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// `tollgate hermes auth <name> <action>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HermesAuthAction {
+    /// Add a credential (Hermes prompts for a key itself)
+    Add {
+        /// Provider id; must be the profile's.
+        provider: String,
+        /// `api-key` or `oauth` (`api_key` is accepted as an alias).
+        #[arg(long = "type", value_name = "TYPE", value_parser = ["api-key", "api_key", "oauth"])]
+        auth_type: String,
+        /// A label for the pool entry.
+        #[arg(long)]
+        label: Option<String>,
+        /// Print the login URL instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Seconds Hermes waits for the login.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Remove one credential
+    Remove {
+        /// Provider id.
+        provider: String,
+        /// The entry to remove, as `hermes auth list` names it.
+        target: String,
+    },
+    /// Clear a provider's exhaustion state
+    Reset {
+        /// Provider id.
+        provider: String,
+    },
 }
 
 /// `tollgate herdr <cmd>`: install and uninstall the plugin and its config wiring.
