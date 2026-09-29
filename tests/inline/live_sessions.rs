@@ -20,6 +20,13 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        executor: None,
+        launch_class: None,
+        key_generation: None,
+        committed_at: None,
+        swap_refusal: None,
+        relaunch_capable: false,
+        relaunched_from: None,
     }
 }
 
@@ -510,6 +517,7 @@ fn a_held_bare_marker_counts_on_the_account_the_credential_link_resolves_to() {
             sessions: 1,
             following: 1,
             last_swap_at: None,
+            swapping: 0,
         },
     );
 }
@@ -624,4 +632,177 @@ fn bare_attribution_ignores_the_readers_own_config_dir() {
         MemberSessions::default(),
         "the READER's own runtime profile hosts nothing"
     );
+}
+
+// ── executor B fields (hot-swap spec part 1) ─────────────────────────────────
+
+// 15
+#[test]
+fn a_row_predating_the_fields_reads_as_oauth_generation_zero() {
+    let pre = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+    let row: LiveSession = serde_json::from_slice(pre).expect("parse a pre-hot-swap row");
+    assert_eq!(row.executor, None);
+    assert_eq!(row.executor(), crate::hot_swap::Executor::Oauth);
+    assert_eq!(row.key_generation, None);
+    assert_eq!(row.key_generation.unwrap_or(0), 0);
+    assert_eq!(row.launch_class, None);
+    assert_eq!(row.swap_refusal, None);
+    assert!(!row.relaunch_capable);
+    assert_eq!(row.relaunched_from, None);
+    // And the fields do not appear on a row that has none of them, so a row
+    // written now reads byte-compatibly by an older tollgate.
+    let bytes = serde_json::to_string(&row).expect("serialise");
+    for key in [
+        "executor",
+        "launch_class",
+        "key_generation",
+        "committed_at",
+        "swap_refusal",
+        "relaunch_capable",
+        "relaunched_from",
+    ] {
+        assert!(!bytes.contains(key), "{key} must be omitted when unset");
+    }
+}
+
+// 16
+#[test]
+fn bump_key_generation_is_monotonic_across_fresh_loads() {
+    let _home = HomeSandbox::new();
+    let written = row("4242-0", "a").with_executor(crate::hot_swap::Executor::ApiKey, None);
+    assert_eq!(written.key_generation, Some(0));
+    assert_eq!(written.current_member.as_deref(), Some("a"));
+    register(&written).expect("register");
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        update_as_session("4242-0", |f| seen.push(f.bump_key_generation())).expect("bump");
+    }
+    assert_eq!(seen, vec![1, 2, 3]);
+    assert_eq!(get("4242-0").expect("row").key_generation, Some(3));
+}
+
+// 17
+#[test]
+fn a_daemon_write_preserves_every_session_owned_hot_swap_field() {
+    let _home = HomeSandbox::new();
+    let class = crate::hot_swap::LaunchClass::of(
+        &crate::testutil::api_key_profile("a", "https://openrouter.ai/api", "sk-a"),
+        true,
+    );
+    let written = row("4242-0", "a")
+        .with_executor(crate::hot_swap::Executor::ApiKey, class)
+        .with_relaunch(true, Some("4000-1".to_string()));
+    register(&written).expect("register");
+    update_as_session("4242-0", |f| {
+        f.set_current_member("b");
+        f.bump_key_generation();
+        f.set_committed_at(1_234);
+        f.set_swap_refusal(SwapRefusal {
+            member: "c".to_string(),
+            code: "class_differs:endpoint".to_string(),
+            text: "a different endpoint".to_string(),
+            at_ms: 1_235,
+        });
+    })
+    .expect("session write");
+    let before = get("4242-0").expect("row");
+    update_as_daemon("4242-0", |f| f.set_intended_member("d")).expect("daemon write");
+    let after = get("4242-0").expect("row");
+    assert_eq!(after.intended_member.as_deref(), Some("d"));
+    assert_eq!(
+        LiveSession {
+            intended_member: None,
+            ..after
+        },
+        before,
+        "the daemon's write carried every session-owned field through"
+    );
+}
+
+// 18
+#[test]
+fn list_reads_only_session_id_json_stems() {
+    let _home = HomeSandbox::new();
+    register(&row("4242-0", "a")).expect("register");
+    let dir = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
+        .join("live_sessions");
+    // Sidecars and strays that WOULD parse as a row if read: `list` must skip
+    // them by name, not by a parse failure.
+    let parsable = serde_json::to_vec(&row("4242-1", "b")).expect("row bytes");
+    for name in [
+        "4242-0.helper",
+        "4242-0.helper.lock",
+        "4242-0.relaunch",
+        "4242-0.relaunch.taken",
+        "4242-0.relaunch.cancel",
+        "4242-0.relaunch.result",
+        "x.json",
+        "4242-0.json.tmp",
+    ] {
+        std::fs::write(dir.join(name), &parsable).expect("write sidecar");
+    }
+    let rows = list();
+    assert_eq!(rows.len(), 1, "only 4242-0.json is a row");
+    assert_eq!(rows[0].session_id, "4242-0");
+}
+
+/// Teardown's sidecar sweep keeps `.relaunch.taken` on the relaunch path only.
+#[test]
+fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
+    let _home = HomeSandbox::new();
+    register(&row("4242-0", "a")).expect("register");
+    let paths: Vec<PathBuf> = [
+        "helper",
+        "helper.lock",
+        "relaunch",
+        "relaunch.taken",
+        "relaunch.result",
+    ]
+    .iter()
+    .map(|s| sidecar_path("4242-0", s).expect("path"))
+    .collect();
+    for p in &paths {
+        std::fs::write(p, b"{}").expect("write");
+    }
+    remove_sidecars("4242-0", KeepSidecars::RelaunchTaken);
+    let left: Vec<bool> = paths.iter().map(|p| p.exists()).collect();
+    assert_eq!(left, vec![false, false, false, true, false]);
+    remove_sidecars("4242-0", KeepSidecars::Nothing);
+    assert!(paths.iter().all(|p| !p.exists()));
+    assert!(get("4242-0").is_some(), "the row itself is `unregister`'s");
+}
+
+/// The tally counts a committed-not-served B session on the SERVED member and
+/// as swapping.
+#[test]
+fn the_tally_counts_a_swapping_session_on_its_served_member() {
+    let _home = HomeSandbox::new();
+    let mut committed = row("4242-0", "a").with_executor(crate::hot_swap::Executor::ApiKey, None);
+    committed.current_member = Some("b".to_string());
+    committed.key_generation = Some(1);
+    committed.committed_at = Some(1_000);
+    let tally = LiveTally::of([committed.clone()]);
+    let a = tally.member(&crate::profile::ProfileName::from("a"));
+    assert_eq!((a.sessions, a.swapping), (1, 1));
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("b"))
+            .sessions,
+        0
+    );
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 1,
+            member: Some("b".to_string()),
+            served_at_ms: Some(1_100),
+            last_failure: None,
+        },
+    );
+    let tally = LiveTally::of([committed]);
+    let b = tally.member(&crate::profile::ProfileName::from("b"));
+    assert_eq!((b.sessions, b.swapping), (1, 0));
 }

@@ -277,6 +277,57 @@ pub(crate) fn run(
     follows_chain: bool,
     announce: Option<&str>,
 ) -> Result<()> {
+    // The relaunch hand-off, read once and verified against the old
+    // session's `.relaunch.taken` nonce. Every child command scrubs the three
+    // variables (`runtime::scrub_tollgate_homes`), so a Claude Code child and
+    // a nested start from its Bash tool never see them.
+    let handoff = crate::relaunch::Handoff::from_env();
+    let spawned = match spawn_session(
+        config,
+        name,
+        claude_args,
+        isolation,
+        workspace,
+        follows_chain,
+        announce,
+        &handoff,
+    ) {
+        Ok(spawned) => spawned,
+        // A relaunched start that fails before its child spawns restarts once
+        // on the original profile.
+        Err(e) => match handoff.fallback.as_deref() {
+            Some(orig) => crate::relaunch::exec_fallback(orig, claude_args, &e),
+            None => return Err(e),
+        },
+    };
+    supervise(spawned, name, claude_args, isolation)
+}
+
+/// Everything a spawned session's supervision needs.
+struct Spawned {
+    runtime: ProfileRuntime,
+    child: std::process::Child,
+    run_start: SystemTime,
+    #[cfg(unix)]
+    signal_watcher: SignalWatcher,
+    #[cfg(unix)]
+    tty: Option<crate::relaunch::TtyState>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "`run`'s own arguments plus the hand-off it read"
+)]
+fn spawn_session(
+    config: &AppConfig,
+    name: &ProfileName,
+    claude_args: &[String],
+    isolation: Isolation,
+    workspace: Option<&Path>,
+    follows_chain: bool,
+    announce: Option<&str>,
+    handoff: &crate::relaunch::Handoff,
+) -> Result<Spawned> {
     let profile = admit(config, name, isolation, follows_chain)?;
 
     // Announced after the refusals, so a start that `admit` refuses never
@@ -311,9 +362,20 @@ pub(crate) fn run(
         seed_guest_passthrough_resume(claude_args)?;
     }
 
+    // A start may choose executor B (the api-key hot swap) and polls for
+    // relaunch requests; the row records where the child runs.
+    let launch = crate::runtime::LaunchInfo {
+        hot_swap: crate::hot_swap::HotSwapPolicy::Allowed,
+        spawn_cwd: workspace
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok()),
+        // The supervisor polls for relaunch requests on unix only.
+        relaunch_capable: cfg!(unix),
+        relaunched_from: handoff.from.clone(),
+    };
     let runtime = {
         let _spinner = Spinner::start("tollgate: preparing runtime");
-        ProfileRuntime::acquire(profile, isolation, &stale_env_keys, follows_chain)?
+        ProfileRuntime::acquire_with(profile, isolation, &stale_env_keys, follows_chain, &launch)?
     };
 
     #[cfg(unix)]
@@ -328,6 +390,10 @@ pub(crate) fn run(
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
     engine.scrub_env(&mut command, &stale_env_keys);
+    // Executor B's backstop: the helper's TTL, on this child alone. The
+    // commit's settings touch is what makes the swap land on the next
+    // request; the TTL covers a touch that failed.
+    crate::runtime::apply_session_env(&mut command, runtime.executor());
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings
@@ -348,24 +414,77 @@ pub(crate) fn run(
     if isolation == Isolation::Isolated {
         command.arg("--strict-mcp-config");
     }
+    // The terminal as it is before Claude Code takes it over: a relaunch that
+    // had to SIGKILL the child puts it back.
+    #[cfg(unix)]
+    let tty = crate::relaunch::TtyState::save(libc::STDIN_FILENO);
     // Marks this run's window: on the shared global store, only sessions touched
     // at or after this instant are attributed to `name` (see stamp below).
     let run_start = SystemTime::now();
-    let mut child = command
+    let child = command
         .args(claude_args)
         .spawn()
         .context("failed to spawn claude")?;
+    Ok(Spawned {
+        runtime,
+        child,
+        run_start,
+        #[cfg(unix)]
+        signal_watcher,
+        #[cfg(unix)]
+        tty,
+    })
+}
+
+/// Wait for the child, then tear the session down — or, when a relaunch
+/// request was accepted mid-session, stop the child, tear down and `exec` the
+/// resume form.
+fn supervise(
+    spawned: Spawned,
+    name: &ProfileName,
+    claude_args: &[String],
+    isolation: Isolation,
+) -> Result<()> {
+    let Spawned {
+        runtime,
+        mut child,
+        run_start,
+        #[cfg(unix)]
+        signal_watcher,
+        #[cfg(unix)]
+        tty,
+    } = spawned;
+    let sid = runtime.session_id().to_string();
 
     #[cfg(unix)]
-    let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;
+    let (outcome, accepted) = {
+        // Only a shared session relaunches: an isolated one's store goes with
+        // it, and the CLI refuses those before writing a request.
+        let mut claim = || {
+            (isolation == Isolation::Shared)
+                .then(|| crate::relaunch::poll_claim(&sid))
+                .flatten()
+        };
+        wait_for_child(&mut child, signal_watcher.receiver(), &mut claim)?
+    };
 
     #[cfg(not(unix))]
-    let outcome = ChildOutcome {
-        status: child
-            .wait()
-            .context("failed to wait for the session child")?,
-        signal: None,
-    };
+    let (outcome, accepted) = (
+        ChildOutcome {
+            status: child
+                .wait()
+                .context("failed to wait for the session child")?,
+            signal: None,
+        },
+        None::<crate::relaunch::Accepted>,
+    );
+
+    if let Some(accepted) = &accepted {
+        crate::relaunch::wait_transcript_flush(&accepted.transcript);
+        // The new process verifies its nonce against `.relaunch.taken`, so
+        // the teardown below keeps it.
+        runtime.keep_relaunch_taken();
+    }
 
     // Record which sessions ran under this profile before teardown — an isolated
     // store is discarded on drop, so its stamp must happen while `runtime` lives.
@@ -394,6 +513,16 @@ pub(crate) fn run(
 
     // Drop runtime before process::exit so final sync + refcount cleanup runs.
     drop(runtime);
+
+    if let Some(accepted) = accepted {
+        // A SIGKILLed Claude Code can leave the terminal raw or in the alt
+        // screen; the relaunched one must start from a sane tty.
+        #[cfg(unix)]
+        if let Some(tty) = &tty {
+            tty.restore();
+        }
+        crate::relaunch::exec_relaunch(&accepted, name.as_str(), claude_args, &sid);
+    }
 
     let code = status_code(outcome.status, outcome.signal);
     if code != 0 {
@@ -484,26 +613,50 @@ impl Drop for SignalWatcher {
     }
 }
 
+/// Wait for the child, forwarding signals. Every
+/// [`crate::relaunch::CLAIM_EVERY`]th iteration `claim` may accept a relaunch
+/// request; the child is then stopped (SIGTERM, SIGKILL after the grace) and
+/// the accepted request returned beside its exit.
 #[cfg(unix)]
 fn wait_for_child(
     child: &mut std::process::Child,
     signals: &Receiver<i32>,
-) -> Result<ChildOutcome> {
+    claim: &mut dyn FnMut() -> Option<crate::relaunch::Accepted>,
+) -> Result<(ChildOutcome, Option<crate::relaunch::Accepted>)> {
+    let mut iteration: u32 = 0;
     loop {
         if let Some(status) = child
             .try_wait()
             .context("failed to wait for the session child")?
         {
-            return Ok(ChildOutcome {
-                status,
-                signal: next_signal(signals),
-            });
+            return Ok((
+                ChildOutcome {
+                    status,
+                    signal: next_signal(signals),
+                },
+                None,
+            ));
+        }
+
+        iteration = iteration.wrapping_add(1);
+        if iteration.is_multiple_of(crate::relaunch::CLAIM_EVERY)
+            && let Some(accepted) = claim()
+        {
+            let status = crate::relaunch::stop_child(child, None)
+                .context("failed to stop the session child for its relaunch")?;
+            return Ok((
+                ChildOutcome {
+                    status,
+                    signal: None,
+                },
+                Some(accepted),
+            ));
         }
 
         match signals.recv_timeout(CHILD_WAIT_INTERVAL) {
             Ok(signal) => {
                 forward_signal_or_warn(child, signal);
-                return wait_after_signal(child, signals, signal);
+                return Ok((wait_after_signal(child, signals, signal)?, None));
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => std::thread::sleep(CHILD_WAIT_INTERVAL),
@@ -815,7 +968,7 @@ pub(crate) fn run_codex(
     })?;
 
     #[cfg(unix)]
-    let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;
+    let (outcome, _) = wait_for_child(&mut child, signal_watcher.receiver(), &mut || None)?;
     #[cfg(not(unix))]
     let outcome = ChildOutcome {
         status: child

@@ -2111,7 +2111,43 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
 /// tollgate's `X`. A hand-edited, foreign or corrupted helper that fails any
 /// of the above yields `None` rather than risk a phantom profile lookup that
 /// returns the wrong account's key into [`capture_snapshot`].
+///
+/// The session form (`<exe> __tollgate-api-key --session <sid>`, executor B)
+/// resolves through the session's registry row, lock-free: the member the row
+/// has committed (`current_member`), else its launch profile.
 fn profile_name_from_helper(helper: &str) -> Option<String> {
+    match helper_target(helper)? {
+        HelperTarget::Profile(name) => Some(name),
+        HelperTarget::Session(sid) => {
+            let row = crate::live_sessions::get(&sid)?;
+            Some(row.current_member.unwrap_or(row.start_profile))
+        }
+    }
+}
+
+/// What an `apiKeyHelper` string of ours names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HelperTarget {
+    /// `<exe> __tollgate-api-key <profile>`.
+    Profile(String),
+    /// `<exe> __tollgate-api-key --session <sid>`.
+    Session(String),
+}
+
+/// `profile_name_from_helper`'s charset: `[A-Za-z0-9_.@+-]+`, no leading dot.
+pub(crate) fn is_profile_name_token(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'@' | b'+' | b'-'))
+}
+
+/// Parse an `apiKeyHelper` string this tool wrote: the exe must be ours
+/// ([`helper_exe_is_ours`]), and after the subcommand comes either exactly one
+/// profile-name token, or `--session` and exactly one session id. Anything
+/// else (a trailing token, a bad sid, a foreign exe) is not ours.
+pub(crate) fn helper_target(helper: &str) -> Option<HelperTarget> {
     let mut tokens = helper.split_whitespace();
     let mut exe_tokens: Vec<&str> = Vec::new();
     while let Some(tok) = tokens.next() {
@@ -2122,19 +2158,22 @@ fn profile_name_from_helper(helper: &str) -> Option<String> {
         if !helper_exe_is_ours(&exe_tokens.join(" ")) {
             return None;
         }
-        // The token immediately after the subcommand is the profile name; a
-        // following token means the shape is `<exe> <subcommand> <profile>
-        // <extra>` (a future flag, a typo), which is not ours.
-        let name = tokens.next()?;
+        // The token immediately after the subcommand is the profile name (or
+        // the session flag); a following token means the shape is `<exe>
+        // <subcommand> <profile> <extra>` (a future flag, a typo), which is
+        // not ours.
+        let first = tokens.next()?;
+        if first == "--session" {
+            let sid = tokens.next()?;
+            if tokens.next().is_some() || !crate::runtime::is_session_id(sid) {
+                return None;
+            }
+            return Some(HelperTarget::Session(sid.to_string()));
+        }
         if tokens.next().is_some() {
             return None;
         }
-        let valid = !name.is_empty()
-            && !name.starts_with('.')
-            && name.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'@' | b'+' | b'-')
-            });
-        return valid.then(|| name.to_string());
+        return is_profile_name_token(first).then(|| HelperTarget::Profile(first.to_string()));
     }
     None
 }
@@ -2294,14 +2333,39 @@ const API_KEY_HELPER_SUBCMD: &str = crate::identity::API_KEY_HELPER_SUBCMD;
 /// dot — entirely within the safe-char set, so it round-trips unquoted; the
 /// helper-quoting exists for the exe path, which may contain spaces
 /// (`/Applications/...`, `C:\Program Files\...`).
-fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
+fn build_api_key_helper_command(
+    exe: &Path,
+    form: HelperForm<'_>,
+    profile_name: &ProfileName,
+) -> String {
     let exe = crate::platform::installed_exe_path(exe);
-    format!(
-        "{} {} {}",
-        shell_quote(&exe.to_string_lossy()),
-        shell_quote(API_KEY_HELPER_SUBCMD),
-        shell_quote(profile_name),
-    )
+    match form {
+        HelperForm::Profile => format!(
+            "{} {} {}",
+            shell_quote(&exe.to_string_lossy()),
+            shell_quote(API_KEY_HELPER_SUBCMD),
+            shell_quote(profile_name),
+        ),
+        // A session id is digits and one `-`, inside the safe-char set.
+        HelperForm::Session(sid) => format!(
+            "{} {} --session {}",
+            shell_quote(&exe.to_string_lossy()),
+            shell_quote(API_KEY_HELPER_SUBCMD),
+            shell_quote(sid),
+        ),
+    }
+}
+
+/// Which `apiKeyHelper` command a settings build writes for an api-key
+/// profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperForm<'a> {
+    /// `<exe> __tollgate-api-key <profile>`: today's bytes, everywhere but a
+    /// B session's runtime.
+    Profile,
+    /// `<exe> __tollgate-api-key --session <sid>`: a B session's runtime
+    /// `settings.json`, so the helper follows the row's committed member.
+    Session(&'a str),
 }
 
 /// Quote `s` for the shell CC runs `apiKeyHelper` under. A safe-char run
@@ -2446,6 +2510,18 @@ pub(crate) fn build_claude_settings_json(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<String> {
+    build_claude_settings_json_with(base, profile, prev_env_keys, HelperForm::Profile)
+}
+
+/// [`build_claude_settings_json`] with the `apiKeyHelper` form chosen: a B
+/// session's runtime writes the session form, every other writer the
+/// profile form.
+pub(crate) fn build_claude_settings_json_with(
+    base: Option<&Path>,
+    profile: &Profile,
+    prev_env_keys: &[String],
+    form: HelperForm<'_>,
+) -> Result<String> {
     let mut settings: serde_json::Value = match base {
         Some(p) if p.exists() => read_json_file(p)?,
         _ => serde_json::json!({}),
@@ -2535,7 +2611,7 @@ pub(crate) fn build_claude_settings_json(
         let exe = env::current_exe().context("resolving current_exe for apiKeyHelper")?;
         obj.insert(
             "apiKeyHelper".into(),
-            build_api_key_helper_command(&exe, &profile.name).into(),
+            build_api_key_helper_command(&exe, form, &profile.name).into(),
         );
     } else {
         obj.remove("apiKeyHelper");

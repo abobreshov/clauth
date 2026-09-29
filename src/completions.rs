@@ -37,6 +37,8 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "switch" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--wait --relaunch --yes --conversation" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
         local profiles sids
         profiles=$(tollgate __complete 2>/dev/null)
@@ -195,6 +197,11 @@ _tollgate() {
         local -a profiles
         profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
         _describe 'profile' profiles
+    elif (( CURRENT >= 5 )) && [[ "${words[2]}" == switch ]]; then
+        _values 'flag' '--wait[wait until the key helper serves an api-key hot swap]' \
+            '--relaunch[stop the session and resume its conversation under the profile]' \
+            '--yes[with --relaunch: do not ask for confirmation]' \
+            '--conversation[with --relaunch: the conversation to resume]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
@@ -343,6 +350,10 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count 
 complete -c tollgate -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c tollgate -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c tollgate -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --wait -d "Wait until the key helper serves an api-key hot swap"
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --relaunch -d "Stop the session and resume its conversation under the profile"
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --yes -d "With --relaunch: do not ask for confirmation"
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --conversation -d "With --relaunch: the conversation to resume"
 __CLATHA_LOGIN_FLAGS__
 complete -c tollgate -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c tollgate -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"

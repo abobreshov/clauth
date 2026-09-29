@@ -233,6 +233,44 @@ pub(crate) struct NoteRecord {
     /// feature is off.
     #[serde(default)]
     pub(crate) context: Option<crate::hook_context::ContextState>,
+    /// The `tollgate start` session this conversation last ran in, read off
+    /// `CLAUDE_CONFIG_DIR` by every main-scope fire. `tollgate switch
+    /// --relaunch` finds the conversation to resume through it. `None` on a
+    /// record written before the field and outside a tollgate runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_sid: Option<String>,
+}
+
+/// The session id encoded in this process's `CLAUDE_CONFIG_DIR`, when that is
+/// a tollgate per-session runtime tree.
+fn runtime_sid_from_env() -> Option<String> {
+    let dir = std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR")?);
+    if !crate::runtime::is_tollgate_runtime_path(&dir) {
+        return None;
+    }
+    crate::runtime::sid_of_runtime_dir_name(dir.file_name()?.to_str()?)
+}
+
+/// The conversations whose main-scope record names `sid` as their runtime.
+pub(crate) fn conversations_for_runtime(sid: &str) -> Vec<String> {
+    let Ok(dir) = records_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let id = name.strip_suffix(".json")?;
+            if !is_bare_id(id) {
+                return None;
+            }
+            let record = load_record(&entry.path())?;
+            (record.runtime_sid.as_deref() == Some(sid)).then(|| id.to_string())
+        })
+        .collect()
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -705,6 +743,11 @@ fn note_for_inner(
     });
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
+    }
+    if payload.agent_id.is_none()
+        && let Some(sid) = runtime_sid_from_env()
+    {
+        record.runtime_sid = Some(sid);
     }
     // The account this scope's record held before the fire. The owner-store
     // write keys on this: only a first attribution or a real change reaches
@@ -1407,6 +1450,9 @@ fn nudge_note(payload: &Payload, read: &NudgeRead) -> Option<String> {
     let mut record = stored.clone().unwrap_or_default();
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
+    }
+    if let Some(sid) = runtime_sid_from_env() {
+        record.runtime_sid = Some(sid);
     }
     match nudge_outcome(read, &record.nudge) {
         NudgeOutcome::Emit(figures) => {

@@ -16,6 +16,7 @@ mod harness;
 mod herdr;
 mod hook_context;
 mod hook_note;
+mod hot_swap;
 mod identity;
 mod jobs_cli;
 mod jsonsync;
@@ -43,6 +44,7 @@ mod profile;
 mod profile_cache;
 mod profile_json;
 mod providers;
+mod relaunch;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -182,7 +184,7 @@ impl std::fmt::Display for Interrupted {
 impl std::error::Error for Interrupted {}
 
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
-fn usage_error(msg: impl Into<String>) -> anyhow::Error {
+pub(crate) fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
 }
 
@@ -202,6 +204,14 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             }
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
+            }
+            // A session switch outcome whose lines are already printed:
+            // `tollgate switch <sid> <p>` exits 1 on a refusal and 3 when
+            // `--wait` saw the commit but not the helper serving it.
+            if let Some(crate::relaunch::Reported(code)) =
+                e.downcast_ref::<crate::relaunch::Reported>()
+            {
+                return *code;
             }
             // Guest mode's refusal is a complete sentence that already names
             // the tool and the way forward; an `Error:` debug chain around it
@@ -275,10 +285,26 @@ fn dispatch(cli: Cli) -> Result<()> {
         // One positional is the bare-word act under its own verb: the exact
         // function `Command::External`'s single-word arm calls, so the exits
         // and copy are identical.
-        Command::Switch { name, profile } => match profile {
-            None => cmd_switch(&name),
-            Some(profile) => sessions_cli::run_switch(&name, &profile),
-        },
+        Command::Switch {
+            name,
+            profile,
+            wait,
+            relaunch,
+            yes,
+            conversation,
+        } => {
+            let flags = sessions_cli::SwitchFlags {
+                wait,
+                relaunch,
+                yes,
+                conversation,
+            };
+            sessions_cli::check_switch_flags(profile.is_some(), &flags)?;
+            match profile {
+                None => cmd_switch(&name),
+                Some(profile) => sessions_cli::run_switch(&name, &profile, &flags),
+            }
+        }
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())
         }
@@ -344,7 +370,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             codex,
             live_sessions,
         } => cmd_complete(codex, live_sessions),
-        Command::ApiKey { profile } => cmd_api_key(&profile),
+        Command::ApiKey { profile, session } => match (profile, session) {
+            (_, Some(sid)) => hot_swap::run_session_helper(&sid, &mut std::io::stdout().lock()),
+            (Some(profile), None) => cmd_api_key(&profile),
+            (None, None) => Err(usage_error("a profile or --session is required")),
+        },
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
         Command::Run { .. } => cmd_run(),

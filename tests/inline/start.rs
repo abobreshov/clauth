@@ -130,9 +130,11 @@ fn an_isolated_teardown_moves_the_session_into_the_global_store() {
 #[test]
 fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
     let src = include_str!("../../src/start.rs");
+    // The teardown tail lives in `supervise`, which `run` hands the spawned
+    // session to.
     let body = src
-        .split_once("pub(crate) fn run(")
-        .expect("run is defined")
+        .split_once("fn supervise(")
+        .expect("supervise is defined")
         .1;
     // Bounded at the drop that discards the tree, i.e. the end of the teardown
     // legs: past it lies the exit-code tail this test has no business reading.

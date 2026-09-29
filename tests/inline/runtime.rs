@@ -1992,9 +1992,12 @@ fn build_runtime_dir_writes_settings_not_symlink() {
             "settings.json must not be a symlink"
         );
 
-        let expected =
-            build_claude_settings_json(Some(&claude_home.join("settings.json")), &profile, &[])
-                .expect("build_claude_settings_json");
+        let expected = crate::claude::build_claude_settings_json(
+            Some(&claude_home.join("settings.json")),
+            &profile,
+            &[],
+        )
+        .expect("build_claude_settings_json");
         let actual = fs::read_to_string(&settings_dst).expect("read settings");
         assert_eq!(actual, expected);
     });
@@ -2025,6 +2028,7 @@ fn build_runtime_dir_strips_active_env_from_another_profile() {
             LinkMode::Fake,
             Isolation::Shared,
             &["FOO".to_string()],
+            HelperForm::Profile,
         )
         .expect("build");
 
@@ -2067,6 +2071,7 @@ fn build_runtime_dir_active_env_strip_is_noop_when_target_is_active() {
             LinkMode::Fake,
             Isolation::Shared,
             &["FOO".to_string()],
+            HelperForm::Profile,
         )
         .expect("build");
 
@@ -2541,15 +2546,25 @@ fn runtime_settings_retightens_a_loose_file_with_current_bytes() {
         );
 
         // Byte-identical to what the merge produces, at the old umask mode.
-        let current =
-            build_claude_settings_json(Some(&claude_home.join("settings.json")), &profile, &[])
-                .expect("build_claude_settings_json");
+        let current = crate::claude::build_claude_settings_json(
+            Some(&claude_home.join("settings.json")),
+            &profile,
+            &[],
+        )
+        .expect("build_claude_settings_json");
         let settings = runtime.join("settings.json");
         fs::write(&settings, &current).expect("write legacy settings");
         fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        write_merged_settings(&runtime, &claude_home, &profile, Isolation::Shared, &[])
-            .expect("write_merged_settings");
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &profile,
+            Isolation::Shared,
+            &[],
+            HelperForm::Profile,
+        )
+        .expect("write_merged_settings");
 
         let mode = fs::metadata(&settings).expect("meta").permissions().mode();
         assert_eq!(
@@ -5596,6 +5611,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            ..crate::testutil::live_row("0-0", "-")
         };
         crate::live_sessions::register(&dead).expect("register dead");
         dead.session_id = "6001-1".into();
@@ -8358,6 +8374,7 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         current_member: None,
         last_swap_at: None,
         launch_store,
+        ..crate::testutil::live_row("0-0", "-")
     })
     .expect("register row");
 }
@@ -11953,4 +11970,794 @@ fn a_guest_projects_link_that_cannot_be_removed_refuses_the_start() {
             claude_home.join("projects")
         );
     });
+}
+
+// ── executor B: the api-key hot swap (hot-swap spec part 1) ───────────────────
+
+const OR: &str = "https://openrouter.ai/api";
+
+/// An OpenRouter api-key member, on disk and in the roster.
+fn b_member(name: &str) -> Profile {
+    let profile = crate::testutil::api_key_profile(name, OR, &format!("sk-or-{name}"));
+    crate::testutil::write_api_key_profile(&profile);
+    profile
+}
+
+/// The launch info `tollgate start` passes.
+fn start_launch() -> LaunchInfo {
+    LaunchInfo {
+        hot_swap: crate::hot_swap::HotSwapPolicy::Allowed,
+        spawn_cwd: None,
+        relaunch_capable: true,
+        relaunched_from: None,
+    }
+}
+
+/// A full B acquire with the gate forced open (watchdog included).
+fn acquire_b(profile: &Profile) -> ProfileRuntime {
+    ProfileRuntime::acquire_inner(
+        &profile.name,
+        Isolation::Shared,
+        &[],
+        false,
+        &start_launch(),
+        Some(&crate::hot_swap::GateStatus::Open),
+        (|| {}, |_: &SessionPaths, _: &SessionId| {}, || {}),
+    )
+    .expect("acquire a B session")
+}
+
+fn runtime_settings(rt: &ProfileRuntime) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(rt.config_dir().join("settings.json")).expect("settings"))
+        .expect("settings parse")
+}
+
+/// A B session with NO watchdog behind it (the [`lone_session`] shape): its
+/// runtime `settings.json` carries the session helper and its row the class.
+fn lone_b_session(launch: &Profile) -> (std::sync::Arc<SessionSwap>, SwappedMarkers) {
+    let claude_home = crate::profile::claude_dir().expect("claude dir");
+    fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    let name = crate::profile::ProfileName::from(launch.name.as_str());
+    let session = SessionId::mint();
+    let paths = SessionPaths::resolve(&name, Isolation::Shared, &session, LinkMode::Real)
+        .expect("session paths");
+    crate::profile::mkdir_700(&paths.runtime).expect("mkdir runtime");
+    write_merged_settings(
+        &paths.runtime,
+        &claude_home,
+        launch,
+        Isolation::Shared,
+        &[],
+        HelperForm::Session(session.as_str()),
+    )
+    .expect("runtime settings");
+    let markers = stamp_swapped_markers(&paths)
+        .expect("stamp the launch marker")
+        .expect("the launch marker is free");
+    let class = crate::hot_swap::LaunchClass::of(launch, true);
+    let row = crate::live_sessions::LiveSession::starting(
+        &session,
+        &name,
+        crate::harness::Harness::Claude,
+        false,
+        false,
+        None,
+    )
+    .with_executor(crate::hot_swap::Executor::ApiKey, class.clone())
+    .with_relaunch(true, None);
+    crate::live_sessions::register(&row).expect("register");
+    let canonical = canonical_credentials(&name).expect("canonical");
+    let swap = std::sync::Arc::new(
+        SessionSwap::new(
+            session,
+            Isolation::Shared,
+            LinkMode::Real,
+            launch,
+            canonical,
+            &paths,
+        )
+        .with_executor(crate::hot_swap::Executor::ApiKey, class),
+    );
+    (swap, markers)
+}
+
+fn intend(swap: &SessionSwap, member: &str) {
+    crate::live_sessions::update_as_daemon(swap.session.as_str(), |f| {
+        f.set_intended_member(member)
+    })
+    .expect("write the intent");
+}
+
+fn row_of(swap: &SessionSwap) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::get(swap.session.as_str()).expect("row")
+}
+
+// 19
+#[cfg(unix)]
+#[test]
+fn an_api_key_start_registers_executor_b_current_member_and_generation_zero() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = HomeSandbox::new();
+    fake_claude_home(home.home());
+    let profile = b_member("or-main");
+    // The real gate block (PASS for 2.1.283) and a stubbed `claude --version`.
+    let bin = home.home().join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+    let claude = bin.join("claude");
+    fs::write(&claude, "#!/bin/sh\n").expect("fake claude");
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", bin.display()));
+    let _path = crate::testutil::EnvPin::new(&home, &[("PATH", Some(path.as_os_str()))]);
+    crate::hot_swap::set_cc_probe(Some(Box::new(|| Some("2.1.283 (Claude Code)".to_string()))));
+
+    let rt = ProfileRuntime::acquire_with(&profile, Isolation::Shared, &[], false, &start_launch())
+        .expect("acquire");
+    crate::hot_swap::set_cc_probe(None);
+    assert_eq!(*rt.executor(), crate::hot_swap::Executor::ApiKey);
+    let row = crate::live_sessions::get(rt.session_id()).expect("row");
+    assert_eq!(row.executor, Some(crate::hot_swap::Executor::ApiKey));
+    assert_eq!(row.current_member.as_deref(), Some("or-main"));
+    assert_eq!(row.key_generation, Some(0));
+    assert!(row.relaunch_capable);
+    let class = row.launch_class.expect("class recorded");
+    assert_eq!(class.endpoint, OR);
+    assert_eq!(class.provider.as_deref(), Some("openrouter"));
+
+    // The same start with the gate pending registers relaunch-only.
+    drop(rt);
+    let _gate =
+        crate::hot_swap::S1GateOverride::new(&home, crate::hot_swap::parse_gate("no block"));
+    crate::hot_swap::set_cc_probe(Some(Box::new(|| Some("2.1.283 (Claude Code)".to_string()))));
+    let rt = ProfileRuntime::acquire_with(&profile, Isolation::Shared, &[], false, &start_launch())
+        .expect("acquire");
+    crate::hot_swap::set_cc_probe(None);
+    assert_eq!(
+        *rt.executor(),
+        crate::hot_swap::Executor::RelaunchOnly {
+            reason: "s1_gate_pending".to_string()
+        }
+    );
+    let row = crate::live_sessions::get(rt.session_id()).expect("row");
+    assert_eq!(row.key_generation, None, "only B starts a key generation");
+}
+
+// 20
+#[test]
+fn an_oauth_start_writes_byte_identical_settings_and_executor_oauth() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    fs::write(
+        claude_home.join("settings.json"),
+        br#"{"theme":"dark","env":{"FOO":"1"}}"#,
+    )
+    .expect("base settings");
+    let profile = configured_profile("oa-main");
+    let started =
+        ProfileRuntime::acquire_with(&profile, Isolation::Shared, &[], false, &start_launch())
+            .expect("start-shaped acquire");
+    let start_bytes = fs::read(started.config_dir().join("settings.json")).expect("settings");
+    assert_eq!(*started.executor(), crate::hot_swap::Executor::Oauth);
+    let row = crate::live_sessions::get(started.session_id()).expect("row");
+    assert_eq!(row.executor, Some(crate::hot_swap::Executor::Oauth));
+    assert_eq!(row.key_generation, None);
+    assert_eq!(row.launch_class, None);
+    drop(started);
+    let plain = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+    let plain_bytes = fs::read(plain.config_dir().join("settings.json")).expect("settings");
+    assert_eq!(
+        start_bytes, plain_bytes,
+        "an OAuth start's settings are today's bytes"
+    );
+    let expected = disable_upstream_plugin(
+        crate::claude::build_claude_settings_json(
+            Some(&claude_home.join("settings.json")),
+            &profile,
+            &[],
+        )
+        .expect("build"),
+    )
+    .expect("plugin pass");
+    assert_eq!(plain_bytes, expected.as_bytes());
+}
+
+// 21
+#[test]
+fn a_b_session_settings_carry_the_session_helper_and_no_ttl_env() {
+    let home = HomeSandbox::new();
+    fake_claude_home(home.home());
+    let profile = b_member("or-a");
+    let rt = acquire_b(&profile);
+    let settings = runtime_settings(&rt);
+    let helper = settings["apiKeyHelper"].as_str().expect("a helper");
+    assert!(
+        helper.ends_with(&format!("__tollgate-api-key --session {}", rt.session_id())),
+        "{helper}"
+    );
+    assert_eq!(
+        crate::claude::helper_target(helper),
+        Some(crate::claude::HelperTarget::Session(
+            rt.session_id().to_string()
+        ))
+    );
+    assert!(
+        settings["env"].get(crate::hot_swap::TTL_ENV_KEY).is_none(),
+        "the TTL rides the child env only"
+    );
+    assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], serde_json::json!(OR));
+}
+
+// 22
+#[test]
+fn a_failed_register_downgrades_b_to_the_profile_helper() {
+    let home = HomeSandbox::new();
+    fake_claude_home(home.home());
+    let profile = b_member("or-reg");
+    set_fail_register(true);
+    let rt = acquire_b(&profile);
+    set_fail_register(false);
+    assert_eq!(
+        *rt.executor(),
+        crate::hot_swap::Executor::RelaunchOnly {
+            reason: "registry".to_string()
+        }
+    );
+    let helper = runtime_settings(&rt)["apiKeyHelper"]
+        .as_str()
+        .expect("a helper")
+        .to_string();
+    assert_eq!(
+        crate::claude::helper_target(&helper),
+        Some(crate::claude::HelperTarget::Profile("or-reg".to_string())),
+        "a session helper with no row would print nothing"
+    );
+    assert!(crate::live_sessions::get(rt.session_id()).is_none());
+}
+
+// 23
+#[test]
+fn poll_never_reaches_swap_to_or_converge_for_a_b_session() {
+    let _home = HomeSandbox::new();
+    let a = b_member("leg-a");
+    b_member("leg-b");
+    let (swap, _launch) = lone_b_session(&a);
+    swap.poll();
+    intend(&swap, "leg-b");
+    swap.poll();
+    intend(&swap, "leg-a");
+    swap.poll();
+    assert_eq!(swap.a_legs(), 0, "B never reaches executor A's legs");
+    assert_eq!(row_of(&swap).key_generation, Some(2));
+
+    // An A session reaches them on every poll.
+    let oa = member("leg-oa");
+    member_store(&oa);
+    let (a_swap, _a_launch) = lone_session(&oa, Isolation::Shared);
+    a_swap.poll();
+    assert_eq!(a_swap.a_legs(), 1);
+}
+
+// 24
+#[test]
+fn poll_for_an_oauth_session_is_unchanged() {
+    let _home = HomeSandbox::new();
+    let launch = member("pa-a");
+    member_store(&launch);
+    let intended = member("pa-b");
+    let intended_store = member_store(&intended);
+    let (swap, _launch) = lone_session(&launch, Isolation::Shared);
+    crate::live_sessions::update_as_daemon(swap.session.as_str(), |f| {
+        f.set_intended_member("pa-b")
+    })
+    .expect("intent");
+    swap.poll();
+    assert_eq!(swap.member(), "pa-b", "executor A still swaps through poll");
+    assert_eq!(swap.canonical(), intended_store);
+    let row = crate::live_sessions::get(swap.session.as_str()).expect("row");
+    assert_eq!(row.current_member.as_deref(), Some("pa-b"));
+    assert_eq!(row.key_generation, None, "A never bumps a key generation");
+}
+
+// 25
+#[test]
+fn b_commit_writes_member_generation_and_committed_at_and_publishes_under_the_state_flock() {
+    let _home = HomeSandbox::new();
+    let a = b_member("cm-a");
+    b_member("cm-b");
+    let (swap, _launch) = lone_b_session(&a);
+    intend(&swap, "cm-b");
+    let before = crate::usage::now_ms();
+    crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+    swap.poll();
+    let holds = crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get);
+    assert_eq!(
+        holds, 1,
+        "the revalidation, claim, commit, touch and publish share ONE state-flock hold"
+    );
+    let row = row_of(&swap);
+    assert_eq!(row.current_member.as_deref(), Some("cm-b"));
+    assert_eq!(row.key_generation, Some(1));
+    assert!(row.committed_at.is_some_and(|t| t >= before));
+    assert_eq!(row.last_swap_at, row.committed_at);
+    assert_eq!(row.swap_refusal, None);
+    assert_eq!(swap.member(), "cm-b");
+    // No credential store touched, no link repointed.
+    assert_eq!(
+        swap.canonical(),
+        canonical_credentials(&a.name).expect("canonical")
+    );
+}
+
+// 26
+#[test]
+fn b_claims_the_target_marker_for_life_and_a_swap_back_is_already_ours() {
+    let _home = HomeSandbox::new();
+    let a = b_member("mk-a");
+    b_member("mk-b");
+    let (swap, _launch) = lone_b_session(&a);
+    let b_name = crate::profile::ProfileName::from("mk-b");
+    assert!(!has_live_session(&b_name));
+    intend(&swap, "mk-b");
+    swap.poll();
+    assert!(
+        has_live_session(&b_name),
+        "the target reads live once committed"
+    );
+    intend(&swap, "mk-a");
+    swap.poll();
+    let row = row_of(&swap);
+    assert_eq!(row.current_member.as_deref(), Some("mk-a"));
+    assert_eq!(
+        row.key_generation,
+        Some(2),
+        "the swap back is ours, not foreign"
+    );
+    assert!(
+        has_live_session(&b_name),
+        "every member's marker is kept for the session's life"
+    );
+    swap.release_swapped_markers();
+    assert!(!has_live_session(&b_name));
+}
+
+// 27
+#[test]
+fn b_refuses_a_class_mismatch_publishes_nothing_and_records_the_refusal_once() {
+    let _home = HomeSandbox::new();
+    let a = b_member("cl-a");
+    let other =
+        crate::testutil::api_key_profile("cl-c", "https://api.deepseek.com/anthropic", "sk-c");
+    crate::testutil::write_api_key_profile(&other);
+    let (swap, _launch) = lone_b_session(&a);
+    intend(&swap, "cl-c");
+    swap.poll();
+    let row = row_of(&swap);
+    let refusal = row.swap_refusal.clone().expect("the refusal is on the row");
+    assert_eq!(refusal.member, "cl-c");
+    assert_eq!(refusal.code, "class_differs:endpoint");
+    assert_eq!(refusal.text, "a different endpoint");
+    assert_eq!(row.current_member.as_deref(), Some("cl-a"));
+    assert_eq!(row.key_generation, Some(0));
+    assert_eq!(swap.member(), "cl-a");
+    assert!(!has_live_session(&crate::profile::ProfileName::from(
+        "cl-c"
+    )));
+    swap.poll();
+    assert_eq!(
+        row_of(&swap).swap_refusal,
+        Some(refusal),
+        "an unchanged refusal is recorded once"
+    );
+}
+
+// 28
+#[test]
+fn b_refuses_a_foreign_marker() {
+    let _home = HomeSandbox::new();
+    let a = b_member("fm-a");
+    b_member("fm-b");
+    let (swap, _launch) = lone_b_session(&a);
+    let _foreign = hold_session_row_marker(
+        &crate::profile::ProfileName::from("fm-b"),
+        false,
+        swap.session.as_str(),
+    )
+    .expect("a foreign holder");
+    intend(&swap, "fm-b");
+    swap.poll();
+    let row = row_of(&swap);
+    assert_eq!(
+        row.swap_refusal.map(|r| r.code).as_deref(),
+        Some("marker_held")
+    );
+    assert_eq!(row.key_generation, Some(0));
+    assert_eq!(swap.member(), "fm-a");
+}
+
+// 29
+#[test]
+fn b_revalidates_in_the_hold_after_a_profile_edit() {
+    let _home = HomeSandbox::new();
+    let a = b_member("rv-a");
+    b_member("rv-b");
+    let (swap, _launch) = lone_b_session(&a);
+    *swap
+        .b_between_checks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(|| {
+        // Lands after the pre-check passed and before the hold.
+        let moved = crate::testutil::api_key_profile("rv-b", "https://elsewhere.example", "sk-b");
+        crate::profile::save_profile(&moved).expect("edit the target");
+    }));
+    intend(&swap, "rv-b");
+    swap.poll();
+    let row = row_of(&swap);
+    assert_eq!(
+        row.swap_refusal.map(|r| r.code).as_deref(),
+        Some("class_differs:endpoint"),
+        "the hold re-reads the target from disk"
+    );
+    assert_eq!(row.key_generation, Some(0));
+    assert_eq!(swap.member(), "rv-a");
+}
+
+// 30
+#[test]
+fn a_failed_commit_releases_the_claim_and_leaves_the_row() {
+    let _home = HomeSandbox::new();
+    let a = b_member("fc-a");
+    b_member("fc-b");
+    let (swap, _launch) = lone_b_session(&a);
+    swap.b_fail_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    intend(&swap, "fc-b");
+    swap.poll();
+    let row = row_of(&swap);
+    assert_eq!(row.current_member.as_deref(), Some("fc-a"));
+    assert_eq!(row.key_generation, Some(0));
+    assert_eq!(
+        row.intended_member.as_deref(),
+        Some("fc-b"),
+        "the intent retries"
+    );
+    assert_eq!(swap.member(), "fc-a", "nothing was published");
+    assert!(
+        !has_live_session(&crate::profile::ProfileName::from("fc-b")),
+        "the stamped marker was released"
+    );
+    // The next tick, with the fault gone, commits.
+    swap.b_fail_commit
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    swap.poll();
+    assert_eq!(row_of(&swap).key_generation, Some(1));
+}
+
+// 31
+#[test]
+fn teardown_removes_sidecars_and_releases_b_markers() {
+    let home = HomeSandbox::new();
+    fake_claude_home(home.home());
+    let a = b_member("td-a");
+    b_member("td-b");
+    let rt = acquire_b(&a);
+    let sid = rt.session_id().to_string();
+    crate::live_sessions::update_as_daemon(&sid, |f| f.set_intended_member("td-b"))
+        .expect("intent");
+    // The session's own watchdog commits it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while crate::live_sessions::get(&sid)
+        .and_then(|r| r.key_generation)
+        .unwrap_or(0)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watchdog never committed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let b_name = crate::profile::ProfileName::from("td-b");
+    assert!(has_live_session(&b_name));
+    let sidecars: Vec<PathBuf> = ["helper", "helper.lock", "relaunch", "relaunch.result"]
+        .iter()
+        .map(|s| crate::live_sessions::sidecar_path_for_test(&sid, s))
+        .collect();
+    for p in &sidecars {
+        fs::write(p, b"{}").expect("sidecar");
+    }
+    drop(rt);
+    for p in &sidecars {
+        assert!(!p.exists(), "{} survived teardown", p.display());
+    }
+    assert!(crate::live_sessions::get(&sid).is_none());
+    assert!(
+        !has_live_session(&b_name),
+        "B's marker is released at teardown"
+    );
+}
+
+// 32
+#[test]
+fn gc_removes_orphan_sidecars_only() {
+    let _home = HomeSandbox::new();
+    let side = crate::live_sessions::sidecar_path_for_test;
+    // A dead row: its row and every sidecar go (an old `.relaunch.taken` too).
+    crate::live_sessions::register(&crate::testutil::live_row("9-0", "g-a")).expect("row");
+    for s in [
+        "helper",
+        "helper.lock",
+        "relaunch",
+        "relaunch.result",
+        "relaunch.taken",
+    ] {
+        fs::write(side("9-0", s), b"{}").expect("sidecar");
+    }
+    set_mtime(
+        &side("9-0", "relaunch.taken"),
+        SystemTime::now() - Duration::from_secs(600),
+    );
+    // No row, but a runtime tree: the orphaned Claude Code may still run the
+    // helper, so its ack and lock stay; the relaunch request goes.
+    for s in ["helper", "helper.lock", "relaunch"] {
+        fs::write(side("9-1", s), b"{}").expect("sidecar");
+    }
+    let tree = crate::profile::profile_dir(&crate::profile::ProfileName::from("g-a"))
+        .expect("profile dir")
+        .join("runtime-9-1");
+    fs::create_dir_all(&tree).expect("runtime tree");
+    // A fresh `.relaunch.taken` waits for its new process.
+    fs::write(side("9-2", "relaunch.taken"), b"{}").expect("sidecar");
+    // A live row keeps everything.
+    crate::live_sessions::register(&crate::testutil::live_row("9-3", "g-a")).expect("row");
+    let _live = hold_session_row_marker(&crate::profile::ProfileName::from("g-a"), false, "9-3")
+        .expect("live marker");
+    for s in ["helper", "helper.lock", "relaunch"] {
+        fs::write(side("9-3", s), b"{}").expect("sidecar");
+    }
+
+    gc_live_session_rows();
+
+    assert!(crate::live_sessions::get("9-0").is_none());
+    for s in [
+        "helper",
+        "helper.lock",
+        "relaunch",
+        "relaunch.result",
+        "relaunch.taken",
+    ] {
+        assert!(!side("9-0", s).exists(), "9-0.{s}");
+    }
+    assert!(side("9-1", "helper").exists());
+    assert!(side("9-1", "helper.lock").exists());
+    assert!(!side("9-1", "relaunch").exists());
+    assert!(side("9-2", "relaunch.taken").exists());
+    for s in ["helper", "helper.lock", "relaunch"] {
+        assert!(side("9-3", s).exists(), "9-3.{s}");
+    }
+    // Once the tree is gone the orphan's ack goes too.
+    fs::remove_dir_all(&tree).expect("drop tree");
+    gc_live_session_rows();
+    assert!(!side("9-1", "helper").exists());
+}
+
+// 33
+#[test]
+fn the_ttl_env_is_scrubbed_then_set_only_for_b() {
+    let home = HomeSandbox::new();
+    let _inherited = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            crate::hot_swap::TTL_ENV_KEY,
+            Some(std::ffi::OsStr::new("1")),
+        )],
+    );
+    let mut oauth = std::process::Command::new("true");
+    scrub_profile_env(&mut oauth, &[]);
+    apply_session_env(&mut oauth, &crate::hot_swap::Executor::Oauth);
+    assert_eq!(
+        crate::testutil::env_overrides(&oauth).get(crate::hot_swap::TTL_ENV_KEY),
+        Some(&None),
+        "an inherited TTL is scrubbed"
+    );
+    let mut b = std::process::Command::new("true");
+    scrub_profile_env(&mut b, &[]);
+    apply_session_env(&mut b, &crate::hot_swap::Executor::ApiKey);
+    assert_eq!(
+        crate::testutil::env_overrides(&b).get(crate::hot_swap::TTL_ENV_KEY),
+        Some(&Some("30000".to_string()))
+    );
+    assert!(
+        !MANAGED_ENV_KEYS.contains(&crate::hot_swap::TTL_ENV_KEY),
+        "settings sync never classifies the TTL"
+    );
+}
+
+// 33a
+#[test]
+fn commit_touches_runtime_settings_even_when_bytes_equal() {
+    let _home = HomeSandbox::new();
+    let a = b_member("tc-a");
+    b_member("tc-b");
+    let (swap, _launch) = lone_b_session(&a);
+    let settings = swap.runtime.join("settings.json");
+    let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    set_mtime(&settings, hour_ago);
+    let bytes = fs::read(&settings).expect("settings");
+    intend(&swap, "tc-b");
+    crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+    swap.poll();
+    assert_eq!(
+        crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get),
+        1,
+        "the touch runs inside the commit's one hold"
+    );
+    let after = fs::metadata(&settings)
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    assert!(
+        after > hour_ago + Duration::from_secs(3000),
+        "the mtime moved"
+    );
+    assert_eq!(
+        fs::read(&settings).expect("settings"),
+        bytes,
+        "no byte changed"
+    );
+}
+
+// 33b
+#[test]
+fn b_refuses_when_the_runtime_settings_env_drifted_from_the_launch_class() {
+    let _home = HomeSandbox::new();
+    let a = b_member("dr-a");
+    b_member("dr-b");
+    let (swap, _launch) = lone_b_session(&a);
+    let settings = swap.runtime.join("settings.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).expect("read")).expect("parse");
+    value["env"]["ANTHROPIC_BASE_URL"] = serde_json::json!("https://drifted.example");
+    fs::write(&settings, serde_json::to_vec(&value).expect("ser")).expect("write");
+    intend(&swap, "dr-b");
+    swap.poll();
+    let row = row_of(&swap);
+    assert_eq!(
+        row.swap_refusal.map(|r| r.code).as_deref(),
+        Some("class_differs:endpoint")
+    );
+    assert_eq!(row.key_generation, Some(0));
+}
+
+// 33c
+#[test]
+fn no_surface_serialises_launch_args() {
+    let home = HomeSandbox::new();
+    fake_claude_home(home.home());
+    let a = b_member("la-a");
+    let rt = acquire_b(&a);
+    let sid = rt.session_id().to_string();
+    // A request that tries to smuggle claude args, claimed by the supervisor.
+    let conv = "conv-la";
+    crate::testutil::transcript_fixture(
+        &crate::relaunch::projects_store().expect("store"),
+        home.home(),
+        &[conv],
+    );
+    let request = serde_json::json!({
+        "version": 1, "target": "la-a", "conversation": conv, "cwd": home.home(),
+        "follows_chain": false, "requested_at_ms": 1, "requester_pid": 1,
+        "claude_args": ["--mcp-config", "SENTINEL-ARG-4242"],
+    });
+    fs::write(
+        crate::live_sessions::relaunch_path(&sid, "").expect("path"),
+        serde_json::to_vec(&request).expect("ser"),
+    )
+    .expect("request");
+    assert!(crate::relaunch::poll_claim(&sid).is_some());
+    let row = crate::live_sessions::get(&sid).expect("row");
+    let ack = crate::live_sessions::read_helper_ack(&sid);
+    let rendered = [
+        serde_json::to_string(&row).expect("row"),
+        serde_json::to_string(&crate::hot_swap::LiveSessionView::of(&row, ack.as_ref()))
+            .expect("view"),
+        format!("{:?}", crate::hot_swap::SwapView::of(&row, ack.as_ref())),
+        crate::hot_swap::attributed_member(&row),
+    ];
+    for text in &rendered {
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
+    let dir = crate::profile::tollgate_dir()
+        .expect("dir")
+        .join("live_sessions");
+    for entry in fs::read_dir(&dir).expect("registry").flatten() {
+        let bytes = fs::read(entry.path()).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("SENTINEL"),
+            "{} carries the smuggled argv",
+            entry.path().display()
+        );
+    }
+    let _ = fs::remove_file(crate::live_sessions::relaunch_path(&sid, "taken").expect("path"));
+}
+
+// 33d
+#[test]
+fn pane_attribution_live_tally_and_the_tag_use_the_served_member() {
+    let _home = HomeSandbox::new();
+    let a = b_member("at-a");
+    b_member("at-b");
+    let (swap, _launch) = lone_b_session(&a);
+    intend(&swap, "at-b");
+    swap.poll();
+    let row = row_of(&swap);
+    assert_eq!(row.current_member.as_deref(), Some("at-b"), "committed");
+    // Committed but not served: every attribution still names the launch
+    // member, whose key Claude Code still sends.
+    assert_eq!(crate::hot_swap::attributed_member(&row), "at-a");
+    let tally = crate::live_sessions::LiveTally::of([row.clone()]);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("at-a"))
+            .sessions,
+        1
+    );
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("at-a"))
+            .swapping,
+        1
+    );
+    // The helper serves generation 1: attribution follows.
+    let mut out = Vec::new();
+    crate::hot_swap::run_session_helper(swap.session.as_str(), &mut out).expect("helper");
+    assert_eq!(out, b"sk-or-at-b");
+    assert_eq!(crate::hot_swap::attributed_member(&row), "at-b");
+    let tally = crate::live_sessions::LiveTally::of([row]);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("at-b"))
+            .sessions,
+        1
+    );
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("at-b"))
+            .swapping,
+        0
+    );
+}
+
+/// §4.7: the watchdog warns about a stalled commit once per key generation,
+/// and an idle (never-run) commit never.
+#[test]
+fn a_stalled_commit_is_warned_once_per_generation_and_an_idle_one_never() {
+    let _home = HomeSandbox::new();
+    let a = b_member("st-a");
+    b_member("st-b");
+    let (swap, _launch) = lone_b_session(&a);
+    intend(&swap, "st-b");
+    swap.poll();
+    swap.poll();
+    assert_eq!(
+        swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "committed and idle: no warning"
+    );
+    crate::hot_swap::write_ack_for_test(
+        swap.session.as_str(),
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 0,
+            member: None,
+            served_at_ms: None,
+            last_failure: Some(crate::hot_swap::HelperFailure {
+                generation: 1,
+                code: "no_key".to_string(),
+                at_ms: crate::usage::now_ms(),
+            }),
+        },
+    );
+    swap.poll();
+    assert_eq!(
+        swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }

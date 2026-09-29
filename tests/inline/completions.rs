@@ -242,6 +242,7 @@ fn session_stem_completion_lists_registry_stems_only() {
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            ..crate::testutil::live_row("0-0", "-")
         };
         crate::live_sessions::register(&row).expect("register row");
     }

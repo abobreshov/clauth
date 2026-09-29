@@ -121,3 +121,39 @@ fn a_held_try_lock_still_reports_busy() {
     release_tx.send(()).expect("release");
     holder.join().expect("holder finishes");
 }
+
+/// Spec test 57. The session helper's ack lock is a leaf ranked above every
+/// production rank: taking it under any of them is the legal ascending order,
+/// and nothing may be taken under it.
+#[test]
+fn helper_ack_is_a_leaf_above_every_production_rank() {
+    let production = [
+        <rank::ApiSwitch as Rank>::VALUE,
+        <rank::Rotation as Rank>::VALUE,
+        <rank::State as Rank>::VALUE,
+        <rank::SwapCell as Rank>::VALUE,
+        <rank::Activity as Rank>::VALUE,
+        <rank::McpDigest as Rank>::VALUE,
+        <rank::GatewayPublished as Rank>::VALUE,
+    ];
+    let helper = <rank::HelperAck as Rank>::VALUE;
+    assert!(
+        production.iter().all(|&r| helper > r),
+        "HelperAck must sit above every production rank"
+    );
+    {
+        let _gateway = RankGuard::enter::<rank::GatewayPublished>();
+        let _ack = RankGuard::enter::<rank::HelperAck>();
+    }
+    let _ack = RankGuard::enter::<rank::HelperAck>();
+    assert!(holds::<rank::HelperAck>());
+}
+
+/// Taking anything under the ack lock inverts the order.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "lock-order violation")]
+fn nothing_is_taken_under_the_helper_ack_lock() {
+    let _ack = RankGuard::enter::<rank::HelperAck>();
+    let _state = RankGuard::enter::<rank::State>();
+}

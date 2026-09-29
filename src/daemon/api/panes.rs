@@ -295,10 +295,9 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
         };
         sessions.push(PaneSession {
             session_id: row.session_id.clone(),
-            profile: row
-                .current_member
-                .clone()
-                .unwrap_or_else(|| row.start_profile.clone()),
+            // The SERVED member: an api-key session committed to another
+            // member still sends the previous key until its helper serves.
+            profile: crate::hot_swap::attributed_member(row),
             kind,
             follows_chain: row.follows_chain,
             isolated: row.isolated,

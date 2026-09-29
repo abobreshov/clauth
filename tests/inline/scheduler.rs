@@ -3857,6 +3857,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        ..crate::testutil::live_row("0-0", "-")
     }
 }
 
@@ -13253,4 +13254,43 @@ fn claude_rolling_tick_restamps_nothing_in_guest_mode() {
     super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
         panic!("'{name}' must not be re-stamped in guest mode")
     });
+}
+
+/// Hot-swap spec test 48. Executor B rows never follow the chain: even a live
+/// B row whose `follows_chain` reads true (a hand-edited or future row) is
+/// skipped by the decision leg, so the daemon never writes its intent.
+#[test]
+fn the_decision_leg_never_writes_a_b_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut b =
+        session_row("4242-0", "dl-a").with_executor(crate::hot_swap::Executor::ApiKey, None);
+    b.follows_chain = true;
+    let _b_marker = register_live_row(&b);
+    assert!(
+        !super::row_follows_chain_live(&b),
+        "a B row is never a chain-following row"
+    );
+    let mut a = session_row("4242-1", "dl-a");
+    a.follows_chain = true;
+    let _a_marker = register_live_row(&a);
+    assert!(
+        super::row_follows_chain_live(&a),
+        "the A control still follows"
+    );
+
+    let config = session_config(&["dl-a", "dl-b"], Some("dl-a"));
+    let store = session_store(&[("dl-a", 100.0), ("dl-b", 10.0)]);
+    scan_sessions(&config, &store, &all_fresh(&["dl-a", "dl-b"]));
+    assert_eq!(
+        decision_of("4242-1").0.as_deref(),
+        Some("dl-b"),
+        "the leg ran and moved the A row"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("B row")
+            .intended_member,
+        None,
+        "the decision leg wrote nothing on the B row"
+    );
 }

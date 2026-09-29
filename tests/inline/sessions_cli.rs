@@ -833,6 +833,7 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        ..crate::testutil::live_row("0-0", "-")
     };
     crate::live_sessions::register(&row).expect("register row");
 }
@@ -866,7 +867,8 @@ fn switch_refuses_an_unknown_sid_with_the_listing_hint() {
     // A transcript-shaped id and a sid-shaped one: neither names a live
     // session, and both get the same named refusal.
     for sid in ["nope", "999999-9"] {
-        let err = run_switch(sid, "work").expect_err("an unknown sid must be refused");
+        let err = run_switch(sid, "work", &SwitchFlags::default())
+            .expect_err("an unknown sid must be refused");
         assert_eq!(
             err.to_string(),
             format!("no live session '{sid}'\nsee `tollgate sessions`"),
@@ -889,7 +891,8 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
     let _sb = HomeSandbox::new();
     seed_profiles(&["work"], &[]);
 
-    let err = run_switch("work", "spare").expect_err("a profile name is not a live sid");
+    let err = run_switch("work", "spare", &SwitchFlags::default())
+        .expect_err("a profile name is not a live sid");
     assert_eq!(
         err.to_string(),
         "no live session 'work'\nsee `tollgate sessions`\nto switch the global account: `tollgate switch work`"
@@ -909,7 +912,8 @@ fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() 
     })
     .expect("seed codex roster");
 
-    let err = run_switch("cx", "spare").expect_err("a codex name is not a live sid");
+    let err = run_switch("cx", "spare", &SwitchFlags::default())
+        .expect_err("a codex name is not a live sid");
     assert_eq!(
         err.to_string(),
         "no live session 'cx'\nsee `tollgate sessions`\nto switch the global account: `tollgate switch cx`"
@@ -923,7 +927,8 @@ fn switch_refuses_a_dead_session_row() {
     // Registered but marker-less: the session ended, its row awaits GC.
     registry_row("4242-0", "work", crate::harness::Harness::Claude);
 
-    let err = run_switch("4242-0", "work").expect_err("a dead row must be refused");
+    let err = run_switch("4242-0", "work", &SwitchFlags::default())
+        .expect_err("a dead row must be refused");
     assert_eq!(
         err.to_string(),
         "session '4242-0' is no longer running\nits row is reaped by the next `tollgate daemon` or `tollgate resume`"
@@ -947,7 +952,8 @@ fn switch_refuses_a_codex_session_row() {
     )
     .expect("hold the marker");
 
-    let err = run_switch("4242-0", "spare").expect_err("a codex row must be refused");
+    let err = run_switch("4242-0", "spare", &SwitchFlags::default())
+        .expect_err("a codex row must be refused");
     assert_eq!(
         err.to_string(),
         "session '4242-0' is a codex session; switch is claude-only"
@@ -970,7 +976,8 @@ fn switch_refuses_an_unknown_profile() {
     seed_profiles(&["work"], &[]);
     let _marker = live_claude_row("4242-0", "work");
 
-    let err = run_switch("4242-0", "nope").expect_err("an unknown profile must be refused");
+    let err = run_switch("4242-0", "nope", &SwitchFlags::default())
+        .expect_err("an unknown profile must be refused");
     assert_eq!(err.to_string(), "profile 'nope' not found\navailable: work");
     assert_eq!(crate::exit_code(Err(err)), 1);
     assert!(
@@ -988,7 +995,7 @@ fn switch_points_the_row_at_the_named_profile_through_the_registry_seam() {
     seed_profiles(&["work", "spare"], &[]);
     let _marker = live_claude_row("4242-0", "work");
 
-    run_switch("4242-0", "spare").expect("the switch records the intent");
+    run_switch("4242-0", "spare", &SwitchFlags::default()).expect("the switch records the intent");
 
     let row = crate::live_sessions::get("4242-0").expect("row survives the write");
     assert_eq!(
@@ -1022,7 +1029,8 @@ fn switch_is_a_no_op_for_a_session_already_on_the_profile() {
     seed_profiles(&["work"], &[]);
     let _marker = live_claude_row("4242-0", "work");
 
-    run_switch("4242-0", "work").expect("already-on is a satisfied ask, not an error");
+    run_switch("4242-0", "work", &SwitchFlags::default())
+        .expect("already-on is a satisfied ask, not an error");
 
     assert_eq!(
         crate::live_sessions::get("4242-0")
@@ -1052,7 +1060,7 @@ fn switch_leaves_the_go_no_go_with_the_sessions_executor() {
         .expect("load keyed");
     let _marker = live_claude_row("4242-0", "work");
 
-    run_switch("4242-0", "keyed")
+    run_switch("4242-0", "keyed", &SwitchFlags::default())
         .expect("the CLI records the intent without pre-judging eligibility");
 
     let row = crate::live_sessions::get("4242-0").expect("row");
@@ -1089,4 +1097,262 @@ fn the_sessions_listing_rejects_extra_arguments() {
     let err = crate::cli::Cli::try_parse_from(["tollgate", "sessions", "--json", "extra"])
         .expect_err("extra args must be a usage error");
     assert_eq!(err.exit_code(), 2);
+}
+
+// ── executor B and the request core (hot-swap spec part 1) ───────────────────
+
+mod hot_swap_switch {
+    use super::*;
+    use crate::testutil::{api_key_profile, write_api_key_profile};
+
+    const OR: &str = "https://openrouter.ai/api";
+
+    fn fast_waits() {
+        set_switch_waits(Some(SwitchWaits {
+            commit: Duration::from_secs(3),
+            served: Duration::from_millis(300),
+            commit_poll: Duration::from_millis(10),
+            served_poll: Duration::from_millis(10),
+        }));
+    }
+
+    /// A live B session of `start`, with its marker held.
+    fn b_session(sid: &str, start: &str) -> std::fs::File {
+        let launch = api_key_profile(start, OR, "sk-start");
+        write_api_key_profile(&launch);
+        let row = crate::testutil::live_row(sid, start).with_executor(
+            crate::hot_swap::Executor::ApiKey,
+            crate::hot_swap::LaunchClass::of(&launch, true),
+        );
+        crate::live_sessions::register(&row).expect("register");
+        crate::runtime::hold_session_row_marker(
+            &crate::profile::ProfileName::from(start),
+            false,
+            sid,
+        )
+        .expect("marker")
+    }
+
+    /// Stand in for the session's executor: commit the intent once it lands.
+    fn committing_session(sid: &'static str) -> std::thread::JoinHandle<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // The home override is process-wide, so the thread resolves inside
+        // the caller's sandbox; the caller joins it before the sandbox drops.
+        std::thread::spawn(move || {
+            while std::time::Instant::now() < deadline {
+                if let Some(intended) =
+                    crate::live_sessions::get(sid).and_then(|r| r.intended_member)
+                {
+                    crate::live_sessions::update_as_session(sid, |f| {
+                        f.set_current_member(intended);
+                        f.bump_key_generation();
+                        f.set_committed_at(crate::usage::now_ms());
+                    })
+                    .expect("commit");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    fn reported(err: anyhow::Error) -> i32 {
+        err.downcast_ref::<crate::relaunch::Reported>()
+            .map(|r| r.0)
+            .unwrap_or_else(|| panic!("not a reported outcome: {err:#}"))
+    }
+
+    // 43
+    #[test]
+    fn switch_on_a_b_session_prints_committed_then_swapping() {
+        let _sb = HomeSandbox::new();
+        fast_waits();
+        let _marker = b_session("4242-0", "sw-a");
+        write_api_key_profile(&api_key_profile("sw-b", OR, "sk-b"));
+        // What the real executor stamps at commit: the target's marker, which
+        // the liveness probe then reads.
+        let _b_marker = crate::runtime::hold_session_row_marker(
+            &crate::profile::ProfileName::from("sw-b"),
+            false,
+            "4242-0",
+        )
+        .expect("target marker");
+        let session = committing_session("4242-0");
+        let request = request_session_switch("4242-0", "sw-b").expect("request");
+        session.join().expect("session thread");
+        assert_eq!(request.outcome, RequestOutcome::Committed(1));
+        assert_eq!(request.current, "sw-a");
+        assert_eq!(
+            committed_lines("4242-0", "sw-b", 1),
+            "tollgate: session '4242-0' committed to 'sw-b' (api-key hot swap, key generation 1)\n\
+             tollgate: swapping… Claude Code picks the new key up on its next request"
+        );
+        // No commit inside the wait: requested.
+        set_switch_waits(Some(SwitchWaits {
+            commit: Duration::from_millis(200),
+            served: Duration::from_millis(200),
+            commit_poll: Duration::from_millis(10),
+            served_poll: Duration::from_millis(10),
+        }));
+        write_api_key_profile(&api_key_profile("sw-c", OR, "sk-c"));
+        let request = request_session_switch("4242-0", "sw-c").expect("request");
+        assert_eq!(request.outcome, RequestOutcome::Requested);
+        set_switch_waits(None);
+    }
+
+    // 44
+    #[test]
+    fn switch_pre_check_refuses_a_different_class_without_writing_intent() {
+        let _sb = HomeSandbox::new();
+        fast_waits();
+        let _marker = b_session("4242-0", "pc-a");
+        write_api_key_profile(&api_key_profile(
+            "pc-ds",
+            "https://api.deepseek.com/anthropic",
+            "sk-ds",
+        ));
+        let request = request_session_switch("4242-0", "pc-ds").expect("request");
+        assert_eq!(
+            request.outcome,
+            RequestOutcome::Refused("class_differs:endpoint".to_string())
+        );
+        assert!(
+            crate::live_sessions::get("4242-0")
+                .expect("row")
+                .intended_member
+                .is_none(),
+            "a pre-check refusal writes nothing"
+        );
+        let err = run_switch("4242-0", "pc-ds", &SwitchFlags::default()).expect_err("refused");
+        assert_eq!(reported(err), 1);
+        set_switch_waits(None);
+    }
+
+    // 45
+    #[test]
+    fn switch_on_a_relaunch_only_session_names_the_reason_and_the_relaunch_command() {
+        let _sb = HomeSandbox::new();
+        write_api_key_profile(&api_key_profile("ro-a", OR, "sk-a"));
+        write_api_key_profile(&api_key_profile("ro-b", OR, "sk-b"));
+        let row = crate::testutil::live_row("4242-0", "ro-a").with_executor(
+            crate::hot_swap::Executor::RelaunchOnly {
+                reason: "kill_switch".to_string(),
+            },
+            None,
+        );
+        crate::live_sessions::register(&row).expect("register");
+        let _marker = crate::runtime::hold_session_row_marker(
+            &crate::profile::ProfileName::from("ro-a"),
+            false,
+            "4242-0",
+        )
+        .expect("marker");
+        let request = request_session_switch("4242-0", "ro-b").expect("request");
+        assert_eq!(
+            request.outcome,
+            RequestOutcome::RelaunchRequired("kill_switch".to_string())
+        );
+        assert_eq!(
+            relaunch_hint("4242-0", "ro-b"),
+            "relaunch instead: tollgate switch 4242-0 ro-b --relaunch"
+        );
+        assert!(
+            crate::live_sessions::get("4242-0")
+                .expect("row")
+                .intended_member
+                .is_none()
+        );
+        let err = run_switch("4242-0", "ro-b", &SwitchFlags::default()).expect_err("refused");
+        assert_eq!(reported(err), 1);
+    }
+
+    // 46
+    #[test]
+    fn switch_wait_exits_3_when_never_served() {
+        let _sb = HomeSandbox::new();
+        fast_waits();
+        let _marker = b_session("4242-0", "wt-a");
+        write_api_key_profile(&api_key_profile("wt-b", OR, "sk-b"));
+        let wait = SwitchFlags {
+            wait: true,
+            ..SwitchFlags::default()
+        };
+        let session = committing_session("4242-0");
+        let err = run_switch("4242-0", "wt-b", &wait).expect_err("never served");
+        session.join().expect("session thread");
+        assert_eq!(reported(err), 3);
+        assert_eq!(
+            crate::exit_code(Err(anyhow::Error::new(crate::relaunch::Reported(3)))),
+            3
+        );
+
+        // Stalled: the helper ran for the commit and failed.
+        crate::hot_swap::write_ack_for_test(
+            "4242-0",
+            &crate::hot_swap::HelperAck {
+                version: 1,
+                generation: 0,
+                member: None,
+                served_at_ms: None,
+                last_failure: Some(crate::hot_swap::HelperFailure {
+                    generation: 1,
+                    code: "no_key".to_string(),
+                    at_ms: crate::usage::now_ms(),
+                }),
+            },
+        );
+        assert_eq!(
+            wait_until_served("4242-0", 1),
+            WaitOutcome::Stalled("no_key".to_string())
+        );
+        // Served once the ack reaches the generation.
+        crate::hot_swap::write_ack_for_test(
+            "4242-0",
+            &crate::hot_swap::HelperAck {
+                version: 1,
+                generation: 1,
+                member: Some("wt-b".to_string()),
+                served_at_ms: Some(crate::usage::now_ms()),
+                last_failure: None,
+            },
+        );
+        assert_eq!(wait_until_served("4242-0", 1), WaitOutcome::Served(1));
+        set_switch_waits(None);
+    }
+
+    // 47
+    #[test]
+    fn session_flags_with_one_name_are_usage_errors() {
+        let _sb = HomeSandbox::new();
+        use clap::Parser as _;
+        let run = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(
+                std::iter::once("tollgate").chain(args.iter().copied()),
+            )
+            .expect("parses");
+            crate::exit_code(crate::dispatch(cli))
+        };
+        for args in [
+            &["switch", "acme", "--wait"][..],
+            &["switch", "acme", "--relaunch"],
+            &["switch", "acme", "--yes"],
+            &["switch", "acme", "--conversation", "c"],
+            &["switch", "4242-0", "acme", "--yes"],
+            &["switch", "4242-0", "acme", "--conversation", "c"],
+        ] {
+            assert_eq!(run(args), 2, "{args:?}");
+        }
+        assert!(
+            check_switch_flags(
+                true,
+                &SwitchFlags {
+                    relaunch: true,
+                    yes: true,
+                    conversation: Some("c".to_string()),
+                    wait: false,
+                }
+            )
+            .is_ok()
+        );
+    }
 }

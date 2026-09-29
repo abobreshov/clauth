@@ -1299,6 +1299,50 @@ pub(crate) fn write_captured_third_party_cache(name: &str, json: &str) {
     );
 }
 
+/// An api-key profile on `base_url` with `key`, not yet on disk.
+pub(crate) fn api_key_profile(name: &str, base_url: &str, key: &str) -> crate::profile::Profile {
+    crate::profile::Profile::new(
+        name.to_string(),
+        Some(base_url.to_string()),
+        Some(key.to_string()),
+    )
+}
+
+/// Put `profile` on disk (its `config.toml`) and into the roster — the
+/// `ApiKeyProfile::write` fixture of the hot-swap spec. Call under a
+/// [`HomeSandbox`].
+pub(crate) fn write_api_key_profile(profile: &crate::profile::Profile) {
+    crate::profile::save_profile(profile).expect("save the api-key profile");
+    register_names(&[profile.name.as_str()]);
+}
+
+/// A child that exits 0 on SIGTERM and otherwise runs until killed — the
+/// supervisor's stand-in for a Claude Code child.
+#[cfg(unix)]
+pub(crate) fn fake_supervisor_child() -> std::process::Child {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("trap 'exit 0' TERM; while :; do sleep 0.05; done")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the fake session child")
+}
+
+/// A transcript store holding one project dir for `cwd` with a `.jsonl` per
+/// conversation id; returns the transcripts' paths.
+pub(crate) fn transcript_fixture(store: &Path, cwd: &Path, conversations: &[&str]) -> Vec<PathBuf> {
+    let dir = store.join(crate::relaunch::encode_cwd(cwd));
+    std::fs::create_dir_all(&dir).expect("create the project dir");
+    conversations
+        .iter()
+        .map(|id| {
+            let path = dir.join(format!("{id}.jsonl"));
+            std::fs::write(&path, b"{\"type\":\"user\"}\n").expect("write the transcript");
+            path
+        })
+        .collect()
+}
+
 /// A live-session registry row with every field a fixture rarely varies already
 /// filled: one non-isolated, chain-following session of `profile` that has never
 /// swapped. Callers override the fields their case is actually about.
@@ -1317,6 +1361,13 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        executor: None,
+        launch_class: None,
+        key_generation: None,
+        committed_at: None,
+        swap_refusal: None,
+        relaunch_capable: false,
+        relaunched_from: None,
     }
 }
 

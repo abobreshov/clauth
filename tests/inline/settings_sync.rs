@@ -774,3 +774,43 @@ fn guest_runtime_settings_are_never_members_with_the_operator_file() {
         "a guest session's edit reaches neither the operator file nor a sibling"
     );
 }
+
+/// Hot-swap spec test 37. A B session's runtime carries the SESSION form of
+/// the helper, the newest file of the reconcile; it must reach neither the
+/// base nor a sibling, and must survive the sync in its own copy.
+#[test]
+fn a_session_helper_never_syncs_into_the_base_or_a_sibling() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let sibling = runtime_path(home.home(), "p1");
+    let session = session_runtime_path(home.home(), "p2", "4242-0");
+    write_config(home.home(), "p1", "");
+    write_config(home.home(), "p2", "");
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    write_json(
+        &sibling,
+        &json!({"apiKeyHelper": "tollgate __tollgate-api-key p1", "theme": "light", "env": {}}),
+        t(2),
+    );
+    let helper = "tollgate __tollgate-api-key --session 4242-0";
+    write_json(
+        &session,
+        &json!({"apiKeyHelper": helper, "theme": "dark", "env": {}}),
+        t(10),
+    );
+
+    sync();
+
+    assert_eq!(read_json(&session)["apiKeyHelper"], json!(helper));
+    assert!(read_json(&base).get("apiKeyHelper").is_none());
+    assert_eq!(
+        read_json(&sibling)["apiKeyHelper"],
+        json!("tollgate __tollgate-api-key p1"),
+        "the sibling keeps its own profile-form helper"
+    );
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "a shared field from the B session's copy still propagates"
+    );
+}

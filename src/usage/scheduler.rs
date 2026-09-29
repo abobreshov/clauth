@@ -1691,7 +1691,10 @@ fn auto_start_should_kick(
 /// row can never count as hosting for the kick gate while the decision leg
 /// refuses to move it (or the reverse).
 fn row_follows_chain_live(row: &crate::live_sessions::LiveSession) -> bool {
-    row.follows_chain && !row.isolated && {
+    // Executor B rows never follow the chain (P6c is out of scope): the
+    // decision leg must never write their `intended_member`, whatever their
+    // `follows_chain` says.
+    row.follows_chain && !row.isolated && row.executor() != crate::hot_swap::Executor::ApiKey && {
         // `gc_stale_runtimes` reaps rows at daemon STARTUP, not per tick,
         // so a SIGKILLed session's row outlives the whole daemon run.
         let probe = ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));

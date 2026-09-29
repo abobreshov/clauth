@@ -27,6 +27,8 @@
 //! - `0` success.
 //! - `1` a genuine error, INCLUDING "no sessions found".
 //! - `2` a usage error (bad flag/args).
+//! - `3` (`switch <sid> <p> --wait` only) the session committed the profile
+//!   but its key helper had not served it when the wait ran out, or failed.
 //!
 //! `1` vs `2` is carried by [`crate::UsageError`] and mapped in
 //! [`crate::exit_code`]: a `sessions`/`resume`/`info` dispatch arm returns a
@@ -38,7 +40,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
-use crate::out::{out, outln};
+use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
 use crate::sessions::{IsolatedHold, SessionInfo, SessionRef, WorkspaceGroup};
@@ -187,15 +189,41 @@ fn info_lines(session: &SessionRef, held_by: Option<&str>) -> String {
     )
 }
 
-/// `tollgate switch <sid> <profile>` — point a live session at another
-/// profile.
-///
-/// Intent only, by design: the row's intended member moves through the same
-/// [`crate::live_sessions::update_as_daemon`] seam the daemon's decision leg
-/// writes, and this process installs no credentials. The session's own
-/// executor is the safety gate — it performs the switch, or refuses it with a
-/// logged reason, exactly as it treats the chain's intents.
-pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
+/// The flags of `tollgate switch`'s session form.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SwitchFlags {
+    pub(crate) wait: bool,
+    pub(crate) relaunch: bool,
+    pub(crate) yes: bool,
+    pub(crate) conversation: Option<String>,
+}
+
+/// A usage error whose exact line is printed here (exit 2).
+fn usage_line(line: &str) -> anyhow::Error {
+    errln!("{line}");
+    anyhow::Error::new(crate::relaunch::Reported(2))
+}
+
+/// The flag rules of `tollgate switch`: every session flag needs the
+/// two-name form, and `--yes` / `--conversation` need `--relaunch`.
+pub(crate) fn check_switch_flags(two_names: bool, flags: &SwitchFlags) -> Result<()> {
+    let any = flags.wait || flags.relaunch || flags.yes || flags.conversation.is_some();
+    if any && !two_names {
+        return Err(usage_line(
+            "tollgate: --wait, --relaunch, --yes and --conversation need a session id and a profile",
+        ));
+    }
+    if (flags.yes || flags.conversation.is_some()) && !flags.relaunch {
+        return Err(usage_line(
+            "tollgate: --yes and --conversation need --relaunch",
+        ));
+    }
+    Ok(())
+}
+
+/// A live claude session's row, or the refusal `tollgate switch` prints for
+/// a missing, codex or dead one.
+pub(crate) fn live_claude_row(sid: &str) -> Result<crate::live_sessions::LiveSession> {
     let Some(row) = crate::live_sessions::get(sid) else {
         // Arity alone chose the session form, so a name that also resolves to
         // a configured profile gets pointed at the spelling that switches the
@@ -231,22 +259,281 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
              its row is reaped by the next `tollgate daemon` or `tollgate resume`"
         );
     }
+    Ok(row)
+}
 
+/// What the switch request core did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestOutcome {
+    /// The session already runs the member.
+    AlreadyOn,
+    /// Executor A: the intent is recorded; the session's executor acts on it.
+    IntentRecorded,
+    /// The row cannot hot-swap; the code names why.
+    RelaunchRequired(String),
+    /// Executor B's pre-check or the session itself refused the member.
+    Refused(String),
+    /// Executor B committed the member at this key generation.
+    Committed(u64),
+    /// No commit inside the commit wait.
+    Requested,
+}
+
+/// One request's outcome plus the names its lines print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwitchRequest {
+    pub(crate) sid: String,
+    pub(crate) target: String,
+    /// The member the session ran on when asked.
+    pub(crate) current: String,
+    pub(crate) outcome: RequestOutcome,
+}
+
+/// How long the request core waits for a commit, and `--wait` for the
+/// helper to serve it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SwitchWaits {
+    pub(crate) commit: std::time::Duration,
+    pub(crate) served: std::time::Duration,
+    pub(crate) commit_poll: std::time::Duration,
+    pub(crate) served_poll: std::time::Duration,
+}
+
+impl SwitchWaits {
+    const PRODUCTION: Self = Self {
+        commit: std::time::Duration::from_secs(5),
+        served: std::time::Duration::from_secs(65),
+        commit_poll: std::time::Duration::from_millis(100),
+        served_poll: std::time::Duration::from_millis(250),
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAITS: std::cell::Cell<Option<SwitchWaits>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test clock seam: shrink the request core's waits.
+#[cfg(test)]
+pub(crate) fn set_switch_waits(waits: Option<SwitchWaits>) {
+    WAITS.with(|w| w.set(waits));
+}
+
+fn switch_waits() -> SwitchWaits {
+    #[cfg(test)]
+    if let Some(w) = WAITS.with(std::cell::Cell::get) {
+        return w;
+    }
+    SwitchWaits::PRODUCTION
+}
+
+/// The request core every surface shares: resolve, branch on the row's
+/// executor, and for executor B write the intent and wait (5 s) for the
+/// session to commit it or refuse it.
+pub(crate) fn request_session_switch(sid: &str, profile: &str) -> Result<SwitchRequest> {
+    let row = live_claude_row(sid)?;
     let config = load_config()?;
     let canonical = resolve_profile_name(&config, profile)?;
     // `current_member` is None until a session's first swap, so a session that
     // never moved runs as its launch profile.
-    let current = row.current_member.as_deref().unwrap_or(&row.start_profile);
+    let current = row
+        .current_member
+        .clone()
+        .unwrap_or_else(|| row.start_profile.clone());
+    let done = |outcome| {
+        Ok(SwitchRequest {
+            sid: sid.to_string(),
+            target: canonical.as_str().to_string(),
+            current: current.clone(),
+            outcome,
+        })
+    };
     if current == canonical.as_str() {
-        outln!("{}", already_on_line(sid, canonical.as_str()));
-        return Ok(());
+        return done(RequestOutcome::AlreadyOn);
     }
+    match row.executor() {
+        crate::hot_swap::Executor::Oauth => {
+            crate::live_sessions::update_as_daemon(sid, |fields| {
+                fields.set_intended_member(canonical.as_str());
+            })?;
+            done(RequestOutcome::IntentRecorded)
+        }
+        crate::hot_swap::Executor::RelaunchOnly { reason } => {
+            done(RequestOutcome::RelaunchRequired(reason))
+        }
+        crate::hot_swap::Executor::None => {
+            anyhow::bail!("session '{sid}' has no in-session executor; switch by relaunch")
+        }
+        crate::hot_swap::Executor::ApiKey => {
+            let Some(class) = row.launch_class.as_ref() else {
+                return done(RequestOutcome::RelaunchRequired("registry".to_string()));
+            };
+            if let Err(code) = crate::hot_swap::check_target(&canonical, class) {
+                return done(RequestOutcome::Refused(code.to_string()));
+            }
+            let g0 = row.key_generation.unwrap_or(0);
+            let t0 = crate::usage::now_ms();
+            crate::live_sessions::update_as_daemon(sid, |fields| {
+                fields.set_intended_member(canonical.as_str());
+            })?;
+            let waits = switch_waits();
+            let deadline = std::time::Instant::now() + waits.commit;
+            loop {
+                if let Some(now) = crate::live_sessions::get(sid) {
+                    let generation = now.key_generation.unwrap_or(0);
+                    if now.current_member.as_deref() == Some(canonical.as_str()) && generation > g0
+                    {
+                        return done(RequestOutcome::Committed(generation));
+                    }
+                    if let Some(refusal) = now
+                        .swap_refusal
+                        .filter(|r| r.member == canonical.as_str() && r.at_ms >= t0)
+                    {
+                        return done(RequestOutcome::Refused(refusal.code));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return done(RequestOutcome::Requested);
+                }
+                std::thread::sleep(waits.commit_poll);
+            }
+        }
+    }
+}
 
-    crate::live_sessions::update_as_daemon(sid, |fields| {
-        fields.set_intended_member(canonical.as_str());
-    })?;
-    outln!("{}", switch_receipt(sid, canonical.as_str()));
-    Ok(())
+/// What `--wait` saw after a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    Served(u64),
+    /// The helper ran for the commit and failed with this code.
+    Stalled(String),
+    /// The wait ran out with the commit not served.
+    TimedOut,
+}
+
+/// Poll the row's [`crate::hot_swap::SwapView`] until the helper serves
+/// `generation`, reports a failure for it, or the wait runs out.
+pub(crate) fn wait_until_served(sid: &str, generation: u64) -> WaitOutcome {
+    let waits = switch_waits();
+    let deadline = std::time::Instant::now() + waits.served;
+    loop {
+        if let Some(row) = crate::live_sessions::get(sid) {
+            let ack = crate::live_sessions::read_helper_ack(sid);
+            let view = crate::hot_swap::SwapView::of(&row, ack.as_ref());
+            if view
+                .served
+                .as_ref()
+                .is_some_and(|p| p.generation >= generation)
+            {
+                return WaitOutcome::Served(generation);
+            }
+            if let Some(code) = view.stall_code {
+                return WaitOutcome::Stalled(code);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return WaitOutcome::TimedOut;
+        }
+        std::thread::sleep(waits.served_poll);
+    }
+}
+
+/// The relaunch hint every B refusal ends with.
+fn relaunch_hint(sid: &str, target: &str) -> String {
+    format!("relaunch instead: tollgate switch {sid} {target} --relaunch")
+}
+
+/// `tollgate switch <sid> <profile> [--wait] [--relaunch ...]` — move a live
+/// session to another profile.
+///
+/// Executor A records the intent through the same
+/// [`crate::live_sessions::update_as_daemon`] seam the daemon's decision leg
+/// writes, and the session's own executor performs or refuses it. Executor B
+/// commits in the session within a tick; this waits five seconds for that and
+/// reports it. `--relaunch` stops the session and resumes its conversation
+/// under the profile ([`crate::relaunch`]).
+pub(crate) fn run_switch(sid: &str, profile: &str, flags: &SwitchFlags) -> Result<()> {
+    if flags.relaunch {
+        return crate::relaunch::run_cli(sid, profile, flags.yes, flags.conversation.as_deref());
+    }
+    let request = request_session_switch(sid, profile)?;
+    let SwitchRequest {
+        sid,
+        target,
+        current,
+        outcome,
+    } = &request;
+    match outcome {
+        RequestOutcome::AlreadyOn => {
+            outln!("{}", already_on_line(sid, target));
+            Ok(())
+        }
+        RequestOutcome::IntentRecorded => {
+            outln!("{}", switch_receipt(sid, target));
+            Ok(())
+        }
+        RequestOutcome::RelaunchRequired(code) => {
+            let cc = crate::hot_swap::cached_cc_version_lockfree();
+            errln!(
+                "tollgate: session '{sid}' cannot hot-swap ({})\n{}",
+                crate::hot_swap::reason_text(code, cc.as_deref()),
+                relaunch_hint(sid, target)
+            );
+            Err(anyhow::Error::new(crate::relaunch::Reported(1)))
+        }
+        RequestOutcome::Refused(code) => {
+            errln!(
+                "tollgate: session '{sid}' stays on '{current}': '{target}' is not hot-swappable ({})\n{}",
+                crate::hot_swap::reason_text(code, None),
+                relaunch_hint(sid, target)
+            );
+            Err(anyhow::Error::new(crate::relaunch::Reported(1)))
+        }
+        RequestOutcome::Requested => {
+            outln!(
+                "tollgate: requested '{target}' for session '{sid}'; the session has not \
+                 committed it yet (swapping…)"
+            );
+            Ok(())
+        }
+        RequestOutcome::Committed(generation) => {
+            outln!("{}", committed_lines(sid, target, *generation));
+            if !flags.wait {
+                return Ok(());
+            }
+            match wait_until_served(sid, *generation) {
+                WaitOutcome::Served(n) => {
+                    outln!(
+                        "tollgate: session '{sid}' is served by '{target}' (key generation {n})"
+                    );
+                    Ok(())
+                }
+                WaitOutcome::Stalled(code) => {
+                    errln!(
+                        "tollgate: session '{sid}' is committed to '{target}' but its key helper \
+                         failed ({code}); Claude Code keeps the previous key until it is rejected"
+                    );
+                    Err(anyhow::Error::new(crate::relaunch::Reported(3)))
+                }
+                WaitOutcome::TimedOut => {
+                    errln!(
+                        "tollgate: session '{sid}' is committed to '{target}' but its key helper \
+                         has not served it yet (still swapping…; the session has made no request \
+                         since the commit)"
+                    );
+                    Err(anyhow::Error::new(crate::relaunch::Reported(3)))
+                }
+            }
+        }
+    }
+}
+
+/// The two lines an executor-B commit prints.
+fn committed_lines(sid: &str, target: &str, generation: u64) -> String {
+    format!(
+        "tollgate: session '{sid}' committed to '{target}' (api-key hot swap, key generation \
+         {generation})\ntollgate: swapping… Claude Code picks the new key up on its next request"
+    )
 }
 
 /// The success receipt. Pure so the copy is assertable without capturing
@@ -296,7 +583,10 @@ fn resume_profile_choice(
 
 /// Resolve a chosen profile name to its canonical spelling, or an error listing
 /// the available names — mirrors `main::resolve_or_bail`.
-fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<crate::profile::ProfileName> {
+pub(crate) fn resolve_profile_name(
+    config: &AppConfig,
+    chosen: &str,
+) -> Result<crate::profile::ProfileName> {
     config
         .canonical_name(chosen)
         .map(crate::profile::ProfileName::from)

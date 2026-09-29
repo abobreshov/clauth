@@ -10616,6 +10616,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        ..crate::testutil::live_row("0-0", "-")
     };
     crate::live_sessions::register(&row).expect("register row");
     let _marker = crate::runtime::hold_session_row_marker(
@@ -10684,6 +10685,7 @@ fn runtime_check_names_a_multi_session_account_with_its_count() {
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            ..crate::testutil::live_row("0-0", "-")
         })
         .expect("register row");
         markers.push(
@@ -10753,6 +10755,7 @@ fn runtime_check_says_one_account_when_every_live_session_shares_it() {
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            ..crate::testutil::live_row("0-0", "-")
         })
         .expect("register row");
         markers.push(
