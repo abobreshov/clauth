@@ -2315,7 +2315,7 @@ const API_KEY_HELPER_SUBCMD: &str = crate::identity::API_KEY_HELPER_SUBCMD;
 /// dot — entirely within the safe-char set, so it round-trips unquoted; the
 /// helper-quoting exists for the exe path, which may contain spaces
 /// (`/Applications/...`, `C:\Program Files\...`).
-fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
+pub(crate) fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
     let exe = crate::platform::installed_exe_path(exe);
     format!(
         "{} {} {}",

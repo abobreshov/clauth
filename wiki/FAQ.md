@@ -4,7 +4,7 @@
 
 **What is the difference between tollgate and clauth?** tollgate is a hard fork of [clauth](https://github.com/uwuclxdy/clauth). It keeps clauth's Claude Code and codex account management and adds usage and spend monitoring across providers (Ollama Cloud, OpenRouter, Nous through Hermes, DeepSeek, Z.ai, MiniMax, Alibaba, generic endpoints), monitoring-only accounts, a local agent API, a Waybar output and the Omarchy palette. It has its own binary, data dir (`~/.tollgate`), plugin ids and daemon port, so both can be installed at once.
 
-**I already use clauth. Will tollgate break it?** No. With `~/.clauth` present tollgate runs in [guest mode](Guest-Mode): it shows clauth's accounts read-only and refuses anything that would change clauth's state in `~/.claude`, `~/.codex`, the plugin registry or herdr's config. Its own plugin, MCP entry and herdr blocks still install beside clauth's, touching nothing else. There is no import from clauth yet, so tollgate cannot take over those files; use `tollgate start <profile>` for its own accounts.
+**I already use clauth. Will tollgate break it?** No. With `~/.clauth` present tollgate runs in [guest mode](Guest-Mode): it shows clauth's accounts read-only and refuses anything that would change clauth's state in `~/.claude`, `~/.codex`, the plugin registry or herdr's config. Its own plugin, MCP entry and herdr blocks still install beside clauth's, touching nothing else. Until you [import clauth](Import) (`tollgate import clauth --dry-run`, then `tollgate import clauth`), use `tollgate start <profile>` for tollgate's own accounts.
 
 **How do I watch an account I never launch from tollgate?** Add a monitor: `tollgate monitor add <id> --kind <nous|ollama_cloud|openrouter|provider> …` with the key named by environment variable. [Providers](Providers#monitors).
 
@@ -58,7 +58,7 @@
 
 **Two daemons, or none.** A second `tollgate daemon` exits immediately by default. `--standby` parks one that takes over when the first dies; `--replace` terminates the running one and takes its place. [Daemon](Daemon).
 
-**Every switch says `upstream clauth manages ~/.claude on this machine (guest mode)`.** That is guest mode: `~/.clauth` exists and no import has run. Run the account with `tollgate start <profile>` instead. [Guest mode](Guest-Mode).
+**Every switch says `upstream clauth manages ~/.claude on this machine (guest mode)`.** That is guest mode: `~/.clauth` exists and no import has run. Run the account with `tollgate start <profile>` instead, or [import clauth](Import). [Guest mode](Guest-Mode).
 
 **A monitor reads `$NAME is not set in the environment tollgate runs in`.** The daemon (or the shell running `monitor refresh`) does not have that variable. Export it where the daemon starts; `tollgate monitor list` marks each unset name `MISSING`.
 

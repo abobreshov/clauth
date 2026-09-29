@@ -472,7 +472,12 @@ fn status_passes_the_published_feed_through() {
     std::fs::write(&feed, br#"{"schema":1,"marker":"published"}"#).unwrap();
     let passed = tcp(&server, "GET", "/v1/status", Some(&token()));
     assert_eq!(passed.status, 200);
-    assert_eq!(passed.body, r#"{"schema":1,"marker":"published"}"#);
+    // The feed's bytes, parsed and re-serialised, plus the import block
+    // (import spec §2.5).
+    assert_eq!(
+        passed.body,
+        r#"{"schema":1,"marker":"published","import":{"state":"none","completed_at":null}}"#
+    );
     assert!(passed.head.contains("ETag: \""));
 }
 
@@ -883,4 +888,47 @@ fn a_data_dir_owned_by_another_user_is_refused() {
     let err = secure_socket_dir(root).unwrap_err().to_string();
     assert!(err.contains("owned by uid"), "{err}");
     assert_eq!(root.symlink_metadata().unwrap().mode(), meta.mode());
+}
+
+/// Test 64 (import spec §2.5): `GET /v1/health` and `GET /v1/status` carry
+/// the import journal's state and completion instant, read without a lock,
+/// and the OpenAPI document names the block.
+#[test]
+fn health_and_status_routes_carry_the_import_state() {
+    let _home = HomeSandbox::new();
+    let server = serve(false);
+    let health = tcp(&server, "GET", "/v1/health", Some(&token())).json();
+    assert_eq!(health["import"]["state"], "none");
+    assert!(health["import"]["completed_at"].is_null());
+    let journal = crate::profile::tollgate_dir()
+        .unwrap()
+        .join(crate::identity::IMPORT_JOURNAL_FILE);
+    for (state, done) in [
+        ("pre", None),
+        ("in_progress", None),
+        ("complete", Some("2026-09-29T12:00:00Z")),
+        ("rolling_back", None),
+        ("rolled_back", None),
+        ("aborted", None),
+    ] {
+        std::fs::write(
+            &journal,
+            serde_json::json!({"state": state, "completed_at": done}).to_string(),
+        )
+        .unwrap();
+        let health = tcp(&server, "GET", "/v1/health", Some(&token())).json();
+        assert_eq!(health["import"]["state"], state);
+        assert_eq!(health["import"]["completed_at"].as_str(), done, "{state}");
+        let status = tcp(&server, "GET", "/v1/status", Some(&token())).json();
+        assert_eq!(status["import"]["state"], state, "{status}");
+    }
+    let doc = tcp(&server, "GET", "/v1/openapi.json", Some(&token())).json();
+    let schemas = &doc["components"]["schemas"];
+    assert!(
+        schemas["HealthBody"]["properties"].get("import").is_some(),
+        "{}",
+        schemas["HealthBody"]
+    );
+    let block = &schemas["ImportBlock"]["properties"];
+    assert!(block.get("state").is_some() && block.get("completed_at").is_some());
 }

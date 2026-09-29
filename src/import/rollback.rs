@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use super::fence::Fence;
-use super::journal::{Journal, Op, Status};
+use super::journal::{Entry, Journal, Op, Status};
 use super::txn::{self, Disk};
 use super::{Finding, ImportBlocked, ImportNeedsAttention, Options, Paths, fsops, procs, slots};
 use crate::identity::ImportState;
@@ -36,20 +36,35 @@ fn attention(j: &Journal, seq: u64, reason: String) -> anyhow::Error {
     .into()
 }
 
-/// Revert entry `i` of `main` and journal the result.
+/// A journal section the reverse replay walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Pre,
+    Main,
+}
+
+fn section(j: &mut Journal, s: Section) -> &mut Vec<Entry> {
+    match s {
+        Section::Pre => &mut j.pre,
+        Section::Main => &mut j.main,
+    }
+}
+
+/// Revert entry `i` of section `s` and journal the result.
 fn revert_entry(
     j: &mut Journal,
+    s: Section,
     i: usize,
     paths: &Paths,
     warnings: &mut Vec<Finding>,
 ) -> Result<()> {
-    let seq = j.main[i].seq;
-    let status = j.main[i].status;
+    let seq = section(j, s)[i].seq;
+    let status = section(j, s)[i].status;
     let act = match status {
         Status::Done => true,
-        Status::Planned => match txn::probe(&j.main[i])? {
+        Status::Planned => match txn::probe(&section(j, s)[i])? {
             Disk::Prior => {
-                j.main[i].status = Status::Skipped;
+                section(j, s)[i].status = Status::Skipped;
                 j.write(paths)?;
                 return Ok(());
             }
@@ -65,24 +80,28 @@ fn revert_entry(
         Status::Undone | Status::Skipped => false,
     };
     if act {
-        let op = j.main[i].op;
+        let entry = section(j, s)[i].clone();
+        let op = entry.op;
         super::seams::log(|| format!("undo {seq} {op:?}"));
-        if let Err(e) = txn::revert(&j.main[i], paths, warnings) {
+        if let Err(e) = txn::revert(&entry, paths, warnings) {
             return Err(attention(
                 j,
                 seq,
                 format!("the reversal stopped part-way: {e:#}"),
             ));
         }
-        j.main[i].status = Status::Undone;
+        section(j, s)[i].status = Status::Undone;
         j.write(paths)?;
     }
     Ok(())
 }
 
-/// Reverse every step of `j` (the fence must be held): `retire` (none in
-/// this build), `main` in reverse except `retire_bin`, then `retire_bin`.
-/// `automatic` ends in `aborted`, a rollback in `rolled_back`.
+/// Reverse every step of `j` (the fence must be held): `main` in reverse
+/// except `retire_bin`, then `retire_bin` (stores before the binary), then
+/// `pre` in reverse (G2's config bytes; nothing is spawned). The `retire`
+/// section is undone before the fence by [`super::retire::undo_all`].
+/// `automatic` ends in `aborted`, a rollback in `rolled_back`; either way
+/// the caller runs [`txn::after_fence`] once the fence is released.
 pub(crate) fn reverse(
     j: &mut Journal,
     paths: &Paths,
@@ -104,7 +123,10 @@ pub(crate) fn reverse(
         )
         .collect();
     for i in order {
-        revert_entry(j, i, paths, warnings)?;
+        revert_entry(j, Section::Main, i, paths, warnings)?;
+    }
+    for i in (0..j.pre.len()).rev() {
+        revert_entry(j, Section::Pre, i, paths, warnings)?;
     }
     fix_slots(j, paths)?;
     j.set_state(if automatic {
@@ -206,7 +228,24 @@ enum SlotFix {
 /// or the clauth shim runs, while an imported profile holds a staged chain,
 /// while the claude slot is on a profile created after the import, and while
 /// an upstream store path is occupied.
+#[cfg(test)]
 pub(crate) fn rollback(opts: &Options) -> Result<RolledBack> {
+    rollback_with(opts, &mut |_| Ok(true))
+}
+
+/// What a rollback is about to undo, for its confirmation.
+#[derive(Debug, Clone)]
+pub(crate) struct Pending {
+    pub(crate) state: &'static str,
+    pub(crate) profiles: usize,
+    pub(crate) steps: usize,
+}
+
+/// [`rollback`] with a confirmation between its checks and its first write.
+pub(crate) fn rollback_with(
+    opts: &Options,
+    confirm: &mut dyn FnMut(&Pending) -> Result<bool>,
+) -> Result<RolledBack> {
     let paths = Paths::resolve()?;
     let Some(mut j) = Journal::load(&paths)? else {
         return Err(crate::usage_error(
@@ -214,7 +253,10 @@ pub(crate) fn rollback(opts: &Options) -> Result<RolledBack> {
         ));
     };
     match j.state() {
-        ImportState::Complete | ImportState::InProgress | ImportState::RollingBack => {}
+        ImportState::Complete
+        | ImportState::InProgress
+        | ImportState::RollingBack
+        | ImportState::Pre => {}
         other => {
             return Err(crate::usage_error(format!(
                 "tollgate import rollback: the journal is {}, so there is nothing to roll back",
@@ -293,6 +335,8 @@ pub(crate) fn rollback(opts: &Options) -> Result<RolledBack> {
             ));
         }
     }
+    let names: Vec<String> = j.profiles.iter().map(|p| p.name.clone()).collect();
+    blockers.extend(super::fence::probe(&paths, &names).1);
     if !blockers.is_empty() {
         return Err(ImportBlocked {
             blockers,
@@ -300,31 +344,57 @@ pub(crate) fn rollback(opts: &Options) -> Result<RolledBack> {
         }
         .into());
     }
-    let names: Vec<String> = j.profiles.iter().map(|p| p.name.clone()).collect();
-    let _fence = Fence::acquire(&paths, &names).map_err(|f| ImportBlocked {
-        blockers: vec![f],
-        printed: false,
-    })?;
-    if let SlotFix::Adopt(store) = &fix {
-        fsops::rename(&slot, store)?;
-        fsops::chmod(store, 0o600)?;
+    let steps = j
+        .pre
+        .iter()
+        .chain(&j.main)
+        .chain(&j.retire)
+        .filter(|e| matches!(e.status, Status::Done | Status::Planned))
+        .count();
+    let pending = Pending {
+        state: j.state().as_str(),
+        profiles: j.profiles.len(),
+        steps,
+    };
+    if !confirm(&pending)? {
+        anyhow::bail!("tollgate import rollback: not confirmed; nothing was changed");
     }
     let mut warnings = Vec::new();
-    reverse(&mut j, &paths, &mut warnings, false)?;
-    if let SlotFix::Relink(p) = &fix
-        && fsops::lmeta(&slot).is_some_and(|m| m.is_file)
-        && let Some((src, _)) = pairs.iter().find(|(_, d)| d == p)
-    {
-        let file = crate::claude::install_source_in(&paths.upstream_profile(src));
-        fsops::repoint_link(&slot, &file, &slots::temp_for(&slot))?;
-    }
-    if let SlotFix::Adopt(store) = fix
-        && fsops::lmeta(&slot).is_none()
-        && let Some((dst, file)) = under_profiles(&root, &store)
-        && let Some((src, _)) = pairs.iter().find(|(_, d)| *d == dst)
-    {
-        let upstream = paths.upstream_profile(src).join(file);
-        fsops::repoint_link(&slot, &upstream, &slots::temp_for(&slot))?;
-    }
+    // Step 1, before the fence: the retire section. Its undo spawns
+    // `claude` and herdr, which never run inside the hold (I15), and it
+    // writes only files the fence does not guard.
+    super::retire::undo_all(&mut j, &paths, &mut warnings)?;
+    let result = (|| -> Result<()> {
+        let fence = Fence::acquire(&paths, &names).map_err(|f| ImportBlocked {
+            blockers: vec![f],
+            printed: false,
+        })?;
+        if let SlotFix::Adopt(store) = &fix {
+            fsops::rename(&slot, store)?;
+            fsops::chmod(store, 0o600)?;
+        }
+        reverse(&mut j, &paths, &mut warnings, false)?;
+        // The slot's own fix, still inside the hold: a copy becomes a link to
+        // the restored store, an adopted login links where it landed.
+        if let SlotFix::Relink(p) = &fix
+            && fsops::lmeta(&slot).is_some_and(|m| m.is_file)
+            && let Some((src, _)) = pairs.iter().find(|(_, d)| d == p)
+        {
+            let file = crate::claude::install_source_in(&paths.upstream_profile(src));
+            fsops::repoint_link(&slot, &file, &slots::temp_for(&slot))?;
+        }
+        if let SlotFix::Adopt(store) = &fix
+            && fsops::lmeta(&slot).is_none()
+            && let Some((dst, file)) = under_profiles(&root, store)
+            && let Some((src, _)) = pairs.iter().find(|(_, d)| *d == dst)
+        {
+            let upstream = paths.upstream_profile(src).join(file);
+            fsops::repoint_link(&slot, &upstream, &slots::temp_for(&slot))?;
+        }
+        drop(fence);
+        Ok(())
+    })();
+    txn::after_fence(&j);
+    result?;
     Ok(RolledBack { warnings })
 }

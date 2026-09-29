@@ -2323,6 +2323,200 @@ impl UpstreamTree {
         self
     }
 
+    // ── part 2: the shared global files the edits touch ─────────────────
+
+    /// Write `value` pretty-printed with a trailing newline (the shape the
+    /// edits keep byte for byte on a round trip).
+    pub(crate) fn write_json(&self, path: &Path, value: &serde_json::Value) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("json parent");
+        }
+        let mut text = serde_json::to_string_pretty(value).expect("json");
+        text.push('\n');
+        std::fs::write(path, text).expect("json write");
+        path.to_path_buf()
+    }
+
+    /// `~/.claude/settings.json` as upstream leaves it for profile `p`: its
+    /// plugin enabled, its marketplace declared, its helper pointing at `p`,
+    /// its MCP tools allowed beside a foreign rule, and an `env` holding a
+    /// fixture secret that no journal, backup or report may ever echo.
+    pub(crate) fn helper_in_settings(&self, p: &str) -> &Self {
+        let bin = self.home.join("bin").join("clauth");
+        self.write_json(
+            &self.home.join(".claude").join("settings.json"),
+            &serde_json::json!({
+                "apiKeyHelper": format!("{} __api-key {p}", bin.display()),
+                "enabledPlugins": {"other@market": true, "clauth@clauth": true},
+                "extraKnownMarketplaces": {
+                    "clauth": {"source": {"source": "github", "repo": "uwuclxdy/clauth"}}
+                },
+                "permissions": {"allow": [
+                    "Bash(ls:*)",
+                    "mcp__plugin_clauth_clauth__profiles",
+                    "mcp__plugin_clauth_clauth__delegate"
+                ]},
+                "env": {"ANTHROPIC_BASE_URL": "https://example.test", "OWNER_TOKEN": "FIXTURE-KEY-env"}
+            }),
+        );
+        self
+    }
+
+    /// `~/.claude/plugins/installed_plugins.json` with one row per path in
+    /// `paths` (under `other@market<i>`) plus upstream's own `clauth@clauth`.
+    pub(crate) fn registry_path(&self, paths: &[&Path]) -> &Self {
+        let mut plugins = serde_json::Map::new();
+        plugins.insert(
+            "clauth@clauth".to_string(),
+            serde_json::json!([{"scope": "user", "version": "0.16.0",
+                "installPath": self.home.join(".claude/plugins/cache/clauth/clauth/0.16.0").display().to_string(),
+                "gitCommitSha": "0123456789abcdef0123456789abcdef01234567"}]),
+        );
+        for (i, p) in paths.iter().enumerate() {
+            plugins.insert(
+                format!("other@market{i}"),
+                serde_json::json!([{"scope": "user", "version": "1.0.0",
+                    "installPath": p.display().to_string()}]),
+            );
+        }
+        self.write_json(
+            &self.home.join(".claude/plugins/installed_plugins.json"),
+            &serde_json::json!({"version": 2, "plugins": plugins}),
+        );
+        self
+    }
+
+    /// `known_marketplaces.json` naming upstream's marketplace and another.
+    pub(crate) fn known_marketplaces(&self) -> &Self {
+        self.write_json(
+            &self.home.join(".claude/plugins/known_marketplaces.json"),
+            &serde_json::json!({
+                "clauth": {"source": {"source": "github", "repo": "uwuclxdy/clauth"},
+                           "installLocation": self.home.join(".claude/plugins/marketplaces/clauth").display().to_string()},
+                "other": {"source": {"source": "github", "repo": "o/other"}}
+            }),
+        );
+        self
+    }
+
+    /// `~/.claude.json` with upstream's MCP server beside another.
+    pub(crate) fn claude_json(&self) -> &Self {
+        self.write_json(
+            &self.home.join(".claude.json"),
+            &serde_json::json!({
+                "numStartups": 3,
+                "mcpServers": {
+                    "clauth": {"type": "stdio", "command": "clauth", "args": ["mcp"]},
+                    "other": {"type": "stdio", "command": "other"}
+                },
+                "projects": {}
+            }),
+        );
+        self
+    }
+
+    /// `~/.bashrc` carrying upstream's completion line.
+    pub(crate) fn bashrc(&self) -> &Self {
+        std::fs::write(
+            self.home.join(".bashrc"),
+            format!(
+                "export EDITOR=vi\n\n# clauth completions\nsource \"{}\"\nalias ll='ls -l'\n",
+                self.src().join("completions/clauth.bash").display()
+            ),
+        )
+        .expect("bashrc");
+        self
+    }
+
+    /// herdr's `config.toml` (`~/.config/herdr/config.toml`) with a user
+    /// line and upstream's marked block.
+    pub(crate) fn herdr_config(&self) -> PathBuf {
+        let path = self.home.join(".config/herdr/config.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("herdr dir");
+        std::fs::write(
+            &path,
+            "theme = \"dark\"\n\n# clauth herdr plugin\n[[keys.bind]]\nkey = \"prefix+c\"\naction = \"clauth.open\"\n",
+        )
+        .expect("herdr config");
+        path
+    }
+
+    /// A fake herdr under `~/fakeherdr/` that lists upstream's `clauth`
+    /// plugin (github, commit `abc123`) until uninstalled, reinstalls it on
+    /// `plugin install` (or fails when `state/offline` exists), and logs
+    /// every argv. Every path is baked in: the fake never reads `$HOME`,
+    /// which in a unit test is the operator's real home.
+    pub(crate) fn fake_herdr(&self) -> FakeHerdr {
+        let dir = self.home.join("fakeherdr");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("fake herdr dir");
+        let record = r#"{"enabled":true,"name":"clauth","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123","managed_path":"MANAGED"},"version":"0.16.0"}"#
+            .replace("MANAGED", &self.home.join(".config/herdr/plugins/clauth").display().to_string());
+        std::fs::write(state.join("clauth.orig"), &record).expect("record");
+        std::fs::write(state.join("clauth"), &record).expect("record");
+        let log = dir.join("log");
+        let cfg_dir = self.home.join(".config/herdr/plugins/config");
+        let body = format!(
+            r#"state='{state}'
+printf '%s\n' "$*" >> '{log}'
+case "$1 $2" in
+  "plugin list")
+    if [ -f "$state/clauth" ]; then
+      printf '{{"id":"cli:plugin","result":{{"plugins":[%s],"type":"plugin_list"}}}}\n' "$(cat "$state/clauth")"
+    else
+      echo '{{"id":"cli:plugin","result":{{"plugins":[],"type":"plugin_list"}}}}'
+    fi ;;
+  "plugin config-dir") printf '%s/%s\n' '{cfg}' "$3" ;;
+  "plugin uninstall") rm -f "$state/$3" ;;
+  "plugin install")
+    if [ -f "$state/offline" ]; then echo "network unreachable" >&2; exit 1; fi
+    cp "$state/clauth.orig" "$state/clauth" ;;
+esac
+exit 0"#,
+            state = state.display(),
+            log = log.display(),
+            cfg = cfg_dir.display(),
+        );
+        let bin = write_shim(&dir, "herdr", &body);
+        FakeHerdr { bin, log, state }
+    }
+
+    /// Replace the upstream `clauth` fixture with one that handles G2:
+    /// `herdr uninstall --yes` logs its argv and env NAMES to `~/g2.log`,
+    /// uninstalls the plugin through `$HERDR_BIN_PATH`, strips upstream's
+    /// marked block from `config`, then runs `~/g2-extra.sh` when a test
+    /// wrote one; `~/g2-fail` makes it exit 3 first. Anything else writes
+    /// the `RAN-CLAUTH` sentinel. Returns the bin dir.
+    pub(crate) fn g2_upstream_bin(&self, config: &Path) -> PathBuf {
+        let bin = self.home.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let home = self.home.display().to_string();
+        let body = format!(
+            r#"home='{home}'
+if [ "$1 $2 $3" = "herdr uninstall --yes" ]; then
+  printf 'argv=%s\n' "$*" >> "$home/g2.log"
+  printf 'env=%s\n' "$(env | cut -d= -f1 | sort | tr '\n' ' ')" >> "$home/g2.log"
+  if [ -f "$home/g2-fail" ]; then echo "g2 refused" >&2; exit 3; fi
+  "$HERDR_BIN_PATH" plugin uninstall clauth
+  sed -i '/^# clauth herdr plugin$/,$d' '{config}'
+  if [ -f "$home/g2-extra.sh" ]; then sh "$home/g2-extra.sh"; fi
+  exit 0
+fi
+touch "$home/RAN-CLAUTH""#,
+            config = config.display(),
+        );
+        write_shim(&bin, "clauth", &body);
+        bin
+    }
+
+    /// A `tollgate` stand-in in the fixture bin dir (what `current_exe`
+    /// names when a test pins it), so `dev_build_exe` passes.
+    pub(crate) fn tollgate_bin(&self) -> PathBuf {
+        let bin = self.home.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        write_shim(&bin, crate::identity::NAME, "exit 0")
+    }
+
     /// The owner machine's shape (spec header): three claude OAuth profiles,
     /// `personal` active and the slot a symlink into its store, the caches,
     /// logs, markers and lock files upstream keeps, and an independent codex
@@ -2360,6 +2554,27 @@ impl UpstreamTree {
         self.live_symlink("personal", "credentials.json");
         self.codex_independent();
         self
+    }
+}
+
+/// The fake herdr [`UpstreamTree::fake_herdr`] writes: its binary, its argv
+/// log, and its state dir (`clauth` = upstream's plugin record while
+/// installed; create `offline` to make `plugin install` fail).
+#[cfg(unix)]
+pub(crate) struct FakeHerdr {
+    pub(crate) bin: PathBuf,
+    pub(crate) log: PathBuf,
+    pub(crate) state: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeHerdr {
+    pub(crate) fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    pub(crate) fn installed(&self) -> bool {
+        self.state.join("clauth").exists()
     }
 }
 

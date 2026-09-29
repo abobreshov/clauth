@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
+use super::edits::{self, G2Plan, GlobalEdit};
 use super::fence::{Fence, LockRow};
 use super::inventory::{Action, Inventory};
 use super::journal::{
@@ -63,6 +64,8 @@ pub(crate) struct Survey {
     pub(crate) hash: String,
     pub(crate) codex_in_scope: bool,
     pub(crate) plan: Option<Plan>,
+    /// G2, planned outside the fence only (finding it spawns herdr).
+    pub(crate) g2: Option<(G2Plan, GlobalEdit)>,
 }
 
 impl Survey {
@@ -91,6 +94,7 @@ impl Survey {
             hash: String::new(),
             codex_in_scope: false,
             plan: None,
+            g2: None,
         }
     }
 
@@ -144,6 +148,8 @@ pub(crate) fn survey_at(
             "already_imported",
             "clauth was already imported (journal complete); see 'tollgate import status'",
         )),
+        // M4 runs after M0 wrote this import's own `pre` journal.
+        ImportState::Pre if mode == Mode::InFence => {}
         ImportState::Pre | ImportState::InProgress | ImportState::RollingBack if !resuming => {
             s.blockers.push(Finding::new(
                 "journal_pending",
@@ -213,10 +219,16 @@ pub(crate) fn survey_at(
         let (locks, lb) = super::fence::probe(paths, &s.upstream_names());
         s.locks = locks;
         s.blockers.extend(lb);
+        // G2 is planned only outside the fence: finding herdr's state runs
+        // herdr, and nothing inside the hold spawns a process (I15).
+        s.g2 = edits::plan_g2(paths, &s.bins, &mut s.warnings);
     }
     s.hash = inventory_hash(paths);
     match plan(&s) {
-        Ok(p) => s.plan = Some(p),
+        Ok(p) => {
+            s.warnings.extend(p.warnings.iter().cloned());
+            s.plan = Some(p);
+        }
         Err(e) => s.blockers.push(Finding::new(
             "plan_failed",
             format!("the import cannot be planned: {e:#}"),
@@ -397,7 +409,10 @@ fn walk_hash(root: &Path, rel: &Path, lines: &mut Vec<String>, top: bool) {
     names.sort();
     for name in names {
         let n = name.to_string_lossy();
-        if top && super::inventory::is_never(&n) {
+        // Fence-held lock files (M3 creates them) and the files upstream
+        // regenerates on any run (its log, status feeds, caches: G2 runs
+        // upstream's binary between M-1 and M4) are not part of the plan.
+        if top && (super::inventory::is_never(&n) || super::inventory::is_regenerated(&n)) {
             continue;
         }
         let child = rel.join(&name);
@@ -464,7 +479,7 @@ pub(crate) struct Report {
     pub(crate) entries: Vec<EntryRow>,
     pub(crate) live_slots: LiveSlots,
     pub(crate) roster: RosterRow,
-    pub(crate) global_edits: Vec<serde_json::Value>,
+    pub(crate) global_edits: Vec<GlobalEdit>,
     pub(crate) locks: Vec<LockRow>,
     pub(crate) processes: Vec<ProcRow>,
     pub(crate) journal: JournalRow,
@@ -533,7 +548,12 @@ pub(crate) fn report(s: &Survey, mode: &'static str) -> Report {
             active: s.upstream.claude_active.clone(),
             renames: s.opts.renames.clone(),
         },
-        global_edits: Vec::new(),
+        global_edits: s
+            .g2
+            .iter()
+            .map(|(_, row)| row.clone())
+            .chain(s.plan.iter().flat_map(|pl| pl.edits.iter().cloned()))
+            .collect(),
         locks: s.locks.clone(),
         processes: s.procs.clone(),
         journal: JournalRow {
@@ -591,6 +611,9 @@ pub(crate) fn render_text(r: &Report, dry_run: bool) -> String {
             .map_or_else(String::new, |d| format!(" -> {d}"));
         out.push(format!("  {:<9} {}{dst}  ({})", e.action, e.src, e.reason));
     }
+    for g in &r.global_edits {
+        out.push(format!("  edit      {} {}: {}", g.id, g.file, g.change));
+    }
     for l in &r.locks {
         out.push(format!("  lock      {} {}", l.path, l.state));
     }
@@ -646,6 +669,10 @@ pub(crate) struct Plan {
     pub(crate) profiles: Vec<ProfileRecord>,
     pub(crate) hold_files: u64,
     pub(crate) hold_bytes: u64,
+    /// The M7 global edits' report rows (G1, G3, G4).
+    pub(crate) edits: Vec<GlobalEdit>,
+    /// What planning the global edits warned about.
+    pub(crate) warnings: Vec<Finding>,
 }
 
 struct Planner<'a> {
@@ -857,6 +884,32 @@ pub(crate) fn plan(s: &Survey) -> Result<Plan> {
             &codex_names,
         )?;
     }
+    // M7: the global edits inside the fence (G1, G3, G4; spec §4.8).
+    let imported_claude: Vec<String> = profiles
+        .iter()
+        .filter(|x| x.harness == Harness::Claude)
+        .map(|x| x.name.clone())
+        .collect();
+    let exe = seams::current_exe();
+    let mut edit_warnings = Vec::new();
+    let mut m7 = edits::plan_settings(
+        p,
+        &s.opts,
+        &imported_claude,
+        exe.as_deref(),
+        &mut edit_warnings,
+    )?;
+    m7.extend(edits::plan_registry(
+        p,
+        &s.opts,
+        &s.inv,
+        &mut edit_warnings,
+    )?);
+    for e in m7 {
+        pl.plan.edits.push(e.row);
+        pl.push(e.op, None, Some(e.dst), false, e.prior, e.after);
+    }
+    pl.plan.warnings = edit_warnings;
     // M8: F2 on each upstream roster, then the tombstone.
     for (file, doc) in [
         ("profiles.toml", s.upstream.claude_doc.as_deref()),
@@ -1315,6 +1368,18 @@ pub(crate) fn probe(e: &Entry) -> Result<Disk> {
                 Disk::Prior
             }
         }
+        Op::RewriteJson => edits::probe_json(e)?,
+        Op::RepointRegistry => edits::probe_registry(e)?,
+        // `pre` and `retire` ops are driven by their own sections, never by
+        // the `main` replay.
+        Op::Exec => edits::probe_g2(e),
+        Op::PluginInstall | Op::HerdrInstall | Op::RewriteLine => {
+            if e.status == Status::Planned {
+                Disk::Prior
+            } else {
+                Disk::After
+            }
+        }
     })
 }
 
@@ -1499,6 +1564,13 @@ pub(crate) fn apply(e: &Entry) -> Result<()> {
             }
             Ok(())
         }
+        Op::RewriteJson => edits::apply_json(e),
+        Op::RepointRegistry => edits::apply_registry(e),
+        Op::Exec | Op::PluginInstall | Op::HerdrInstall | Op::RewriteLine => Err(anyhow!(
+            "step {} ({:?}) is not a main-section op",
+            e.seq,
+            e.op
+        )),
     }
 }
 
@@ -1635,6 +1707,14 @@ pub(crate) fn revert(e: &Entry, paths: &Paths, warnings: &mut Vec<Finding>) -> R
             fsops::sync_dirs(&[fsops::parent(bin)])
         }
         Op::Write => fsops::remove_if_present(path_of(&e.dst)?),
+        Op::RewriteJson => edits::revert_json(e, paths, warnings),
+        Op::RepointRegistry => edits::revert_registry(e),
+        Op::Exec => edits::revert_g2(e, paths, warnings),
+        Op::PluginInstall | Op::HerdrInstall | Op::RewriteLine => Err(anyhow!(
+            "step {} ({:?}) is undone by `import retire`'s own replay",
+            e.seq,
+            e.op
+        )),
     }
 }
 
@@ -1814,6 +1894,16 @@ fn committed(journal: &Journal, warnings: Vec<Finding>) -> Committed {
     }
 }
 
+/// The confirmation question (spec §2.3; the caller adds `[y/N]`).
+pub(crate) fn confirm_question(r: &Report) -> String {
+    format!(
+        "import {} claude and {} codex profiles and make the {} global edits above?",
+        r.roster.claude.len(),
+        r.roster.codex.len(),
+        r.global_edits.len()
+    )
+}
+
 /// The commit line (spec §2.3).
 pub(crate) fn commit_message(c: &Committed) -> String {
     format!(
@@ -1822,67 +1912,46 @@ pub(crate) fn commit_message(c: &Committed) -> String {
     )
 }
 
-/// `tollgate import clauth` (the engine; the part-1 CLI does not reach it).
-/// `confirm` sees the report and answers the prompt.
+/// The answer to a declined confirmation.
+pub(crate) const NOT_CONFIRMED: &str = "tollgate import clauth: not confirmed; nothing was changed";
+
+/// `tollgate import clauth` with no report sink; `confirm` sees the report
+/// and answers the prompt.
+#[cfg(test)]
 pub(crate) fn run(
     opts: &Options,
     confirm: &mut dyn FnMut(&Report) -> Result<bool>,
 ) -> Result<Committed> {
-    let paths = Paths::resolve()?;
-    let first = survey_at(&paths, opts, Mode::Run, false)?;
-    blocked_outcome(&first, false)?;
-    let mut warnings = first.warnings.clone();
-    if !confirm(&report(&first, "run"))? {
-        anyhow::bail!("tollgate import clauth: not confirmed; nothing was changed");
-    }
-    seams::after_confirm();
-    // Post-confirmation recheck (I21): the prompt was unbounded.
-    let scope = first.scope();
-    let mut recheck = procs::check(&paths, &scope).blockers;
-    recheck.extend(procs::markers(&paths).0);
-    recheck.extend(super::fence::probe(&paths, &first.upstream_names()).1);
-    if !recheck.is_empty() {
-        return Err(ImportBlocked {
-            blockers: recheck,
-            printed: false,
-        }
-        .into());
-    }
-    // M3.
-    let _fence = Fence::acquire(&paths, &first.upstream_names()).map_err(|f| ImportBlocked {
-        blockers: vec![f],
+    run_with(opts, &mut |_| {}, confirm)
+}
+
+fn blocked(blockers: Vec<Finding>) -> anyhow::Error {
+    ImportBlocked {
+        blockers,
         printed: false,
-    })?;
-    // M4: the same checks under the fence, the same tree.
-    let under = survey_at(&paths, opts, Mode::InFence, false)?;
-    blocked_outcome(&under, false)?;
-    if under.hash != first.hash {
-        return Err(ImportBlocked {
-            blockers: vec![Finding::new(
-                "inventory_changed",
-                "~/.clauth or a live slot changed between the check and the fence; nothing was changed, retry",
-            )],
-            printed: false,
-        }
-        .into());
     }
-    let planned = match under.plan.clone() {
-        Some(p) => p,
-        None => plan(&under)?,
-    };
-    if matches!(
-        crate::identity::import_state_at(&paths.journal()),
-        ImportState::Aborted | ImportState::RolledBack
-    ) {
-        journal::Journal::archive(&paths)?;
+    .into()
+}
+
+/// The post-confirmation recheck (I21): the prompt was unbounded, so the
+/// process scan, the markers and the lock probes run again. Writes nothing.
+fn recheck(paths: &Paths, scope: &procs::Scope, names: &[String]) -> Result<()> {
+    let mut blockers = procs::check(paths, scope).blockers;
+    blockers.extend(procs::markers(paths).0);
+    blockers.extend(super::fence::probe(paths, names).1);
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(blocked(blockers))
     }
-    for (path, bytes) in &planned.backups {
-        journal::write_backup(path, bytes)?;
-    }
+}
+
+/// A fresh journal in state `pre` (M0).
+fn new_journal(paths: &Paths, opts: &Options) -> Journal {
     let now = super::now_rfc3339();
-    let mut j = Journal {
+    Journal {
         schema_version: journal::SCHEMA_VERSION,
-        state: ImportState::InProgress.as_str().to_string(),
+        state: ImportState::Pre.as_str().to_string(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: now.clone(),
         updated_at: now,
@@ -1892,18 +1961,153 @@ pub(crate) fn run(
         target: paths.target.clone(),
         source_dev: fsops::dev_of(&paths.source).unwrap_or(0),
         options: opts.clone(),
-        upstream_bins: under.bins.clone(),
-        profiles: planned.profiles.clone(),
+        upstream_bins: Vec::new(),
+        profiles: Vec::new(),
         pre: Vec::new(),
-        main: planned.entries,
+        main: Vec::new(),
         retire: Vec::new(),
         rollback_from: None,
-    };
+    }
+}
+
+/// Run every planned `pre` entry (G2). A G2 that fails is marked `done`
+/// (it may have changed herdr's config), so the reversal that follows
+/// restores what it touched.
+fn run_pre(j: &mut Journal, paths: &Paths) -> Result<(), Finding> {
+    for i in 0..j.pre.len() {
+        if j.pre[i].status != Status::Planned || j.pre[i].op != Op::Exec {
+            continue;
+        }
+        let outcome = edits::run_g2(&mut j.pre[i]);
+        j.pre[i].status = Status::Done;
+        j.write(paths)
+            .map_err(|e| Finding::new("journal_write_failed", format!("{e:#}")))?;
+        outcome?;
+    }
+    Ok(())
+}
+
+/// A refusal after M0 and before M5 (G2 failed, M3 busy, M4 revalidation):
+/// reverse `pre` and record `aborted`. The caller exits 3 (I24: only `pre`
+/// was undone).
+fn abort_before_m5(j: &mut Journal, paths: &Paths, warnings: &mut Vec<Finding>) -> Result<()> {
+    super::rollback::reverse(j, paths, warnings, true)
+}
+
+/// After the fence is released: a reversed G2's best-effort reinstall at
+/// its recorded commit, printed.
+pub(crate) fn after_fence(j: &Journal) {
+    if matches!(j.state(), ImportState::Aborted | ImportState::RolledBack) {
+        for line in edits::reinstall_after_fence(j) {
+            crate::out::errln!("{line}");
+        }
+    }
+}
+
+/// `tollgate import clauth`: M-1, the report (`show`), the confirmation,
+/// the recheck, M0 (`pre`: G2), then M3–M8 under the fence.
+pub(crate) fn run_with(
+    opts: &Options,
+    show: &mut dyn FnMut(&Report),
+    confirm: &mut dyn FnMut(&Report) -> Result<bool>,
+) -> Result<Committed> {
+    let paths = Paths::resolve()?;
+    let first = survey_at(&paths, opts, Mode::Run, false)?;
+    let shown = report(&first, "run");
+    show(&shown);
+    blocked_outcome(&first, true)?;
+    if !confirm(&shown)? {
+        anyhow::bail!(NOT_CONFIRMED);
+    }
+    seams::after_confirm();
+    recheck(&paths, &first.scope(), &first.upstream_names())?;
+    // M0: archive a terminal journal, write `pre`, run G2 — before any lock.
+    if matches!(
+        crate::identity::import_state_at(&paths.journal()),
+        ImportState::Aborted | ImportState::RolledBack
+    ) {
+        Journal::archive(&paths)?;
+    }
+    let mut j = new_journal(&paths, opts);
+    if let Some((g2, _)) = &first.g2 {
+        let (entry, bytes) = edits::g2_entry(&paths, g2)?;
+        if let (Some(backup), Some(bytes)) = (&entry.prior.backup, &bytes) {
+            journal::write_backup(backup, bytes)?;
+        }
+        j.pre.push(entry);
+    }
     j.write(&paths)?;
-    warnings.extend(under.warnings.iter().cloned());
-    let scope = under.scope();
-    let outcome = forward(&mut j, &paths, &scope).and_then(|()| commit(&mut j, &paths, &scope));
-    finish(outcome, &mut j, &paths, warnings)
+    let mut warnings = first.warnings.clone();
+    if let Err(f) = run_pre(&mut j, &paths) {
+        abort_before_m5(&mut j, &paths, &mut warnings)?;
+        after_fence(&j);
+        return Err(blocked(vec![f]));
+    }
+    fence_and_commit(
+        &mut j,
+        &paths,
+        opts,
+        &first.upstream_names(),
+        &first.hash,
+        warnings,
+    )
+}
+
+/// M3–M8: take the fence, revalidate and plan under it (M4), journal
+/// `in_progress`, run `main`, commit — or reverse. The G2 reinstall of a
+/// reversal runs only once the fence is released.
+fn fence_and_commit(
+    j: &mut Journal,
+    paths: &Paths,
+    opts: &Options,
+    names: &[String],
+    expected_hash: &str,
+    mut warnings: Vec<Finding>,
+) -> Result<Committed> {
+    let result = (|| -> Result<Committed> {
+        // M3.
+        let fence = match Fence::acquire(paths, names) {
+            Ok(fence) => fence,
+            Err(f) => {
+                abort_before_m5(j, paths, &mut warnings)?;
+                return Err(blocked(vec![f]));
+            }
+        };
+        // M4: the same checks under the fence, the same tree.
+        let under = survey_at(paths, opts, Mode::InFence, false)?;
+        let mut blockers = under.blockers.clone();
+        if blockers.is_empty() && under.hash != expected_hash {
+            blockers.push(Finding::new(
+                "inventory_changed",
+                "~/.clauth or a live slot changed between the check and the fence; nothing was changed, retry",
+            ));
+        }
+        if !blockers.is_empty() {
+            abort_before_m5(j, paths, &mut warnings)?;
+            drop(fence);
+            return Err(blocked(blockers));
+        }
+        let planned = match under.plan.clone() {
+            Some(p) => p,
+            None => plan(&under)?,
+        };
+        for (path, bytes) in &planned.backups {
+            journal::write_backup(path, bytes)?;
+        }
+        j.upstream_bins = under.bins.clone();
+        j.profiles = planned.profiles.clone();
+        j.main = planned.entries;
+        j.set_state(ImportState::InProgress);
+        j.write(paths)?;
+        warnings.extend(under.warnings.iter().cloned());
+        let scope = under.scope();
+        let outcome = forward(j, paths, &scope).and_then(|()| commit(j, paths, &scope));
+        let settled = finish(outcome, j, paths, warnings);
+        drop(fence);
+        settled
+    })();
+    after_fence(j);
+    result
 }
 
 /// Settle a forward pass: commit, a simulated crash (left as is), or the
@@ -1940,8 +2144,10 @@ fn finish(
 }
 
 /// `tollgate import clauth --resume`: continue an interrupted journal
-/// forward under the fence. A step whose disk matches neither side stops
-/// everything with exit 4 and changes nothing more.
+/// forward. From `pre`, G2 re-runs if it never finished and the transaction
+/// continues at M3 (with M-1's checks run again first); from `in_progress`,
+/// the `main` replay continues under the fence. A step whose disk matches
+/// neither side stops everything with exit 4 and changes nothing more.
 pub(crate) fn resume() -> Result<Committed> {
     let paths = Paths::resolve()?;
     let Some(mut j) = Journal::load(&paths)? else {
@@ -1949,38 +2155,59 @@ pub(crate) fn resume() -> Result<Committed> {
             "tollgate import clauth --resume: there is no interrupted import",
         ));
     };
-    if j.state() != ImportState::InProgress {
-        return Err(crate::usage_error(format!(
-            "tollgate import clauth --resume: the journal is {}, not interrupted",
-            j.state
-        )));
+    match j.state() {
+        ImportState::Pre => return resume_pre(j, &paths),
+        ImportState::InProgress => {}
+        _ => {
+            return Err(crate::usage_error(format!(
+                "tollgate import clauth --resume: the journal is {}, not interrupted",
+                j.state
+            )));
+        }
     }
     let scope = journal_scope(&j);
     let names: Vec<String> = j.profiles.iter().map(|p| p.name.clone()).collect();
-    let mut blockers = procs::check(&paths, &scope).blockers;
-    blockers.extend(procs::markers(&paths).0);
-    blockers.extend(super::fence::probe(&paths, &names).1);
-    if !blockers.is_empty() {
-        return Err(ImportBlocked {
-            blockers,
-            printed: false,
-        }
-        .into());
+    recheck(&paths, &scope, &names)?;
+    let result = (|| -> Result<Committed> {
+        let fence = Fence::acquire(&paths, &names).map_err(|f| blocked(vec![f]))?;
+        let outcome = forward(&mut j, &paths, &scope).and_then(|()| commit(&mut j, &paths, &scope));
+        let settled = match outcome {
+            Err(Stop::Disagree(seq)) => Err(ImportNeedsAttention {
+                state: j.state.clone(),
+                step: Some(seq),
+                reason: "journal_disagrees: disk matches neither side of this step; nothing more was changed".to_string(),
+            }
+            .into()),
+            other => finish(other, &mut j, &paths, Vec::new()),
+        };
+        drop(fence);
+        settled
+    })();
+    after_fence(&j);
+    result
+}
+
+/// `--resume` from `pre`: M-1's checks again (the journal's own `pre` state
+/// excepted), G2 if it never finished, then M3 onward.
+fn resume_pre(mut j: Journal, paths: &Paths) -> Result<Committed> {
+    let opts = j.options.clone();
+    let mut first = survey_at(paths, &opts, Mode::Run, false)?;
+    first.blockers.retain(|b| b.code != "journal_pending");
+    blocked_outcome(&first, false)?;
+    let mut warnings = first.warnings.clone();
+    if let Err(f) = run_pre(&mut j, paths) {
+        abort_before_m5(&mut j, paths, &mut warnings)?;
+        after_fence(&j);
+        return Err(blocked(vec![f]));
     }
-    let _fence = Fence::acquire(&paths, &names).map_err(|f| ImportBlocked {
-        blockers: vec![f],
-        printed: false,
-    })?;
-    let outcome = forward(&mut j, &paths, &scope).and_then(|()| commit(&mut j, &paths, &scope));
-    match outcome {
-        Err(Stop::Disagree(seq)) => Err(ImportNeedsAttention {
-            state: j.state.clone(),
-            step: Some(seq),
-            reason: "journal_disagrees: disk matches neither side of this step; nothing more was changed".to_string(),
-        }
-        .into()),
-        other => finish(other, &mut j, &paths, Vec::new()),
-    }
+    fence_and_commit(
+        &mut j,
+        paths,
+        &opts,
+        &first.upstream_names(),
+        &first.hash,
+        warnings,
+    )
 }
 
 /// The process scope a journal implies (resume, rollback).

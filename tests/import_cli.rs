@@ -1,6 +1,9 @@
-//! `tollgate import` against the real binary (spec import-clauth.md §7,
-//! part 1): the dry-run is provably read-only, the part-1 CLI refuses a real
-//! run and a rollback with exit 2, and the status read works on a fresh home.
+//! `tollgate import` against the real binary (spec import-clauth.md §7):
+//! the dry-run is provably read-only (its global edits planned), a changing
+//! command on a non-interactive stdin without `--yes` exits 2 and changes
+//! nothing, every exit code of §2.2 is what the binary returns, a real run
+//! and its rollback round-trip inside a sandbox, an interrupted journal is
+//! named on every command, and the status read works on a fresh home.
 //!
 //! Every run points `HOME` at a tempdir fixture and pins `PATH` to the
 //! built binary's own directory plus the system dirs, so no real home, no
@@ -39,6 +42,9 @@ fn tollgate(home: &Path) -> Command {
     cmd.env("HOME", home)
         .env("PATH", stub_path())
         .env("TOLLGATE_NO_API", "1")
+        .env("HERDR_BIN_PATH", home.join("no-herdr"))
+        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env_remove("HERDR_CONFIG_PATH")
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
@@ -73,6 +79,13 @@ fn fixture(home: &Path) {
     std::fs::write(src.join("clauth.log"), "log\n").unwrap();
     std::fs::write(src.join(".lock"), "").unwrap();
     std::fs::create_dir_all(home.join(".claude")).unwrap();
+    // Upstream's plugin on, so the dry-run plans G1 (a global edit it must
+    // still not write).
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        "{\n  \"enabledPlugins\": {\n    \"clauth@clauth\": true\n  }\n}\n",
+    )
+    .unwrap();
     std::os::unix::fs::symlink(
         src.join("profiles/personal/credentials.json"),
         home.join(".claude/.credentials.json"),
@@ -130,6 +143,14 @@ fn text(out: &Output) -> (String, String) {
 /// The bubblewrap command a read-only dry-run runs under, or `None` when
 /// this machine cannot run one.
 fn bwrap(home: &Path) -> Option<Command> {
+    sandbox(home, false)
+}
+
+/// [`bwrap`] with the fixture home bound read-WRITE (everything else stays
+/// read-only and the operator's home stays an empty tmpfs): a real run's
+/// sandbox, its own pid namespace so no live session of the operator's is in
+/// its process scan.
+fn sandbox(home: &Path, writable: bool) -> Option<Command> {
     let probe = Command::new("bwrap")
         .args([
             "--unshare-pid",
@@ -161,7 +182,7 @@ fn bwrap(home: &Path) -> Option<Command> {
         .arg("--ro-bind")
         .arg(bin_dir())
         .arg(bin_dir())
-        .arg("--ro-bind")
+        .arg(if writable { "--bind" } else { "--ro-bind" })
         .arg(home)
         .arg(home)
         .arg("--setenv")
@@ -170,6 +191,10 @@ fn bwrap(home: &Path) -> Option<Command> {
         .args(["--setenv", "PATH"])
         .arg(stub_path())
         .args(["--setenv", "TOLLGATE_NO_API", "1"])
+        // No herdr in reach (a path-like HERDR_BIN_PATH that does not exist
+        // resolves to none), so G2 is skipped rather than run.
+        .args(["--setenv", "HERDR_BIN_PATH"])
+        .arg(home.join("no-herdr"))
         .args([
             "--unsetenv",
             "CLAUDE_CONFIG_DIR",
@@ -272,27 +297,216 @@ fn dry_run_leaves_a_full_byte_and_metadata_snapshot_unchanged() {
     }
 }
 
-/// Part 1 has no real run and no rollback: both answer the one sentence and
-/// exit 2, changing nothing.
+/// Test 58. A real run, a rollback and a retire on a non-interactive stdin
+/// without `--yes` refuse before reading anything: exit 2, the one
+/// sentence, nothing changed.
 #[test]
-fn a_real_run_and_a_rollback_exit_2_in_this_build() {
+fn non_tty_without_yes_exits_2_and_changes_nothing() {
     let home = tempfile::tempdir().unwrap();
     fixture(home.path());
     let before = snapshot(home.path());
     for args in [
         &["import", "clauth"][..],
+        &["import", "clauth", "--json"][..],
+        &["import", "rollback"][..],
+        &["import", "retire"][..],
+    ] {
+        let out = tollgate(home.path()).args(args).output().unwrap();
+        let (stdout, stderr) = text(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(
+                "tollgate import clauth: refusing to change files without --yes on a non-interactive stdin"
+            ),
+            "{args:?}: {stderr}"
+        );
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+    assert_eq!(snapshot(home.path()), before);
+}
+
+/// An interrupted journal (M5 stopped at step 3) as a crash leaves it.
+fn interrupted_journal(home: &Path) {
+    std::fs::write(
+        home.join(".tollgate/import-journal.json"),
+        r#"{"schema_version":1,"state":"in_progress","tool_version":"0","started_at":"t","updated_at":"t","completed_at":null,"uid":0,"source":"/s","target":"/t","source_dev":0,"options":{},"main":[{"seq":1,"op":"mkdir","secret":false,"status":"done"},{"seq":2,"op":"mkdir","secret":false,"status":"done"},{"seq":3,"op":"mkdir","secret":false,"status":"planned"}],"rollback_from":null}"#,
+    )
+    .unwrap();
+}
+
+/// Test 59. The exit codes of §2.2, off the binary: 2 for a usage error, 3
+/// for a refusal before anything changed, 4 for a journal that needs a
+/// person, 0 for a committed import and a finished rollback, and 1 for a
+/// failure once stores moved, after the automatic reversal. The 0 and 1
+/// cases run inside the sandbox (their process scan must not see the
+/// operator's own sessions); a machine without bubblewrap checks the rest.
+#[test]
+fn exit_codes_match_the_table() {
+    // 2: a clap error.
+    let home = tempfile::tempdir().unwrap();
+    fixture(home.path());
+    let out = tollgate(home.path())
+        .args(["import", "clauth", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    // 3: a refusal at M-1 (dry-run and real run alike).
+    std::fs::write(home.path().join(".clauth/mystery.bin"), "?").unwrap();
+    for args in [
+        &["import", "clauth", "--dry-run"][..],
         &["import", "clauth", "--yes"][..],
-        &["import", "rollback", "--yes"][..],
+    ] {
+        let out = tollgate(home.path()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {:?}", text(&out));
+    }
+    std::fs::remove_file(home.path().join(".clauth/mystery.bin")).unwrap();
+    // 4: an interrupted journal, for the dry-run and the real run.
+    interrupted_journal(home.path());
+    for args in [
+        &["import", "clauth", "--dry-run"][..],
+        &["import", "clauth", "--yes"][..],
+    ] {
+        let out = tollgate(home.path()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(4), "{args:?}: {:?}", text(&out));
+    }
+    // 2: `--resume` with nothing to resume.
+    std::fs::remove_file(home.path().join(".tollgate/import-journal.json")).unwrap();
+    let out = tollgate(home.path())
+        .args(["import", "clauth", "--resume"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{:?}", text(&out));
+
+    // 0 and 1 run a real transaction: only inside the sandbox.
+    if sandbox(home.path(), true).is_none() {
+        eprintln!("skipped the 0/1 cases: bubblewrap is not usable here");
+        return;
+    }
+    // 1: a copy fails once the stores moved (the conversations destination
+    // is read-only), so every step is reversed and the journal is aborted.
+    let blocked_dst = home.path().join(".tollgate/conversations");
+    std::fs::create_dir_all(&blocked_dst).unwrap();
+    std::fs::write(blocked_dst.join("keep.json"), "{}").unwrap();
+    set_mode(&blocked_dst, 0o500);
+    let before = snapshot(home.path());
+    let out = sandbox(home.path(), true)
+        .unwrap()
+        .arg(bin())
+        .args(["import", "clauth", "--yes"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&out);
+    set_mode(&blocked_dst, 0o700);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("every step was reversed"), "{stderr}");
+    let journal: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".tollgate/import-journal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(journal["state"], "aborted");
+    let carriers = |snap: &BTreeMap<String, String>| {
+        snap.iter()
+            // Files only: a directory's mtime moves with every rename in it.
+            .filter(|(k, v)| k.starts_with(".clauth/profiles/") && v.contains("is_file: true"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        carriers(&snapshot(home.path())),
+        carriers(&before),
+        "every store is back, inode, mode and bytes"
+    );
+    std::fs::remove_dir_all(&blocked_dst).unwrap();
+
+    // 0: the import commits, and its rollback finishes.
+    let out = sandbox(home.path(), true)
+        .unwrap()
+        .arg(bin())
+        .args(["import", "clauth", "--yes", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["mode"], "run");
+    assert_eq!(report["journal"]["state"], "complete");
+    assert!(
+        report["global_edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["id"] == "G1"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("tollgate: imported 2 claude and 0 codex profiles from ~/.clauth; guest mode is off. Next: tollgate import retire"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("FIXTURE") && !stderr.contains("FIXTURE"));
+    let link = std::fs::read_link(home.path().join(".claude/.credentials.json")).unwrap();
+    assert!(
+        link.starts_with(home.path().join(".tollgate/profiles/personal")),
+        "{}",
+        link.display()
+    );
+    let out = sandbox(home.path(), true)
+        .unwrap()
+        .arg(bin())
+        .args(["import", "rollback", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{:?}", text(&out));
+    let link = std::fs::read_link(home.path().join(".claude/.credentials.json")).unwrap();
+    assert_eq!(
+        link,
+        home.path()
+            .join(".clauth/profiles/personal/credentials.json")
+    );
+    let out = tollgate(home.path())
+        .args(["import", "status", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "rolled_back");
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Test 61. While a journal is interrupted, every command names it on
+/// stderr (spec §2.3), and shell completion's hidden helper stays quiet.
+#[test]
+fn an_interrupted_journal_warns_on_every_command() {
+    let home = tempfile::tempdir().unwrap();
+    fixture(home.path());
+    interrupted_journal(home.path());
+    let line = "tollgate: an import of clauth was interrupted at step 3; run 'tollgate import clauth --resume' or 'tollgate import rollback'";
+    for args in [
+        &["import", "status"][..],
+        &["import", "status", "--json"][..],
+        &["import", "clauth", "--dry-run"][..],
+        &["list"][..],
+        &["which"][..],
+        &["completions", "bash"][..],
+        &["status", "--json"][..],
     ] {
         let out = tollgate(home.path()).args(args).output().unwrap();
         let (_, stderr) = text(&out);
-        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
-        assert!(
-            stderr.contains("tollgate import clauth: only --dry-run is available in this build"),
-            "{stderr}"
-        );
+        assert!(stderr.contains(line), "{args:?}: {stderr}");
     }
-    assert_eq!(snapshot(home.path()), before);
+    let out = tollgate(home.path()).args(["__complete"]).output().unwrap();
+    let (_, stderr) = text(&out);
+    assert!(!stderr.contains("interrupted"), "{stderr}");
 }
 
 /// A blocked dry-run exits 3 and prints each blocker once, in the report.

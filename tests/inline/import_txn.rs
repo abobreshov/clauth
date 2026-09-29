@@ -308,8 +308,17 @@ fn commit_writes_complete_last_and_upstream_active_turns_false() {
     run_ok();
     assert!(!crate::identity::upstream_active(), "guest mode after");
     let log = env.seams.op_log();
-    let last = log.last().expect("log");
+    let last = log
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("journal "))
+        .expect("log");
     assert!(last.starts_with("journal state=complete"), "{log:?}");
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some("fence released"),
+        "{log:?}"
+    );
     assert_eq!(
         log.iter()
             .filter(|l| l.starts_with("journal state=complete"))
@@ -412,7 +421,8 @@ fn an_exdev_rename_reverses_without_a_copy() {
 }
 
 /// Test 51e. A reversal once M5 started exits 1; a refusal at M4 (the tree
-/// changed between the check and the fence) exits 3 and writes no journal.
+/// changed between the check and the fence) exits 3, and its journal holds
+/// only the undone `pre` section, `aborted` (spec §2.2, test 56).
 #[test]
 fn a_reversal_after_m5_started_exits_1_and_an_m4_refusal_exits_3() {
     let env = Env::new();
@@ -426,7 +436,9 @@ fn a_reversal_after_m5_started_exits_1_and_an_m4_refusal_exits_3() {
     let e = run(&Options::default()).expect_err("M4 refuses");
     assert_eq!(blocked_codes(&e), ["inventory_changed"]);
     assert_eq!(exit_of(Err(e)), 3);
-    assert!(!env.paths().journal().exists());
+    let j = env.journal();
+    assert_eq!(j.state, "aborted");
+    assert!(j.main.is_empty(), "nothing was planned into main");
     let src = store(&env, "scifoo", "credentials.json");
     env.seams.set(|s| s.exdev = vec![src]);
     let e = run(&Options::default()).expect_err("reversed");
@@ -697,11 +709,18 @@ fn every_journal_write_is_fsynced_before_its_op() {
         );
     }
     assert_eq!(ops, env.journal().main.len());
-    assert!(
-        log[0].starts_with("journal state=in_progress"),
-        "{:?}",
-        log.first()
-    );
+    // M0 writes `pre` first; the first `in_progress` write names every main
+    // step planned before any of them runs.
+    assert!(log[0].starts_with("journal state=pre"), "{:?}", log.first());
+    let first_main = log
+        .iter()
+        .position(|l| l.starts_with("journal state=in_progress"))
+        .expect("an in_progress write");
+    let first_op = log
+        .iter()
+        .position(|l| l.starts_with("op "))
+        .expect("an op");
+    assert!(first_main < first_op, "{log:?}");
 }
 
 /// Test 42, the regular-slot shapes: a Same slot captured onto a

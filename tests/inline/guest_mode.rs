@@ -429,3 +429,17 @@ fn status_json_gains_guest_mode_additively() {
         false
     );
 }
+
+/// Test 66 (import spec §2.3): the guest refusal ends by naming the command
+/// that ends guest mode, now that the import exists.
+#[test]
+fn guest_refusal_names_the_import_command() {
+    assert!(
+        GUEST_REFUSAL.ends_with(&format!(
+            ", or run '{} import clauth --dry-run' to import clauth.",
+            crate::identity::NAME
+        )),
+        "{GUEST_REFUSAL}"
+    );
+    assert!(!GUEST_REFUSAL.contains("not yet available"));
+}

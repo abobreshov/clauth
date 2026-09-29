@@ -94,11 +94,7 @@ pub(crate) const UPSTREAM_NAME: &str = "clauth";
 /// The upstream tool's data directory name under `$HOME` (`~/.clauth`).
 pub(crate) const UPSTREAM_DATA_DIR_NAME: &str = ".clauth";
 
-/// The upstream tool's herdr plugin id.
-#[allow(
-    dead_code,
-    reason = "read by the import's G2 edit (spec import-clauth.md §4.8, part 2)"
-)]
+/// The upstream tool's herdr plugin id (the import's G2 edit uninstalls it).
 pub(crate) const UPSTREAM_HERDR_PLUGIN_ID: &str = "clauth";
 
 /// The upstream tool's Claude Code plugin key.
@@ -115,7 +111,9 @@ pub(crate) const GUEST_REFUSAL: &str = concat!(
     tool_name!(),
     ": upstream clauth manages ~/.claude on this machine (guest mode). Use '",
     tool_name!(),
-    " start <profile>' for a per-session account, or import clauth first (not yet available)."
+    " start <profile>' for a per-session account, or run '",
+    tool_name!(),
+    " import clauth --dry-run' to import clauth."
 );
 
 /// Guest mode (plan §4.0, the "guest mode (pre-import)" coexistence row): the
@@ -230,18 +228,27 @@ impl ImportState {
 
 /// The import journal's state under this home's data dir. Never takes a lock
 /// and never writes.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "read by the local API's import block and the interrupted-import warning (spec part 2)"
-    )
-)]
 pub(crate) fn import_state() -> ImportState {
     let Ok(dir) = crate::profile::tollgate_dir() else {
         return ImportState::None;
     };
     import_state_at(&dir.join(IMPORT_JOURNAL_FILE))
+}
+
+/// The import's state and completion instant, for the local API's `import`
+/// block (spec §2.5). Read without a lock; never writes.
+pub(crate) fn import_summary() -> (ImportState, Option<String>) {
+    let state = import_state();
+    let completed_at = crate::profile::tollgate_dir()
+        .ok()
+        .and_then(|dir| std::fs::read(dir.join(IMPORT_JOURNAL_FILE)).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|v| {
+            v.get("completed_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    (state, completed_at)
 }
 
 /// [`import_state`] for the journal at `path`.

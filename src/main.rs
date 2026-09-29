@@ -246,9 +246,7 @@ pub(crate) mod exit_codes {
     pub(crate) const IMPORT_NEEDS_ATTENTION: i32 = 4;
 }
 
-/// `tollgate import <cmd>`. Part 1 of the import spec: only the dry-run and
-/// the status read are wired; the real run and the rollback exist in the
-/// engine but answer [`import::DRY_RUN_ONLY`] until the global edits land.
+/// `tollgate import <cmd>` (spec docs/specs/import-clauth.md §2.1).
 fn cmd_import(cmd: cli::ImportCommand) -> Result<()> {
     match cmd {
         cli::ImportCommand::Clauth {
@@ -256,20 +254,31 @@ fn cmd_import(cmd: cli::ImportCommand) -> Result<()> {
             json,
             rename,
             adopt_live,
-            yes: _,
-            resume: _,
+            yes,
+            resume,
         } => {
-            if !dry_run {
-                return Err(usage_error(import::DRY_RUN_ONLY));
+            if dry_run && resume {
+                return Err(usage_error(
+                    "tollgate import clauth: --dry-run and --resume do not combine",
+                ));
             }
             let opts = import::Options {
                 renames: import::Options::parse_renames(&rename)?,
                 adopt_live,
             };
-            import::cmd_dry_run(&opts, json)
+            if dry_run {
+                import::cmd_dry_run(&opts, json)
+            } else {
+                import::cmd_run(&opts, json, yes, resume)
+            }
         }
-        cli::ImportCommand::Rollback { .. } => Err(usage_error(import::DRY_RUN_ONLY)),
+        cli::ImportCommand::Rollback {
+            yes,
+            json,
+            adopt_live,
+        } => import::cmd_rollback(adopt_live, json, yes),
         cli::ImportCommand::Status { json } => import::cmd_status(json),
+        cli::ImportCommand::Retire { yes, step } => import::cmd_retire(&step, yes),
     }
 }
 
@@ -289,6 +298,20 @@ fn cmd_plugin(cmd: cli::PluginCommand) -> Result<()> {
     }
 }
 
+/// Whether the interrupted-import check may resolve the home: always in a
+/// real run; in a test only under a `HomeSandbox`, so a dispatch test never
+/// reads the operator's real `~/.tollgate`.
+fn interrupted_check_allowed() -> bool {
+    #[cfg(test)]
+    {
+        crate::profile::home_override_active()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     // `--theme` is a root-level global, so it parses ahead of any subcommand
     // and is accepted (and ignored) on the non-TUI paths.
@@ -296,6 +319,17 @@ fn dispatch(cli: Cli) -> Result<()> {
         ThemeArg::Full => tui::theme::Tier::Full,
         ThemeArg::Compatible => tui::theme::Tier::Compatible,
     });
+
+    // An interrupted import names itself on every command (spec §2.3),
+    // on stderr. Shell completion's hidden helper is spared: its stderr
+    // lands in the middle of the user's prompt line.
+    if !matches!(cli.command, Some(Command::Complete { .. }))
+        && interrupted_check_allowed()
+        && let Ok(paths) = import::Paths::resolve()
+        && let Some(line) = import::journal::interrupted_warning(&paths)
+    {
+        errln!("{line}");
+    }
 
     let Some(command) = cli.command else {
         use std::io::IsTerminal as _;

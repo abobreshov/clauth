@@ -343,7 +343,9 @@ The daemon must be started from an environment that holds the named variables; `
   monitors/<id>.json       # one monitor's last reading, 429 hold and alert state; never a credential
   api-token                # the local agent API's bearer, 64 hex characters (0600)
   api.sock                 # the local agent API's unix socket, no token needed (0600)
-  import-journal.json      # written by the future `import clauth`; a completed one ends guest mode
+  import-journal.json      # the `import clauth` journal (0600); state "complete" ends guest mode (see Import)
+  import-journal.<ms>.json # an aborted or rolled-back journal, archived by the next import
+  import-backup/           # the import's non-secret byte backups (rosters, herdr's config.toml)
   devices.json             # devices paired with the REST API: name, tier, sessions grant, a SHA-256 of each token (0600)
   pairing.json             # the waiting pairing code's SHA-256 while `tollgate devices pair` runs (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start

@@ -503,12 +503,14 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
-    /// Import upstream clauth's accounts into tollgate, or inspect an import
+    /// Import upstream clauth's accounts into tollgate, undo it, or inspect it
     ///
     /// `tollgate import clauth --dry-run` lists everything under ~/.clauth
     /// and the live slots with what the import would do to each, every
-    /// blocker, and the steps it would journal, and changes nothing.
-    /// `tollgate import status` reports the import journal's state.
+    /// blocker, the global edits and the steps it would journal, and
+    /// changes nothing. `tollgate import clauth` runs the import after one
+    /// confirmation; `import rollback` undoes it; `import status` reports
+    /// the journal's state; `import retire` runs the post-import checklist.
     Import {
         #[command(subcommand)]
         cmd: ImportCommand,
@@ -782,9 +784,12 @@ pub(crate) enum ApiCommand {
 pub(crate) enum ImportCommand {
     /// Import upstream clauth 0.16.0 from ~/.clauth
     ///
-    /// Only `--dry-run` is available in this build: it prints the
-    /// inventory, the live slots, the blockers and the planned steps, and
-    /// changes nothing (it creates no file, not even a lock file).
+    /// With `--dry-run`, prints the inventory, the live slots, the
+    /// blockers, the global edits and the planned steps, and changes
+    /// nothing (it creates no file, not even a lock file). Without it, the
+    /// same report, one confirmation (`--yes` skips it; a non-interactive
+    /// stdin needs `--yes`), then the journaled transaction, reversed
+    /// automatically on any refusal before it commits.
     Clauth {
         /// Print the report and change nothing.
         #[arg(long)]
@@ -824,6 +829,17 @@ pub(crate) enum ImportCommand {
         /// Print one JSON document on stdout instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Run the post-import checklist (upstream's plugin wiring out,
+    /// tollgate's plugin, herdr plugin and completion line in)
+    Retire {
+        /// Skip the confirmation prompt (herdr's config is then left alone).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Run only this step (r1, r2, r3 or r4; repeatable). Default: every
+        /// pending step.
+        #[arg(long, value_name = "r1|r2|r3|r4")]
+        step: Vec<String>,
     },
 }
 

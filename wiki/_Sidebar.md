@@ -4,6 +4,7 @@
 - [Install](Install)
 - [Quickstart](Quickstart)
 - [Guest mode](Guest-Mode)
+- [Importing clauth](Import)
 - [Interface and keys](Interface-And-Keys)
 
 **Reference**

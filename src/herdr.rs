@@ -1125,7 +1125,7 @@ fn short_commit(commit: &str) -> &str {
 /// The one kill-on-deadline reap loop: [`bounded_output`] spawns and hands
 /// its child here, and the heal's install and remote probe spawn their own so
 /// a failed spawn is named at the call site rather than read as a timeout.
-fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
+pub(crate) fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {

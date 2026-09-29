@@ -2,13 +2,11 @@
 //! `~/.tollgate` so tollgate becomes the only writer of every refresh chain
 //! and guest mode ends (spec `docs/specs/import-clauth.md`, plan §4.0).
 //!
-//! Part 1 of the spec's §8 lands here: the read-only inventory and its
-//! dry-run report, the write-ahead journal, the lock fence, the process and
-//! marker scan, the move engine with its crash replay, the live-slot rules,
-//! the roster merges, and the reverse replay. The CLI exposes only
-//! `import clauth --dry-run` and `import status`; the real run and
-//! `import rollback` answer "only --dry-run is available in this build" until
-//! part 2 adds the global edits (G1–G4) they must not run without.
+//! The commands: `import clauth [--dry-run] [--resume]`, `import rollback`,
+//! `import status` and `import retire`. The dry-run and the status read
+//! change nothing; the real run is the writer-exclusive transaction M-1…M8
+//! with the global edits G1–G4, journaled write-ahead and reversed
+//! automatically on any refusal before commit.
 //!
 //! | module | spec |
 //! |--------|------|
@@ -21,63 +19,22 @@
 //! | [`fsops`] | §4.4 move engine primitives |
 //! | [`txn`] | §4.1 the precheck, the plan and M3–M8, resume |
 //! | [`rollback`] | §4.10 reverse replay |
+//! | [`edits`] | §4.8 global edits G1–G4 and G2's split undo |
+//! | [`retire`] | §4.11 the post-commit checklist R1–R4 |
 //!
 //! Nothing here reads a credential value into a report, a journal entry or
 //! a backup: tokens are compared in memory and dropped.
 
-// The engine (M3–M8, resume, rollback) is complete in part 1 and driven by
-// the hermetic tests, but the part-1 CLI reaches only the dry-run and the
-// status read (spec §8), so a non-test build sees parts of it as unused.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "engine reached by tests only until part 2 wires the real run (spec §8)"
-    )
-)]
+pub(crate) mod edits;
 pub(crate) mod fence;
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "engine reached by tests only until part 2 wires the real run (spec §8)"
-    )
-)]
 pub(crate) mod fsops;
 pub(crate) mod inventory;
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "engine reached by tests only until part 2 wires the real run (spec §8)"
-    )
-)]
 pub(crate) mod journal;
 pub(crate) mod procs;
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "engine reached by tests only until part 2 wires the real run (spec §8)"
-    )
-)]
+pub(crate) mod retire;
 pub(crate) mod rollback;
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "engine reached by tests only until part 2 wires the real run (spec §8)"
-    )
-)]
 pub(crate) mod roster;
 pub(crate) mod slots;
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "engine reached by tests only until part 2 wires the real run (spec §8)"
-    )
-)]
 pub(crate) mod txn;
 
 use std::collections::BTreeMap;
@@ -298,9 +255,10 @@ impl std::fmt::Display for ImportNeedsAttention {
 
 impl std::error::Error for ImportNeedsAttention {}
 
-/// The one sentence the part-1 CLI answers a real run or rollback with.
-pub(crate) const DRY_RUN_ONLY: &str =
-    "tollgate import clauth: only --dry-run is available in this build";
+/// The refusal a real run, rollback or retire answers on a non-interactive
+/// stdin without `--yes` (spec §2.3; exit 2).
+pub(crate) const NON_TTY: &str =
+    "tollgate import clauth: refusing to change files without --yes on a non-interactive stdin";
 
 /// The seams the hermetic tests drive the engine through. Outside `cfg(test)`
 /// every function is the real thing; under it the defaults are the SAFE
@@ -453,6 +411,74 @@ pub(crate) mod seams {
         let _ = event;
     }
 
+    /// The herdr binary G2, its undo and R3 drive: `None` when herdr is not
+    /// installed. Tests pin one (a fake) or get none, never the operator's.
+    pub(crate) fn herdr_bin() -> Option<PathBuf> {
+        #[cfg(test)]
+        {
+            with(|s| s.herdr_bin.clone())
+        }
+        #[cfg(not(test))]
+        {
+            crate::herdr::resolved_bin()
+        }
+    }
+
+    /// G2's subprocess budget (tests shorten it).
+    pub(crate) fn g2_deadline() -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(d) = with(|s| s.g2_deadline) {
+            return d;
+        }
+        super::edits::G2_DEADLINE
+    }
+
+    /// Whether stdin is a terminal a confirmation can be read from.
+    pub(crate) fn stdin_is_tty() -> bool {
+        #[cfg(test)]
+        {
+            with(|s| s.tty)
+        }
+        #[cfg(not(test))]
+        {
+            use std::io::IsTerminal as _;
+            std::io::stdin().is_terminal()
+        }
+    }
+
+    /// R3 and its undo: tollgate's herdr plugin install (`true`) or uninstall
+    /// (`false`), `no_config` as given. Tests pose a hook (the real install
+    /// reaches the network for a release tag); without one a test build
+    /// refuses.
+    pub(crate) fn herdr_plugin(install: bool, no_config: bool, yes: bool) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            let _ = yes;
+            let hook = with(|s| s.herdr_plugin.take());
+            let Some(mut hook) = hook else {
+                anyhow::bail!("no herdr plugin hook posed in this test");
+            };
+            let out = hook(install, no_config);
+            with(|s| {
+                if s.herdr_plugin.is_none() {
+                    s.herdr_plugin = Some(hook);
+                }
+            });
+            out
+        }
+        #[cfg(not(test))]
+        {
+            if install {
+                let delegate_row_text = crate::profile::load_config_read_only()
+                    .map(|c| c.state.herdr.delegate_row_text)
+                    .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_row_text);
+                crate::herdr::install(None, no_config, yes, delegate_row_text)
+            } else {
+                crate::herdr::uninstall(no_config, true)
+            }
+        }
+    }
+
     /// The pause between rescans while only exempt read-only tollgate runs
     /// are alive (spec §4.3: up to 3 × 200 ms).
     pub(crate) fn exempt_retry_delay() -> std::time::Duration {
@@ -470,6 +496,7 @@ pub(crate) mod seams {
 
         type Hook = Box<dyn FnMut(u64) + Send>;
         type Plain = Box<dyn FnMut() + Send>;
+        type HerdrHook = Box<dyn FnMut(bool, bool) -> anyhow::Result<()> + Send>;
 
         /// Everything a test may pin. `Default` is the safe baseline.
         #[derive(Default)]
@@ -484,6 +511,10 @@ pub(crate) mod seams {
             pub(crate) exdev: Vec<PathBuf>,
             pub(crate) foreign_dev: Vec<PathBuf>,
             pub(crate) op_log: Option<Vec<String>>,
+            pub(crate) herdr_bin: Option<PathBuf>,
+            pub(crate) g2_deadline: Option<std::time::Duration>,
+            pub(crate) tty: bool,
+            pub(crate) herdr_plugin: Option<HerdrHook>,
         }
 
         pub(crate) static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -551,6 +582,162 @@ pub(crate) fn cmd_status(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Ask `question` on the terminal, default no. The prompt goes to stdout,
+/// or to stderr where stdout is reserved for one JSON document.
+fn ask(question: &str, json: bool) -> Result<bool> {
+    if json {
+        crate::out::errln!("{question} [y/N]");
+    } else {
+        crate::out::out!("{question} [y/N] ");
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+/// Refuse a changing command on a non-interactive stdin without `--yes`.
+fn require_tty_or_yes(yes: bool) -> Result<()> {
+    if yes || seams::stdin_is_tty() {
+        Ok(())
+    } else {
+        Err(crate::usage_error(NON_TTY))
+    }
+}
+
+fn print_warnings(warnings: &[Finding]) {
+    for w in warnings {
+        crate::out::errln!("  warning  {}: {}", w.code, w.message);
+    }
+}
+
+/// `tollgate import clauth` (no `--dry-run`): the report, one confirmation
+/// covering every move and global edit, then the transaction. `--json`
+/// prints the final report as the only thing on stdout; the prompt,
+/// progress and the commit line go to stderr then.
+pub(crate) fn cmd_run(opts: &Options, json: bool, yes: bool, resume: bool) -> Result<()> {
+    if resume {
+        let committed = txn::resume()?;
+        print_warnings(&committed.warnings);
+        crate::out::outln!("{}", txn::commit_message(&committed));
+        return Ok(());
+    }
+    require_tty_or_yes(yes)?;
+    let mut last: Option<txn::Report> = None;
+    let mut show = |r: &txn::Report| {
+        if json && !r.ok {
+            // A blocked run's report is the only output, as a dry-run's is.
+            let _ = print_report(r, true, false);
+        } else if json {
+            crate::out::errln!("{}", txn::render_text(r, false));
+        } else {
+            crate::out::outln!("{}", txn::render_text(r, false));
+        }
+    };
+    let mut confirm = |r: &txn::Report| -> Result<bool> {
+        last = Some(r.clone());
+        if yes {
+            return Ok(true);
+        }
+        ask(&txn::confirm_question(r), json)
+    };
+    let committed = txn::run_with(opts, &mut show, &mut confirm)?;
+    print_warnings(&committed.warnings);
+    let line = txn::commit_message(&committed);
+    if json {
+        if let Some(mut r) = last {
+            r.journal.state = crate::identity::ImportState::Complete.as_str();
+            r.warnings.extend(committed.warnings.iter().cloned());
+            print_report(&r, true, false)?;
+        }
+        crate::out::errln!("{line}");
+    } else {
+        crate::out::outln!("{line}");
+    }
+    Ok(())
+}
+
+/// `tollgate import rollback`.
+pub(crate) fn cmd_rollback(adopt_live: bool, json: bool, yes: bool) -> Result<()> {
+    require_tty_or_yes(yes)?;
+    let opts = Options {
+        adopt_live,
+        ..Options::default()
+    };
+    let mut confirm = |p: &rollback::Pending| -> Result<bool> {
+        if yes {
+            return Ok(true);
+        }
+        ask(
+            &format!(
+                "roll back the import (journal {}: {} profiles, {} steps to undo)?",
+                p.state, p.profiles, p.steps
+            ),
+            json,
+        )
+    };
+    let done = rollback::rollback_with(&opts, &mut confirm)?;
+    let paths = Paths::resolve()?;
+    if json {
+        let doc = serde_json::json!({
+            "schema_version": 1,
+            "command": "import rollback",
+            "mode": "rollback",
+            "generated_at": now_rfc3339(),
+            "source": paths.source.display().to_string(),
+            "target": paths.target.display().to_string(),
+            "ok": true,
+            "blockers": [],
+            "warnings": done.warnings,
+            "journal": {"state": crate::identity::import_state_at(&paths.journal()).as_str()},
+        });
+        crate::out::outln!("{}", serde_json::to_string_pretty(&doc)?);
+    } else {
+        print_warnings(&done.warnings);
+        crate::out::outln!(
+            "tollgate: the import is rolled back; upstream clauth owns ~/.claude again (guest mode is on)"
+        );
+    }
+    Ok(())
+}
+
+/// `tollgate import retire [--step rN]…`.
+pub(crate) fn cmd_retire(steps: &[String], yes: bool) -> Result<()> {
+    let mut parsed = Vec::new();
+    for s in steps {
+        match retire::Step::parse(s) {
+            Some(step) => parsed.push(step),
+            None => {
+                return Err(crate::usage_error(format!(
+                    "--step takes r1, r2, r3 or r4, got '{s}'"
+                )));
+            }
+        }
+    }
+    require_tty_or_yes(yes)?;
+    let pending = retire::pending(&parsed)?;
+    if !yes && !pending.is_empty() {
+        for (step, what) in &pending {
+            crate::out::errln!("  {}  {what}", step.as_str());
+        }
+        if !ask("run these retire steps?", false)? {
+            anyhow::bail!("tollgate import retire: not confirmed; nothing was changed");
+        }
+    }
+    let done = retire::retire(&parsed, yes)?;
+    for line in &done.lines {
+        crate::out::outln!("tollgate import retire: {line}");
+    }
+    print_warnings(&done.warnings);
+    let paths = Paths::resolve()?;
+    if let Some(j) = journal::Journal::load(&paths)? {
+        for line in retire::last_steps(&paths, &j) {
+            crate::out::outln!("  {line}");
+        }
+    }
+    Ok(())
+}
+
 /// Print a report as text or as one JSON document on stdout.
 pub(crate) fn print_report(report: &txn::Report, json: bool, dry_run: bool) -> Result<()> {
     if json {
@@ -584,3 +771,11 @@ mod slots_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/import_rollback.rs"]
 mod rollback_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/import_edits.rs"]
+mod edits_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/import_retire.rs"]
+mod retire_tests;

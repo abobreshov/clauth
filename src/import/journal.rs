@@ -33,6 +33,20 @@ pub(crate) enum Op {
     RewriteToml,
     RetireBin,
     Write,
+    /// A JSON value at one pointer of a shared Claude Code file (G1, G3, R1):
+    /// `prior.prior_value` → `after.new_value`, each JSON text or absent.
+    /// Never for a secret-bearing key.
+    RewriteJson,
+    /// `installed_plugins.json` installPath spellings (G4): `after.pairs`.
+    RepointRegistry,
+    /// A subprocess (G2: upstream's `clauth herdr uninstall --yes`).
+    Exec,
+    /// `tollgate@tollgate` installed into `~/.claude` (R2).
+    PluginInstall,
+    /// tollgate's herdr plugin installed (R3).
+    HerdrInstall,
+    /// One line of a shell rc file replaced (R4).
+    RewriteLine,
 }
 
 impl Op {
@@ -109,6 +123,58 @@ pub(crate) struct Facts {
     pub(crate) shim_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exists: Option<bool>,
+    /// `rewrite_json`: the RFC 6901 pointer inside `dst`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pointer: Option<String>,
+    /// `rewrite_json`: the value the op writes (JSON text; absent = removed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) new_value: Option<String>,
+    /// `rewrite_json`: the removed key's position in its parent object, so
+    /// an undo puts it back where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) index: Option<usize>,
+    /// `exec`: the argv (never a secret).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) argv: Option<Vec<String>>,
+    /// `exec`: the NAMES of the env vars handed to the child, never values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) env_keys: Option<Vec<String>>,
+    /// `exec` (G2): upstream's herdr plugin record before the uninstall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plugin: Option<HerdrRecord>,
+    /// `repoint_registry`: every installPath spelling the op re-points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pairs: Option<Vec<Repoint>>,
+    /// `rewrite_line`: the one line replaced (a completion `source` line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<String>,
+    /// Which global edit or retire step the entry is (`G1`…`G4`, `r1`…`r4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) step: Option<String>,
+}
+
+/// Upstream's herdr plugin as `herdr plugin list --json` listed it (G2):
+/// the fields a reinstall at the same commit needs, nothing else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HerdrRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) managed_path: Option<String>,
+    pub(crate) enabled: bool,
+}
+
+/// One installPath re-point (G4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Repoint {
+    pub(crate) from: String,
+    pub(crate) to: String,
 }
 
 /// One journaled step.
@@ -275,11 +341,7 @@ pub(crate) fn status(paths: &Paths) -> StatusReport {
         steps.insert("main", counts(&j.main));
         steps.insert("retire", counts(&j.retire));
         if state.is_interrupted() {
-            interrupted_at = j
-                .main
-                .iter()
-                .find(|e| e.status == Status::Planned)
-                .map(|e| e.seq);
+            interrupted_at = Some(interrupted_step(j));
         }
     }
     let next = match state {
@@ -303,6 +365,53 @@ pub(crate) fn status(paths: &Paths) -> StatusReport {
         interrupted_at,
         next,
     }
+}
+
+/// The step an interrupted journal stopped at: the first entry still
+/// `planned` (`pre`, then `main`); for a rollback that stopped, the last
+/// entry it has not undone yet. `0` when every entry is settled (the crash
+/// fell between the last step and the state flip).
+pub(crate) fn interrupted_step(j: &Journal) -> u64 {
+    let planned = j
+        .pre
+        .iter()
+        .chain(&j.main)
+        .chain(&j.retire)
+        .find(|e| e.status == Status::Planned)
+        .map(|e| e.seq);
+    if j.state() == ImportState::RollingBack {
+        let pending = j
+            .main
+            .iter()
+            .chain(&j.pre)
+            .filter(|e| e.status == Status::Done)
+            .map(|e| e.seq)
+            .max();
+        if let Some(seq) = pending {
+            return seq;
+        }
+    }
+    planned.unwrap_or(0)
+}
+
+/// The warning every command prints on stderr while an import is
+/// interrupted (spec §2.3), or `None` when none is. Reads the journal
+/// without any lock.
+pub(crate) fn interrupted_warning(paths: &Paths) -> Option<String> {
+    let state = crate::identity::import_state_at(&paths.journal());
+    if !state.is_interrupted() {
+        return None;
+    }
+    let seq = Journal::load(paths)
+        .ok()
+        .flatten()
+        .map_or(0, |j| interrupted_step(&j));
+    Some(format!(
+        "{}: an import of clauth was interrupted at step {seq}; run '{} import clauth --resume' or '{} import rollback'",
+        crate::identity::NAME,
+        crate::identity::NAME,
+        crate::identity::NAME
+    ))
 }
 
 /// The text form of [`status`].

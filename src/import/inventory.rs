@@ -151,6 +151,21 @@ pub(crate) fn is_never(name: &str) -> bool {
     NEVER.contains(&name)
 }
 
+/// Whether a top-level name is a file upstream regenerates on any run (its
+/// log, status feeds and caches): skipped by the import, and left out of
+/// the inventory hash, since G2 runs upstream's binary between M-1 and M4.
+pub(crate) fn is_regenerated(name: &str) -> bool {
+    matches!(
+        name,
+        "status.json"
+            | "status_cache.json"
+            | "throughput_cache.json"
+            | "clauth.log"
+            | "daemon.log"
+            | "clauthd.pid"
+    ) || (name.contains("price_cache") && name.ends_with(".json"))
+}
+
 fn kind_of(meta: Option<&Meta>) -> &'static str {
     match meta {
         Some(m) if m.is_symlink => "symlink",

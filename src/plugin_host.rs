@@ -102,11 +102,18 @@ pub(crate) fn uninstall() -> anyhow::Result<Uninstalled> {
             dir.display()
         );
     }
-    let plugin = crate::guest_write::owned_keys_guarded(&guarded_files(), || {
-        Ok(TollgatePlugin::uninstall(Scope::User)?)
-    })?;
+    let plugin = uninstall_plugin()?;
     let mcp_entry = crate::plugin_probe::unwire_mcp_server()?;
     Ok(Uninstalled { plugin, mcp_entry })
+}
+
+/// The plugin half of [`uninstall`] alone: `tollgate@tollgate` and its
+/// marketplace, under the owned-keys guard, `mcpServers` left as it is. The
+/// undo of the import's retire step R2, which installed only the plugin.
+pub(crate) fn uninstall_plugin() -> anyhow::Result<Outcome> {
+    crate::guest_write::owned_keys_guarded(&guarded_files(), || {
+        Ok(TollgatePlugin::uninstall(Scope::User)?)
+    })
 }
 
 /// The one line `tollgate plugin uninstall` prints.

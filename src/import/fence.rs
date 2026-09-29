@@ -145,15 +145,20 @@ impl Fence {
             Ok(lock) => fence.state = Some(lock),
             Err(_) => return Err(lock_held(&paths.tilde(&state_lock_path(paths)))),
         }
+        super::seams::log(|| "fence acquired".to_string());
         Ok(fence)
     }
 }
 
 impl Drop for Fence {
     fn drop(&mut self) {
+        let held = self.state.is_some();
         drop(self.state.take());
         while let Some(file) = self.files.pop() {
             drop(file);
+        }
+        if held {
+            super::seams::log(|| "fence released".to_string());
         }
     }
 }
