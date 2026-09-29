@@ -85,9 +85,18 @@ fn api_serve_preserves_inherited_sigterm_ignore() {
         .status()
         .expect("signal local API");
     assert!(signal.success());
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.0.try_wait().expect("poll ignored signal"), None);
-    assert!(socket.exists());
+    let survive_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        assert_eq!(server.0.try_wait().expect("poll ignored signal"), None);
+        assert!(
+            socket.exists(),
+            "local API socket vanished after ignored SIGTERM"
+        );
+        if Instant::now() >= survive_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

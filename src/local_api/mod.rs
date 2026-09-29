@@ -346,9 +346,11 @@ impl Server {
         else {
             return;
         };
-        if listener_identity(listener).ok() == Some(identity.listener)
-            && socket_path_matches(path, identity.path)
-        {
+        let listener_matches = match listener_identity(listener) {
+            Ok(actual) => actual == identity.listener,
+            Err(_) => true,
+        };
+        if listener_matches && socket_path_matches(path, identity.path) {
             let _ = std::fs::remove_file(path);
         }
         stop_unix_accept(listener);
@@ -523,30 +525,40 @@ fn bind_unix(path: &Path) -> Result<(std::os::unix::net::UnixListener, SocketIde
     }
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind the local API socket {}", path.display()))?;
-    let metadata = path
-        .symlink_metadata()
-        .with_context(|| format!("failed to inspect bound socket {}", path.display()))?;
-    let path_identity = (metadata.dev(), metadata.ino());
+    let mut path_identity = None;
     let prepared = (|| {
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("failed to inspect bound socket {}", path.display()))?;
+        let identity = (metadata.dev(), metadata.ino());
+        path_identity = Some(identity);
         if !metadata.file_type().is_socket() {
             bail!("{} is no longer the bound socket", path.display());
+        }
+        if !socket_path_matches(path, identity) {
+            bail!("{} changed while binding the socket", path.display());
         }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to restrict {}", path.display()))?;
         let listener_identity = listener_identity(&listener)
             .with_context(|| format!("failed to inspect bound listener for {}", path.display()))?;
-        if !socket_path_matches(path, path_identity) {
+        if !socket_path_matches(path, identity) {
             bail!("{} changed while binding the socket", path.display());
         }
         Ok(SocketIdentity {
-            path: path_identity,
+            path: identity,
             listener: listener_identity,
         })
     })();
     match prepared {
         Ok(identity) => Ok((listener, identity)),
         Err(error) => {
-            if socket_path_matches(path, path_identity) {
+            // Failed lstat gives no identity: NotFound leaves nothing to remove;
+            // any other error leaves the node for the next bind's stale-socket
+            // check rather than risking removal of an unidentified replacement.
+            if let Some(identity) = path_identity
+                && socket_path_matches(path, identity)
+            {
                 let _ = std::fs::remove_file(path);
             }
             Err(error)

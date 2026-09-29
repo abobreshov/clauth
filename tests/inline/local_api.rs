@@ -377,6 +377,23 @@ fn a_live_socket_is_never_stolen_but_a_stale_one_is_replaced() {
     assert_eq!(fresh.socket(), Some(path.as_path()));
 }
 
+#[cfg(unix)]
+#[test]
+fn bind_unix_replaces_a_stale_socket_node_after_listener_drops() {
+    use std::os::unix::net::UnixStream;
+
+    let _home = HomeSandbox::new();
+    let path = socket_path().unwrap();
+    let (stale, _) = bind_unix(&path).unwrap();
+    drop(stale);
+    assert!(path.exists());
+
+    let (rebound, _) = bind_unix(&path).unwrap();
+    assert!(UnixStream::connect(&path).is_ok());
+    drop(rebound);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// One OAuth profile, and one api-key profile whose endpoint carries every
 /// credential shape a URL can: userinfo, a key-shaped path segment, a query.
 fn seed_profiles_with_a_leaky_endpoint() {

@@ -1068,7 +1068,7 @@ fn a_skewed_persisted_hold_is_rewritten_and_credits_resume_after_the_cap() {
 }
 
 #[test]
-fn reading_an_in_cap_hold_preserves_its_bytes() {
+fn an_in_cap_persisted_read_does_not_rewrite_the_file() {
     let _home = crate::testutil::HomeSandbox::new();
     let now_ms = 1_000_000;
     let until_ms = now_ms + 600_000;
@@ -1141,6 +1141,9 @@ fn a_failed_clamp_write_keeps_the_disk_deadline() {
     let dir = path.parent().unwrap();
     let permissions = std::fs::metadata(dir).unwrap().permissions();
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let lock = WalletHolds::lock_hold(&path).expect("read-only directory still permits locking");
+    assert_eq!(WalletHolds::read_until(&path), Some(skewed));
+    drop(lock);
     let result = WalletHolds::clamp_skewed(&path, skewed, now_ms + cap_ms);
     std::fs::set_permissions(dir, permissions).unwrap();
 
