@@ -2640,6 +2640,8 @@ fn typed_throttler_hint(provider: Provider) -> &'static str {
         Provider::Alibaba => "alibaba model studio is throttling usage reads",
         Provider::OpenRouter => "openrouter is throttling usage reads",
         Provider::MiniMax => "minimax is throttling usage reads",
+        Provider::OllamaCloud => "ollama cloud is throttling usage reads",
+        Provider::OllamaDaemon => "ollama daemon is throttling usage reads",
     }
 }
 
@@ -2659,6 +2661,8 @@ fn stuck_429_hint_names_the_throttler() {
         Provider::Alibaba,
         Provider::OpenRouter,
         Provider::MiniMax,
+        Provider::OllamaCloud,
+        Provider::OllamaDaemon,
     ] {
         let mut p = crate::testutil::blank_profile(&ProfileName::from("acct"));
         p.provider = Some(provider);

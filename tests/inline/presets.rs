@@ -14,7 +14,7 @@ fn models(default: &str) -> ModelSettings {
 }
 
 /// The shipped names in menu order, so a table change lands in one place.
-const BUILTIN_NAMES: [&str; 8] = [
+const BUILTIN_NAMES: [&str; 9] = [
     "DeepSeek",
     "Z.ai",
     "OpenRouter",
@@ -23,6 +23,7 @@ const BUILTIN_NAMES: [&str; 8] = [
     "Qwen-TokenPlan-CN",
     "Qwen-CodingPlan-Intl",
     "Qwen-CodingPlan-CN",
+    "Ollama-Cloud",
 ];
 
 fn names(presets: &[super::Preset]) -> Vec<&str> {
@@ -283,5 +284,118 @@ fn a_hand_written_file_cannot_shadow_a_builtins_slot() {
         load_preset("DeepSeek").expect("loads").base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic"),
         "so does a load by name",
+    );
+}
+
+/// Ollama Cloud: the root endpoint (CC's `/v1/messages` lands on
+/// `https://ollama.com/v1/messages`), no model pinned (the operator picks from
+/// `GET /api/tags`), and an env allowlist of telemetry switches that never
+/// carries a credential — the key reaches CC through the `apiKeyHelper` only,
+/// which is what keeps a same-provider hot swap possible.
+#[test]
+fn the_ollama_cloud_preset_pins_the_root_endpoint_and_no_model() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let p = load_preset("ollama-cloud").expect("ships in the binary, any case");
+    assert!(p.builtin);
+    assert_eq!(p.base_url.as_deref(), Some("https://ollama.com"));
+    assert_eq!(
+        crate::providers::Provider::from_base_url(p.base_url.as_deref().unwrap()),
+        Some(crate::providers::Provider::OllamaCloud),
+        "the preset's endpoint is the one the usage integration claims"
+    );
+    assert_eq!(
+        p.models,
+        ModelSettings::default(),
+        "every slot is the operator's"
+    );
+
+    let env: Vec<(&str, &str)> = p
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        env,
+        [
+            ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
+            ("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1"),
+            ("DISABLE_ERROR_REPORTING", "1"),
+        ]
+    );
+    for preset in list_presets() {
+        for key in preset.env.keys() {
+            assert!(
+                !key.starts_with("ANTHROPIC_"),
+                "{} carries {key}: a preset never routes or authenticates via env",
+                preset.name
+            );
+        }
+    }
+}
+
+/// A custom preset carries no env, whatever its file says.
+#[test]
+fn a_custom_preset_carries_no_env() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    save_preset("mine", &None, &models("m")).expect("save");
+    let dir = presets_dir().expect("presets dir");
+    std::fs::write(
+        dir.join("sneaky.json"),
+        r#"{"models":{},"env":{"ANTHROPIC_API_KEY":"leak"}}"#,
+    )
+    .expect("hand-write a preset with env");
+    assert!(load_preset("sneaky").expect("loads").env.is_empty());
+    assert!(
+        list_presets()
+            .iter()
+            .filter(|p| !p.builtin)
+            .all(|p| p.env.is_empty())
+    );
+}
+
+/// Applying a built-in's env to a saved account adds only the keys the account
+/// lacks: an operator's own value wins, nothing is removed, and the account's
+/// api key and provider follow the endpoint as for any preset.
+#[test]
+fn a_preset_env_fills_gaps_and_never_overrides_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("oll");
+    let mut profile = crate::profile::Profile::new(
+        "oll".to_string(),
+        None,
+        Some("test-key-not-real".to_string()),
+    );
+    profile
+        .env
+        .insert("DISABLE_ERROR_REPORTING".to_string(), "0".to_string());
+    profile.env.insert("MY_OWN".to_string(), "kept".to_string());
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+
+    let preset = load_preset("Ollama-Cloud").expect("built-in");
+    crate::actions::edit_profile_preset_with_env(
+        &mut config,
+        &name,
+        preset.base_url.clone(),
+        preset.models.clone(),
+        &preset.env,
+    )
+    .expect("applied");
+
+    let p = config.find(&name).expect("still there");
+    assert_eq!(p.base_url.as_deref(), Some("https://ollama.com"));
+    assert_eq!(p.provider, Some(crate::providers::Provider::OllamaCloud));
+    assert_eq!(p.api_key.as_deref(), Some("test-key-not-real"));
+    assert_eq!(p.env["DISABLE_ERROR_REPORTING"], "0", "the operator's wins");
+    assert_eq!(p.env["MY_OWN"], "kept");
+    assert_eq!(p.env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0");
+    assert_eq!(p.env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"], "1");
+    assert!(
+        !p.env.contains_key("ANTHROPIC_AUTH_TOKEN") && !p.env.contains_key("ANTHROPIC_API_KEY"),
+        "the key reaches CC through the apiKeyHelper only"
     );
 }

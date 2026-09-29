@@ -38,6 +38,7 @@ pub(crate) mod alibaba;
 mod deepseek;
 mod generic;
 mod minimax;
+pub(crate) mod ollama_cloud;
 mod openrouter;
 mod zai;
 
@@ -131,6 +132,12 @@ pub(crate) enum Provider {
     Alibaba,
     OpenRouter,
     MiniMax,
+    /// Ollama Cloud direct (`https://ollama.com`), an inference key.
+    OllamaCloud,
+    /// The local Ollama daemon (`127.0.0.1:11434` / `localhost:11434`). It
+    /// signs with its own machine-global key and has no usage route, so it is
+    /// typed to keep the generic scanner from probing it.
+    OllamaDaemon,
 }
 
 impl Provider {
@@ -146,6 +153,10 @@ impl Provider {
             Some(Self::OpenRouter)
         } else if minimax::matches_base_url(url) {
             Some(Self::MiniMax)
+        } else if ollama_cloud::matches_base_url(url) {
+            Some(Self::OllamaCloud)
+        } else if ollama_cloud::matches_daemon_url(url) {
+            Some(Self::OllamaDaemon)
         } else {
             None
         }
@@ -158,6 +169,8 @@ impl Provider {
             Self::Alibaba => alibaba::DISPLAY_NAME,
             Self::OpenRouter => openrouter::DISPLAY_NAME,
             Self::MiniMax => minimax::DISPLAY_NAME,
+            Self::OllamaCloud => ollama_cloud::DISPLAY_NAME,
+            Self::OllamaDaemon => ollama_cloud::DAEMON_DISPLAY_NAME,
         }
     }
 
@@ -169,12 +182,15 @@ impl Provider {
 
     /// Whether this provider publishes usage windows of its own (percentage
     /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai`,
-    /// `Alibaba` and `MiniMax` do; `DeepSeek` and `OpenRouter` publish a
-    /// wallet. The MCP headroom clause denies a 5h/7d limit only where it
+    /// `Alibaba`, `MiniMax` and `OllamaCloud` do; `DeepSeek` and `OpenRouter`
+    /// publish a wallet, and the Ollama daemon publishes nothing. The MCP headroom clause denies a 5h/7d limit only where it
     /// knows the provider has none: a windows-publishing provider HAS the
     /// limits even when one cached response carried no bars.
     pub(crate) fn publishes_windows(self) -> bool {
-        matches!(self, Self::Zai | Self::Alibaba | Self::MiniMax)
+        matches!(
+            self,
+            Self::Zai | Self::Alibaba | Self::MiniMax | Self::OllamaCloud
+        )
     }
 
     /// The source name this provider's own rows carry in the price store
@@ -189,6 +205,8 @@ impl Provider {
             Self::Alibaba => Some("dashscope"),
             Self::OpenRouter => None,
             Self::MiniMax => Some("minimax"),
+            // No first-party Ollama rows in the price store yet.
+            Self::OllamaCloud | Self::OllamaDaemon => None,
         }
     }
 
@@ -210,6 +228,14 @@ impl Provider {
                 openrouter::matches_base_url(base_url).then_some(openrouter::CONSOLE_URL)
             }
             Self::MiniMax => minimax::matches_base_url(base_url).then_some(minimax::CONSOLE_URL),
+            Self::OllamaCloud => {
+                ollama_cloud::matches_base_url(base_url).then_some(ollama_cloud::CONSOLE_URL)
+            }
+            // The daemon's own key is never the operator's to mint, but the
+            // key that unlocks its usage is minted on the same page.
+            Self::OllamaDaemon => {
+                ollama_cloud::matches_daemon_url(base_url).then_some(ollama_cloud::CONSOLE_URL)
+            }
         }
     }
 
@@ -228,6 +254,9 @@ impl Provider {
             Self::Alibaba => alibaba::fetch(console),
             Self::OpenRouter => openrouter::fetch(api_key),
             Self::MiniMax => minimax::fetch(api_key),
+            Self::OllamaCloud => ollama_cloud::fetch(api_key),
+            // No request: the daemon has no usage route.
+            Self::OllamaDaemon => Ok(ollama_cloud::daemon_stats()),
         }
     }
 }
@@ -265,6 +294,8 @@ impl ThirdPartyTarget {
                 Provider::Alibaba => alibaba::gateway_origin(console.as_ref()).to_string(),
                 Provider::OpenRouter => openrouter::ORIGIN.to_string(),
                 Provider::MiniMax => minimax::ORIGIN.to_string(),
+                Provider::OllamaCloud => ollama_cloud::ORIGIN.to_string(),
+                Provider::OllamaDaemon => ollama_cloud::DAEMON_ORIGIN.to_string(),
             },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
         }
@@ -514,6 +545,13 @@ pub(crate) enum ThirdPartyError {
     /// delta-seconds form (the HTTP-date form is treated as absent), used to
     /// defer this profile's next slot — mirrors the OAuth fetch path.
     RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
+    /// HTTP 429 whose body is the provider's QUOTA verdict (Ollama's
+    /// `session usage limit`), not a request-rate throttle. Paced like
+    /// [`Self::RateLimited`] (it is a 429, and `retry_after` is honoured), but
+    /// kept distinct so a reader can tell a spent window from a busy endpoint.
+    QuotaExhausted {
         retry_after: Option<std::time::Duration>,
     },
     Network,

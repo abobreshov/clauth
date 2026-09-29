@@ -22,7 +22,7 @@ A mint is a narrower credential than a `/login` session: it carries `user:infere
 
 ### Third-party usage data
 
-Five providers get typed usage panels:
+Six providers get typed usage panels:
 
 | Provider | Base URL | Shows |
 |----------|----------|-------|
@@ -31,12 +31,15 @@ Five providers get typed usage panels:
 | OpenRouter | `https://openrouter.ai` | wallet rows from the credits endpoint: api balance (remaining credits, red when overdrawn), used, purchased; then today / this week / this month usage, per-key cap rows when set, free-tier flag |
 | Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
 | MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
+| Ollama Cloud | `https://ollama.com` | read from `GET https://ollama.com/api/usage` with the account's own key. A legacy plan reports a 5h and a 7d bar (both feed auto-switch); a new-pricing plan reports one `month` bar for its dollar pool (display only). Bars can pass 100 %, a window the API names without a figure reads `usage not reported` rather than 0 %, and the API publishes no reset time. Then the spend over the last four weeks (exact, in USD) and per-model request counts per window. A month at or past 100 % reads `included credits used up`: extra use draws on purchased credits or team billing, which the API does not show |
 
-Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
+Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A profile pointed at a local Ollama daemon (`http://127.0.0.1:11434` or `http://localhost:11434`) is not scanned: the daemon signs requests with its own `ollama signin` key and has no usage route, so its panel reads `usage needs an ollama.com API key`, and nothing is requested. To watch that account's usage, give a profile an ollama.com key (below).
+
+A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
 
 #### Where the keys come from
 
-For those five, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
+For those six, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
 
 | Endpoint | Page |
 |----------|------|
@@ -44,6 +47,7 @@ For those five, `open provider console` in the TUI action menu ([Interface and k
 | Z.ai | <https://z.ai/manage-apikey/apikey-list> |
 | OpenRouter | <https://openrouter.ai/settings/keys> |
 | MiniMax | <https://platform.minimax.io/user-center/payment/token-plan> |
+| Ollama Cloud | <https://ollama.com/settings/keys> |
 | Alibaba Token Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview> |
 | Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
 | Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
@@ -81,7 +85,7 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Eight ship built in:
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Nine ship built in:
 
 | Preset | Endpoint |
 |---|---|
@@ -93,8 +97,9 @@ A preset is a named `base_url` + `[models]` pair you can stamp onto any account 
 | `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
+| `Ollama-Cloud` | `https://ollama.com` |
 
-`DeepSeek`, `Z.ai`, `OpenRouter` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All eight leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+`DeepSeek`, `Z.ai`, `OpenRouter` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. `Ollama-Cloud` sets the endpoint and no model at all (see below). All nine leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 
@@ -103,6 +108,34 @@ A preset is a named `base_url` + `[models]` pair you can stamp onto any account 
 ```
 
 `apply preset` opens the picker, built-ins first. Applying replaces the account's endpoint and its whole `[models]` block, so a tier the preset leaves unset is cleared rather than kept; the picker warns and names the fields first when the account already carries any. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
+
+### Setting up an Ollama Cloud account
+
+Ollama Cloud serves an Anthropic-compatible `/v1/messages` at its root, so Claude Code needs only the endpoint and a key; nothing runs locally.
+
+1. Mint a key at <https://ollama.com/settings/keys>. Keys do not expire and can be revoked there.
+2. Create the account with the endpoint and the key:
+
+   ```sh
+   tollgate login oll-main --base-url https://ollama.com
+   ```
+
+   With `--api-key` left off, the key is prompted for echo-off (`--api-key <key>` works too, but lands in shell history). It is stored in the account's `config.toml` (0600), and handed to Claude Code only through `apiKeyHelper`. Do not put it in `[env]` as `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`: that pins one key into the session and stops a swap to another Ollama account from taking effect.
+3. Pick the models. No id ships with the preset, because the catalogue changes too often; list what is served with the unauthenticated `curl https://ollama.com/api/tags`, then set the slots on the Setup tab or in the account's `config.toml`. `--model <id>` on the login sets `default` in the same step.
+
+   ```toml
+   [models]
+   default  = "<id from /api/tags>"
+   opus     = "<id>"
+   sonnet   = "<id>"
+   haiku    = "<id>"
+   fable    = "<id>"
+   subagent = "<id>"   # usually the sonnet one
+   ```
+
+Applying the `Ollama-Cloud` preset from the Setup tab sets the endpoint and adds three switches to the account's `[env]` that `ollama launch claude` also sets, without replacing a value you already have: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `DISABLE_ERROR_REPORTING=1` and `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`. Like every preset it clears the `[models]` block, so pick the models after applying it. The preset writes no env when stamped onto a `+ new` draft; apply it again once the account is saved.
+
+The plan label (`pro-legacy`, `pro`, `max`, `team`) is not in the usage response, so an Ollama account shows no tier unless you name one. Personal and team keys are separate Ollama accounts, so give each its own profile.
 
 ## Auto-start the 5-hour window
 

@@ -25,7 +25,7 @@ use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
     capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
     create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
+    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset_with_env,
     find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
     rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
     snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
@@ -9532,7 +9532,7 @@ fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
 }
 
 /// Stamp `preset` onto `target`. A saved account is written in a single locked
-/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
+/// transaction ([`edit_profile_preset_with_env`]) so a failure leaves the whole profile on
 /// its prior state. On `+ new` (cursor past the roster) the target names the
 /// unsaved draft, not a profile on disk — the preset's fields are written into
 /// the draft's input buffers directly and committed when the create form fires.
@@ -9557,11 +9557,12 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
     let target = ProfileName::from(target);
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(
+        edit_profile_preset_with_env(
             &mut cfg,
             &target,
             preset.base_url.clone(),
             preset.models.clone(),
+            &preset.env,
         )
     };
     match result {
