@@ -324,6 +324,7 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     });
     let stringify = |lines: &[Line<'static>]| -> Vec<String> {
         lines
@@ -1351,6 +1352,7 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     });
     let rendered = status_text(&status_lines(&generic, &header, 120));
     assert!(
@@ -2961,6 +2963,7 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
         plan: None,
         endpoint: None,
         best_effort: true,
+        observed: None,
     });
 
     let mut app = App::new(AppConfig {

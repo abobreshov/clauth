@@ -1,0 +1,17 @@
+{
+    "data": {
+        "label": "sk-or-v1-5f5...a9d",
+        "is_management_key": false,
+        "limit": 0.01,
+        "limit_reset": "daily",
+        "limit_remaining": 0.00999985,
+        "usage": 0.000400000000000001,
+        "usage_daily": 1.5e-7,
+        "usage_weekly": 0.0000042,
+        "usage_monthly": 0.000400000000000001,
+        "is_free_tier": false,
+        "expires_at": null,
+        "organization_id": null,
+        "creator_user_id": "user_tiny_0003"
+    }
+}

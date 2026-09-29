@@ -35,10 +35,11 @@
 //! invites a bug report.
 
 pub(crate) mod alibaba;
+pub(crate) mod billing_key;
 mod deepseek;
 mod generic;
 mod minimax;
-mod openrouter;
+pub(crate) mod openrouter;
 mod zai;
 
 pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
@@ -215,18 +216,21 @@ impl Provider {
 
     /// Fetch this provider's usage. `api_key` authorises every provider except
     /// Alibaba: its quota lives behind the per-profile console session
-    /// (`console`), and its api key reads inference only.
+    /// (`console`), and its api key reads inference only. `billing_key_env`
+    /// names the env var of an optional monitoring credential (OpenRouter's
+    /// management key, [`billing_key`]); other providers ignore it.
     fn fetch(
         self,
         api_key: &str,
         console: Option<&ConsoleCredential>,
+        billing_key_env: Option<&str>,
     ) -> Result<ThirdPartyStats, ThirdPartyError> {
         match self {
             Self::DeepSeek => deepseek::fetch(api_key),
             Self::Zai => zai::fetch(api_key),
             // The api key is not a quota credential here — the console session is.
             Self::Alibaba => alibaba::fetch(console),
-            Self::OpenRouter => openrouter::fetch(api_key),
+            Self::OpenRouter => openrouter::fetch(api_key, billing_key_env),
             Self::MiniMax => minimax::fetch(api_key),
         }
     }
@@ -245,6 +249,10 @@ pub(crate) enum ThirdPartyTarget {
     Known {
         provider: Provider,
         console: Option<ConsoleCredential>,
+        /// Name of the env var holding an optional monitoring credential
+        /// ([`billing_key`]); only OpenRouter reads it. The NAME only, never
+        /// the value.
+        billing_key_env: Option<String>,
     },
     /// Generic api-key endpoint: usage is discovered + scanned at this base_url's
     /// API origin (same host the key already authorises for completions).
@@ -258,7 +266,9 @@ impl ThirdPartyTarget {
     /// stable per-account key.
     pub(crate) fn throttle_key(&self) -> String {
         match self {
-            Self::Known { provider, console } => match provider {
+            Self::Known {
+                provider, console, ..
+            } => match provider {
                 Provider::DeepSeek => deepseek::ORIGIN.to_string(),
                 Provider::Zai => zai::ORIGIN.to_string(),
                 // One of four console gateways, chosen by region + site.
@@ -335,7 +345,11 @@ pub(crate) fn fetch_third_party_usage(
     hint: Option<&str>,
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
     match target {
-        ThirdPartyTarget::Known { provider, console } => provider.fetch(api_key, console.as_ref()),
+        ThirdPartyTarget::Known {
+            provider,
+            console,
+            billing_key_env,
+        } => provider.fetch(api_key, console.as_ref(), billing_key_env.as_deref()),
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }
 }
@@ -368,6 +382,26 @@ pub(crate) struct ThirdPartyStats {
     /// "looks wrong? open an issue" hint. Typed providers leave it `false`.
     #[serde(default)]
     pub(crate) best_effort: bool,
+    /// Typed meters parsed from the provider's RAW JSON numbers, when the
+    /// provider produces them (OpenRouter v2). The observation projection
+    /// (`usage::project::apply_third_party`) prefers these over re-parsing
+    /// the rounded display `rows`. `None` for providers that only publish
+    /// rows, and for every cache written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed: Option<Box<ObservedMeters>>,
+}
+
+/// Exact money meters and quota windows a typed provider parsed from its raw
+/// response, carried in the third-party cache beside the display rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ObservedMeters {
+    #[serde(default)]
+    pub(crate) money: Vec<crate::usage::observation::MoneyMeter>,
+    #[serde(default)]
+    pub(crate) windows: Vec<crate::usage::observation::QuotaWindow>,
+    /// Sanitised degradation notes (a wallet the key could not read).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notes: Vec<String>,
 }
 
 /// One percentage-based usage window for bar rendering.
@@ -399,6 +433,7 @@ impl ThirdPartyStats {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         }
     }
 
@@ -421,6 +456,7 @@ impl ThirdPartyStats {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         }
     }
 }

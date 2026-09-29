@@ -21,6 +21,9 @@ fn the_claude_engine_carries_the_spawn_facts_unchanged() {
 /// else inherits.
 #[test]
 fn the_claude_scrub_is_the_shared_scrub() {
+    // The scrub reads the configured profiles' monitoring-credential env
+    // names (`providers::billing_key`), so it needs a home.
+    let _home = crate::testutil::HomeSandbox::new();
     let engine: &dyn HarnessEngine = &ClaudeEngine;
     let mut cmd = std::process::Command::new("probe");
     cmd.env("ANTHROPIC_BASE_URL", "https://a")

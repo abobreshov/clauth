@@ -1,0 +1,24 @@
+{
+    "data": {
+        "label": "sk-or-v1-9bc...e01",
+        "is_management_key": false,
+        "limit": 25,
+        "limit_reset": "monthly",
+        "limit_remaining": 3.5,
+        "include_byok_in_limit": false,
+        "usage": 71.25,
+        "usage_daily": 1.2,
+        "usage_weekly": 6.75,
+        "usage_monthly": 21.5,
+        "byok_usage": 0,
+        "byok_usage_daily": 0,
+        "byok_usage_weekly": 0,
+        "byok_usage_monthly": 0,
+        "is_free_tier": false,
+        "expires_at": "2026-12-31T23:59:59Z",
+        "workspace_id": "ws_acme_research",
+        "organization_id": "org_acme_0042",
+        "creator_user_id": "user_member_0007",
+        "free_model_daily_requests": {"used": 50, "limit": 50, "remaining": 0}
+    }
+}

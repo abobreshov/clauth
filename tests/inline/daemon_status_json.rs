@@ -471,6 +471,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
 
@@ -748,6 +749,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
 
@@ -1207,6 +1209,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
             plan: Some("lite".to_string()),
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     let dead = config_of(profile("dead-token"));
@@ -2118,6 +2121,7 @@ fn status_body_never_leaks_a_credential() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     crate::profile_cache::write_profile_cache(
@@ -2475,6 +2479,7 @@ fn status_schema_agrees_with_the_serialized_body() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
 

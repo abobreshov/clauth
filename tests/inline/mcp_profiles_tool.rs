@@ -607,6 +607,7 @@ fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
                 plan: None,
                 endpoint: None,
                 best_effort: false,
+                observed: None,
             },
             now - hours_ago * 3_600_000,
         );

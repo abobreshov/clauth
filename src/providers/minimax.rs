@@ -89,6 +89,7 @@ fn stats(models: &[ModelRemains]) -> ThirdPartyStats {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 

@@ -1,9 +1,112 @@
-//! Inline tests for the OpenRouter provider — base-URL matching and the
-//! two-endpoint response → display-rows mapping.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Inline tests for the OpenRouter provider (v2): base-URL matching, raw-number
+//! parsing, the `/key`-first fetch order over a recording transport, per-meter
+//! degradation of `/credits`, the management-key path allowlist, the typed
+//! meters, and the v1-compatible display rows. Every response is a fixture
+//! under `tests/fixtures/openrouter/`; the recorder answers from a script and
+//! [`LiveHttp`] panics under `cfg(test)`, so nothing here can reach the
+//! network.
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use super::*;
 
 use crate::providers::Provider;
+use crate::usage::observation::{
+    AccountObservation, AuthKind, MoneyKind, MoneyScope, Origin, PeriodKind, ScopeOrigin, SourceId,
+    WindowScope,
+};
+
+const KEY_PAID: &str = include_str!("../fixtures/openrouter/key_paid.json");
+const KEY_FREE: &str = include_str!("../fixtures/openrouter/key_free.json");
+const KEY_LIMITED: &str = include_str!("../fixtures/openrouter/key_limited.json");
+const KEY_SUBCENT: &str = include_str!("../fixtures/openrouter/key_subcent.json");
+const CREDITS_OVERDRAWN: &str = include_str!("../fixtures/openrouter/credits_overdrawn.json");
+const CREDITS_FUNDED: &str = include_str!("../fixtures/openrouter/credits_funded.json");
+const CREDITS_403: &str = include_str!("../fixtures/openrouter/credits_403.json");
+
+/// Placeholder credentials. Neither is a real key; both must stay out of
+/// every output.
+const INFERENCE: &str = "sk-or-v1-test-inference-not-a-real-key-0000000000";
+const MANAGEMENT: &str = "sk-or-v1-test-management-not-a-real-key-111111111";
+
+const KEY_URL: &str = "https://openrouter.ai/api/v1/key";
+const CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
+
+/// 2026-09-30T12:00:00Z, a Wednesday.
+fn now() -> i64 {
+    chrono::NaiveDate::from_ymd_opt(2026, 9, 30)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp()
+}
+
+fn ts(y: i32, m: u32, d: u32) -> i64 {
+    chrono::NaiveDate::from_ymd_opt(y, m, d)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp()
+}
+
+/// Scripted transport: answers in order and records `(url, bearer)` per call.
+struct Recorder {
+    replies: RefCell<VecDeque<HttpReply>>,
+    calls: RefCell<Vec<(String, String)>>,
+}
+
+impl Recorder {
+    fn new(replies: Vec<HttpReply>) -> Self {
+        Self {
+            replies: RefCell::new(replies.into()),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn urls(&self) -> Vec<String> {
+        self.calls.borrow().iter().map(|(u, _)| u.clone()).collect()
+    }
+}
+
+impl OpenRouterHttp for Recorder {
+    fn get(&self, url: &str, bearer: &str) -> HttpReply {
+        self.calls
+            .borrow_mut()
+            .push((url.to_string(), bearer.to_string()));
+        self.replies
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| panic!("unscripted request to {url}"))
+    }
+}
+
+fn body(s: &str) -> HttpReply {
+    HttpReply::Body(s.to_string())
+}
+
+fn status(code: u16) -> HttpReply {
+    HttpReply::Status {
+        code,
+        retry_after: None,
+    }
+}
+
+fn fetch_with(key: HttpReply, credits: HttpReply, billing: Option<&str>) -> OpenRouterUsage {
+    let http = Recorder::new(vec![key, credits]);
+    fetch_openrouter_usage(INFERENCE, billing, &http).expect("fetch")
+}
+
+fn meter<'a>(m: &'a ObservedMeters, id: &str) -> Option<&'a MoneyMeter> {
+    m.money.iter().find(|x| x.meter_id == id)
+}
+
+fn amt(s: &str) -> Amount {
+    Amount::parse(s).unwrap()
+}
 
 // ── Provider::from_base_url dispatch ───────────────────────────────────────────
 //
@@ -48,173 +151,566 @@ fn from_base_url_rejects_host_extension_and_userinfo() {
     assert_eq!(Provider::from_base_url("https://api.anthropic.com"), None);
 }
 
-// ── wire parsing ───────────────────────────────────────────────────────────────
-//
-// Both fixtures are real captured bodies (2026-08-17, two live regular keys),
-// redacted of the label and the user id. The credits body is the key whose
-// inference calls answer `402 ... can only afford 0`: its `limit` fields are
-// null while the wallet is overdrawn, which is what the null-cap row semantics
-// below pin.
+// ── raw numbers ────────────────────────────────────────────────────────────────
 
-const KEY_BODY: &str = r#"{
-    "data": {
-        "label": "sk-or-v1-e3d...94f",
-        "is_management_key": false,
-        "is_provisioning_key": false,
-        "limit": null,
-        "limit_reset": null,
-        "limit_remaining": null,
-        "include_byok_in_limit": false,
-        "usage": 162.870592992,
-        "usage_daily": 0.000001536,
-        "usage_weekly": 0.000001536,
-        "usage_monthly": 0.003722806,
-        "byok_usage": 9.49797775,
-        "byok_usage_daily": 0,
-        "byok_usage_weekly": 0,
-        "byok_usage_monthly": 0,
-        "is_free_tier": false,
-        "expires_at": null,
-        "rate_limit": {"requests": -1, "interval": "10s"}
+#[test]
+fn json_numbers_become_exact_decimals() {
+    for (raw, want) in [
+        ("0.000001536", Some("0.000001536")),
+        ("162.870592992", Some("162.870592992")),
+        // An f64 would print this as 0.0004.
+        ("0.000400000000000001", Some("0.000400000000000001")),
+        ("1.5e-7", Some("0.00000015")),
+        ("1E3", Some("1000")),
+        ("2.5e+2", Some("250")),
+        ("-3", Some("-3")),
+        ("0", Some("0")),
+        ("\"2.50\"", Some("2.50")),
+        ("null", None),
+        ("true", None),
+        ("\"12 USD\"", None),
+        ("1e999", None),
+    ] {
+        let got = json_number_amount(raw);
+        assert_eq!(got.as_ref().map(Amount::as_str), want, "{raw}");
     }
-}"#;
-
-const CREDITS_BODY: &str = r#"{
-    "data": {"total_credits": 600.815, "total_usage": 601.014979078}
-}"#;
-
-#[test]
-fn both_responses_parse_wire_shape() {
-    let credits: CreditsEnvelope = serde_json::from_str(CREDITS_BODY).expect("parse credits");
-    assert_eq!(credits.data.total_credits, 600.815);
-    assert_eq!(credits.data.total_usage, 601.014979078);
-
-    let key: KeyEnvelope = serde_json::from_str(KEY_BODY).expect("parse key response");
-    assert_eq!(key.data.limit, None);
-    assert_eq!(key.data.limit_remaining, None);
-    assert!(!key.data.is_free_tier);
-    // Every period field the mapping renders, so a serde rename or typo reds
-    // here rather than silently zeroing a row.
-    assert_eq!(key.data.usage_daily, 0.000001536);
-    assert_eq!(key.data.usage_weekly, 0.000001536);
-    assert_eq!(key.data.usage_monthly, 0.003722806);
 }
 
 #[test]
-fn credits_without_required_numbers_fails_to_parse() {
-    // Both numbers are required: a degraded wallet body must never invent one.
+fn exact_subtraction_keeps_sub_cent_and_sign() {
+    for (a, b, want) in [
+        ("600.815", "601.014979078", "-0.199979078"),
+        ("100", "40.123456789", "59.876543211"),
+        ("0.1", "0.3", "-0.2"),
+        ("5", "5.00", "0.00"),
+        ("-1.5", "2", "-3.5"),
+    ] {
+        assert_eq!(amount_sub(&amt(a), &amt(b)).as_str(), want, "{a} - {b}");
+    }
+}
+
+#[test]
+fn the_key_body_parses_every_modelled_field_from_raw_json() {
+    let key: KeyEnvelope = serde_json::from_str(KEY_LIMITED).unwrap();
+    let k = key.data;
+    assert_eq!(k.limit.as_ref().unwrap().0.as_str(), "25");
+    assert_eq!(k.limit_remaining.as_ref().unwrap().0.as_str(), "3.5");
+    assert_eq!(k.limit_reset.as_deref(), Some("monthly"));
+    assert_eq!(k.usage.as_ref().unwrap().0.as_str(), "71.25");
+    assert_eq!(k.usage_daily.as_ref().unwrap().0.as_str(), "1.2");
+    assert_eq!(k.usage_weekly.as_ref().unwrap().0.as_str(), "6.75");
+    assert_eq!(k.usage_monthly.as_ref().unwrap().0.as_str(), "21.5");
+    assert_eq!(k.workspace_id.as_deref(), Some("ws_acme_research"));
+    assert_eq!(k.organization_id.as_deref(), Some("org_acme_0042"));
+    assert_eq!(k.creator_user_id.as_deref(), Some("user_member_0007"));
+    assert_eq!(k.expires_at.as_deref(), Some("2026-12-31T23:59:59Z"));
+    assert_eq!(
+        k.free_model_daily_requests,
+        Some(FreeDaily {
+            used: Some(50.0),
+            limit: Some(50.0),
+            remaining: Some(0.0),
+        })
+    );
+    // The org wins over the member for "which account owns this key".
+    assert_eq!(k.owner_id(), Some("org_acme_0042"));
+}
+
+#[test]
+fn a_captured_paid_key_keeps_its_sub_cent_figures_exact() {
+    let key: KeyEnvelope = serde_json::from_str(KEY_PAID).unwrap();
+    let k = key.data;
+    assert_eq!(k.usage_daily.as_ref().unwrap().0.as_str(), "0.000001536");
+    assert_eq!(k.usage_monthly.as_ref().unwrap().0.as_str(), "0.003722806");
+    assert_eq!(k.byok_usage.as_ref().unwrap().0.as_str(), "9.49797775");
+    assert_eq!(k.limit, None, "null cap");
+    assert_eq!(k.owner_id(), None, "the captured body predates owner ids");
+}
+
+#[test]
+fn bodies_missing_required_parts_fail_to_parse() {
+    // The wallet needs both numbers; a degraded body never invents one.
     assert!(serde_json::from_str::<CreditsEnvelope>(r#"{"data":{}}"#).is_err());
-}
-
-#[test]
-fn key_response_without_data_fails_to_parse() {
-    // `data` is required: an error envelope carrying no key info must never
-    // count as usable usage.
+    assert!(
+        serde_json::from_str::<CreditsEnvelope>(
+            r#"{"data":{"total_credits":"lots","total_usage":1}}"#
+        )
+        .is_err()
+    );
+    // `data` is required: an error envelope never reads as usable usage.
     assert!(serde_json::from_str::<KeyEnvelope>("{}").is_err());
+    assert!(serde_json::from_str::<KeyEnvelope>(CREDITS_403).is_err());
 }
 
-// ── response → rows ────────────────────────────────────────────────────────────
+// ── fetch order and degradation ────────────────────────────────────────────────
 
 #[test]
-fn stats_builds_wallet_rows() {
-    let credits: CreditsEnvelope = serde_json::from_str(CREDITS_BODY).unwrap();
-    let key: KeyEnvelope = serde_json::from_str(KEY_BODY).unwrap();
-    let stats = stats(&credits.data, Some(&key.data));
+fn key_is_fetched_before_credits_with_the_inference_key() {
+    let http = Recorder::new(vec![body(KEY_PAID), body(CREDITS_FUNDED)]);
+    fetch_openrouter_usage(INFERENCE, None, &http).unwrap();
+    let calls = http.calls.borrow();
+    assert_eq!(
+        *calls,
+        vec![
+            (KEY_URL.to_string(), INFERENCE.to_string()),
+            (CREDITS_URL.to_string(), INFERENCE.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn a_management_key_reaches_credits_and_nothing_else() {
+    let http = Recorder::new(vec![body(KEY_LIMITED), body(CREDITS_FUNDED)]);
+    let usage = fetch_openrouter_usage(INFERENCE, Some(MANAGEMENT), &http).unwrap();
+    let calls = http.calls.borrow();
+    assert_eq!(
+        *calls,
+        vec![
+            (KEY_URL.to_string(), INFERENCE.to_string()),
+            (CREDITS_URL.to_string(), MANAGEMENT.to_string()),
+        ],
+        "the auth probe runs on the inference key; the management key reads only the wallet"
+    );
+    assert_eq!(
+        usage.wallet.as_ref().unwrap().read_with,
+        WalletCredential::Management
+    );
+}
+
+#[test]
+fn a_blank_management_key_is_no_management_key() {
+    let http = Recorder::new(vec![body(KEY_PAID), body(CREDITS_FUNDED)]);
+    fetch_openrouter_usage(INFERENCE, Some("   "), &http).unwrap();
+    assert_eq!(http.calls.borrow()[1].1, INFERENCE);
+}
+
+#[test]
+fn the_management_key_path_allowlist_is_credits_only() {
+    assert!(billing_key_may_reach(CREDITS_PATH));
+    for path in [KEY_PATH, "/api/v1/keys", "/api/v1/chat/completions", ""] {
+        assert!(!billing_key_may_reach(path), "{path}");
+    }
+    // The guard refuses before sending: nothing reaches the transport.
+    let http = Recorder::new(vec![]);
+    let reply = guarded_get(&http, KEY_PATH, MANAGEMENT, WalletCredential::Management);
+    assert_eq!(reply, status(403));
+    assert!(http.calls.borrow().is_empty());
+}
+
+#[test]
+fn credits_403_drops_only_the_wallet_meter() {
+    let usage = fetch_with(
+        body(KEY_LIMITED),
+        HttpReply::Status {
+            code: 403,
+            retry_after: None,
+        },
+        None,
+    );
+    assert_eq!(usage.wallet, None);
+    assert_eq!(usage.notes.len(), 1);
+    assert!(
+        usage.notes[0].contains("management key") && usage.notes[0].contains("403"),
+        "{:?}",
+        usage.notes
+    );
+    let st = stats(&usage, now());
+    let observed = st.observed.as_ref().unwrap();
+    assert!(meter(observed, METER_WALLET).is_none());
+    for id in [
+        "spend.daily",
+        "spend.weekly",
+        "spend.monthly",
+        "spend.lifetime",
+        METER_KEY_LIMIT,
+    ] {
+        assert!(meter(observed, id).is_some(), "{id} survives a 403 wallet");
+    }
+    assert_eq!(observed.notes, usage.notes);
+    // No wallet is no verdict: the account is not called unfunded.
+    assert!(st.is_available);
+    assert!(
+        !st.rows
+            .iter()
+            .any(|r| crate::providers::is_balance_row(&r.label)),
+        "no balance row is invented"
+    );
+    assert!(
+        st.rows
+            .iter()
+            .any(|r| r.kind == StatRowKind::Faint && r.value.contains("403")),
+        "the note renders"
+    );
+}
+
+#[test]
+fn every_credits_failure_degrades_and_none_marks_the_key_dead() {
+    for (reply, billing, needle) in [
+        (status(404), None, "404"),
+        (status(401), None, "401"),
+        (status(401), Some(MANAGEMENT), "expired"),
+        (status(403), Some(MANAGEMENT), "management key refused"),
+        (status(429), None, "rate limited"),
+        (status(500), None, "500"),
+        (HttpReply::Network, None, "network"),
+        (body("<html>oops</html>"), None, "unreadable"),
+        (body(CREDITS_403), None, "unreadable"),
+    ] {
+        let usage = fetch_with(body(KEY_PAID), reply.clone(), billing);
+        assert_eq!(usage.wallet, None, "{reply:?}");
+        assert!(
+            usage.notes.iter().any(|n| n.contains(needle)),
+            "{reply:?}: {:?}",
+            usage.notes
+        );
+    }
+}
+
+#[test]
+fn key_failures_fail_the_fetch_before_credits_is_tried() {
+    type IsExpected = fn(&ThirdPartyError) -> bool;
+    let cases: Vec<(HttpReply, IsExpected)> = vec![
+        (status(401), |e| matches!(e, ThirdPartyError::AuthExpired)),
+        (
+            HttpReply::Status {
+                code: 429,
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            |e| {
+                matches!(
+                    e,
+                    ThirdPartyError::RateLimited {
+                        retry_after: Some(d)
+                    } if *d == Duration::from_secs(30)
+                )
+            },
+        ),
+        (status(403), |e| matches!(e, ThirdPartyError::Status)),
+        (status(503), |e| matches!(e, ThirdPartyError::Status)),
+        (HttpReply::Network, |e| {
+            matches!(e, ThirdPartyError::Network)
+        }),
+        (body("not json"), |e| matches!(e, ThirdPartyError::Parse)),
+        (body(CREDITS_403), |e| matches!(e, ThirdPartyError::Parse)),
+    ];
+    for (reply, is_expected) in cases {
+        let http = Recorder::new(vec![reply.clone()]);
+        let err = fetch_openrouter_usage(INFERENCE, Some(MANAGEMENT), &http)
+            .expect_err("a /key failure fails the fetch");
+        assert!(is_expected(&err), "{reply:?} → {err:?}");
+        assert_eq!(http.urls(), vec![KEY_URL.to_string()], "{reply:?}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "real network call attempted in a test")]
+fn the_live_transport_refuses_to_run_under_test() {
+    let _ = LiveHttp.get(KEY_URL, INFERENCE);
+}
+
+// ── meters ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_negative_balance_is_an_exact_signed_wallet() {
+    let usage = fetch_with(body(KEY_PAID), body(CREDITS_OVERDRAWN), None);
+    let m = observed_meters(&usage, now());
+    let wallet = meter(&m, METER_WALLET).unwrap();
+    assert_eq!(wallet.kind, MoneyKind::Balance);
+    assert_eq!(wallet.amount.as_str(), "-0.199979078");
+    assert!(wallet.amount.is_negative());
+    assert_eq!(wallet.limit, Some(amt("600.815")));
+    assert_eq!(wallet.currency, "USD");
+    assert_eq!(wallet.scope, MoneyScope::Organization);
+    assert_eq!(wallet.scope_origin, ScopeOrigin::Provider);
+    assert_eq!(wallet.scope_id, None, "the captured key names no owner");
+}
+
+#[test]
+fn a_funded_org_wallet_carries_the_owner_for_de_dup() {
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_FUNDED), None);
+    let m = observed_meters(&usage, now());
+    let wallet = meter(&m, METER_WALLET).unwrap();
+    assert_eq!(wallet.amount.as_str(), "59.876543211");
+    assert_eq!(wallet.scope_id.as_deref(), Some("org_acme_0042"));
+    assert_eq!(wallet.scope_origin, ScopeOrigin::Provider);
+}
+
+#[test]
+fn a_management_key_wallet_is_never_bound_or_de_duplicated() {
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_FUNDED), Some(MANAGEMENT));
+    let m = observed_meters(&usage, now());
+    let wallet = meter(&m, METER_WALLET).unwrap();
+    assert_eq!(wallet.scope_id, None);
+    assert_eq!(
+        wallet.scope_origin,
+        ScopeOrigin::MonitoringCredential { bound: false }
+    );
+}
+
+#[test]
+fn spend_rows_are_three_key_scoped_periods_plus_lifetime() {
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_FUNDED), None);
+    let m = observed_meters(&usage, now());
+    let day = meter(&m, "spend.daily").unwrap();
+    assert_eq!(day.amount.as_str(), "1.2");
+    assert_eq!(day.kind, MoneyKind::Spend);
+    assert_eq!(day.scope, MoneyScope::Key);
+    let p = day.period.unwrap();
+    assert_eq!(p.kind, PeriodKind::Daily);
+    assert_eq!(p.start.unwrap().secs(), ts(2026, 9, 30));
+    assert_eq!(p.end.unwrap().secs(), ts(2026, 10, 1));
+    assert!(p.derived);
+
+    let week = meter(&m, "spend.weekly").unwrap();
+    assert_eq!(week.amount.as_str(), "6.75");
+    let p = week.period.unwrap();
+    // Monday–Sunday UTC: 2026-09-30 is a Wednesday.
+    assert_eq!(p.start.unwrap().secs(), ts(2026, 9, 28));
+    assert_eq!(p.end.unwrap().secs(), ts(2026, 10, 5));
+
+    let month = meter(&m, "spend.monthly").unwrap();
+    assert_eq!(month.amount.as_str(), "21.5");
+    let p = month.period.unwrap();
+    assert_eq!(p.start.unwrap().secs(), ts(2026, 9, 1));
+    assert_eq!(p.end.unwrap().secs(), ts(2026, 10, 1));
+
+    let life = meter(&m, "spend.lifetime").unwrap();
+    assert_eq!(life.amount.as_str(), "71.25");
+    assert_eq!(life.scope, MoneyScope::Key);
+    assert_eq!(life.period.unwrap().kind, PeriodKind::Lifetime);
+}
+
+#[test]
+fn a_december_month_ends_in_january() {
+    let p = utc_period(PeriodKind::Monthly, ts(2026, 12, 15) + 3600);
+    assert_eq!(p.start.unwrap().secs(), ts(2026, 12, 1));
+    assert_eq!(p.end.unwrap().secs(), ts(2027, 1, 1));
+}
+
+#[test]
+fn a_key_cap_is_a_limit_meter_left_under_cap() {
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_FUNDED), None);
+    let m = observed_meters(&usage, now());
+    let cap = meter(&m, METER_KEY_LIMIT).unwrap();
+    assert_eq!(cap.kind, MoneyKind::Limit);
+    assert_eq!(cap.amount.as_str(), "3.5");
+    assert_eq!(cap.limit, Some(amt("25")));
+    assert_eq!(cap.scope, MoneyScope::Key);
+    assert_eq!(cap.period.unwrap().kind, PeriodKind::Monthly);
+
+    // A null cap is no meter at all.
+    let usage = fetch_with(body(KEY_PAID), body(CREDITS_FUNDED), None);
+    assert!(meter(&observed_meters(&usage, now()), METER_KEY_LIMIT).is_none());
+}
+
+#[test]
+fn sub_cent_figures_stay_exact_in_meters_and_round_in_rows() {
+    let usage = fetch_with(body(KEY_SUBCENT), body(CREDITS_FUNDED), None);
+    let st = stats(&usage, now());
+    let m = st.observed.as_ref().unwrap();
+    assert_eq!(
+        meter(m, "spend.daily").unwrap().amount.as_str(),
+        "0.00000015"
+    );
+    assert_eq!(
+        meter(m, "spend.monthly").unwrap().amount.as_str(),
+        "0.000400000000000001"
+    );
+    let cap = meter(m, METER_KEY_LIMIT).unwrap();
+    assert_eq!(cap.amount.as_str(), "0.00999985");
+    assert_eq!(cap.period.unwrap().kind, PeriodKind::Daily);
+    assert_eq!(
+        meter(m, METER_WALLET).unwrap().scope_id.as_deref(),
+        Some("user_tiny_0003"),
+        "no org: the minting user owns the key"
+    );
+    let row = |label: &str| {
+        st.rows
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.value.clone())
+    };
+    assert_eq!(row("today").as_deref(), Some("0.00 USD"));
+    assert_eq!(row("key limit left").as_deref(), Some("0.01 USD"));
+}
+
+#[test]
+fn byok_spend_is_non_additive_and_only_when_used() {
+    let usage = fetch_with(body(KEY_PAID), body(CREDITS_FUNDED), None);
+    let m = observed_meters(&usage, now());
+    let life = meter(&m, "byok.lifetime").unwrap();
+    assert_eq!(life.amount.as_str(), "9.49797775");
+    assert!(!life.additive);
+    assert!(meter(&m, "byok.daily").is_some_and(|d| d.amount.is_zero()));
+
+    let usage = fetch_with(body(KEY_FREE), body(CREDITS_FUNDED), None);
+    let m = observed_meters(&usage, now());
+    assert!(
+        !m.money.iter().any(|x| x.meter_id.starts_with("byok.")),
+        "an account with no BYOK spend gets no BYOK rows"
+    );
+}
+
+#[test]
+fn free_model_daily_requests_is_an_account_window_outside_the_chain() {
+    let usage = fetch_with(body(KEY_FREE), body(CREDITS_FUNDED), None);
+    let st = stats(&usage, now());
+    let w = &st.observed.as_ref().unwrap().windows[0];
+    assert_eq!(w.id, WINDOW_FREE_DAILY);
+    assert_eq!(w.scope, WindowScope::Account);
+    assert!(!w.chain_eligible);
+    assert_eq!(w.used, Some(12.0));
+    assert_eq!(w.limit, Some(50.0));
+    assert_eq!(w.used_pct, Some(24.0));
+    assert!(!w.exhausted);
+    assert_eq!(w.window_secs, Some(86_400));
+    assert_eq!(w.resets_at.unwrap().secs(), ts(2026, 10, 1), "UTC midnight");
+
+    // The Usage tab's bar, and nothing the chain reads.
+    assert_eq!(st.bars.len(), 1);
+    assert_eq!(st.bars[0].label, FREE_DAILY_LABEL);
+    assert_eq!(st.bars[0].pct, 24.0);
+    assert_eq!(st.bars[0].used, Some(12.0));
+    assert_eq!(st.bars[0].total, Some(50.0));
+    assert!(st.to_usage_info().is_none(), "chain behaviour unchanged");
+
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_FUNDED), None);
+    let w = &observed_meters(&usage, now()).windows[0];
+    assert!(w.exhausted, "50 of 50 used");
+}
+
+#[test]
+fn a_key_without_the_free_counter_publishes_no_window() {
+    let usage = fetch_with(body(KEY_PAID), body(CREDITS_FUNDED), None);
+    let st = stats(&usage, now());
+    assert!(st.observed.as_ref().unwrap().windows.is_empty());
+    assert!(st.bars.is_empty());
+}
+
+// ── display rows (v1-compatible) ───────────────────────────────────────────────
+
+#[test]
+fn stats_builds_the_v1_wallet_rows_from_exact_amounts() {
+    let usage = fetch_with(body(KEY_PAID), body(CREDITS_OVERDRAWN), None);
+    let st = stats(&usage, now());
     // The live account is overdrawn: the rows render, but the reachability
-    // dot must read red (every paid call 402s) and the refusal rides beside
-    // the figures rather than replacing them.
-    assert!(!stats.is_available);
-    let last = stats.rows.last().expect("refusal row");
+    // dot must read red and the refusal rides beside the figures.
+    assert!(!st.is_available);
+    let last = st.rows.last().expect("refusal row");
     assert_eq!(last.kind, StatRowKind::Danger);
     assert_eq!(last.value, crate::providers::LOW_BALANCE);
-    // Heading + 3 wallet rows + 3 period rows, plus that refusal. No cap, no
-    // free tier.
-    assert_eq!(stats.rows.len(), 8);
-    assert_eq!(stats.rows[0].kind, StatRowKind::Heading);
-    assert_eq!(stats.rows[0].label, "credits");
-    // The literal, not the constant: this row's label is a cross-module contract
-    // (the MCP roster's wallet rank matches on it), so a rename has to red here
-    // rather than follow silently.
-    assert_eq!(stats.rows[1].label, "api balance");
-    // The live overdrawn account: usage exceeds the purchased credits.
-    assert_eq!(stats.rows[1].value, "-0.20 USD");
-    assert_eq!(stats.rows[1].kind, StatRowKind::Danger);
-    // `2..7`, not `2..`: the trailing entry is the refusal asserted above, and
-    // it carries no label.
-    let labels: Vec<&str> = stats.rows[2..7].iter().map(|r| r.label.as_str()).collect();
+    // Heading + 3 wallet rows + 3 period rows, plus that refusal.
+    assert_eq!(st.rows.len(), 8);
+    assert_eq!(st.rows[0].kind, StatRowKind::Heading);
+    assert_eq!(st.rows[0].label, "credits");
+    // The literal, not the constant: this row's label is a cross-module
+    // contract (the MCP roster's wallet rank matches on it).
+    assert_eq!(st.rows[1].label, "api balance");
+    assert_eq!(st.rows[1].value, "-0.20 USD");
+    assert_eq!(st.rows[1].kind, StatRowKind::Danger);
+    let labels: Vec<&str> = st.rows[2..7].iter().map(|r| r.label.as_str()).collect();
     assert_eq!(
         labels,
         ["used", "purchased", "today", "this week", "this month"]
     );
-    assert_eq!(stats.rows[2].value, "601.01 USD");
-    assert_eq!(stats.rows[3].value, "600.82 USD");
-    assert_eq!(stats.rows[4].value, "0.00 USD");
-    assert_eq!(stats.rows[5].value, "0.00 USD");
-    assert_eq!(stats.rows[6].value, "0.00 USD");
+    assert_eq!(st.rows[2].value, "601.01 USD");
+    assert_eq!(st.rows[3].value, "600.82 USD");
+    assert_eq!(st.rows[4].value, "0.00 USD");
 }
 
 #[test]
 fn remaining_danger_boundary_tracks_the_rendered_value() {
-    // Danger must agree with what the row SAYS: anything under half a cent
-    // (an overdrawn account included) renders as `0.00 USD` or worse, so an
-    // exact `== 0.0` test would leave a spent key reading as a healthy one.
-    // A full cent still formats as `0.01 USD` and stays Body.
+    // Anything under half a cent (an overdrawn account included) renders as
+    // `0.00 USD` or worse, so it must read Danger and unfunded.
     for (total, used, expect_kind, expect_value, expect_available) in [
-        (100.0, 100.0, StatRowKind::Danger, "0.00 USD", false),
-        (100.0, 99.999, StatRowKind::Danger, "0.00 USD", false),
-        (100.0, 100.2, StatRowKind::Danger, "-0.20 USD", false),
-        (100.0, 99.99, StatRowKind::Body, "0.01 USD", true),
+        ("100", "100", StatRowKind::Danger, "0.00 USD", false),
+        ("100", "99.999", StatRowKind::Danger, "0.00 USD", false),
+        ("100", "100.001", StatRowKind::Danger, "-0.00 USD", false),
+        ("100", "100.2", StatRowKind::Danger, "-0.20 USD", false),
+        ("100", "99.995", StatRowKind::Body, "0.01 USD", true),
+        ("100", "99.99", StatRowKind::Body, "0.01 USD", true),
     ] {
-        let credits = CreditsData {
-            total_credits: total,
-            total_usage: used,
+        let usage = OpenRouterUsage {
+            key: KeySnapshot::default(),
+            wallet: Some(WalletRead {
+                total_credits: amt(total),
+                total_usage: amt(used),
+                read_with: WalletCredential::Inference,
+            }),
+            notes: Vec::new(),
         };
-        let stats = stats(&credits, None);
-        assert_eq!(stats.rows[1].kind, expect_kind, "total {total} used {used}");
-        assert_eq!(
-            stats.rows[1].value, expect_value,
-            "total {total} used {used}"
-        );
-        assert_eq!(
-            stats.is_available, expect_available,
-            "total {total} used {used}"
-        );
+        let st = stats(&usage, now());
+        assert_eq!(st.rows[1].kind, expect_kind, "{total} - {used}");
+        assert_eq!(st.rows[1].value, expect_value, "{total} - {used}");
+        assert_eq!(st.is_available, expect_available, "{total} - {used}");
     }
 }
 
 #[test]
 fn key_cap_and_free_tier_rows_append_when_present() {
-    let credits = CreditsData {
-        total_credits: 100.0,
-        total_usage: 40.0,
-    };
-    let key = KeyData {
-        limit: Some(50.0),
-        limit_remaining: Some(10.0),
-        usage_daily: 0.0,
-        usage_weekly: 0.0,
-        usage_monthly: 0.0,
-        is_free_tier: true,
-    };
-    let stats = stats(&credits, Some(&key));
-    let rows: Vec<(&str, &str, StatRowKind)> = stats
+    let usage = fetch_with(body(KEY_FREE), body(CREDITS_FUNDED), None);
+    let st = stats(&usage, now());
+    assert!(
+        st.rows
+            .iter()
+            .any(|r| r.label == "free tier" && r.kind == StatRowKind::Faint)
+    );
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_FUNDED), None);
+    let st = stats(&usage, now());
+    let rows: Vec<(&str, &str)> = st
         .rows
         .iter()
-        .map(|r| (r.label.as_str(), r.value.as_str(), r.kind))
+        .map(|r| (r.label.as_str(), r.value.as_str()))
         .collect();
-    assert!(rows.contains(&("key limit", "50.00 USD", StatRowKind::Body)));
-    assert!(rows.contains(&("key limit left", "10.00 USD", StatRowKind::Body)));
-    assert!(rows.contains(&("free tier", "", StatRowKind::Faint)));
+    assert!(rows.contains(&("key limit", "25.00 USD")));
+    assert!(rows.contains(&("key limit left", "3.50 USD")));
+    assert!(rows.contains(&("api balance", "59.88 USD")));
+}
+
+// ── cache + projection ─────────────────────────────────────────────────────────
+
+#[test]
+fn the_cache_round_trips_and_the_observation_reads_the_raw_meters() {
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_OVERDRAWN), None);
+    let st = stats(&usage, now());
+    let json = serde_json::to_string(&st).unwrap();
+    let back: ThirdPartyStats = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.observed, st.observed);
+
+    let mut obs = AccountObservation::new(
+        "claude:or".to_string(),
+        SourceId::OpenRouter,
+        AuthKind::ApiKey,
+        Origin::Profile,
+        "or",
+    );
+    crate::usage::project::apply_third_party(&mut obs, &back, now());
+    assert_eq!(
+        obs.meter(METER_WALLET).unwrap().amount.as_str(),
+        "-0.199979078"
+    );
+    assert_eq!(
+        obs.meter("spend.lifetime").unwrap().scope,
+        MoneyScope::Key,
+        "the raw meters win over re-parsing the rounded rows"
+    );
+    assert_eq!(obs.window(WINDOW_FREE_DAILY).unwrap().used_pct, Some(100.0));
+    // The unfunded verdict still lands.
+    assert!(obs.failure.is_some());
+
+    // Past its reset the free window is the previous day's reading: dropped.
+    let mut later = obs.clone();
+    crate::usage::project::apply_third_party(&mut later, &back, ts(2026, 10, 1) + 1);
+    assert!(later.window(WINDOW_FREE_DAILY).is_none());
 }
 
 #[test]
-fn key_endpoint_absent_drops_only_the_key_rows() {
-    let credits = CreditsData {
-        total_credits: 100.0,
-        total_usage: 40.0,
-    };
-    let stats = stats(&credits, None);
-    let labels: Vec<&str> = stats.rows.iter().map(|r| r.label.as_str()).collect();
-    assert_eq!(labels, ["credits", "api balance", "used", "purchased"]);
-    assert_eq!(stats.rows[1].value, "60.00 USD");
+fn no_credential_reaches_the_cache_or_the_notes() {
+    for credits in [body(CREDITS_FUNDED), status(403), status(401)] {
+        let usage = fetch_with(body(KEY_LIMITED), credits, Some(MANAGEMENT));
+        let json = serde_json::to_string(&stats(&usage, now())).unwrap();
+        assert!(!json.contains(INFERENCE));
+        assert!(!json.contains(MANAGEMENT));
+        assert!(!json.contains("test-management"));
+    }
 }

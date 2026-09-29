@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] } # raw_value: exact provider money figures (providers::openrouter)
 utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
 toml = "1.1.6"
 # Format-preserving edits of the user's own `shunt.toml` (the gateway's admin

@@ -94,6 +94,7 @@ pub(super) fn fetch(
             // Unknown provider, mapped heuristically — flag it so the UI can hint
             // "looks wrong? open an issue".
             best_effort: true,
+            observed: None,
         });
     }
     // No candidate yielded usable data this pass — surface as a generic failure

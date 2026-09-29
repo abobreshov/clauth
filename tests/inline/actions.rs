@@ -1297,6 +1297,46 @@ fn set_profile_default_model_blank_clears_default() {
     );
 }
 
+/// A preset's env overlays the account's own env, and only allowlisted keys
+/// land — a caller passing a credential key cannot route it through here.
+#[test]
+fn edit_profile_preset_overlays_only_allowlisted_env() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    config.profiles[0]
+        .env
+        .insert("MY_OWN".to_string(), "keep".to_string());
+
+    let env = std::collections::BTreeMap::from([
+        (
+            "CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK".to_string(),
+            "1".to_string(),
+        ),
+        ("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-nope".to_string()),
+    ]);
+    edit_profile_preset(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        Some("https://openrouter.ai/api".to_string()),
+        ModelSettings::default(),
+        &env,
+    )
+    .expect("preset applied");
+
+    let profile = config
+        .find(&crate::profile::ProfileName::from("acct"))
+        .unwrap();
+    assert_eq!(
+        profile
+            .env
+            .get("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(profile.env.get("MY_OWN").map(String::as_str), Some("keep"));
+    assert!(!profile.env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+}
+
 #[test]
 fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
     let _home = HomeSandbox::new();
@@ -1316,6 +1356,7 @@ fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
             default: Some("deepseek-chat".to_string()),
             ..ModelSettings::default()
         },
+        &std::collections::BTreeMap::new(),
     )
     .expect("preset applied");
 
@@ -5681,6 +5722,7 @@ fn an_endpoint_edit_drops_the_third_party_disk_cache() {
         &crate::profile::ProfileName::from("cache-preset"),
         Some("https://api.z.ai/api/anthropic".to_string()),
         crate::profile::ModelSettings::default(),
+        &std::collections::BTreeMap::new(),
     )
     .expect("edit_profile_preset");
     assert!(

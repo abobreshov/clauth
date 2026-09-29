@@ -1196,6 +1196,7 @@ fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     crate::testutil::set_mtime(
@@ -5370,6 +5371,7 @@ fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
                 site: crate::profile::ConsoleSite::International,
                 region: "ap-southeast-1".to_string(),
             }),
+            billing_key_env: None,
         },
         api_key: String::new(),
     }
@@ -5475,6 +5477,7 @@ fn stub_ok_stats(
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     })
 }
 
@@ -5566,6 +5569,7 @@ fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     }
 }
 
@@ -5746,6 +5750,7 @@ fn fetch_third_party_due_does_not_insert_cached() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     crate::profile_cache::write_auth_expired(&name, fp);
@@ -5977,6 +5982,7 @@ fn bootstrap_third_party_seeds_any_cache() {
         plan: None,
         endpoint: None,
         best_effort: false,
+        observed: None,
     };
     // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
     crate::testutil::register_names(&["cached", "stale", "windowless"]);
@@ -12370,6 +12376,7 @@ fn fetch_third_party_due_leaves_the_streak_untouched_on_a_transient_blip() {
             plan: None,
             endpoint: None,
             best_effort: false,
+            observed: None,
         },
     );
     let state = third_party_state(stub_network_error);
