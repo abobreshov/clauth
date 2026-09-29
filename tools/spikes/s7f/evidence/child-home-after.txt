@@ -1,0 +1,4 @@
+d 0o700 .config
+l 0o777 .ssh -> <run>/home/.ssh
+l 0o777 .gitconfig -> <run>/home/.gitconfig
+l 0o777 .config/git -> <run>/home/.config/git

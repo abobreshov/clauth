@@ -1,0 +1,18 @@
+{"scenario": "03-probe-redirect", "ok_budget": 0}
+{"seq": 1, "t": 1790709305.161, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 1, "user": "S7F title probe (natural)", "status": 402}
+{"seq": 2, "t": 1790709305.176, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 2, "user": "S7F title probe (natural)", "status": 402}
+{"seq": 3, "t": 1790709305.178, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 3, "user": "S7F title probe (custom_unhealthy)", "status": 402}
+{"scenario": "04-probe-forcegate", "ok_budget": 0}
+{"seq": 1, "t": 1790709306.972, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 1, "user": "S7F title probe (natural)", "status": 402}
+{"seq": 2, "t": 1790709306.989, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 2, "user": "S7F title probe (natural)", "status": 402}
+{"seq": 3, "t": 1790709306.992, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 3, "user": "S7F title probe (custom_unhealthy)", "status": 402}
+{"scenario": "05-chat", "ok_budget": 1}
+{"seq": 1, "t": 1790709310.289, "path": "/api/v1/models", "status": 200}
+{"seq": 2, "t": 1790709310.329, "path": "/api/v1/models", "status": 200}
+{"seq": 3, "t": 1790709310.333, "path": "/api/show", "status": 404}
+{"seq": 4, "t": 1790709310.338, "path": "/api/v1/models", "status": 200}
+{"seq": 5, "t": 1790709310.338, "path": "/v1/models/stub-model", "status": 404}
+{"seq": 6, "t": 1790709310.38, "path": "/v1/models", "status": 200}
+{"seq": 7, "t": 1790709310.644, "path": "/v1/chat/completions", "model": "stub-model", "stream": true, "n": 1, "user": "S7F say ok", "status": 200}
+{"seq": 8, "t": 1790709310.91, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 2, "user": "User: S7F say ok\n\nAssistant: ok", "status": 402}
+{"seq": 9, "t": 1790709311.004, "path": "/v1/chat/completions", "model": "stub-model", "stream": false, "n": 3, "user": "User: S7F say ok\n\nAssistant: ok", "status": 402}

@@ -1,0 +1,19 @@
+d 700 .ssh 
+d 700 .tollgate/profiles/s7f 
+d 700 .tollgate/profiles/s7f/child-home 
+d 700 .tollgate/profiles/s7f/child-home/.config 
+d 755  
+d 755 .claude 
+d 755 .config 
+d 755 .config/git 
+d 755 .tollgate 
+d 755 .tollgate/profiles 
+f 600 .claude/.credentials.json 
+f 600 .claude.json 
+f 600 .ssh/config 
+f 600 .ssh/id_ed25519 
+f 644 .config/git/ignore 
+f 644 .gitconfig 
+l 777 .tollgate/profiles/s7f/child-home/.config/git <run>/home/.config/git
+l 777 .tollgate/profiles/s7f/child-home/.gitconfig <run>/home/.gitconfig
+l 777 .tollgate/profiles/s7f/child-home/.ssh <run>/home/.ssh

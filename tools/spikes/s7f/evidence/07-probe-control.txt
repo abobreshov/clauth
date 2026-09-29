@@ -1,0 +1,20 @@
+$ /home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/python -B <run>/probe.py control
+# HOME=<run>/home
+# rc=0 elapsed=0.0s
+--- stdout
+{
+ "claude_cred_path": "<run>/home/.claude/.credentials.json",
+ "claude_cred_path_exists": true,
+ "default_hermes_root": "<run>/home/.tollgate/profiles/s7f/hermes-home",
+ "env_HOME": "<run>/home",
+ "expanduser": "<run>/home",
+ "hermes_home": "<run>/home/.tollgate/profiles/s7f/hermes-home",
+ "mode": "control",
+ "path_home": "<run>/home",
+ "read_claude_code_credentials_found": true,
+ "resolve_anthropic_token_found": true,
+ "resolve_anthropic_token_is_sentinel": true,
+ "scrubbed_env_present": []
+}
+
+--- stderr

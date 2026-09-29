@@ -1,0 +1,7 @@
+$ git config --global --show-origin --get user.email
+# HOME=<run>/home/.tollgate/profiles/s7f/child-home
+# rc=0 elapsed=0.0s
+--- stdout
+file:<run>/home/.tollgate/profiles/s7f/child-home/.gitconfig	s7f@example.invalid
+
+--- stderr

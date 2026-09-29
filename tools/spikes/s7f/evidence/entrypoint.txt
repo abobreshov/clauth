@@ -1,0 +1,6 @@
+entry=/home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/hermes
+python=/home/abobreshov/.local/share/mise/installs/pipx-hermes-agent/0.19.0/hermes-agent/bin/python
+version=0.19.0
+real_home_listing=['.local']
+real ~/.claude visible: False
+real ~/.local/bin/hermes visible: False
