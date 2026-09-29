@@ -247,7 +247,7 @@ fn the_catalog_lists_every_source_once_with_its_auth_kinds() {
             serde_json::json!(source.as_str())
         );
     }
-    assert_eq!(CATALOG.len(), 15);
+    assert_eq!(CATALOG.len(), 17);
 
     let mut obs = leaky_observation();
     obs.source = SourceId::DeepSeek;
@@ -580,4 +580,19 @@ fn tcp_checks_the_host_before_the_token() {
     assert_eq!(unix.status, 200);
     let unix = handle(&ctx, &with(None, None), Door::Unix);
     assert_eq!(unix.status, 200);
+}
+
+#[test]
+fn providers_list_lane4_sources_and_native_auth() {
+    assert_eq!(
+        auth_kinds(SourceId::OpenaiApi),
+        &[AuthKind::ApiKey, AuthKind::ReadOnly]
+    );
+    assert_eq!(auth_kinds(SourceId::GoogleAi), &[AuthKind::ApiKey]);
+    for s in [SourceId::Codex, SourceId::Grok, SourceId::Antigravity] {
+        assert_eq!(
+            auth_kinds(s),
+            &[AuthKind::Subscription, AuthKind::NativeLogin]
+        );
+    }
 }

@@ -340,3 +340,76 @@ fn a_generic_provider_monitor_reads_its_named_provider() {
     );
     assert_eq!(source_for(cfg.kind).source_id(&target), SourceId::DeepSeek);
 }
+
+#[test]
+fn native_and_key_request_allowlist_is_exhaustive() {
+    let token = Secret::new("TOKEN-CANARY");
+    let cases = [
+        (
+            MonitorKind::Grok,
+            Method::Get,
+            "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+            Auth::Bearer(&token),
+            &[("X-XAI-Token-Auth", "xai-grok-cli")][..],
+        ),
+        (
+            MonitorKind::Antigravity,
+            Method::Post,
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            Auth::Bearer(&token),
+            &[][..],
+        ),
+        (
+            MonitorKind::Openai,
+            Method::Get,
+            "https://api.openai.com/v1/models",
+            Auth::Bearer(&token),
+            &[][..],
+        ),
+        (
+            MonitorKind::GoogleAi,
+            Method::Get,
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
+            Auth::GoogApiKey(&token),
+            &[][..],
+        ),
+        (
+            MonitorKind::Nous,
+            Method::Get,
+            "https://inference-api.nousresearch.com/v1/models",
+            Auth::None,
+            &[][..],
+        ),
+        (
+            MonitorKind::Nous,
+            Method::Post,
+            "https://inference-api.nousresearch.com/v1/chat/completions",
+            Auth::Bearer(&token),
+            &[][..],
+        ),
+    ];
+    for (kind, method, url, auth, extra) in cases {
+        let req = Request {
+            method,
+            url,
+            auth,
+            extra,
+            json_body: None,
+        };
+        assert!(request_allowed(kind, &req), "{url}");
+        for bad in [
+            url.replacen("https://", "https://user@", 1),
+            url.replacen(".com/", ".com:443/", 1).replacen(
+                ".googleapis.com/",
+                ".googleapis.com:443/",
+                1,
+            ),
+            format!("{url}#secret"),
+            format!("{url}&key=CANARY"),
+            url.replacen("/v1", "/../v1", 1),
+        ] {
+            let bad_req = Request { url: &bad, ..req };
+            assert!(!request_allowed(kind, &bad_req), "{kind:?} {bad}");
+        }
+    }
+}

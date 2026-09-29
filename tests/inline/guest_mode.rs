@@ -396,3 +396,46 @@ fn status_json_gains_guest_mode_additively() {
         false
     );
 }
+
+#[test]
+fn native_monitors_and_secrets_leave_guest_operator_files_unchanged() {
+    use crate::usage::monitor::{cli::preset, config, source};
+    let sb = HomeSandbox::new();
+    stage_upstream(sb.home());
+    assert!(upstream_active());
+    let grok_home = sb.home().join(".grok");
+    std::fs::create_dir_all(&grok_home).unwrap();
+    std::fs::write(grok_home.join("auth.json"), r#"{"https://auth.x.ai::test":{"key":"TOKEN-CANARY","expires_at":1,"refresh_token":"REFRESH-CANARY"}}"#).unwrap();
+    std::fs::write(grok_home.join("auth.json.lock"), "LOCK-CANARY").unwrap();
+    let before = global_files(sb.home());
+    let grok_before = std::fs::read(grok_home.join("auth.json")).unwrap();
+    for name in ["grok", "agy", "codex-native"] {
+        let m = preset(name).unwrap();
+        config::add(&m).unwrap();
+        let target = source::resolve_target(&m, sb.home(), 1_900_000_000, &|_| None);
+        let result = source::source_for(m.kind).fetch(&target, &source::FakeHttp::offline());
+        assert!(result.is_err());
+    }
+    let dir = crate::profile::tollgate_dir().unwrap();
+    crate::profile::atomic_write_600(&dir.join("secrets.env"), "LANE4_GUEST_KEY=TOKEN-CANARY\n")
+        .unwrap();
+    crate::secrets::dispatch(crate::secrets::SecretCommand::List { json: true }).unwrap();
+    assert_eq!(
+        crate::secrets::resolve("LANE4_GUEST_KEY").as_deref(),
+        Some("TOKEN-CANARY")
+    );
+    crate::secrets::dispatch(crate::secrets::SecretCommand::Rm {
+        name: "LANE4_GUEST_KEY".into(),
+        yes: true,
+    })
+    .unwrap();
+    assert_eq!(global_files(sb.home()), before);
+    assert_eq!(
+        std::fs::read(grok_home.join("auth.json")).unwrap(),
+        grok_before
+    );
+    assert_eq!(
+        std::fs::read(grok_home.join("auth.json.lock")).unwrap(),
+        b"LOCK-CANARY"
+    );
+}

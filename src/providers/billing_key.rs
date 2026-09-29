@@ -111,7 +111,7 @@ pub(crate) fn resolve(name: &str) -> Option<String> {
     if !valid_env_name(name) {
         return None;
     }
-    let value = std::env::var(name).ok()?;
+    let value = crate::secrets::resolve(name)?;
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
 }
@@ -131,6 +131,7 @@ pub(crate) fn referenced_env_vars() -> Vec<String> {
             names.extend(m.billing_key_env);
         }
     }
+    names.extend(crate::secrets::stored_names());
     names.retain(|n| valid_env_name(n));
     names.sort();
     names.dedup();
@@ -148,6 +149,7 @@ pub(crate) fn monitoring_only_env_vars() -> Vec<String> {
     if let Ok(monitors) = crate::usage::monitor::config::load() {
         names.extend(monitors.into_iter().filter_map(|m| m.billing_key_env));
     }
+    names.extend(crate::secrets::stored_names());
     names.retain(|n| valid_env_name(n));
     names.sort();
     names.dedup();

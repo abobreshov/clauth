@@ -610,17 +610,13 @@ fn subcommand_branch(shell: &str, script: &str, name: &str) -> Option<String> {
         // zsh pins it in `[[ "${words[2]}" == … ]]`, bare or as an alternation.
         "zsh" => guarded_arms(script, |guard| zsh_word_matches(guard, 2, name)),
         // fish pins it in a `__fish_seen_subcommand_from` condition, which may
-        // name several subcommands, and chains them with `; and `. A chained
-        // line's first group reads `devices;`, so the token compare strips the
-        // separator.
+        // name several root subcommands. Only the first group owns the root
+        // branch; later groups after `; and ` describe nested verbs.
         "fish" => joined(script.lines().filter(|l| {
             l.split("__fish_seen_subcommand_from ")
-                .skip(1)
-                .filter_map(|rest| rest.split('"').next())
-                .any(|list| {
-                    list.split_whitespace()
-                        .any(|w| w.trim_end_matches(';') == name)
-                })
+                .nth(1)
+                .and_then(|rest| rest.split([';', '"']).next())
+                .is_some_and(|parent| parent.split_whitespace().any(|word| word == name))
         })),
         _ => None,
     }

@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor api status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor secret api status mcp herdr completions --theme --prefer-store" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -75,13 +75,27 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     elif [ "${COMP_WORDS[1]}" = "limit-reset" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--list --yes -y" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "monitor" ]; then
-        COMPREPLY=( $(compgen -W "list add remove refresh --json" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "list add remove refresh detect --json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "add" ] && [ "$prev" = "--kind" ]; then
-        COMPREPLY=( $(compgen -W "nous ollama_cloud openrouter provider" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "nous ollama_cloud openrouter provider grok antigravity codex_native openai google_ai" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "add" ] && [ "$prev" = "--via" ]; then
+        COMPREPLY=( $(compgen -W "keyring cli" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "add" ]; then
+        COMPREPLY=( $(compgen -W "grok antigravity agy codex-native openai google-ai gemini nous hermes nous-key openrouter" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "add" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--kind --provider --label --api-key-env --billing-key-env --hermes-home --budget-usd-month --alert-pct --ttl-secs --disabled" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--kind --provider --label --api-key-env --billing-key-env --hermes-home --id --tool-home --auth-entry --via --probe --probe-model --admin-key-env --budget-usd-month --alert-pct --ttl-secs --disabled" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "refresh" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json --capture" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "monitor" ] && [ "${COMP_WORDS[2]}" = "detect" ]; then
+        COMPREPLY=( $(compgen -W "--json --explain --apply --yes" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "secret" ]; then
+        COMPREPLY=( $(compgen -W "set list rm" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "secret" ] && [ "${COMP_WORDS[2]}" = "set" ]; then
+        COMPREPLY=( $(compgen -W "--stdin --force" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "secret" ] && [ "${COMP_WORDS[2]}" = "list" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "secret" ] && [ "${COMP_WORDS[2]}" = "rm" ]; then
+        COMPREPLY=( $(compgen -W "--yes" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "usage" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --plain --waybar --watch --all --account --provider" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "api" ]; then
@@ -127,12 +141,13 @@ _tollgate() {
             'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'usage[print every account'"'"'s quota windows and money meters]' \
             'monitor[list, add, remove and refresh monitoring-only usage sources]' \
+            'secret[manage private monitor secrets]' \
             'api[serve or locate the local agent API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install, link or uninstall the herdr plugin and bind a key to it]' \
             'completions[emit shell completion script]'
-        _values 'option' '--theme[force a color depth instead of auto-detecting]'
+        _values 'option' '--theme[force a color depth instead of auto-detecting]' '--prefer-store[prefer stored secrets over the environment]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
@@ -223,21 +238,45 @@ _tollgate() {
         _values 'subcommand' 'list[list the monitors and their cached figures]' \
             'add[add a monitor to monitors.toml]' \
             'remove[remove a monitor and its cache]' \
-            'refresh[fetch monitors now]'
+            'refresh[fetch monitors now]' \
+            'detect[discover local monitor candidates without network calls]'
         _values 'flag' '--json[emit the monitor list as JSON]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == add && "${words[CURRENT-1]}" == --kind ]]; then
+        _values 'kind' nous ollama_cloud openrouter provider grok antigravity codex_native openai google_ai
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == add && "${words[CURRENT-1]}" == --via ]]; then
+        _values 'transport' keyring cli
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == add ]]; then
-        _values 'flag' '--kind[nous, ollama_cloud, openrouter or provider]' \
+        (( CURRENT == 4 )) && _values 'preset' grok antigravity agy codex-native openai google-ai gemini nous hermes nous-key openrouter
+        _values 'flag' '--kind[nous, ollama_cloud, openrouter, provider, grok, antigravity, codex_native, openai or google_ai]' \
             '--provider[with --kind provider: the typed provider]' \
             '--label[human name]' \
             '--api-key-env[NAME of the env var holding the api key]' \
             '--billing-key-env[NAME of the env var holding a monitoring-only key]' \
             '--hermes-home[with --kind nous: the Hermes home]' \
+            '--id[override preset id]' \
+            '--tool-home[native CLI home]' \
+            '--auth-entry[Grok login map entry]' \
+            '--via[keyring or cli]' \
+            '--probe[enable free Nous health probe]' \
+            '--probe-model[free probe model]' \
+            '--admin-key-env[OpenAI admin key variable name]' \
+
             '--budget-usd-month[monthly budget in USD]' \
             '--alert-pct[notify once past this percent]' \
             '--ttl-secs[refresh interval in seconds]' \
             '--disabled[add it disabled]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == refresh ]]; then
-        _values 'flag' '--json[emit JSON]'
+        _values 'flag' '--json[emit JSON]' '--capture[write private response shape files]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == monitor && "${words[3]}" == detect ]]; then
+        _values 'flag' '--json[emit candidates as JSON]' '--explain[explain credential store shapes]' '--apply[add proposed monitors]' '--yes[confirm adding monitors]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == secret ]]; then
+        _values 'subcommand' 'set[store a secret from hidden input]' 'list[list secret names]' 'rm[remove a stored secret]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == secret && "${words[3]}" == set ]]; then
+        _values 'flag' '--stdin[read one line from stdin]' '--force[replace an existing secret]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == secret && "${words[3]}" == list ]]; then
+        _values 'flag' '--json[emit secret names as JSON]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == secret && "${words[3]}" == rm ]]; then
+        _values 'flag' '--yes[confirm removing the secret]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == usage ]]; then
         _values 'flag' '--json[emit the stable JSON envelope]' '--plain[the text report without colour]' \
             '--waybar[one JSON line for a Waybar module]' '--watch[repeat every N seconds]' \
@@ -288,12 +327,37 @@ complete -c tollgate -f -n __fish_is_first_token -a completions -d "Emit shell c
 complete -c tollgate -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
 complete -c tollgate -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
 complete -c tollgate -f -n __fish_is_first_token -a usage -d "Print every account's quota windows and money meters"
+complete -c tollgate -f -n __fish_is_first_token -a secret -d "Manage private monitor secrets"
+complete -c tollgate -f -n __fish_is_first_token -a --prefer-store -d "Prefer stored secrets over the environment"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret" -a set -d "Store a secret from hidden input"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret" -a list -d "List secret names"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret" -a rm -d "Remove a stored secret"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret; and __fish_seen_subcommand_from set" -a --stdin -d "Read one line from stdin"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret; and __fish_seen_subcommand_from set" -a --force -d "Replace an existing secret"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret; and __fish_seen_subcommand_from list" -a --json -d "Emit secret names as JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from secret; and __fish_seen_subcommand_from rm" -a --yes -d "Confirm removing the secret"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a detect -d "Discover local monitor candidates"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from detect" -a --json -d "Emit JSON"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from detect" -a --explain -d "Explain store shapes"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from detect" -a --apply -d "Add proposed monitors"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from detect" -a --yes -d "Confirm adding monitors"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --id -d "Override preset id"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --tool-home -d "Native CLI home"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --auth-entry -d "Grok login map entry"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --via -d "keyring or cli"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --probe -d "Enable free Nous health probe"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --probe-model -d "Free probe model"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --admin-key-env -d "OpenAI admin key variable name"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from refresh" -a --capture -d "Write private response shape files"
 complete -c tollgate -f -n __fish_is_first_token -a monitor -d "List, add, remove and refresh monitoring-only usage sources"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a list -d "List the monitors and their cached figures"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a add -d "Add a monitor to monitors.toml"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a remove -d "Remove a monitor and its cache"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor" -a refresh -d "Fetch monitors now"
-complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --kind -d "nous, ollama_cloud, openrouter or provider"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -l kind -x -a "nous ollama_cloud openrouter provider grok antigravity codex_native openai google_ai"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -l via -x -a "keyring cli"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a "grok antigravity agy codex-native openai google-ai gemini nous hermes nous-key openrouter"
+complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --kind -d "nous, ollama_cloud, openrouter, provider, grok, antigravity, codex_native, openai or google_ai"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --provider -d "With --kind provider: the typed provider"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --label -d "Human name"
 complete -c tollgate -f -n "__fish_seen_subcommand_from monitor; and __fish_seen_subcommand_from add" -a --api-key-env -d "NAME of the env var holding the api key"

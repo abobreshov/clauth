@@ -229,7 +229,7 @@ The cache never holds a credential; the existing tests pin that.
 
 ### 4.3 Antigravity via keyring (`src/usage/monitor/antigravity.rs`; port of branch `antigravity.rs`)
 1. **Guard** (fact-check caveat). Through a `KeyringProbe` seam, call `org.freedesktop.DBus.NameHasOwner("org.freedesktop.secrets")` on the session bus. With no owner → `Unavailable` "no Secret Service running; tollgate will not start one". This stops D-Bus activation from bringing up a wallet prompt.
-2. **Search.** `SecretService::connect(Dh)` (crate `secret-service` 5.x, `cfg(target_os = "linux")`), then `search_items({service: gemini, username: antigravity})`.
+2. **Search.** Linux Secret Service `SearchItems({service: gemini, username: antigravity})` over zbus. The implementation pins the existing unique D-Bus owner, uses `NoAutoStart`, and opens a local `plain` session only after confirming one unlocked item. It exposes no `Unlock` or `Prompt` call. This lighter path was authorized on 2026-09-29: it reuses the existing Tokio runtime and avoids secret-service's DH/AES and duplicate async runtime dependencies. `/usr/bin/secret-tool lookup` is unsuitable because it can unlock items and prompt; direct zbus exposes both locked and unlocked search results.
    - More than one item in total → `AuthRequired` "several agy logins in the keyring".
    - Only a locked item → `AuthRequired` "keyring locked; unlock your session (tollgate never unlocks it)".
    - Tollgate never calls `unlock` and never creates an item.
@@ -589,7 +589,7 @@ Finally, update the `tests/dump_openapi.rs` golden.
 
 **Slice 1: foundation and native monitors** (tests 1–74)
 - **Code:** `keyed_http::send` plus the header allowlist; the `MonitorHttp::send` and `codex_usage` seams; the `request_allowed` table; `SourceId::{OpenaiApi, GoogleAi}` (stubs, so routes compile); `attribution`; `MonitorKind::{Grok, Antigravity, CodexNative}`, the §3.1 keys and floors; `grok.rs`, `antigravity.rs` (keyring path, `KeyringProbe`), `codex_native.rs`; `src/secrets.rs` and `Command::Secret`, the overlay and scrub unions, `--prefer-store`; presets; `detect`, `--explain`, `--capture`; the herdr codex fallback.
-- **Deps:** `secret-service` (linux), `zeroize`.
+- **Deps:** `zbus` (Linux; existing Tokio runtime, blocking API), `zeroize`.
 - **Docs:** `wiki/Monitors.md`, `CHANGELOG.md`, and plan §10 rows P4b/P4c.
 
 **Slice 2: key monitors and opt-ins** (tests 75–107)

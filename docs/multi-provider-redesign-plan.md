@@ -870,6 +870,7 @@ The tool shipped as **tollgate** 0.1.0 on `feat/tollgate` (D8). The user-facing 
 | P4-OLL | `Provider::OllamaCloud` + `OllamaDaemon`, `/api/usage` source for both body shapes, `Ollama-Cloud` preset with the env allowlist | No catalog refresh, no plan / `account` label from config |
 | P4-OR | `/key` first, per-meter `/credits`, raw-number exact meters (a)–(f), preset v2, `billing_key_env` | No management-key binding by `organization_id ?? creator_user_id`, no org de-dup; S1(g) and S6 not run |
 | Monitors / P4-NOUS (part) | `monitors.toml`, `tollgate monitor`, per-monitor cache (TTL, 429 hold, 7-day stale, single flight, fingerprint), budgets and `notify-send` alerts, daemon polling; Nous via Hermes' unexpired access token (D10 reader); `provider` monitors; upstream read-only view from `~/.clauth/status.json` | No own Nous device login (S5(a)); the monitor layer is new relative to §5's rows |
+| Lane 4 / P4b (native legs) | Read-only Grok, Linux Antigravity keyring, native Codex; private secret store; monitor presets, offline detect/explain, shape capture | Socket-dependent tests require an owner run outside the sandbox; Grok monetary units and agy CLI print path require owner-run gates; `tollgate providers` remains separate |
 | Agent API | Read-only loopback HTTP (`127.0.0.1:8454`, bearer `~/.tollgate/api-token`) + unix socket, seven routes, OpenAPI, redaction, `tollgate api serve\|token\|url`, MCP `usage` | New relative to §5; documented in `docs/agent-api.md` |
 | herdr H1 / H2 / H4-lite | Usage-aware `$tollgate` tag + `$tollgate_severity`; native `hermes` / `grok` / `agy` panes matched to a single owning account; `tollgate.usage` action (`--tab usage`); `tollgate herdr link` / `unlink` | H4-lite is the usage action only: no `tollgate.swap`. No H2h, H3 narrow popup layout or H5 compat suite |
 
@@ -882,7 +883,7 @@ The tool shipped as **tollgate** 0.1.0 on `feat/tollgate` (D8). The user-facing 
 | Hermes as a harness: `Harness::Hermes`, homes and guards, `tollgate hermes new\|auth`, `hermes_local` estimate, pool view, relaunch-to-switch | H-1a–H-4 |
 | TUI restyle of all tabs and consolidation 8 → 6 with the `HomeTab` alias map | P5 (only the Usage tab's monitor cards landed), P5b |
 | Fork-signed self-update: new minisign key, release workflow, mandatory verification in `install.sh` | R1 |
-| Grok / Antigravity legs, `tollgate providers`, Anthropic Admin and other management sources, a local estimate for Claude Code | P4b, P4c, P4d |
+| `tollgate providers`, Anthropic Admin and other management sources, a local estimate for Claude Code | Remaining P4b, P4c, P4d |
 | The spikes S1–S8 | — |
 
 **Known gaps found in review** (also in `CHANGELOG.md`): `tollgate login` still runs the Claude OAuth flow in guest mode; `list` and `status --json` print `base_url` unredacted; `tollgate api serve` leaves `api.sock` on SIGTERM; the herdr `--display-agent` scope is unverified.

@@ -1,0 +1,1 @@
+{"config":{"creditUsagePercent":123.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":2000000000,"end":2000604800},"productUsage":[{"product":"Chat","usagePercent":123.0}],"prepaidBalance":{"val":10000}}}

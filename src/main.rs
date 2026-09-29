@@ -44,6 +44,7 @@ mod profile_cache;
 mod profile_json;
 mod providers;
 mod runtime;
+mod secrets;
 mod sessions;
 mod sessions_cli;
 mod settings_sync;
@@ -223,6 +224,7 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    secrets::configure_prefer_store(cli.prefer_store);
     // `--theme` is a root-level global, so it parses ahead of any subcommand
     // and is accepted (and ignored) on the non-TUI paths.
     let theme_override = cli.theme.map(|t| match t {
@@ -239,6 +241,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
 
     match command {
+        Command::Secret { cmd } => secrets::dispatch(cmd),
         Command::Start(a) => cmd_start(
             &a.target(),
             &a.passthrough(),

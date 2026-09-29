@@ -152,6 +152,9 @@ pub(crate) fn redact(obs: &mut AccountObservation) {
     }
     for w in &mut obs.windows {
         w.label = sanitize_message(&w.label);
+        for share in &mut w.attribution {
+            share.label = sanitize_message(&share.label);
+        }
     }
     for m in &mut obs.money {
         m.label = sanitize_message(&m.label);
@@ -315,6 +318,8 @@ pub(crate) const CATALOG: &[SourceId] = &[
     SourceId::Alibaba,
     SourceId::Grok,
     SourceId::Antigravity,
+    SourceId::OpenaiApi,
+    SourceId::GoogleAi,
     SourceId::Generic,
     SourceId::UpstreamClauth,
 ];
@@ -324,9 +329,10 @@ pub(crate) const CATALOG: &[SourceId] = &[
 pub(crate) fn auth_kinds(source: SourceId) -> &'static [AuthKind] {
     use AuthKind::{ApiKey, Hybrid, NativeLogin, ReadOnly, Subscription};
     match source {
-        SourceId::AnthropicOauth | SourceId::Codex | SourceId::Grok | SourceId::Antigravity => {
-            &[Subscription]
-        }
+        SourceId::AnthropicOauth => &[Subscription],
+        SourceId::Codex | SourceId::Grok | SourceId::Antigravity => &[Subscription, NativeLogin],
+        SourceId::OpenaiApi => &[ApiKey, ReadOnly],
+        SourceId::GoogleAi => &[ApiKey],
         SourceId::Ollama | SourceId::Hermes => &[NativeLogin],
         SourceId::OllamaCloud => &[ApiKey, ReadOnly],
         SourceId::OpenRouter => &[ApiKey, Hybrid, ReadOnly],

@@ -252,6 +252,7 @@ fn portal_statuses_become_typed_failures() {
     let limited = FakeHttp {
         bearer_reply: Box::new(|_| {
             Ok(HttpReply {
+                headers: Vec::new(),
                 status: 429,
                 body: String::new(),
                 retry_after_secs: Some(900),

@@ -34,6 +34,9 @@ pub(crate) const DEFAULT_LISTEN: &str = crate::identity::DEFAULT_LISTEN;
                   The color depth can also be pinned in ~/.tollgate/profiles.toml with `theme = \"full\"`."
 )]
 pub(crate) struct Cli {
+    /// Prefer stored monitoring credentials over environment values.
+    #[arg(long, global = true)]
+    pub(crate) prefer_store: bool,
     /// Force a color depth instead of auto-detecting one (TUI only).
     // `display_order` keeps the propagated copy at the bottom of every
     // subcommand's option list instead of clap's default slot near the top,
@@ -79,6 +82,11 @@ pub(crate) enum ThemeArg {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Manage private monitoring credentials (values never enter argv).
+    Secret {
+        #[command(subcommand)]
+        cmd: crate::secrets::SecretCommand,
+    },
     /// Launch claude under a profile, in a per-profile CLAUDE_CONFIG_DIR
     ///
     /// Args tollgate does not recognize go to `claude` untouched, leading hyphens

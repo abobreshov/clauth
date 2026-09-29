@@ -210,31 +210,39 @@ fn closed_stdout(home: &Path, args: &[&str]) -> std::process::Output {
         .expect("run tollgate")
 }
 
-/// `tollgate <args>` with stdout pointed at a socket whose send buffer is
-/// already full and whose peer never reads, so every write fails with `EAGAIN`
+/// `tollgate <args>` with stdout pointed at a pipe whose buffer is
+/// already full and whose reader never reads, so every write fails with `EAGAIN`
 /// instead of the `EPIPE` a closed pipe gives: the write-error arm the
 /// closed-pipe tests never exercise. A full buffer is the one write fault that
 /// fails the same way on every Unix runner — the Linux `/dev/full` has no
 /// macOS twin, and a read-only handle's `EBADF` is what stdio swallows, not
 /// what tollgate sees.
 fn full_stdout(home: &Path, args: &[&str]) -> std::process::Output {
-    let (peer, writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-    writer.set_nonblocking(true).expect("nonblocking write end");
+    let (peer, writer) = std::io::pipe().expect("pipe");
+    use std::os::fd::AsRawFd;
+    // SAFETY: writer owns a live pipe descriptor; fcntl only changes its flags.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        let flags = libc::fcntl(writer.as_raw_fd(), libc::F_GETFL);
+        assert!(flags >= 0, "read pipe flags");
+        libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+    };
+    assert_eq!(result, 0, "nonblocking write end");
     let mut filler = writer.try_clone().expect("clone the write end");
-    // Fill the send buffer to capacity: a write that stops at `EAGAIN` has met
+    // Fill the pipe buffer to capacity: a write that stops at `EAGAIN` has met
     // a full buffer, and a full buffer is what every later write meets too.
     let chunk = [0u8; 8192];
     loop {
         match filler.write(&chunk) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => panic!("fill the send buffer: {e}"),
+            Err(e) => panic!("fill the pipe buffer: {e}"),
         }
     }
     drop(filler);
     let out = tollgate(home)
         .args(args)
-        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stdout(Stdio::from(writer))
         .output()
         .expect("run tollgate");
     // `peer` stays open past the child's exit, so the child meets a full

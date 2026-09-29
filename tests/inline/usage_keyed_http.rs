@@ -129,3 +129,73 @@ fn a_stalled_body_ends_at_the_deadline() {
     // Either the call or the body read gave up; no body was invented.
     assert!(reply.as_ref().is_none_or(|r| r.body.is_none()), "{reply:?}");
 }
+
+#[test]
+fn send_keeps_only_allowlisted_response_headers() {
+    let (url, server) = serve_once(|mut s| {
+        read_head(&mut s);
+        write!(s, "HTTP/1.1 200 OK\r\nX-Ratelimit-Limit-Requests: 60\r\nX-Nous-Credits-Remaining-Micros: 1000\r\nSet-Cookie: TOKEN-CANARY\r\nX-Secret: TOKEN-CANARY\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+    });
+    let reply = send(
+        agent(),
+        &Request {
+            method: Method::Get,
+            url: &url,
+            auth: Auth::None,
+            extra: &[],
+            json_body: None,
+        },
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        reply.headers,
+        vec![
+            ("x-ratelimit-limit-requests".into(), "60".into()),
+            ("x-nous-credits-remaining-micros".into(), "1000".into())
+        ]
+    );
+    assert!(!format!("{:?}", reply.headers).contains("CANARY"));
+}
+
+#[test]
+fn send_never_follows_a_redirect_for_post() {
+    let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    target.set_nonblocking(true).unwrap();
+    let location = format!("http://{}/steal", target.local_addr().unwrap());
+    let (url, server) = serve_once(move |mut s| {
+        let head = read_head(&mut s);
+        assert!(head.starts_with("POST "));
+        assert!(head.to_lowercase().contains("user-agent: antigravity"));
+        write!(s, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let token = crate::usage::monitor::source::Secret::new("TOKEN-CANARY");
+    assert!(
+        send(
+            agent(),
+            &Request {
+                method: Method::Post,
+                url: &url,
+                auth: Auth::Bearer(&token),
+                extra: &[("User-Agent", "antigravity")],
+                json_body: Some(b"{}")
+            }
+        )
+        .is_none()
+    );
+    server.join().unwrap();
+    assert!(target.accept().is_err());
+}
+
+#[test]
+fn response_header_bounds_and_exact_names() {
+    assert!(response_header_allowed("x-nous-tool-pool-free"));
+    assert!(!response_header_allowed("retry-after-secret"));
+    let (url, server) = serve_once(|mut s| {
+        read_head(&mut s);
+        write!(s, "HTTP/1.1 200 OK\r\nX-Ratelimit-Limit: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "1".repeat(300)).unwrap();
+    });
+    let reply = get_bearer(&url, "CANARY").unwrap();
+    server.join().unwrap();
+    assert_eq!(reply.headers[0].1.len(), 256);
+}

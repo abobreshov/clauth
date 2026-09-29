@@ -330,3 +330,77 @@ fn a_process_variable_is_refused_as_a_key_name() {
     validate_env_name("OPENROUTER_API_KEY").unwrap();
     validate_env_name("MY_PATH_KEY").unwrap();
 }
+
+#[test]
+fn new_keys_are_refused_outside_their_kinds() {
+    for (field, value) in [
+        ("tool_home", "\"~/tool\""),
+        ("auth_entry", "\"issuer::client\""),
+        ("via", "\"keyring\""),
+        ("probe", "true"),
+        ("probe_model", "\"model:free\""),
+    ] {
+        let text = format!(
+            "[[monitor]]\nid = \"or\"\nkind = \"openrouter\"\napi_key_env = \"TEST_KEY\"\n{field} = {value}\n"
+        );
+        let error = parse(&text).unwrap_err().to_string();
+        assert!(error.contains(field), "{field}: {error}");
+    }
+    for (kind, field, value) in [
+        ("grok", "tool_home", "~/grok"),
+        ("grok", "auth_entry", "issuer::client"),
+        ("codex_native", "tool_home", "~/codex"),
+        ("antigravity", "via", "keyring"),
+        ("nous", "probe_model", "model:free"),
+    ] {
+        let text =
+            format!("[[monitor]]\nid = \"test\"\nkind = \"{kind}\"\n{field} = \"{value}\"\n");
+        assert!(parse(&text).is_ok(), "{text}");
+    }
+}
+
+#[test]
+fn ttl_floors_per_kind() {
+    for (kind, floor, default) in [
+        (MonitorKind::Grok, 120, 300),
+        (MonitorKind::Antigravity, 300, 600),
+        (MonitorKind::CodexNative, 120, 300),
+        (MonitorKind::Openai, 300, 900),
+        (MonitorKind::GoogleAi, 300, 900),
+    ] {
+        let mut m = MonitorConfig::new("test", kind);
+        m.api_key_env =
+            matches!(kind, MonitorKind::Openai | MonitorKind::GoogleAi).then(|| "TEST_KEY".into());
+        assert_eq!(m.ttl_ms(), default * 1000);
+        m.ttl_secs = Some(floor - 1);
+        assert!(m.validate().is_err(), "{kind:?}");
+        m.ttl_secs = Some(floor);
+        assert!(m.validate().is_ok(), "{kind:?}");
+    }
+    let mut nous = MonitorConfig::new("nous", MonitorKind::Nous);
+    nous.probe = true;
+    nous.api_key_env = Some("TEST_KEY".into());
+    assert_eq!(nous.ttl_ms(), 1_800_000);
+    nous.ttl_secs = Some(899);
+    assert!(nous.validate().is_err());
+    nous.ttl_secs = Some(900);
+    assert!(nous.validate().is_ok());
+}
+
+#[test]
+fn fingerprint_covers_new_keys() {
+    let m = MonitorConfig::new("test", MonitorKind::Grok);
+    let base = m.fingerprint();
+    for field in ["tool_home", "auth_entry", "via", "probe", "probe_model"] {
+        let mut changed = m.clone();
+        match field {
+            "tool_home" => changed.tool_home = Some("~/other".into()),
+            "auth_entry" => changed.auth_entry = Some("entry".into()),
+            "via" => changed.via = Some("cli".into()),
+            "probe" => changed.probe = true,
+            "probe_model" => changed.probe_model = Some("model:free".into()),
+            _ => unreachable!(),
+        }
+        assert_ne!(base, changed.fingerprint(), "{field}");
+    }
+}

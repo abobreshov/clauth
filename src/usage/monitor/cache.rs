@@ -204,7 +204,8 @@ pub(crate) fn refresh_one(
 
     let home = crate::profile::home_dir()?;
     let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
-    let target = resolve_target(cfg, &home, now_secs, deps.env);
+    let mut target = resolve_target(cfg, &home, now_secs, deps.env);
+    target.previous = prev.as_ref().and_then(|c| c.reading.clone());
     let result = source_for(cfg.kind).fetch(&target, deps.http);
     drop(target);
 
@@ -228,7 +229,12 @@ pub(crate) fn refresh_one(
                     .retry_after
                     .and_then(|t| u64::try_from(t.secs()).ok())
                     .map(|s| s.saturating_mul(1000));
-                let floor = now_ms.saturating_add(RATE_LIMIT_HOLD_MS);
+                let hold = if cfg.kind == super::config::MonitorKind::Antigravity {
+                    15 * 60_000
+                } else {
+                    RATE_LIMIT_HOLD_MS
+                };
+                let floor = now_ms.saturating_add(hold);
                 next.hold_until_ms = Some(retry_ms.map_or(floor, |r| r.max(floor)));
             }
             next.failure = Some(failure);

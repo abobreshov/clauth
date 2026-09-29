@@ -518,6 +518,8 @@ pub(crate) enum SourceId {
     Alibaba,
     Grok,
     Antigravity,
+    OpenaiApi,
+    GoogleAi,
     /// An unrecognised api-key endpoint read by the best-effort scanner.
     Generic,
     /// Upstream clauth's own caches, read-only.
@@ -542,6 +544,8 @@ impl SourceId {
             Self::Alibaba => "alibaba",
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
+            Self::OpenaiApi => "openai_api",
+            Self::GoogleAi => "google_ai",
             Self::Generic => "generic",
             Self::UpstreamClauth => "upstream_clauth",
         }
@@ -563,6 +567,8 @@ impl SourceId {
             Self::Alibaba => "Alibaba",
             Self::Grok => "Grok",
             Self::Antigravity => "Antigravity",
+            Self::OpenaiApi => "OpenAI API",
+            Self::GoogleAi => "Google AI Studio",
             Self::Generic => "generic",
             Self::UpstreamClauth => "clauth",
         }
@@ -839,6 +845,8 @@ pub(crate) struct QuotaWindow {
     pub(crate) limit: Option<f64>,
     /// Per-model request counts inside this window (Ollama); informational.
     pub(crate) breakdown: Vec<ModelCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) attribution: Vec<Share>,
 }
 
 impl QuotaWindow {
@@ -856,8 +864,15 @@ impl QuotaWindow {
             used: None,
             limit: None,
             breakdown: Vec::new(),
+            attribution: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Share {
+    pub(crate) label: String,
+    pub(crate) used_pct: f64,
 }
 
 /// What a window's counter covers. `{"kind": "shared"}`,

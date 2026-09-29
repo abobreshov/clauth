@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Native monitors and secret store
+
+- Added read-only Grok, Antigravity (Linux Secret Service), and native Codex monitors. Borrowed tokens are never refreshed; expired or undated tokens make no network call. Managed Codex store symlinks are refused.
+- Added monitor presets, offline `monitor detect --explain`, and private `monitor refresh --capture DIR` structure dumps. Detection never executes a CLI or reads a keyring secret.
+- Added `secret set|list|rm` with hidden input, an atomic private store, environment-first lookup (`--prefer-store` reverses it), and stored-name child environment scrubbing.
+
 ### Guest mode
 
 - The Plugin tab's Claude Code plugin install and `mcpServers` wiring, `tollgate herdr install` / `uninstall` and the Plugin tab's herdr config fix now run in guest mode instead of refusing. They add, change or remove only tollgate's own entries: `tollgate@tollgate` in the plugin registry and `enabledPlugins`, the `tollgate` marketplace declaration in `settings.json`'s `extraKnownMarketplaces`, `mcpServers.tollgate` in `~/.claude.json`, the herdr plugin `tollgate` and the herdr config blocks under tollgate's marker (the keybinding conflict check still applies).
