@@ -95,7 +95,7 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     crate::testutil::buffer_rows(term.backend().buffer())
 }
 
-/// A header row's content past the claude-glyph column (0..10).
+/// A header row's content past the logo column (0..10).
 fn row_content(app: &App, width: u16, row: usize) -> String {
     render_header_rows(app, width)[row]
         .chars()
@@ -582,5 +582,186 @@ fn the_word_accounts_renders_on_the_panel_title_alone() {
         rows[carrying[0]].starts_with("╭─ ACCOUNTS "),
         "and it is the accounts panel's title: {:?}",
         rows[carrying[0]]
+    );
+}
+
+// ── The logo ─────────────────────────────────────────────────────────────
+//
+// Three rows of nine cells in the 10-cell logo column, block and quadrant
+// glyphs only, drawn in `accent_2`. The candidates the owner picks from are
+// kept here at real size; `cargo nextest run logo_candidates --no-capture`
+// prints them as the terminal draws them.
+
+/// The wired mark first, then the alternatives `header.rs` keeps commented.
+const LOGO_CANDIDATES: [(&str, [&str; 3]); 3] = [
+    ("booth", LOGO),
+    ("gantry", ["▗▄▄▄▄▄▄▄▖", "▐▌▄ ▄ ▄▐▌", "▐▌     ▐▌"]),
+    ("gauge", [" ▗▄▀▀▀▄▖ ", "▗▘   ▞ ▝▖", "▐▄▄▄▟▄▄▄▌"]),
+];
+
+/// The upstream clauth mascot this mark replaced.
+const UPSTREAM_MASCOT: [&str; 4] = [" ▐▛███▜▌ ", " ▐█████▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  "];
+
+/// A candidate drawn alone into the 10 × 3 logo column, as `draw_logo` draws.
+fn render_logo(rows: [&str; 3]) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(10, 3)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(logo_lines(rows)).style(theme::base()),
+            area,
+        );
+    })
+    .unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The header drawn with the animation clock pinned at `anim_ms`.
+fn render_header_at(anim_ms: u64, width: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
+    let mut app = app_with(Vec::new(), None);
+    app.anim_phase_ms = Some(anim_ms);
+    let mut term = Terminal::new(TestBackend::new(width, header_height(&app))).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, &app);
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    (crate::testutil::buffer_rows(&buf), buf)
+}
+
+fn is_block_glyph(c: char) -> bool {
+    c == ' ' || ('\u{2580}'..='\u{259f}').contains(&c)
+}
+
+#[test]
+fn logo_candidates_fill_the_three_by_nine_footprint_in_block_glyphs() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (name, rows) in LOGO_CANDIDATES {
+        let drawn = render_logo(rows);
+        eprintln!("{name}:");
+        for line in &drawn {
+            eprintln!("  |{line}|");
+        }
+        for (y, row) in rows.iter().enumerate() {
+            assert_eq!(row.chars().count(), 9, "{name} row {y} is nine cells");
+            assert!(
+                row.chars().all(is_block_glyph),
+                "{name} row {y} is block and quadrant glyphs only: {row:?}"
+            );
+            assert!(
+                row.chars().any(|c| c != ' '),
+                "{name} row {y} carries ink: {row:?}"
+            );
+            assert_eq!(
+                drawn[y],
+                format!("{row} "),
+                "{name} row {y} draws as written, the tenth cell a gap"
+            );
+        }
+        assert!(
+            !UPSTREAM_MASCOT.iter().any(|m| rows.contains(m)),
+            "{name} shares no row with the upstream mascot"
+        );
+    }
+}
+
+#[test]
+fn every_logo_alternative_stays_commented_beside_the_wired_one() {
+    let source = include_str!("../../src/tui/render/header.rs");
+    for (name, rows) in &LOGO_CANDIDATES[1..] {
+        let line = format!(
+            "// {:<8}[\"{}\", \"{}\", \"{}\"]",
+            format!("{name}:"),
+            rows[0],
+            rows[1],
+            rows[2]
+        );
+        assert!(
+            source.contains(&line),
+            "header.rs keeps the {name} alternative as one comment line: {line}"
+        );
+    }
+    for mascot in UPSTREAM_MASCOT {
+        assert!(
+            !source.contains(mascot),
+            "the upstream mascot row {mascot:?} is gone from header.rs"
+        );
+    }
+}
+
+#[test]
+fn the_header_draws_the_logo_in_accent_2_on_both_tiers() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let orange = theme::accent_2_color();
+        if tier == crate::tui::theme::Tier::Compatible {
+            assert!(
+                matches!(orange, ratatui::style::Color::Indexed(_)),
+                "the Compatible tier draws the logo from the 256-colour palette: {orange:?}"
+            );
+        }
+        let width = 100u16;
+        let (rows, buf) = render_header_at(1000, width);
+        for (y, want) in LOGO.iter().enumerate() {
+            let cells: String = rows[y].chars().take(10).collect();
+            assert_eq!(cells, format!("{want} "), "{tier:?} logo row {y}");
+            for (x, c) in want.chars().enumerate() {
+                if c != ' ' {
+                    assert_eq!(
+                        buf.content[y * width as usize + x].fg,
+                        orange,
+                        "{tier:?} logo cell ({x}, {y}) renders accent_2"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Orange once per screen: with no active account the logo is the header's
+/// only `accent_2` ink.
+#[test]
+fn the_logo_is_the_only_orange_in_the_header() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let orange = theme::accent_2_color();
+    let width = 100usize;
+    let (rows, buf) = render_header_at(1000, width as u16);
+    for (y, row) in rows.iter().enumerate() {
+        for x in 10..width {
+            let cell = &buf.content[y * width + x];
+            assert!(
+                cell.fg != orange && cell.bg != orange,
+                "no orange past the logo column at ({x}, {y}): {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_booth_window_flickers_on_the_six_second_beat() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (ms, lit) in [
+        (0, true),
+        (199, true),
+        (200, false),
+        (5999, false),
+        (6100, true),
+    ] {
+        let (rows, _buf) = render_header_at(ms, 60);
+        let logo: Vec<String> = rows.iter().map(|r| r.chars().take(9).collect()).collect();
+        let mid = if lit { LOGO_FLICKER_MID } else { LOGO[1] };
+        assert_eq!(logo, [LOGO[0], mid, LOGO[2]], "logo at {ms} ms");
+    }
+    assert_ne!(LOGO_FLICKER_MID, LOGO[1], "the flicker frame differs");
+    assert_eq!(
+        LOGO_FLICKER_MID.chars().count(),
+        9,
+        "the flicker frame keeps the footprint"
     );
 }

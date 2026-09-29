@@ -1,6 +1,6 @@
-//! Top bar: claude glyph on the left; brand, usage gauge and status source in
-//! the text column to the right. Three rows always — [`header_height`] keeps
-//! `render::draw`'s layout in step.
+//! Top bar: the tollgate logo on the left; brand, usage gauge and status
+//! source in the text column to the right. Three rows always —
+//! [`header_height`] keeps `render::draw`'s layout in step.
 //!
 //! Row 0 reads `tollgate vX.Y.Z` on the left with the herdr tag between them,
 //! and the `[ daemon ]` health chip on the right edge; it sheds the tag first,
@@ -346,26 +346,41 @@ fn daemon_chip_color(app: &App) -> ratatui::style::Color {
     }
 }
 
-fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let blink = (app.anim_ms() % 6000) < 200;
+// ── Logo ─────────────────────────────────────────────────────────────────
 
-    let style = Style::default().fg(theme::accent_2_color());
+/// The tollgate mark: a toll booth (roof, lit window, base) with its barrier
+/// arm raised on the diagonal. Three rows of nine cells, block and quadrant
+/// glyphs only, so it draws the same on the Full and the Compatible tier.
+/// Alternatives in the same footprint (swap into `LOGO` to try one):
+// gantry: ["▗▄▄▄▄▄▄▄▖", "▐▌▄ ▄ ▄▐▌", "▐▌     ▐▌"]
+// gauge:  [" ▗▄▀▀▀▄▖ ", "▗▘   ▞ ▝▖", "▐▄▄▄▟▄▄▄▌"]
+const LOGO: [&str; 3] = ["▄▄▄▄   ▄▀", "▐▛▜▌ ▄▀  ", "▐██▌▀    "];
 
-    let logo_top = if blink {
-        " ▐█████▌ "
+/// The window row while the booth light flickers on: the 200 ms beat every
+/// 6 s that the upstream mascot spent on its blink.
+const LOGO_FLICKER_MID: &str = "▐██▌ ▄▀  ";
+
+/// The logo rows for this frame, flicker applied.
+fn logo_rows(app: &App) -> [&'static str; 3] {
+    let flicker = (app.anim_ms() % 6000) < 200;
+    if flicker {
+        [LOGO[0], LOGO_FLICKER_MID, LOGO[2]]
     } else {
-        " ▐▛███▜▌ "
-    };
-    let logo_mid = "▝▜█████▛▘";
-    let logo_eyes = "  ▘▘ ▝▝  ";
+        LOGO
+    }
+}
 
-    let lines = vec![
-        Line::from(Span::styled(logo_top, style)).alignment(Alignment::Left),
-        Line::from(Span::styled(logo_mid, style)).alignment(Alignment::Left),
-        Line::from(Span::styled(logo_eyes, style)).alignment(Alignment::Left),
-    ];
+/// The logo rows as lines in `accent_2` — the screen's one orange mark beside
+/// the active-account marker.
+fn logo_lines<'a>(rows: [&'a str; 3]) -> Vec<Line<'a>> {
+    let style = Style::default().fg(theme::accent_2_color());
+    rows.into_iter()
+        .map(|row| Line::from(Span::styled(row, style)).alignment(Alignment::Left))
+        .collect()
+}
 
-    let para = Paragraph::new(lines).style(theme::base());
+fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let para = Paragraph::new(logo_lines(logo_rows(app))).style(theme::base());
     frame.render_widget(para, area);
 }
 
