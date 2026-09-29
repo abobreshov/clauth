@@ -46,7 +46,6 @@ pub(crate) struct CollectCtx<'a> {
     /// The refresh cadence staleness is judged against, ms.
     pub(crate) interval_ms: u64,
     /// Upstream clauth owns `~/.claude` (identity::upstream_active).
-    #[allow(dead_code)] // read by the upstream hooks; none registered yet
     pub(crate) guest_mode: bool,
     /// The caller asked for disabled profiles too.
     pub(crate) include_disabled: bool,
@@ -84,6 +83,7 @@ pub(crate) type SourceHook = fn(&CollectCtx<'_>) -> Vec<AccountObservation>;
 /// `crate::usage::ollama::monitor_observations,`. Keep the slice in a stable
 /// order — it is the output order.
 pub(crate) static MONITOR_SOURCES: &[SourceHook] = &[
+    crate::usage::monitor::monitor_observations,
     // append monitor hooks here
 ];
 
@@ -92,6 +92,7 @@ pub(crate) static MONITOR_SOURCES: &[SourceHook] = &[
 ///
 /// **Feature agents: append your hook here.**
 pub(crate) static UPSTREAM_SOURCES: &[SourceHook] = &[
+    crate::usage::upstream::upstream_observations,
     // append upstream hooks here
 ];
 

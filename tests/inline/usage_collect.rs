@@ -328,10 +328,20 @@ fn hooks_append_in_order_and_a_duplicate_id_keeps_the_first() {
     );
 }
 
+/// The shipped slices carry exactly the registered hooks, in output order:
+/// the monitors.toml reader, then the upstream clauth view.
 #[test]
-fn the_shipped_hook_slices_start_empty() {
-    assert!(MONITOR_SOURCES.is_empty());
-    assert!(UPSTREAM_SOURCES.is_empty());
+fn the_shipped_hook_slices_carry_the_registered_hooks() {
+    assert_eq!(MONITOR_SOURCES.len(), 1);
+    assert!(std::ptr::fn_addr_eq(
+        MONITOR_SOURCES[0],
+        crate::usage::monitor::monitor_observations as SourceHook
+    ));
+    assert_eq!(UPSTREAM_SOURCES.len(), 1);
+    assert!(std::ptr::fn_addr_eq(
+        UPSTREAM_SOURCES[0],
+        crate::usage::upstream::upstream_observations as SourceHook
+    ));
 }
 
 #[test]

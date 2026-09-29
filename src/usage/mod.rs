@@ -14,10 +14,15 @@ pub(crate) mod codex_reset;
 pub(crate) mod collect;
 pub(crate) mod derive;
 mod fetch;
+// Monitoring-only sources (`monitors.toml`, the Nous/Hermes reader, the
+// daemon's monitor poll) and upstream clauth's read-only view (plan v3.1
+// §4.2, §4.7, §4.8, §4.0 guest mode).
+pub(crate) mod monitor;
 pub(crate) mod observation;
 pub(crate) mod project;
 pub(crate) mod report;
 mod scheduler;
+pub(crate) mod upstream;
 
 pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,

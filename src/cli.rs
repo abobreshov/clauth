@@ -409,6 +409,23 @@ pub(crate) enum Command {
         provider: Option<String>,
     },
 
+    /// List, add, remove and refresh monitoring-only usage sources
+    ///
+    /// A monitor is an account tollgate watches without launching anything on
+    /// it: a Nous Portal account read through Hermes' login, a billing-only
+    /// OpenRouter key, another provider's key. Monitors live in
+    /// ~/.tollgate/monitors.toml, name their keys by environment variable only,
+    /// are polled by the daemon, and appear in `tollgate usage` as
+    /// `monitor:<id>`. Bare, it lists them.
+    #[command(args_conflicts_with_subcommands = true)]
+    Monitor {
+        /// Emit the monitor list as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        cmd: Option<crate::usage::monitor::cli::MonitorCommand>,
+    },
+
     /// Print the usage / auto-switch snapshot as JSON
     ///
     /// The same shape the daemon writes to ~/.tollgate/status.json.
