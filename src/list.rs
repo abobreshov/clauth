@@ -127,7 +127,11 @@ impl Row {
                 .to_string(),
             five_h,
             seven_d,
-            endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
+            endpoint: entry
+                .base_url
+                .as_deref()
+                .map(crate::local_api::routes::redact_endpoint)
+                .unwrap_or_else(|| "-".to_string()),
             disabled: profile.is_some_and(|p| p.is_disabled()),
             keyless: profile
                 .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),

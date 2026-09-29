@@ -274,6 +274,38 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
     );
 }
 
+#[test]
+fn list_redacts_credentials_in_endpoints() {
+    let _home = HomeSandbox::new();
+    for (raw, safe) in [
+        (
+            "https://user:sk-abc123@host/v1?key=sk-live-XYZ",
+            "https://host/v1",
+        ),
+        (
+            "https://host/v1/sk-or-v1-deadbeef1234567890abcdef",
+            "https://host/v1/[redacted]",
+        ),
+        ("https://host/v1", "https://host/v1"),
+    ] {
+        let profile = Profile::new(
+            "vendor".to_string(),
+            Some(raw.to_string()),
+            Some("sk-test".to_string()),
+        );
+        let config = AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        };
+        let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+        let table = render_table(&config, &entries);
+        assert!(table.contains(safe), "{table}");
+        assert!(!table.contains("sk-"), "{table}");
+        assert!(!table.contains("user:"), "{table}");
+        assert!(!table.contains("?key="), "{table}");
+    }
+}
+
 /// A third-party profile with no inference auth source reads as viable —
 /// indistinguishable from a keyed one — unless the row names the state. The
 /// word is the MCP roster's own `keyless` flag, so the two surfaces cannot

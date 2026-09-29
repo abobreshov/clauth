@@ -44,6 +44,38 @@ fn oauth_profile(name: &str) -> Profile {
 }
 
 #[test]
+fn status_json_redacts_credentials_in_base_url() {
+    let _home = HomeSandbox::new();
+    for (raw, safe) in [
+        (
+            "https://user:sk-abc123@host/v1?key=sk-live-XYZ",
+            "https://host/v1",
+        ),
+        (
+            "https://host/v1/sk-or-v1-deadbeef1234567890abcdef",
+            "https://host/v1/[redacted]",
+        ),
+        ("https://host/v1", "https://host/v1"),
+    ] {
+        let profile = Profile::new(
+            "vendor".to_string(),
+            Some(raw.to_string()),
+            Some("sk-test".to_string()),
+        );
+        let config = AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        };
+        let value = status_value(&config, config.state.refresh_interval_ms, None, false);
+        assert_eq!(value["profiles"][0]["base_url"], safe);
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("sk-"), "{serialized}");
+        assert!(!serialized.contains("user:"), "{serialized}");
+        assert!(!serialized.contains("?key="), "{serialized}");
+    }
+}
+
+#[test]
 fn build_status_top_level_shape_and_active() {
     let _home = HomeSandbox::new();
     let mut config = AppConfig {
