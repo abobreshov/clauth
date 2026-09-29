@@ -791,7 +791,23 @@ case "$1" in
             # Re-add over the same name re-points, like the real CLI.
             printf '%s\n' "$4" > "$CLAUDE_SHIM_MKT_STATE"
             ;;
+          remove)
+            rm -f "$CLAUDE_SHIM_MKT_STATE"
+            if [ -n "$CLAUDE_SHIM_CLOBBER" ]; then
+              printf '{}\n' > "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json"
+            fi
+            ;;
         esac
+        ;;
+      uninstall)
+        rm -f "$CLAUDE_SHIM_STATE"
+        # The worst case again: a CLI that rewrites the shared files keeping
+        # nothing, so only the owned-keys guard can put the other tools'
+        # entries back.
+        if [ -n "$CLAUDE_SHIM_CLOBBER" ]; then
+          printf '{}\n' > "$CLAUDE_CONFIG_DIR/settings.json"
+          printf '{"plugins":{}}\n' > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+        fi
         ;;
       install)
         : > "$CLAUDE_SHIM_STATE"
@@ -2009,4 +2025,471 @@ pub(crate) fn heal_env<'a>(
         pins.push((key, Some(*value)));
     }
     EnvPin::new(home, &pins)
+}
+
+// ── import clauth fixtures (spec docs/specs/import-clauth.md §7) ─────────────
+//
+// An upstream clauth 0.16.0 tree built inside the sandbox home, a byte and
+// metadata snapshot of that home, and a second-handle lock holder. Every
+// token is synthetic and greppable (`sk-ant-oat01-FIXTURE-<p>-<n>`,
+// `FIXTURE-RT-<p>-<n>`), so a leak test can search any output for the
+// `FIXTURE` stem.
+
+/// The access token the fixtures give profile `p`'s `n`-th login.
+pub(crate) fn fixture_access(p: &str, n: u32) -> String {
+    format!("sk-ant-oat01-FIXTURE-{p}-{n}")
+}
+
+/// The refresh token the fixtures give profile `p`'s `n`-th login.
+pub(crate) fn fixture_refresh(p: &str, n: u32) -> String {
+    format!("FIXTURE-RT-{p}-{n}")
+}
+
+/// A Claude Code credentials body for `p`'s `n`-th OAuth login (a rotating
+/// pair, with an `mcpOAuth` block like Claude Code writes).
+pub(crate) fn fixture_oauth_body(p: &str, n: u32) -> String {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": fixture_access(p, n),
+            "refreshToken": fixture_refresh(p, n),
+            "expiresAt": 1_900_000_000_000_i64,
+            "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"],
+            "subscriptionType": "max"
+        },
+        "mcpOAuth": {"srv": {"accessToken": format!("FIXTURE-MCP-{p}-{n}")}}
+    })
+    .to_string()
+}
+
+/// An upstream clauth tree under a [`HomeSandbox`] (`~/.clauth`), plus the
+/// live slots and the tollgate dir a guest-mode tollgate already has.
+#[cfg(unix)]
+pub(crate) struct UpstreamTree {
+    home: PathBuf,
+}
+
+#[cfg(unix)]
+impl UpstreamTree {
+    /// An empty upstream tree: `~/.clauth/profiles/`, `~/.claude/`,
+    /// `~/.tollgate/` (guest mode's own dir).
+    pub(crate) fn new(home: &HomeSandbox) -> Self {
+        let home = home.home().to_path_buf();
+        for dir in [".clauth/profiles", ".claude", ".tollgate"] {
+            std::fs::create_dir_all(home.join(dir)).expect("fixture dir");
+        }
+        Self { home }
+    }
+
+    pub(crate) fn src(&self) -> PathBuf {
+        self.home.join(".clauth")
+    }
+
+    pub(crate) fn dir(&self, p: &str) -> PathBuf {
+        let dir = self.src().join("profiles").join(p);
+        std::fs::create_dir_all(&dir).expect("profile dir");
+        dir
+    }
+
+    pub(crate) fn write(&self, rel: &str, body: &str) -> PathBuf {
+        let path = self.src().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture parent");
+        }
+        std::fs::write(&path, body).expect("fixture write");
+        path
+    }
+
+    /// `profiles.toml` naming `claude` in order, `active` active.
+    pub(crate) fn roster(&self, claude: &[&str], active: Option<&str>) -> &Self {
+        let list = claude
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut body = String::new();
+        if let Some(a) = active {
+            body.push_str(&format!("active_profile = {a:?}\n"));
+        }
+        body.push_str(&format!(
+            "profiles = [{list}]\nfallback_chain = [{list}]\ntheme = \"compatible\"\n\n[serve]\nport = 9999\n"
+        ));
+        self.write("profiles.toml", &body);
+        self
+    }
+
+    /// `codex-profiles.toml` naming `codex`, `active` active.
+    pub(crate) fn codex_roster(&self, codex: &[&str], active: Option<&str>) -> &Self {
+        let list = codex
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut body = String::new();
+        if let Some(a) = active {
+            body.push_str(&format!("active_profile = {a:?}\n"));
+        }
+        body.push_str(&format!("profiles = [{list}]\n"));
+        self.write("codex-profiles.toml", &body);
+        self
+    }
+
+    /// A claude OAuth profile: `credentials.json` (a rotating pair) and the
+    /// non-secret caches the machine carries.
+    pub(crate) fn oauth(&self, p: &str) -> &Self {
+        let dir = self.dir(p);
+        std::fs::write(dir.join("credentials.json"), fixture_oauth_body(p, 1)).expect("creds");
+        std::fs::write(dir.join("account_id.json"), format!("\"acct-{p}\"")).expect("acct");
+        std::fs::write(dir.join("usage_cache.json"), "{\"five_hour\":null}").expect("usage");
+        std::fs::write(dir.join("usage_history.jsonl"), "{\"t\":1}\n").expect("hist");
+        std::fs::write(dir.join("config.toml"), "name = \"x\"\n").expect("config");
+        self
+    }
+
+    /// A rolling-bearer profile: the OAuth pair plus a refresh-less
+    /// `session-token.json` carrying the plan stamp (install source).
+    pub(crate) fn rolling(&self, p: &str) -> &Self {
+        self.oauth(p);
+        let body = serde_json::json!({"claudeAiOauth": {
+            "accessToken": fixture_access(p, 7),
+            "subscriptionType": "max",
+            "scopes": ["user:inference", "user:profile"]
+        }});
+        std::fs::write(self.dir(p).join("session-token.json"), body.to_string()).expect("rolling");
+        self
+    }
+
+    /// A `claude setup-token` mint profile: the pair plus a refresh-less
+    /// `session-token.json` with the setup scopes (install source).
+    pub(crate) fn static_token(&self, p: &str) -> &Self {
+        self.oauth(p);
+        let body = serde_json::json!({"claudeAiOauth": {
+            "accessToken": fixture_access(p, 9),
+            "scopes": ["user:inference", "user:sessions:claude_code"]
+        }});
+        std::fs::write(self.dir(p).join("session-token.json"), body.to_string()).expect("static");
+        self
+    }
+
+    /// An api-key profile: a `config.toml` holding a key, no login.
+    pub(crate) fn api_key(&self, p: &str) -> &Self {
+        std::fs::write(
+            self.dir(p).join("config.toml"),
+            format!("base_url = \"https://api.example\"\napi_key = \"FIXTURE-KEY-{p}\"\n"),
+        )
+        .expect("api key");
+        self
+    }
+
+    /// A codex profile: `auth.json`, its last-known-good belt and a
+    /// quarantine verdict.
+    pub(crate) fn codex(&self, p: &str) -> &Self {
+        let body = codex_auth_body(
+            &format!("FIXTURE-CODEX-AT-{p}"),
+            &format!("FIXTURE-CODEX-RT-{p}"),
+        );
+        let dir = self.dir(p);
+        std::fs::write(dir.join("auth.json"), &body).expect("codex auth");
+        std::fs::write(dir.join("auth.lkg.json"), &body).expect("codex lkg");
+        std::fs::write(dir.join("auth.quarantine.json"), "{\"kind\":\"x\"}").expect("codex q");
+        self
+    }
+
+    pub(crate) fn quarantine(&self, p: &str) -> &Self {
+        let q = self.dir(p).join("quarantine");
+        std::fs::create_dir_all(&q).expect("quarantine");
+        std::fs::write(q.join("credentials.json.1"), fixture_oauth_body(p, 0)).expect("q file");
+        self
+    }
+
+    pub(crate) fn mcp_logins(&self, p: &str) -> &Self {
+        std::fs::write(
+            self.dir(p).join("mcp-logins.json"),
+            format!("{{\"mcpOAuth\":{{\"s\":{{\"accessToken\":\"FIXTURE-MCPL-{p}\"}}}}}}"),
+        )
+        .expect("mcp logins");
+        self
+    }
+
+    pub(crate) fn pending(&self, p: &str) -> &Self {
+        std::fs::write(
+            self.dir(p).join("credentials.json.pending"),
+            fixture_oauth_body(p, 2),
+        )
+        .expect("pending");
+        self
+    }
+
+    pub(crate) fn stray_temp(&self, p: &str) -> &Self {
+        std::fs::write(
+            self.dir(p).join(".credentials.json.tmp.4242.0"),
+            fixture_oauth_body(p, 3),
+        )
+        .expect("temp");
+        self
+    }
+
+    /// A second hard link to `p`'s `credentials.json` outside the tree.
+    pub(crate) fn hardlink(&self, p: &str) -> &Self {
+        std::fs::hard_link(
+            self.dir(p).join("credentials.json"),
+            self.home.join("stash.json"),
+        )
+        .expect("hardlink");
+        self
+    }
+
+    /// A stale per-session tree: its `.credentials.json` a regular-file copy
+    /// of the chain (`fake_copy`) or a symlink to the store.
+    pub(crate) fn runtime_tree(&self, p: &str, fake_copy: bool) -> &Self {
+        let rt = self.dir(p).join("runtime-abc");
+        std::fs::create_dir_all(&rt).expect("runtime");
+        let link = rt.join(".credentials.json");
+        if fake_copy {
+            std::fs::write(&link, fixture_oauth_body(p, 1)).expect("fake copy");
+        } else {
+            std::os::unix::fs::symlink(self.dir(p).join("credentials.json"), &link)
+                .expect("runtime link");
+        }
+        self
+    }
+
+    /// `~/.claude/.credentials.json` → `~/.clauth/profiles/<p>/<file>`.
+    pub(crate) fn live_symlink(&self, p: &str, file: &str) -> &Self {
+        let slot = self.home.join(".claude").join(".credentials.json");
+        let _ = std::fs::remove_file(&slot);
+        std::os::unix::fs::symlink(self.dir(p).join(file), slot).expect("slot link");
+        self
+    }
+
+    /// A regular-file slot holding exactly `p`'s install source login.
+    pub(crate) fn live_regular_same(&self, p: &str) -> &Self {
+        let source = crate::claude::install_source_in(&self.dir(p));
+        let bytes = std::fs::read(source).expect("install source");
+        let slot = self.home.join(".claude").join(".credentials.json");
+        let _ = std::fs::remove_file(&slot);
+        std::fs::write(slot, bytes).expect("regular slot");
+        self
+    }
+
+    /// A regular-file slot holding a different login than `p`'s.
+    pub(crate) fn live_regular_diverged(&self, p: &str) -> &Self {
+        let slot = self.home.join(".claude").join(".credentials.json");
+        let _ = std::fs::remove_file(&slot);
+        std::fs::write(slot, fixture_oauth_body(p, 5)).expect("diverged slot");
+        self
+    }
+
+    /// `~/.codex/auth.json` → `~/.clauth/profiles/<p>/auth.json`.
+    pub(crate) fn codex_symlink(&self, p: &str) -> &Self {
+        let dir = self.home.join(".codex");
+        std::fs::create_dir_all(&dir).expect("codex dir");
+        let slot = dir.join("auth.json");
+        let _ = std::fs::remove_file(&slot);
+        std::os::unix::fs::symlink(self.dir(p).join("auth.json"), slot).expect("codex link");
+        self
+    }
+
+    /// A regular `~/.codex/auth.json` copying `p`'s chain.
+    pub(crate) fn codex_regular_copy(&self, p: &str) -> &Self {
+        let dir = self.home.join(".codex");
+        std::fs::create_dir_all(&dir).expect("codex dir");
+        std::fs::copy(self.dir(p).join("auth.json"), dir.join("auth.json")).expect("codex copy");
+        self
+    }
+
+    /// An independent codex login in `~/.codex/auth.json`.
+    pub(crate) fn codex_independent(&self) -> &Self {
+        let dir = self.home.join(".codex");
+        std::fs::create_dir_all(&dir).expect("codex dir");
+        std::fs::write(
+            dir.join("auth.json"),
+            codex_auth_body("FIXTURE-CODEX-AT-own", "FIXTURE-CODEX-RT-own"),
+        )
+        .expect("codex own");
+        self
+    }
+
+    /// A fake upstream `clauth` in `~/bin` that writes a sentinel if it is
+    /// ever run. Returns the bin dir (to pin as the seams' `PATH`).
+    pub(crate) fn upstream_bin(&self) -> PathBuf {
+        let bin = self.home.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        write_shim(&bin, "clauth", "touch \"$(dirname \"$0\")/../RAN-CLAUTH\"");
+        bin
+    }
+
+    pub(crate) fn unknown_entry(&self, rel: &str) -> &Self {
+        self.write(rel, "?");
+        self
+    }
+
+    /// The owner machine's shape (spec header): three claude OAuth profiles,
+    /// `personal` active and the slot a symlink into its store, the caches,
+    /// logs, markers and lock files upstream keeps, and an independent codex
+    /// login.
+    pub(crate) fn reference(&self) -> &Self {
+        self.roster(&["leadtone", "personal", "scifoo"], Some("personal"));
+        for p in ["leadtone", "personal", "scifoo"] {
+            self.oauth(p);
+            std::fs::write(self.dir(p).join("profile_fetched.json"), "1").expect("fetched");
+        }
+        for i in 0..3 {
+            self.write(
+                &format!("conversations/c{i}.json"),
+                &format!("{{\"id\":{i}}}"),
+            );
+        }
+        self.write(
+            "session_profiles.json",
+            "{\"sessions\":{\"s-1\":{\"known\":\"personal\"},\"s-2\":\"contested\"}}",
+        );
+        for dir in ["live_bare", "mcp_live", "completions", "rotation-locks"] {
+            std::fs::create_dir_all(self.src().join(dir)).expect("dir");
+        }
+        for f in [
+            ".completions_installed",
+            ".lock",
+            "usage-fetch.lock",
+            "status.json",
+            "status_cache.json",
+            "ai_pricelog_v4_price_cache.json",
+            "clauth.log",
+        ] {
+            self.write(f, "");
+        }
+        self.live_symlink("personal", "credentials.json");
+        self.codex_independent();
+        self
+    }
+}
+
+/// One path's snapshot: type, inode, mode, link count, link target (with the
+/// home spelled `~`) and content digest.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapNode {
+    pub(crate) kind: &'static str,
+    pub(crate) ino: u64,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u64,
+    pub(crate) link: Option<String>,
+    pub(crate) sha256: Option<String>,
+}
+
+/// A whole-tree snapshot (every path under the home, symlinks not followed).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeSnapshot(pub(crate) BTreeMap<String, SnapNode>);
+
+#[cfg(unix)]
+impl TreeSnapshot {
+    pub(crate) fn of(home: &Path) -> Self {
+        let mut out = BTreeMap::new();
+        snapshot_walk(home, home, &mut out);
+        Self(out)
+    }
+
+    /// The snapshot without every path for which `drop` answers true.
+    pub(crate) fn without(&self, drop: impl Fn(&str) -> bool) -> Self {
+        Self(
+            self.0
+                .iter()
+                .filter(|(k, _)| !drop(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
+
+    /// The snapshot with inodes and link counts zeroed: for comparing two
+    /// different sandboxes' trees by content, type, mode and link text.
+    pub(crate) fn content(&self) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|(k, v)| {
+                    let mut v = v.clone();
+                    v.ino = 0;
+                    v.nlink = 0;
+                    (k.clone(), v)
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn get(&self, rel: &str) -> Option<&SnapNode> {
+        self.0.get(rel)
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_walk(home: &Path, dir: &Path, out: &mut BTreeMap<String, SnapNode>) {
+    use sha2::Digest as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(home)
+            .expect("under home")
+            .display()
+            .to_string();
+        let ft = meta.file_type();
+        let kind = if ft.is_symlink() {
+            "symlink"
+        } else if ft.is_dir() {
+            "dir"
+        } else {
+            "file"
+        };
+        let link = ft.is_symlink().then(|| {
+            std::fs::read_link(&path)
+                .expect("read link")
+                .display()
+                .to_string()
+                .replace(&home.display().to_string(), "~")
+        });
+        let sha256 = ft
+            .is_file()
+            .then(|| hex::encode(sha2::Sha256::digest(std::fs::read(&path).expect("read"))));
+        // A directory's link count is its subdirectory count, and a
+        // symlink's own inode is not the identity a repoint keeps (its
+        // target text is): neither is compared.
+        out.insert(
+            rel,
+            SnapNode {
+                kind,
+                ino: if ft.is_symlink() { 0 } else { meta.ino() },
+                mode: meta.mode() & 0o7777,
+                nlink: if ft.is_dir() { 0 } else { meta.nlink() },
+                link,
+                sha256,
+            },
+        );
+        if ft.is_dir() {
+            snapshot_walk(home, &path, out);
+        }
+    }
+}
+
+/// A flock held from a second open of `path` (created if absent), standing
+/// in for another process: `flock(2)` binds to the open file description, so
+/// it genuinely contends with the code under test. Drop to release.
+pub(crate) struct LockHolder {
+    _file: std::fs::File,
+}
+
+impl LockHolder {
+    pub(crate) fn hold(path: &Path) -> Self {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("lock parent");
+        }
+        let file = crate::profile::open_state_file(path).expect("open lock");
+        file.try_lock().expect("hold the lock");
+        Self { _file: file }
+    }
 }

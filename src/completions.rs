@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor api status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor api status mcp herdr import plugin completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -64,6 +64,16 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "link" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--path" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "import" ]; then
+        COMPREPLY=( $(compgen -W "clauth rollback status" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "import" ] && [ "${COMP_WORDS[2]}" = "clauth" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--dry-run --json --rename --adopt-live --yes -y --resume" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "import" ] && [ "${COMP_WORDS[2]}" = "rollback" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y --json --adopt-live" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "import" ] && [ "${COMP_WORDS[2]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "plugin" ]; then
+        COMPREPLY=( $(compgen -W "install uninstall" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -131,6 +141,8 @@ _tollgate() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install, link or uninstall the herdr plugin and bind a key to it]' \
+            'import[import upstream clauth'"'"'s accounts (dry-run), or read the import journal]' \
+            'plugin[install or remove tollgate'"'"'s Claude Code plugin]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -171,6 +183,22 @@ _tollgate() {
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == link ]]; then
         _values 'flag' '--path[repo root or plugin dir to link]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == import ]]; then
+        _values 'subcommand' 'clauth[import upstream clauth from ~/.clauth]' \
+            'rollback[undo an import]' \
+            'status[print the import journal'"'"'s state]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == import && "${words[3]}" == clauth ]]; then
+        _values 'flag' '--dry-run[print the report and change nothing]' '--json[one JSON document on stdout]' \
+            '--rename[import OLD under the name NEW]' '--adopt-live[import a diverged live slot as its profile]' \
+            '--yes[skip the confirmation]' '-y[skip the confirmation]' '--resume[continue an interrupted import]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == import && "${words[3]}" == rollback ]]; then
+        _values 'flag' '--yes[skip the confirmation]' '-y[skip the confirmation]' '--json[one JSON document on stdout]' \
+            '--adopt-live[roll a diverged live slot back as its profile]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == import && "${words[3]}" == status ]]; then
+        _values 'flag' '--json[one JSON document on stdout]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == plugin ]]; then
+        _values 'subcommand' 'install[install the plugin into ~/.claude]' \
+            'uninstall[remove tollgate'"'"'s plugin and its MCP wiring]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
@@ -327,6 +355,23 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_s
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
 complete -c tollgate -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from link" -a --path -d "Repo root or plugin dir to link"
+complete -c tollgate -f -n __fish_is_first_token -a import -d "Import upstream clauth's accounts (dry-run), or read the import journal"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import" -a clauth -d "Import upstream clauth from ~/.clauth"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import" -a rollback -d "Undo an import"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import" -a status -d "Print the import journal's state"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from clauth" -a --dry-run -d "Print the report and change nothing"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from clauth" -a --json -d "One JSON document on stdout"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from clauth" -a --rename -d "Import OLD under the name NEW"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from clauth" -a --adopt-live -d "Import a diverged live slot as its profile"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from clauth" -a --yes -d "Skip the confirmation"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from clauth" -a --resume -d "Continue an interrupted import"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from rollback" -a --yes -d "Skip the confirmation"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from rollback" -a --json -d "One JSON document on stdout"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from rollback" -a --adopt-live -d "Roll a diverged live slot back as its profile"
+complete -c tollgate -f -n "__fish_seen_subcommand_from import; and __fish_seen_subcommand_from status" -a --json -d "One JSON document on stdout"
+complete -c tollgate -f -n __fish_is_first_token -a plugin -d "Install or remove tollgate's Claude Code plugin"
+complete -c tollgate -f -n "__fish_seen_subcommand_from plugin" -a install -d "Install the plugin into ~/.claude"
+complete -c tollgate -f -n "__fish_seen_subcommand_from plugin" -a uninstall -d "Remove tollgate's plugin and its MCP wiring"
 complete -c tollgate -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c tollgate -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c tollgate -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__tollgate_profiles)" -d Profile

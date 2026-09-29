@@ -70,11 +70,16 @@ impl SessionTokenStatus {
 /// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
 /// corrupt to parse a login out of — same disengaged outcome either way).
 pub(crate) fn session_token_status(name: &ProfileName) -> Option<SessionTokenStatus> {
-    let path = profile_dir(name).ok()?.join("session-token.json");
+    session_token_status_at(&profile_dir(name).ok()?.join("session-token.json"))
+}
+
+/// [`session_token_status`] for the sidecar at `path`, whichever tree holds it
+/// (the import reads upstream clauth's stores by path).
+pub(crate) fn session_token_status_at(path: &Path) -> Option<SessionTokenStatus> {
     if !path.exists() {
         return None;
     }
-    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    let creds = read_json_file::<ClaudeCredentials>(path).ok()?;
     let oauth = creds.claude_ai_oauth.as_ref()?;
     if oauth.refresh_token.is_some() {
         return Some(SessionTokenStatus::NotLongLived);
@@ -896,6 +901,22 @@ pub(crate) fn install_source_path(name: &ProfileName) -> Result<PathBuf> {
         return Ok(dir.join("session-token.json"));
     }
     Ok(dir.join("credentials.json"))
+}
+
+/// [`install_source_path`] evaluated on a profile DIRECTORY rather than a
+/// name: the same content-aware rule (`session-token.json` when it holds a
+/// genuine long-lived login, else `credentials.json`), for a store tollgate
+/// does not own yet. The import records upstream clauth's install source with
+/// it before moving a store and asserts tollgate's agrees afterwards.
+pub(crate) fn install_source_in(dir: &Path) -> PathBuf {
+    let sidecar = dir.join("session-token.json");
+    if matches!(
+        session_token_status_at(&sidecar),
+        Some(SessionTokenStatus::LongLived(_))
+    ) {
+        return sidecar;
+    }
+    dir.join("credentials.json")
 }
 
 /// Whether a switch to `name` would install an OAuth login once its long-lived

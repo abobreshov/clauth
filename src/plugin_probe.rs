@@ -352,6 +352,29 @@ pub(crate) fn wire_mcp_server() -> Result<()> {
     Ok(())
 }
 
+/// Remove `mcpServers.tollgate` from `~/.claude.json`, and `mcpServers`
+/// itself when that leaves it empty. Every other key stays byte-for-byte
+/// what it was in value: the write goes through
+/// `guest_write::guest_additive_write` in every mode, which refuses when
+/// anything but tollgate's own entry would change. Returns whether the file
+/// changed; an absent file or entry is left alone (never created).
+pub(crate) fn unwire_mcp_server() -> Result<bool> {
+    let path = home_dir()?.join(".claude.json");
+    crate::guest_write::guest_additive_write(&path, crate::guest_write::CLAUDE_JSON_KEYS, |root| {
+        let emptied = match root.get_mut("mcpServers") {
+            Some(Value::Object(servers)) => {
+                servers.shift_remove(crate::identity::NAME);
+                servers.is_empty()
+            }
+            _ => false,
+        };
+        if emptied {
+            root.shift_remove("mcpServers");
+        }
+        Ok(())
+    })
+}
+
 /// Set `mcpServers.tollgate` to the canonical entry, creating `mcpServers`
 /// when absent. A non-object `mcpServers` is replaced by a fresh map — which
 /// guest mode's owned-keys check then refuses, since that value is not

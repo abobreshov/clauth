@@ -20,6 +20,10 @@ To wire the server by hand instead, add this to `mcpServers` in `~/.claude.json`
 "tollgate": { "type": "stdio", "command": "tollgate", "args": ["mcp"] }
 ```
 
+## Uninstall
+
+`tollgate plugin uninstall` removes tollgate's own entries and nothing else: the `tollgate@tollgate` plugin (through `claude plugin uninstall`), the `tollgate` marketplace once no plugin from it is left, and the `mcpServers.tollgate` entry in `~/.claude.json` (and `mcpServers` itself if that leaves it empty). Every other tool's keys in `settings.json`, the two plugin registries and `~/.claude.json` stay exactly as they were, in guest mode or not: if the `claude` child changes one, it is put back. Run it from a shell outside Claude Code; under a session's `CLAUDE_CONFIG_DIR` it refuses, since the child would edit that session's config instead. `tollgate plugin install` is the Plugin tab's install from the command line.
+
 The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same five tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes or its context crosses the configured threshold.
 
 ## Tools

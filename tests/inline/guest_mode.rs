@@ -98,6 +98,39 @@ fn no_refresh(
     panic!("guest mode must refuse before the AUTH-1 gate spends a refresh")
 }
 
+/// The journal contract, every state (spec import-clauth.md §3.2): only
+/// `complete` ends guest mode; `import_state` names each one for the status
+/// surfaces and an interrupted one (`pre`, `in_progress`, `rolling_back`)
+/// reads as such. A missing journal is `none`, a torn one `unreadable`.
+#[test]
+fn every_journal_state_reads_back_and_only_complete_ends_guest_mode() {
+    use crate::identity::{ImportState, import_state};
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(UPSTREAM_DATA_DIR_NAME)).unwrap();
+    let data = home.home().join(DATA_DIR_NAME);
+    std::fs::create_dir_all(&data).unwrap();
+    assert_eq!(import_state(), ImportState::None);
+    let journal = data.join(IMPORT_JOURNAL_FILE);
+    for (state, want, interrupted) in [
+        ("pre", ImportState::Pre, true),
+        ("in_progress", ImportState::InProgress, true),
+        ("complete", ImportState::Complete, false),
+        ("rolling_back", ImportState::RollingBack, true),
+        ("rolled_back", ImportState::RolledBack, false),
+        ("aborted", ImportState::Aborted, false),
+    ] {
+        std::fs::write(&journal, format!("{{\"state\":\"{state}\"}}")).unwrap();
+        assert_eq!(import_state(), want, "{state}");
+        assert_eq!(want.as_str(), state);
+        assert_eq!(want.is_interrupted(), interrupted, "{state}");
+        assert_eq!(upstream_active(), state != "complete", "{state}");
+    }
+    std::fs::write(&journal, "{\"state\":").unwrap();
+    assert_eq!(import_state(), ImportState::Unreadable);
+    std::fs::write(&journal, "{\"state\":\"sideways\"}").unwrap();
+    assert_eq!(import_state(), ImportState::Unreadable);
+}
+
 #[test]
 fn upstream_active_needs_the_upstream_dir_and_no_completed_import() {
     let home = HomeSandbox::new();

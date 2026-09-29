@@ -111,6 +111,17 @@ pub(crate) mod rank {
         /// existed — nothing takes `ApiSwitch` while holding `Rotation` — but
         /// the assert is the enforcement, and it was firing on a false premise.
         ApiSwitch = 60;
+        /// `import::fence::Fence` (`tollgate import clauth`, spec
+        /// `docs/specs/import-clauth.md` §4.2): entered ONCE for the whole
+        /// hold, then the fence takes raw file flocks in a fixed order —
+        /// upstream's and tollgate's daemon, standby and fetch leases, every
+        /// upstream rotation-lock file, upstream's state lock — and last
+        /// tollgate's state flock (`State`). Outer to `Rotation` on purpose:
+        /// the per-profile upstream rotation locks are taken raw under this one
+        /// rank, never through `RotationGuard`, whose N nested rank-100
+        /// entries would violate strict ordering. Nothing below `State` is
+        /// entered once the state flock is held.
+        ImportFence = 80;
         /// `RotationGuard` (per-profile rotation flock). Held across HTTP, and
         /// outermost of everything except [`ApiSwitch`], which wraps a whole
         /// REST switch and therefore wraps this too.
@@ -263,6 +274,31 @@ thread_local! {
     static HELD: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    /// Every rank [`RankGuard::enter`] entered on this thread while a
+    /// [`record_entries`] scope is open, in entry order.
+    static ENTERED: std::cell::RefCell<Option<Vec<u16>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` and return every rank entered on this thread while it ran, in
+/// order, next to its result: what a test reads to prove a code path never
+/// entered a rank (the import fence enters nothing below `State` once the
+/// state flock is held). Debug builds only, like the rank stack itself.
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn record_entries<T>(f: impl FnOnce() -> T) -> (T, Vec<u16>) {
+    ENTERED.with(|log| *log.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let entered = ENTERED.with(|log| log.borrow_mut().take().unwrap_or_default());
+    (out, entered)
+}
+
+/// A rank's weight, for comparing a [`record_entries`] log against the order.
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn value_of<R: Rank>() -> u16 {
+    R::VALUE
+}
+
 /// Tracks one held rank on the current thread; pops it on drop. Used directly by
 /// the two file-lock guards ([`crate::lock`]'s state flock and
 /// [`crate::runtime::RotationGuard`]) — not [`Mutex`]es but still in the order.
@@ -291,6 +327,12 @@ impl RankGuard {
                     h.as_slice(),
                 );
                 h.push(rank);
+            });
+            #[cfg(test)]
+            ENTERED.with(|log| {
+                if let Some(log) = log.borrow_mut().as_mut() {
+                    log.push(rank);
+                }
             });
             Self { rank }
         }

@@ -6,7 +6,7 @@ tollgate is a fork of [clauth](https://github.com/uwuclxdy/clauth) and is built 
 
 Guest mode is on when `~/.clauth` exists and `~/.tollgate/import-journal.json` does not record a completed import. It is decided on every run; there is no flag or setting.
 
-The import that would end it (`tollgate import clauth`) is **not implemented yet**. Until it ships, guest mode ends only when `~/.clauth` is gone. Hand-writing an import journal is not a supported way out: nothing would have moved upstream's accounts, and both tools would then write the same files.
+The import that would end it (`tollgate import clauth`) is **not available yet**: this build has only `tollgate import clauth --dry-run`, which lists everything under `~/.clauth` and the live slots with what the import would do to each, every blocker, and the steps it would journal, and changes nothing (add `--json` for one JSON document; `tollgate import status` reads the journal). Until the import ships, guest mode ends only when `~/.clauth` is gone. Hand-writing an import journal is not a supported way out: nothing would have moved upstream's accounts, and both tools would then write the same files.
 
 How to tell:
 

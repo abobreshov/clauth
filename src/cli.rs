@@ -503,6 +503,28 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
+    /// Import upstream clauth's accounts into tollgate, or inspect an import
+    ///
+    /// `tollgate import clauth --dry-run` lists everything under ~/.clauth
+    /// and the live slots with what the import would do to each, every
+    /// blocker, and the steps it would journal, and changes nothing.
+    /// `tollgate import status` reports the import journal's state.
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCommand,
+    },
+
+    /// Install or remove tollgate's Claude Code plugin
+    ///
+    /// `tollgate plugin uninstall` removes only tollgate's own entries:
+    /// the `tollgate@tollgate` plugin and its marketplace, and the manual
+    /// `mcpServers.tollgate` wiring in ~/.claude.json. Every other tool's
+    /// keys in those files stay exactly as they were.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `tollgate completions <bash|zsh|fish>` prints the script to stdout.
@@ -753,6 +775,70 @@ pub(crate) enum ApiCommand {
     },
     /// Print the API's base URL and a curl example for each door
     Url,
+}
+
+/// `tollgate import <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ImportCommand {
+    /// Import upstream clauth 0.16.0 from ~/.clauth
+    ///
+    /// Only `--dry-run` is available in this build: it prints the
+    /// inventory, the live slots, the blockers and the planned steps, and
+    /// changes nothing (it creates no file, not even a lock file).
+    Clauth {
+        /// Print the report and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print one JSON document on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Import upstream profile OLD under the tollgate name NEW (repeatable).
+        #[arg(long, value_name = "OLD=NEW")]
+        rename: Vec<String>,
+        /// Import a regular-file ~/.claude/.credentials.json that differs from
+        /// its profile's stored login as that profile (the stored chain is
+        /// discarded).
+        #[arg(long)]
+        adopt_live: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Continue an interrupted import forward.
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Undo an import
+    Rollback {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Print one JSON document on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Roll a diverged regular-file live slot back as its profile.
+        #[arg(long)]
+        adopt_live: bool,
+    },
+    /// Print the import journal's state and the next step
+    Status {
+        /// Print one JSON document on stdout instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `tollgate plugin <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginCommand {
+    /// Install tollgate's Claude Code plugin into ~/.claude (user scope)
+    Install,
+    /// Remove tollgate's Claude Code plugin and its manual MCP wiring
+    ///
+    /// Runs `claude plugin uninstall tollgate@tollgate` and removes the
+    /// `tollgate` marketplace, then drops `mcpServers.tollgate` from
+    /// ~/.claude.json. Any change the `claude` child makes to another
+    /// tool's keys is put back.
+    Uninstall,
 }
 
 /// `tollgate herdr <cmd>`: install and uninstall the plugin and its config wiring.
