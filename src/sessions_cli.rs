@@ -131,11 +131,18 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
 
     let canonical = resolve_profile_name(&config, &chosen)?;
 
+    // Guest mode: the session's `projects/` is tollgate's guest store, never
+    // the operator's, so the transcript is copied there for `--resume` to find
+    // (`runtime::seed_guest_resume`; a no-op otherwise).
+    crate::runtime::seed_guest_resume(&session.path)?;
+
     let resume_args = vec!["--resume".to_string(), session.id];
     // Shared isolation: a resume adopts the chosen account against the shared
     // store, the same lifecycle a bare `tollgate start <name>` uses. A resume never
     // opts into the fallback chain — there is no `--with-fallback` on this
-    // surface to ask for it.
+    // surface to ask for it. In guest mode the shared runtime it builds is the
+    // guest one (`runtime::build_runtime_dir_with_active_env`), so a resume
+    // links neither `plugins/` nor `projects/` at the operator's trees.
     crate::start::run(
         &config,
         &canonical,

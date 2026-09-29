@@ -4686,6 +4686,11 @@ fn is_session_alive(pid_file: &Path) -> bool {
 /// and, critically, no writable store: its CC (empty settings → default
 /// `cleanupPeriodDays`) can never write or clean the operator's `projects/`.
 ///
+/// In guest mode ([`crate::identity::upstream_active`]) a SHARED session still
+/// links the rest, but never [`GUEST_PRIVATE_CLAUDE_ENTRIES`]: `plugins/` is a
+/// private copy and `projects/` resolves to tollgate's own guest store
+/// ([`place_guest_private_entries`]).
+///
 /// `stale_env_keys` (the outgoing activation's custom env: the active
 /// profile's, or every configured profile's with no marker to read) are
 /// stripped from the shared `settings.json` base before this profile's
@@ -4710,6 +4715,7 @@ fn build_runtime_dir_with_active_env(
     // source gets re-linked by the walk.
     prune_dangling_links(runtime)?;
 
+    let guest = isolation == Isolation::Shared && crate::identity::upstream_active();
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
@@ -4741,11 +4747,23 @@ fn build_runtime_dir_with_active_env(
         if isolation == Isolation::Isolated {
             continue;
         }
+        // Guest mode: these two never link at the operator's trees; they are
+        // placed privately below.
+        if guest
+            && file_name
+                .to_str()
+                .is_some_and(|n| GUEST_PRIVATE_CLAUDE_ENTRIES.contains(&n))
+        {
+            continue;
+        }
         let dst = runtime.join(&file_name);
         if dst.symlink_metadata().is_ok() {
             continue;
         }
         pending.push((entry.path(), dst));
+    }
+    if guest {
+        pending.extend(place_guest_private_entries(runtime, claude_home)?);
     }
     materialize_entries(pending, mode)?;
     write_merged_settings(runtime, claude_home, profile, isolation, stale_env_keys)?;
@@ -4781,6 +4799,126 @@ fn build_runtime_dir(
         isolation,
         &[],
     )
+}
+
+/// The top-level `~/.claude/` entries a GUEST-mode shared session never links
+/// at (nor mirrors with) the operator's tree (plan §4.0: upstream clauth owns
+/// `~/.claude` until an import). `plugins/` holds the Claude Code plugin
+/// registry (`installed_plugins.json`, `known_marketplaces.json`) and the
+/// marketplace clones Claude Code auto-updates at startup, so a linked one lets
+/// a guest session rewrite upstream's registry. `projects/` is the transcript
+/// store every Claude Code session appends to and prunes by
+/// `cleanupPeriodDays`. See [`place_guest_private_entries`] for what each gets
+/// instead.
+const GUEST_PRIVATE_CLAUDE_ENTRIES: &[&str] = &["plugins", "projects"];
+
+/// The dir under the data dir holding guest-mode sessions' own Claude Code
+/// state ([`guest_projects_store`]).
+const GUEST_CLAUDE_STEM: &str = "guest-claude";
+
+/// Guest mode's transcript store, `~/.tollgate/guest-claude/projects`: what a
+/// guest-mode shared session's `projects/` resolves to instead of the
+/// operator's `~/.claude/projects`. Durable and shared across guest sessions,
+/// unlike the rest of a per-session tree, because a shared tree is removed
+/// whole at teardown with no rescue leg (`gc_one_pair_synced`): a
+/// per-session-only `projects/` would delete every guest session's transcript
+/// the moment it exits, and Claude Code's own `/resume` picker could never
+/// reach an earlier one.
+pub(crate) fn guest_projects_store() -> Result<PathBuf> {
+    Ok(tollgate_dir()?.join(GUEST_CLAUDE_STEM).join("projects"))
+}
+
+/// Place a guest-mode shared session's private [`GUEST_PRIVATE_CLAUDE_ENTRIES`],
+/// returning the materializations still to run under the tree's own transport.
+///
+/// - `plugins/` — COPIED at start from the operator's, under both transports.
+///   The runtime `settings.json` is seeded from the operator's base, so its
+///   `enabledPlugins` names plugins whose registry entries and cache must be
+///   present for them to load; an empty dir would start every guest session
+///   with the operator's plugins broken. The copy is the session's to rewrite
+///   (a marketplace auto-update, an install) and dies with the tree. Its cost
+///   is one tree copy per session start (144 MB / 6k files on the reference
+///   install), accepted for a mode that only lasts until the import. A copy
+///   that fails part-way is logged and the session starts on what was copied:
+///   a dangling link in the operator's plugin tree must not refuse a start that
+///   linking it used to allow.
+/// - `projects/` — the guest store ([`guest_projects_store`]), materialized by
+///   the caller like any other entry (a link under real symlinks, a copy the
+///   fake-mode watchdog then mirrors against the store). Copy-on-start from
+///   the operator's is not an option: it is the operator's whole transcript
+///   history (half a gigabyte on the reference install), per session.
+///
+/// A link either name already holds is dropped first unless it is the one this
+/// mode places: a tree built before guest mode began links both at `~/.claude`,
+/// and the additive walk would otherwise keep that link.
+fn place_guest_private_entries(
+    runtime: &Path,
+    claude_home: &Path,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let store = guest_projects_store()?;
+    for name in GUEST_PRIVATE_CLAUDE_ENTRIES {
+        let dst = runtime.join(name);
+        let is_link = dst
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        let ours = *name == "projects" && std::fs::read_link(&dst).is_ok_and(|t| t == store);
+        if is_link && !ours {
+            unlink_link(&dst, "guest-mode operator link");
+        }
+    }
+
+    let plugins_src = claude_home.join("plugins");
+    let plugins_dst = runtime.join("plugins");
+    if plugins_dst.symlink_metadata().is_err()
+        && plugins_src.exists()
+        && let Err(e) = copy_tree(&plugins_src, &plugins_dst)
+    {
+        logline!(
+            "tollgate: guest mode: the private copy of {} is incomplete ({e:#}); \
+             the session starts on what was copied",
+            plugins_src.display()
+        );
+    }
+
+    crate::profile::mkdir_700(&store)
+        .with_context(|| format!("failed to create {}", store.display()))?;
+    let projects_dst = runtime.join("projects");
+    if projects_dst.symlink_metadata().is_err() {
+        return Ok(vec![(store, projects_dst)]);
+    }
+    Ok(Vec::new())
+}
+
+/// Guest mode: give `tollgate resume` the transcript it names inside the guest
+/// store ([`guest_projects_store`]), where the resumed session's Claude Code
+/// looks for it — the session never sees the operator's `~/.claude/projects`.
+/// A COPY (the transcript and its `<id>/` sidecar dir), so the resumed session
+/// appends to tollgate's copy and the operator's file stays byte-identical. A
+/// guest copy already there is kept: it carries whatever an earlier guest
+/// resume appended. A no-op outside guest mode and for a transcript outside
+/// the operator's store.
+pub(crate) fn seed_guest_resume(transcript: &Path) -> Result<()> {
+    if !crate::identity::upstream_active() {
+        return Ok(());
+    }
+    let Ok(rel) = transcript.strip_prefix(claude_dir()?.join("projects")) else {
+        return Ok(());
+    };
+    let dst = guest_projects_store()?.join(rel);
+    if dst.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        crate::profile::mkdir_700(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    copy_file(transcript, &dst)?;
+    let sidecars = transcript.with_extension("");
+    let sidecars_dst = dst.with_extension("");
+    if sidecars.is_dir() && sidecars_dst.symlink_metadata().is_err() {
+        copy_tree(&sidecars, &sidecars_dst)?;
+    }
+    Ok(())
 }
 
 /// Remove top-level symlinks in the runtime whose target no longer resolves
@@ -4854,6 +4992,8 @@ fn unlink_link(path: &Path, label: &str) {
 /// the base and every sibling runtime for the session's lifetime. The two agree
 /// by construction: the syncer writes shared fields back into the base, so this
 /// recompute reproduces the same bytes on the next start instead of undoing it.
+/// In guest mode the syncer is off, and this one-way seed is the only link
+/// between the copy and the operator's base.
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
@@ -5876,13 +6016,26 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
 /// The walk closes with one pass over [`AliasClasses`], which is what keeps two
 /// `~/.claude` names resolving to ONE file from letting sort order decide whose
 /// bytes survive.
+///
+/// Guest mode ([`crate::identity::upstream_active`], plan §4.0) turns the walk
+/// against `~/.claude` ONE-WAY: the operator's edits still reach the runtime,
+/// but nothing is ever written into `~/.claude` — upstream clauth owns it until
+/// an import. [`GUEST_PRIVATE_CLAUDE_ENTRIES`] are left out of that walk
+/// entirely: the runtime's `plugins/` is the session's private copy, and its
+/// `projects/` mirrors both ways with tollgate's own guest store instead
+/// ([`guest_projects_store`]), which is what the real-symlink transport links
+/// it at.
 fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
+    let guest = crate::identity::upstream_active();
     // `.claude.json` is a per-profile copy reconciled by `crate::claude_json`,
     // not part of the `~/.claude/` tree — skip it here so the tree mirror never
     // copies it into `~/.claude/.claude.json`.
-    let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
+    let mut skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
         .into_iter()
         .collect();
+    if guest {
+        skip_top.extend(GUEST_PRIVATE_CLAUDE_ENTRIES);
+    }
     // The one `canonicalize` this walk pays for: every entry below inherits it.
     let root_key = claude_home.canonicalize().ok();
     let mut classes = AliasClasses::default();
@@ -5895,9 +6048,34 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
             &runtime.join(&name),
             root_key.as_deref(),
             &mut classes,
+            !guest,
         )?;
     }
-    classes.converge()
+    // The alias pass publishes the canonical bytes over every runtime copy in
+    // a class, which one-way would turn into reverting a session's own edit
+    // each tick; the per-name pull above already carries the operator's.
+    if !guest {
+        classes.converge()?;
+    }
+    if guest {
+        let store = guest_projects_store()?;
+        let projects = runtime.join("projects");
+        if store.exists() || projects.exists() {
+            crate::profile::mkdir_700(&store)
+                .with_context(|| format!("failed to create {}", store.display()))?;
+            let store_parent_key = store.parent().and_then(|p| p.canonicalize().ok());
+            let mut classes = AliasClasses::default();
+            merge_path(
+                &store,
+                &projects,
+                store_parent_key.as_deref(),
+                &mut classes,
+                true,
+            )?;
+            classes.converge()?;
+        }
+    }
+    Ok(())
 }
 
 /// Runtime copies grouped by the canonical file a mirror write to them lands on.
@@ -6058,11 +6236,14 @@ fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
 /// resolved, threaded down so [`child_key`] costs a join instead of a walk.
 /// `classes` is the walk-scoped alias bookkeeping — see [`AliasClasses`] for why
 /// the mtime comparisons below read the class's clock instead of re-stating `a`.
+/// `write_back` false makes the merge one-way: `a` is only ever read, and a
+/// newer or one-sided `b` stays where it is (guest mode, [`mirror_tree`]).
 fn merge_path(
     a: &Path,
     b: &Path,
     parent_key: Option<&Path>,
     classes: &mut AliasClasses,
+    write_back: bool,
 ) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
@@ -6118,6 +6299,11 @@ fn merge_path(
                 .with_context(|| format!("failed to create {}", b.display()))?;
         }
         if b_is_dir && !a.exists() {
+            // One-way: a runtime-only subtree has nothing to pull, and its
+            // canonical side must not be created.
+            if !write_back {
+                return Ok(());
+            }
             // `a` is the canonical `~/.claude/` side (see `mirror_tree`'s callers) —
             // owner-only like every other dir tollgate creates there, not the
             // process umask, matching the rescue path's `mkdir_700` invariant.
@@ -6125,7 +6311,13 @@ fn merge_path(
                 .with_context(|| format!("failed to create {}", a.display()))?;
         }
         for name in union_children(a, b) {
-            merge_path(&a.join(&name), &b.join(&name), key.as_deref(), classes)?;
+            merge_path(
+                &a.join(&name),
+                &b.join(&name),
+                key.as_deref(),
+                classes,
+                write_back,
+            )?;
         }
         return Ok(());
     }
@@ -6182,7 +6374,7 @@ fn merge_path(
             }
             if mtime_newer(owner_time, b_time) {
                 copy_file(a, b)?;
-            } else if mtime_newer(b_time, owner_time) {
+            } else if write_back && mtime_newer(b_time, owner_time) {
                 copy_file(b, &a_write)?;
                 if let Some(k) = key.as_deref() {
                     classes.adopt_owner_time(k, b_time);
@@ -6192,13 +6384,13 @@ fn merge_path(
         (Some(_), None) => {
             copy_file(a, b)?;
         }
-        (None, Some(_)) => {
+        (None, Some(_)) if write_back => {
             copy_file(b, &a_write)?;
             if let Some(k) = key.as_deref() {
                 classes.adopt_owner_time(k, b_time);
             }
         }
-        (None, None) => {}
+        (None, Some(_)) | (None, None) => {}
     }
     Ok(())
 }
@@ -6596,7 +6788,8 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   link would mutate the operator's own file). Absent operator config copies
 ///   nothing.
 /// - the operator surfaces ([`CODEX_OPERATOR_ENTRIES`]) — shared flavor only,
-///   links (fake: copies); isolated links nothing from the operator.
+///   links (fake: copies); isolated links nothing from the operator. Guest
+///   mode copies under both transports, so no session writes `~/.codex`.
 /// - the durable stores ([`CODEX_DURABLE_ENTRIES`]) — shared flavor under real
 ///   symlinks: links into the profile-global home, dangling until codex
 ///   creates through them, which is the point. Isolated: per-session. Fake:
@@ -6612,13 +6805,26 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
     let global = codex_global_home(name)?;
     let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
 
+    // Guest mode (plan §4.0): `~/.codex` is upstream clauth's until an import,
+    // so an operator surface is COPIED into the home under either transport —
+    // a link would let the session write (a plugin install, a skill edit)
+    // straight into it. A link a pre-guest build left in a reused home is
+    // dropped first, or the additive walk would keep it.
+    let guest = crate::identity::upstream_active();
     let place = |src: &Path, dst: &Path| -> Result<()> {
+        if guest
+            && dst
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            unlink_link(dst, "guest-mode operator link");
+        }
         if dst.symlink_metadata().is_ok() || !src.exists() {
             return Ok(());
         }
         match mode {
-            LinkMode::Real => link_entry(src, dst),
-            LinkMode::Fake => copy_tree(src, dst),
+            LinkMode::Real if !guest => link_entry(src, dst),
+            LinkMode::Real | LinkMode::Fake => copy_tree(src, dst),
         }
     };
 

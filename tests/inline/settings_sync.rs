@@ -729,3 +729,48 @@ fn only_upstreams_plugin_is_per_profile_in_enabled_plugins() {
         KeyRule::Shared
     );
 }
+
+/// Guest mode (plan §4.0, "guest runtime copies are never sync members of the
+/// operator base"): the operator's `~/.claude/settings.json` belongs to
+/// upstream clauth, whose active account keeps its own `[env]` there — keys no
+/// tollgate `config.toml` declares, so the per-profile rule reads them as
+/// shared. Whichever side is newest, nothing crosses: the operator file is
+/// neither written nor pushed into a runtime copy, and a session's own edit
+/// does not travel to a sibling through the reconcile either.
+#[test]
+fn guest_runtime_settings_are_never_members_with_the_operator_file() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage upstream data dir");
+    assert!(crate::identity::upstream_active());
+    let base = base_path(home.home());
+    let s1 = session_runtime_path(home.home(), "p1", "4242-0");
+    let s2 = session_runtime_path(home.home(), "p2", "4343-0");
+
+    // The operator file is newest and carries upstream's account env.
+    write_json(&s1, &json!({"theme": "dark", "env": {}}), t(1));
+    write_json(&s2, &json!({"theme": "dark", "env": {}}), t(2));
+    write_json(
+        &base,
+        &json!({"theme": "light", "env": {"UPSTREAM_ONLY_KEY": "upstream-route"}}),
+        t(10),
+    );
+    let snapshot = || [&base, &s1, &s2].map(|p| fs::read(p).expect("read member"));
+    let before = snapshot();
+    sync();
+    assert_eq!(
+        snapshot(),
+        before,
+        "an operator edit reaches no guest runtime copy, and nothing is written back"
+    );
+
+    // A session edits its own copy: it stays that session's.
+    write_json(&s1, &json!({"theme": "solarized", "env": {}}), t(20));
+    let before = snapshot();
+    sync();
+    assert_eq!(
+        snapshot(),
+        before,
+        "a guest session's edit reaches neither the operator file nor a sibling"
+    );
+}

@@ -28,6 +28,10 @@
 //!   neither propagate outward nor be overwritten by a sibling's — which the
 //!   symmetric [`key_role`] rule gives for free.
 //!
+//! Guest mode (plan §4.0) turns the whole reconcile off: upstream clauth owns
+//! `~/.claude/settings.json`, so a guest runtime copy is seeded from it once at
+//! start and is never a member alongside it (see [`crate::jsonsync::sync_paths`]).
+//!
 //! With no live `tollgate start` session there is nothing to reconcile and nothing
 //! to lose: teardown discards each session's runtime tree, so the base is the
 //! only surviving member and the engine's `members.len() < 2` short-circuit makes
