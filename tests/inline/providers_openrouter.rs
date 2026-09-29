@@ -761,3 +761,164 @@ fn a_wallet_only_fetch_maps_every_failure() {
     ));
     assert!(http.urls().is_empty());
 }
+
+// ── an unbound management wallet (plan §4.7 (a)) ───────────────────────────────
+
+/// A management key from an UNRELATED account: the inference key belongs to
+/// `org_acme_0042` and is healthy, while the management key's own wallet is
+/// overdrawn. That wallet is published as its own unbound meter and must not
+/// decide the inference account's availability: no "balance too low", no
+/// projected `QuotaExhausted`, and no balance row the roster ranks on.
+#[test]
+fn an_unbound_management_wallet_never_drives_the_inference_account() {
+    let usage = fetch_with(body(KEY_LIMITED), body(CREDITS_OVERDRAWN), Some(MANAGEMENT));
+    assert_eq!(
+        usage.wallet.as_ref().map(|w| w.read_with),
+        Some(WalletCredential::Management)
+    );
+    let st = stats(&usage, now());
+    assert!(
+        st.is_available,
+        "an unbound wallet is no verdict on this key"
+    );
+    assert!(
+        !st.rows
+            .iter()
+            .any(|r| r.value == crate::providers::LOW_BALANCE),
+        "{:?}",
+        st.rows
+    );
+    assert!(
+        crate::providers::funded_wallets(&st.rows).is_empty()
+            && !st
+                .rows
+                .iter()
+                .any(|r| crate::providers::is_balance_row(&r.label)),
+        "the unbound wallet never ranks as this account's balance: {:?}",
+        st.rows
+    );
+    // The figure still renders, under its own label.
+    let row = st
+        .rows
+        .iter()
+        .find(|r| r.label == UNBOUND_WALLET_ROW_LABEL)
+        .expect("the monitoring wallet row");
+    assert_eq!(row.value, "-0.20 USD");
+
+    // Its meter is separate and unbound.
+    let observed = st.observed.as_ref().unwrap();
+    let wallet = meter(observed, METER_WALLET).unwrap();
+    assert_eq!(
+        wallet.scope_origin,
+        ScopeOrigin::MonitoringCredential { bound: false }
+    );
+    assert_eq!(wallet.scope_id, None);
+
+    // Projected, the inference account is not exhausted.
+    let mut obs = AccountObservation::new(
+        "claude:or".to_string(),
+        SourceId::OpenRouter,
+        AuthKind::ApiKey,
+        Origin::Profile,
+        "or",
+    );
+    crate::usage::project::apply_third_party(&mut obs, &st, now());
+    assert_eq!(obs.failure, None, "{:?}", obs.failure);
+    assert!(
+        obs.meter(METER_WALLET).is_some(),
+        "the meter is still published"
+    );
+
+    // The same overdrawn wallet read by the inference key itself IS this
+    // account's: unfunded, as before.
+    let own = fetch_with(body(KEY_LIMITED), body(CREDITS_OVERDRAWN), None);
+    assert!(!stats(&own, now()).is_available);
+}
+
+// ── the /credits backoff ────────────────────────────────────────────────────────
+
+fn rate_limited(secs: u64) -> HttpReply {
+    HttpReply::Status {
+        code: 429,
+        retry_after: Some(Duration::from_secs(secs)),
+    }
+}
+
+/// A `/credits` 429 keeps the key meters and holds the wallet credential for
+/// its `Retry-After`: the next fetch inside the hold reads `/key` alone, and
+/// one after it reads `/credits` again.
+#[test]
+fn a_credits_429_holds_the_wallet_for_its_retry_after_and_keeps_the_key() {
+    let holds = WalletHolds::default();
+    let t0: u64 = 1_000_000;
+    let retry = 10 * 60; // past the floor, inside the cap
+    let http = Recorder::new(vec![body(KEY_LIMITED), rate_limited(retry)]);
+    let usage =
+        fetch_openrouter_usage_held(INFERENCE, Some(MANAGEMENT), &http, &holds, t0).unwrap();
+    assert_eq!(usage.wallet, None);
+    assert!(usage.key.limit.is_some(), "the key meters survive");
+    assert!(
+        usage.notes.iter().any(|n| n.contains("429")),
+        "{:?}",
+        usage.notes
+    );
+    assert!(holds.remaining(MANAGEMENT, t0).is_some());
+
+    // Inside the hold: `/key` only, and the note says the wallet is held.
+    let inside = t0 + 60_000;
+    let http = Recorder::new(vec![body(KEY_LIMITED)]);
+    let usage =
+        fetch_openrouter_usage_held(INFERENCE, Some(MANAGEMENT), &http, &holds, inside).unwrap();
+    assert_eq!(http.urls(), [KEY_URL], "no /credits while held");
+    assert!(
+        usage.notes.iter().any(|n| n.contains("held")),
+        "{:?}",
+        usage.notes
+    );
+    let st = stats(&usage, now());
+    assert!(st.is_available);
+    assert!(meter(st.observed.as_ref().unwrap(), "spend.daily").is_some());
+
+    // A different wallet credential is not held.
+    let http = Recorder::new(vec![body(KEY_LIMITED), body(CREDITS_FUNDED)]);
+    fetch_openrouter_usage_held(INFERENCE, None, &http, &holds, inside).unwrap();
+    assert_eq!(http.urls(), [KEY_URL, CREDITS_URL]);
+
+    // Past the Retry-After: `/credits` again.
+    let after = t0 + retry * 1000 + 1;
+    let http = Recorder::new(vec![body(KEY_LIMITED), body(CREDITS_FUNDED)]);
+    let usage =
+        fetch_openrouter_usage_held(INFERENCE, Some(MANAGEMENT), &http, &holds, after).unwrap();
+    assert_eq!(http.urls(), [KEY_URL, CREDITS_URL]);
+    assert!(usage.wallet.is_some());
+}
+
+/// A 429 with no (or a tiny) `Retry-After` still holds for the floor.
+#[test]
+fn a_credits_429_without_retry_after_holds_for_the_floor() {
+    let holds = WalletHolds::default();
+    let http = Recorder::new(vec![body(KEY_LIMITED), status(429)]);
+    fetch_openrouter_usage_held(INFERENCE, None, &http, &holds, 0).unwrap();
+    assert_eq!(holds.remaining(INFERENCE, 0), Some(WALLET_HOLD_FLOOR));
+    holds.hold(MANAGEMENT, 0, Some(Duration::from_secs(1)));
+    assert_eq!(holds.remaining(MANAGEMENT, 0), Some(WALLET_HOLD_FLOOR));
+    let floor_ms = u64::try_from(WALLET_HOLD_FLOOR.as_millis()).unwrap();
+    assert_eq!(holds.remaining(MANAGEMENT, floor_ms), None);
+}
+
+/// The wallet-only leg shares the hold: a held key sends nothing and answers
+/// `RateLimited` with the time left.
+#[test]
+fn the_wallet_only_leg_honours_the_hold() {
+    let holds = WalletHolds::default();
+    let http = Recorder::new(vec![rate_limited(600)]);
+    let err = fetch_openrouter_wallet_held(MANAGEMENT, &http, &holds, 0).unwrap_err();
+    assert!(matches!(err, ThirdPartyError::RateLimited { .. }));
+    let http = Recorder::new(Vec::new());
+    let err = fetch_openrouter_wallet_held(MANAGEMENT, &http, &holds, 300_000).unwrap_err();
+    assert!(
+        matches!(err, ThirdPartyError::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(300)),
+        "{err:?}"
+    );
+    assert!(http.urls().is_empty(), "nothing is sent while held");
+}

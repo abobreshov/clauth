@@ -960,6 +960,12 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(8)))
+        // `timeout_recv_response` is re-armed per header byte and the body has
+        // no bound of its own: without an end-to-end deadline a server that
+        // sends headers and then stalls holds the caller for as long as the
+        // socket lives.
+        .timeout_recv_body(Some(crate::usage::keyed_http::CALL_DEADLINE))
+        .timeout_global(Some(crate::usage::keyed_http::CALL_DEADLINE))
         // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`; our callers read
         // the status off the `Ok` response (401 → rotate, 429 → retry-after).
         // Without this flag those branches are unreachable and every HTTP error

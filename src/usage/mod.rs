@@ -17,6 +17,9 @@ pub(crate) mod cards;
 pub(crate) mod collect;
 pub(crate) mod derive;
 mod fetch;
+// The key-bearing provider transport: no redirects, a 2 MiB body cap and an
+// end-to-end deadline on every read that carries an API key (plan v3.1 §4.2).
+pub(crate) mod keyed_http;
 // Monitoring-only sources (`monitors.toml`, the Nous/Hermes reader, the
 // daemon's monitor poll) and upstream clauth's read-only view (plan v3.1
 // §4.2, §4.7, §4.8, §4.0 guest mode).

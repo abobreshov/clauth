@@ -277,3 +277,45 @@ fn a_skeleton_observation_is_not_fetched_and_finds_windows_and_meters_by_id() {
         serde_json::from_value(serde_json::to_value(&obs).unwrap()).unwrap();
     assert_eq!(back, obs, "an observation round-trips through JSON");
 }
+
+/// A credential wrapped in punctuation (a JSON body, `key=value`, a quoted
+/// header) is still masked: each token-alphabet run inside a word is judged
+/// on its own, and the punctuation around it survives.
+#[test]
+fn redaction_finds_credentials_embedded_in_punctuation() {
+    for (raw, want) in [
+        (
+            r#"{"token":"sk-abcdefghijklmnopqrstuv0123456789"}"#,
+            r#"{"token":"[redacted]"}"#,
+        ),
+        (
+            r#"{"key":"sk-or-v1-0123456789abcdef","ok":true}"#,
+            r#"{"key":"[redacted]","ok":true}"#,
+        ),
+        ("error(sk-ant-api03-abcdefgh12345678)", "error([redacted])"),
+        ("api_key=sk-nous-abc0123456789", "api_key=[redacted]"),
+        // A 32+ glued word is credential-shaped whole: masked whole, as before.
+        ("key=sk-nous-abcdefghij0123456789", "[redacted]"),
+        (
+            r#"{"Authorization":"Bearer abc.def.ghi"}"#,
+            r#"{"Authorization":"Bearer [redacted]"}"#,
+        ),
+        (r#""Bearer abc.def.ghi""#, r#""Bearer [redacted]""#),
+        ("id:0123456789abcdef0123456789abcdef01;", "id:[redacted];"),
+        (
+            r#"{"secret":"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0NTY3ODk="}"#,
+            r#"{"secret":"[redacted]"}"#,
+        ),
+    ] {
+        assert_eq!(redact_credentials(raw), want, "{raw}");
+        assert_eq!(sanitize_message(raw), want, "{raw}");
+    }
+    // Ordinary punctuated prose and a plain URL stay as written.
+    for keep in [
+        r#"{"error":"rate limited","retry":30}"#,
+        "https://portal.nousresearch.com/api/billing/summary",
+        "monitor 'or-watch': kind = openrouter",
+    ] {
+        assert_eq!(redact_credentials(keep), keep);
+    }
+}

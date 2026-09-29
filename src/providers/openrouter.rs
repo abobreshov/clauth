@@ -34,6 +34,8 @@
 //! Wire shapes per <https://openrouter.ai/docs/api/api-reference/api-keys/get-current-key>
 //! and <https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits>.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
@@ -68,6 +70,12 @@ pub(crate) const WINDOW_FREE_DAILY: &str = "free_daily";
 /// `7d`, so [`ThirdPartyStats::to_usage_info`] never folds it into the chain.
 pub(crate) const FREE_DAILY_LABEL: &str = "free/day";
 
+/// Row label of a wallet read with a management key. Deliberately NOT a
+/// balance-row label ([`crate::providers::is_balance_row`]): an unbound
+/// wallet is not this account's balance, so no rank or balance column may
+/// read it as one.
+pub(crate) const UNBOUND_WALLET_ROW_LABEL: &str = "monitoring wallet";
+
 const DAY_SECS: i64 = 86_400;
 
 pub(super) fn matches_base_url(url: &str) -> bool {
@@ -80,7 +88,7 @@ pub(super) fn matches_base_url(url: &str) -> bool {
 /// degrade one meter on a 403 instead of failing the fetch.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HttpReply {
-    /// A 2xx/3xx body.
+    /// A 2xx body (a 3xx is never followed and reads as [`Self::Network`]).
     Body(String),
     /// A >= 400 status. `retry_after` is the `retry-after` header in
     /// delta-seconds form, when present.
@@ -99,7 +107,7 @@ pub(crate) trait OpenRouterHttp {
     fn get(&self, url: &str, bearer: &str) -> HttpReply;
 }
 
-/// The shared `ureq` agent ([`crate::usage::http_agent`]).
+/// The key-bearing transport ([`crate::usage::keyed_http`]).
 pub(crate) struct LiveHttp;
 
 impl OpenRouterHttp for LiveHttp {
@@ -109,25 +117,20 @@ impl OpenRouterHttp for LiveHttp {
             // sent a real request with whatever key it held.
             panic!("openrouter: real network call attempted in a test ({url})");
         }
-        let Ok(mut response) = crate::usage::http_agent()
-            .get(url)
-            .header("Authorization", &format!("Bearer {bearer}"))
-            .call()
-        else {
+        // The key-bearing transport: no redirect followed (a 3xx is no
+        // answer), a 2 MiB body cap, and an end-to-end deadline.
+        let Some(reply) = crate::usage::keyed_http::get_bearer(url, bearer) else {
             return HttpReply::Network;
         };
-        let code = response.status().as_u16();
-        if code >= 400 {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(crate::usage::parse_retry_after);
-            return HttpReply::Status { code, retry_after };
+        if reply.status >= 400 {
+            return HttpReply::Status {
+                code: reply.status,
+                retry_after: reply.retry_after,
+            };
         }
-        match response.body_mut().read_to_string() {
-            Ok(body) => HttpReply::Body(body),
-            Err(_) => HttpReply::Network,
+        match reply.body {
+            Some(body) => HttpReply::Body(body),
+            None => HttpReply::Network,
         }
     }
 }
@@ -253,6 +256,17 @@ pub(crate) struct OpenRouterUsage {
     pub(crate) notes: Vec<String>,
 }
 
+/// [`fetch_openrouter_usage_held`] without a backoff (a fresh
+/// [`WalletHolds`]): the tests' entry.
+#[cfg(test)]
+pub(crate) fn fetch_openrouter_usage(
+    inference_key: &str,
+    billing_key: Option<&str>,
+    http: &dyn OpenRouterHttp,
+) -> Result<OpenRouterUsage, ThirdPartyError> {
+    fetch_openrouter_usage_held(inference_key, billing_key, http, &WalletHolds::default(), 0)
+}
+
 /// Fetch one OpenRouter account: `GET /api/v1/key` with `inference_key`, then
 /// `GET /api/v1/credits` with `billing_key` when one is given, else with the
 /// inference key.
@@ -263,12 +277,17 @@ pub(crate) struct OpenRouterUsage {
 /// unreadable body [`ThirdPartyError::Parse`]. Every `/credits` outcome is an
 /// `Ok`: a failure there leaves `wallet = None` plus a note.
 ///
-/// For reuse by the monitoring leg (an unbound management key's own wallet)
-/// as well as the profile fetch.
-pub(crate) fn fetch_openrouter_usage(
+/// The `/credits` leg runs under a per-credential backoff: a wallet
+/// credential `holds` has on hold is not sent, and a `/credits` 429 puts it
+/// on hold until its `Retry-After` (at least [`WALLET_HOLD_FLOOR`]). The key
+/// leg is never held here, so its meters keep refreshing while the wallet
+/// waits.
+pub(crate) fn fetch_openrouter_usage_held(
     inference_key: &str,
     billing_key: Option<&str>,
     http: &dyn OpenRouterHttp,
+    holds: &WalletHolds,
+    now_ms: u64,
 ) -> Result<OpenRouterUsage, ThirdPartyError> {
     let key = match http.get(&format!("{ORIGIN}{KEY_PATH}"), inference_key) {
         HttpReply::Body(body) => {
@@ -294,8 +313,26 @@ pub(crate) fn fetch_openrouter_usage(
         Some(k) => (k, WalletCredential::Management),
         None => (inference_key, WalletCredential::Inference),
     };
-    let wallet = match guarded_get(http, CREDITS_PATH, bearer, read_with) {
-        HttpReply::Body(body) => match serde_json::from_str::<CreditsEnvelope>(&body) {
+    let reply = match holds.remaining(bearer, now_ms) {
+        Some(left) => {
+            notes.push(format!(
+                "wallet unavailable: rate limited (429); /credits held for {}s",
+                left.as_secs().max(1)
+            ));
+            None
+        }
+        None => Some(guarded_get(http, CREDITS_PATH, bearer, read_with)),
+    };
+    if let Some(HttpReply::Status {
+        code: 429,
+        retry_after,
+    }) = &reply
+    {
+        holds.hold(bearer, now_ms, *retry_after);
+    }
+    let wallet = match reply {
+        None => None,
+        Some(HttpReply::Body(body)) => match serde_json::from_str::<CreditsEnvelope>(&body) {
             Ok(env) => Some(WalletRead {
                 total_credits: env.data.total_credits.0,
                 total_usage: env.data.total_usage.0,
@@ -306,11 +343,11 @@ pub(crate) fn fetch_openrouter_usage(
                 None
             }
         },
-        HttpReply::Status { code, .. } => {
+        Some(HttpReply::Status { code, .. }) => {
             notes.push(wallet_status_note(code, read_with));
             None
         }
-        HttpReply::Network => {
+        Some(HttpReply::Network) => {
             notes.push("wallet unavailable: network error".to_string());
             None
         }
@@ -319,27 +356,55 @@ pub(crate) fn fetch_openrouter_usage(
     Ok(OpenRouterUsage { key, wallet, notes })
 }
 
+/// [`fetch_openrouter_wallet_held`] without a backoff: the tests' entry.
+#[cfg(test)]
+pub(crate) fn fetch_openrouter_wallet(
+    billing_key: &str,
+    http: &dyn OpenRouterHttp,
+) -> Result<OpenRouterUsage, ThirdPartyError> {
+    fetch_openrouter_wallet_held(billing_key, http, &WalletHolds::default(), 0)
+}
+
 /// Read one OpenRouter wallet with a management key alone: `GET
 /// /api/v1/credits` and nothing else (the key never reaches `/api/v1/key`).
 /// The monitoring leg for a monitor configured with only `billing_key_env`.
 ///
-/// Unlike the `/credits` leg of [`fetch_openrouter_usage`], a failure here is
-/// the whole fetch: 401 is [`ThirdPartyError::AuthExpired`], 429
+/// Unlike the `/credits` leg of [`fetch_openrouter_usage_held`], a failure
+/// here is the whole fetch: 401 is [`ThirdPartyError::AuthExpired`], 429
 /// [`ThirdPartyError::RateLimited`], any other status
 /// [`ThirdPartyError::Status`], no status [`ThirdPartyError::Network`], and an
 /// unreadable body [`ThirdPartyError::Parse`]. The wallet is read with
 /// [`WalletCredential::Management`], so it projects as an unbound monitoring
 /// meter; the key snapshot is empty (no key spend, no cap, no free window).
-pub(crate) fn fetch_openrouter_wallet(
+///
+/// Under the same `/credits` backoff: a held key sends nothing and answers
+/// [`ThirdPartyError::RateLimited`] with the time left; a 429 puts the key on
+/// hold.
+pub(crate) fn fetch_openrouter_wallet_held(
     billing_key: &str,
     http: &dyn OpenRouterHttp,
+    holds: &WalletHolds,
+    now_ms: u64,
 ) -> Result<OpenRouterUsage, ThirdPartyError> {
     let billing_key = billing_key.trim();
     if billing_key.is_empty() {
         return Err(ThirdPartyError::AuthExpired);
     }
+    if let Some(left) = holds.remaining(billing_key, now_ms) {
+        return Err(ThirdPartyError::RateLimited {
+            retry_after: Some(left),
+        });
+    }
     let read_with = WalletCredential::Management;
-    match guarded_get(http, CREDITS_PATH, billing_key, read_with) {
+    let reply = guarded_get(http, CREDITS_PATH, billing_key, read_with);
+    if let HttpReply::Status {
+        code: 429,
+        retry_after,
+    } = &reply
+    {
+        holds.hold(billing_key, now_ms, *retry_after);
+    }
+    match reply {
         HttpReply::Body(body) => {
             let env = serde_json::from_str::<CreditsEnvelope>(&body)
                 .map_err(|_| ThirdPartyError::Parse)?;
@@ -366,8 +431,58 @@ pub(crate) fn fetch_openrouter_wallet(
 /// [`fetch_openrouter_wallet`] over [`LiveHttp`], projected to
 /// [`ThirdPartyStats`] (the monitor source's live leg).
 pub(crate) fn fetch_wallet_stats(billing_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
-    let usage = fetch_openrouter_wallet(billing_key, &LiveHttp)?;
+    let usage =
+        fetch_openrouter_wallet_held(billing_key, &LiveHttp, &WALLET_HOLDS, wall_clock_ms())?;
     Ok(stats(&usage, crate::usage::now_epoch_secs()))
+}
+
+/// Shortest `/credits` hold after a 429, when the answer names no
+/// `Retry-After` (or a shorter one): the monitor poll's own 429 floor.
+pub(crate) const WALLET_HOLD_FLOOR: Duration = Duration::from_secs(5 * 60);
+
+/// A per-credential `/credits` backoff (plan §4.2: a 429 is honoured). The
+/// wallet leg of a fetch fails soft (a note, the key meters kept), so the
+/// fetch-level hold never sees its 429 and a successful `/key` read would
+/// otherwise re-send `/credits` on every poll. Keyed by a SHA-256 of the
+/// credential, never the credential; held in memory only.
+#[derive(Debug, Default)]
+pub(crate) struct WalletHolds(Mutex<HashMap<[u8; 32], u64>>);
+
+impl WalletHolds {
+    fn fingerprint(bearer: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bearer.trim().as_bytes()).into()
+    }
+
+    /// How much longer `bearer`'s `/credits` read is held, if at all.
+    pub(crate) fn remaining(&self, bearer: &str, now_ms: u64) -> Option<Duration> {
+        let map = self.0.lock().ok()?;
+        let until = *map.get(&Self::fingerprint(bearer))?;
+        (until > now_ms).then(|| Duration::from_millis(until - now_ms))
+    }
+
+    /// Hold `bearer`'s `/credits` read for `retry_after`, at least
+    /// [`WALLET_HOLD_FLOOR`] (and at most the scheduler's retry cap).
+    pub(crate) fn hold(&self, bearer: &str, now_ms: u64, retry_after: Option<Duration>) {
+        let cap = Duration::from_millis(crate::usage::MAX_RETRY_AFTER_MS);
+        let wait = retry_after
+            .unwrap_or(WALLET_HOLD_FLOOR)
+            .max(WALLET_HOLD_FLOOR)
+            .min(cap.max(WALLET_HOLD_FLOOR));
+        let until = now_ms.saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
+        if let Ok(mut map) = self.0.lock() {
+            map.retain(|_, t| *t > now_ms);
+            map.insert(Self::fingerprint(bearer), until);
+        }
+    }
+}
+
+/// The process-wide wallet holds the live fetches share, so a profile and a
+/// monitor reading the same wallet with the same key back off together.
+static WALLET_HOLDS: LazyLock<WalletHolds> = LazyLock::new(WalletHolds::default);
+
+fn wall_clock_ms() -> u64 {
+    crate::usage::now_ms()
 }
 
 /// `GET ORIGIN+path`, refusing to send a management key to any path outside
@@ -423,7 +538,13 @@ pub(super) fn fetch(
         }
         value
     });
-    let mut usage = fetch_openrouter_usage(api_key, billing_key.as_deref(), &LiveHttp)?;
+    let mut usage = fetch_openrouter_usage_held(
+        api_key,
+        billing_key.as_deref(),
+        &LiveHttp,
+        &WALLET_HOLDS,
+        wall_clock_ms(),
+    )?;
     drop(billing_key);
     pre_notes.extend(usage.notes);
     usage.notes = pre_notes.iter().map(|n| sanitize_message(n)).collect();
@@ -700,14 +821,28 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
             // a cent (an overdrawn account included) renders as `0.00 USD` or
             // worse, so an exact zero test would leave a spent key reading
             // as a healthy one.
-            funded = remaining >= half_cent();
-            // The wallet row shares the DeepSeek balance label on purpose:
-            // the MCP roster's balance rank and the overview's balance column
-            // single that label out.
+            let wallet_funded = remaining >= half_cent();
+            // Only a wallet the inference key read itself is this account's
+            // own. A management key's wallet is unbound (its owner is not
+            // proven to be the inference key's account, plan §4.7 (a)): it is
+            // published as its own `MonitoringCredential { bound: false }`
+            // meter and never decides whether this account can run a call,
+            // nor ranks as its balance.
+            let own = w.read_with == WalletCredential::Inference;
+            if own {
+                funded = wallet_funded;
+            }
+            // The account's own wallet row shares the DeepSeek balance label
+            // on purpose: the MCP roster's balance rank and the overview's
+            // balance column single that label out.
             rows.push(StatRow {
-                label: DEEPSEEK_BALANCE_ROW_LABEL.to_string(),
+                label: if own {
+                    DEEPSEEK_BALANCE_ROW_LABEL.to_string()
+                } else {
+                    UNBOUND_WALLET_ROW_LABEL.to_string()
+                },
                 value: dollars(&remaining),
-                kind: if funded {
+                kind: if wallet_funded {
                     StatRowKind::Body
                 } else {
                     StatRowKind::Danger

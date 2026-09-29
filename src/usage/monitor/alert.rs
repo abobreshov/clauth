@@ -57,27 +57,34 @@ impl Notifier for DesktopNotifier {
         if cfg!(test) {
             return;
         }
-        let urgency = if n.critical { "critical" } else { "normal" };
-        let spawned = std::process::Command::new("notify-send")
-            .args([
-                "-a",
-                crate::identity::NAME,
-                "-u",
-                urgency,
-                &n.summary,
-                &n.body,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if let Ok(mut child) = spawned {
+        if let Ok(mut child) = notify_command(n).spawn() {
             // Reap it off-thread so no zombie outlives the send.
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
         }
     }
+}
+
+/// The `notify-send` invocation for `n`. The daemon holds the monitoring and
+/// billing keys in its own env to read balances; a desktop helper inherits
+/// none of them ([`crate::providers::billing_key::scrub_helper_env`]).
+pub(crate) fn notify_command(n: &Notification) -> std::process::Command {
+    let urgency = if n.critical { "critical" } else { "normal" };
+    let mut cmd = std::process::Command::new("notify-send");
+    cmd.args([
+        "-a",
+        crate::identity::NAME,
+        "-u",
+        urgency,
+        &n.summary,
+        &n.body,
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
+    cmd
 }
 
 /// Collects notifications instead of sending them, for tests.

@@ -299,6 +299,7 @@ fn report(shared: &Shared, state: &str, seq: u64) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     let Ok(mut child) = cmd.spawn() else {
         logline!(
             "tollgate: herdr pane report-metadata spawn failed (pane state {state} not reported)"

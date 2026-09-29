@@ -274,3 +274,66 @@ fn the_gateway_scrub_drops_monitoring_keys_and_keeps_inference_keys() {
         "{removed:?}"
     );
 }
+
+/// Seed one profile management key and one monitor holding both key slots,
+/// and return the names a helper spawn must never inherit.
+fn seed_helper_keys() -> [&'static str; 3] {
+    seed(&[("or", Some(OR_URL), Some("PROFILE_MGMT"))]);
+    let mut m = crate::usage::monitor::config::MonitorConfig::new(
+        "orm",
+        crate::usage::monitor::config::MonitorKind::OpenRouter,
+    );
+    m.api_key_env = Some("MONITOR_INFERENCE".into());
+    m.billing_key_env = Some("MONITOR_MGMT".into());
+    crate::usage::monitor::config::add(&m).unwrap();
+    ["MONITOR_INFERENCE", "MONITOR_MGMT", "PROFILE_MGMT"]
+}
+
+fn assert_scrubbed(cmd: &std::process::Command, names: &[&str]) {
+    let env = env_overrides(cmd);
+    for name in names {
+        assert_eq!(env.get(*name), Some(&None), "{name} rides into the helper");
+    }
+}
+
+/// Every helper the daemon or the CLI spawns (notify-send, the browser
+/// opener, herdr, git, the MCP probe …) drops each referenced monitoring and
+/// billing key, the monitor's `api_key_env` included.
+#[test]
+fn a_helper_spawn_inherits_no_monitoring_or_billing_key() {
+    let _home = HomeSandbox::new();
+    let names = seed_helper_keys();
+    let mut cmd = std::process::Command::new("helper");
+    cmd.env("UNRELATED", "1");
+    scrub_helper_env(&mut cmd);
+    assert_scrubbed(&cmd, &names);
+    assert_eq!(
+        env_overrides(&cmd).get("UNRELATED"),
+        Some(&Some("1".to_string()))
+    );
+}
+
+/// The monitor alert's `notify-send` is built scrubbed.
+#[test]
+fn the_notify_send_helper_is_scrubbed() {
+    let _home = HomeSandbox::new();
+    let names = seed_helper_keys();
+    let n = crate::usage::monitor::alert::Notification {
+        key: "severity:high:x".into(),
+        summary: "s".into(),
+        body: "b".into(),
+        critical: true,
+    };
+    let cmd = crate::usage::monitor::alert::notify_command(&n);
+    assert_eq!(cmd.get_program(), "notify-send");
+    assert_scrubbed(&cmd, &names);
+}
+
+/// The browser opener (`xdg-open` / `open` / `rundll32`) is built scrubbed.
+#[test]
+fn the_browser_opener_is_scrubbed() {
+    let _home = HomeSandbox::new();
+    let names = seed_helper_keys();
+    let cmd = crate::platform::open_url_command("https://example.invalid/authorize");
+    assert_scrubbed(&cmd, &names);
+}

@@ -310,7 +310,10 @@ pub(crate) fn herdr_bin() -> String {
 }
 
 fn run(bin: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(bin).args(args).status().with_context(|| {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
+    let status = cmd.status().with_context(|| {
         format!(
             "could not run `{bin} {}`; is herdr installed and on PATH?",
             args.join(" ")
@@ -460,6 +463,7 @@ pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -500,6 +504,7 @@ pub(crate) fn daemon_bounded_output_deadline(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     strip_session_env(&mut cmd);
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     let child = cmd.spawn().ok()?;
     run_bounded(child, timeout)
 }
@@ -902,6 +907,7 @@ pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     let child = cmd.spawn().with_context(|| {
         format!(
             "could not run `{bin} plugin install {GITHUB_SOURCE} --ref {tag} --yes`; is herdr installed and on PATH?"
@@ -1006,6 +1012,7 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     let child = cmd
         .spawn()
         .with_context(|| "could not run `git`; is git installed?")?;
@@ -1033,6 +1040,7 @@ fn latest_release_target() -> Result<Option<(String, String)>> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     let child = cmd
         .spawn()
         .with_context(|| "could not run `git ls-remote`; is git installed?")?;
@@ -1782,14 +1790,14 @@ fn unlink_failure_note(bin: &str) -> String {
 
 /// `herdr plugin uninstall tollgate`. herdr exits 1 with a `plugin not installed` line when there is nothing to remove; the caller treats that as a no-op. The phrase must start a line, so a real failure that merely mentions it still fails.
 fn uninstall_plugin(bin: &str) -> Result<PluginUninstall> {
-    let out = Command::new(bin)
-        .args(["plugin", "uninstall", PLUGIN_ID])
-        .output()
-        .with_context(|| {
-            format!(
-                "could not run `{bin} plugin uninstall {PLUGIN_ID}`; is herdr installed and on PATH?"
-            )
-        })?;
+    let mut cmd = Command::new(bin);
+    cmd.args(["plugin", "uninstall", PLUGIN_ID]);
+    crate::providers::billing_key::scrub_helper_env(&mut cmd);
+    let out = cmd.output().with_context(|| {
+        format!(
+            "could not run `{bin} plugin uninstall {PLUGIN_ID}`; is herdr installed and on PATH?"
+        )
+    })?;
     if out.status.success() {
         return Ok(PluginUninstall::Done);
     }
