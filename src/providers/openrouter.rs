@@ -461,9 +461,14 @@ pub(crate) const WALLET_HOLD_FLOOR: Duration = Duration::from_secs(5 * 60);
 /// each hold is written to `~/.tollgate/holds/openrouter-credits-<hex>.json`
 /// (atomic, 0600), and every read consults that file, so the daemon, a
 /// forced `tollgate monitor refresh` and any other process back off one
-/// wallet together. The write lands under the fetch's own single-flight
-/// flock (a monitor's `<id>.lock`, the profile fetch lease); the file holds
-/// one deadline, so a torn write is impossible and the newest 429 wins.
+/// wallet together. Monitor locks and the profile fetch lease are keyed by
+/// monitor / profile, not by credential, so two of them can share one wallet
+/// key: every hold write and every expiry removal therefore runs under the
+/// credential's own flock (`openrouter-credits-<hex>.lock` beside the hold,
+/// 0600, never removed). A write keeps the later of the persisted deadline and
+/// the new one, so a shorter 429 never cuts a longer hold short, and an
+/// expired file is removed only while it still holds the expired deadline
+/// that was read, so a stale reader never unlinks a hold renewed meanwhile.
 #[derive(Debug, Default)]
 pub(crate) struct WalletHolds {
     map: Mutex<HashMap<[u8; 32], u64>>,
@@ -521,12 +526,23 @@ impl WalletHolds {
         Some(dir.join(format!("openrouter-credits-{hex}.json")))
     }
 
-    /// The persisted deadline for `fingerprint`, when one is in force at
-    /// `now_ms`. An expired file is removed; an unreadable one reads as none.
-    fn persisted_until(fingerprint: &[u8; 32], now_ms: u64) -> Option<u64> {
+    /// Take `fingerprint`'s hold flock (`<hold>.lock`, created 0600 and never
+    /// removed, so every process contends on one inode), creating the 0700
+    /// `holds/` dir first. Blocks: the section it guards is one small read
+    /// and one small write, and nothing is locked inside it. `None` when the
+    /// dir or the lock cannot be had.
+    fn lock_hold(hold: &std::path::Path) -> Option<std::fs::File> {
+        crate::profile::mkdir_700(hold.parent()?).ok()?;
+        let lock = crate::profile::open_state_file(&hold.with_extension("lock")).ok()?;
+        lock.lock().ok()?;
+        Some(lock)
+    }
+
+    /// The deadline the hold file at `path` carries, expired or not. A
+    /// missing, oversized, torn or foreign-version file reads as none.
+    fn read_until(path: &std::path::Path) -> Option<u64> {
         use std::io::Read as _;
-        let path = Self::hold_path(fingerprint)?;
-        let file = std::fs::File::open(&path).ok()?;
+        let file = std::fs::File::open(path).ok()?;
         let mut bytes = Vec::new();
         file.take(MAX_WALLET_HOLD_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -534,31 +550,61 @@ impl WalletHolds {
         if bytes.len() as u64 > MAX_WALLET_HOLD_BYTES {
             return None;
         }
-        let hold = serde_json::from_slice::<PersistedWalletHold>(&bytes)
+        serde_json::from_slice::<PersistedWalletHold>(&bytes)
             .ok()
-            .filter(|h| h.version == WALLET_HOLD_VERSION)?;
-        if hold.until_ms <= now_ms {
-            let _ = std::fs::remove_file(&path);
-            return None;
-        }
-        Some(hold.until_ms)
+            .filter(|h| h.version == WALLET_HOLD_VERSION)
+            .map(|h| h.until_ms)
     }
 
-    /// Write `until_ms` as `fingerprint`'s persisted hold. Best effort: the
-    /// in-memory hold still covers this process when the write fails.
-    fn persist_until(fingerprint: &[u8; 32], until_ms: u64) {
+    /// The persisted deadline for `fingerprint`, when one is in force at
+    /// `now_ms`. An expired file is removed (see [`Self::remove_if_expired`]);
+    /// an unreadable one reads as none.
+    fn persisted_until(fingerprint: &[u8; 32], now_ms: u64) -> Option<u64> {
+        let until = Self::read_until(&Self::hold_path(fingerprint)?)?;
+        if until <= now_ms {
+            Self::remove_if_expired(fingerprint, until, now_ms);
+            return None;
+        }
+        Some(until)
+    }
+
+    /// Remove `fingerprint`'s hold file, under its flock, only when it still
+    /// carries `seen_until` — the expired deadline an unlocked read saw — and
+    /// that is expired at `now_ms`. A hold another process wrote after that
+    /// read survives. Returns whether the file was removed.
+    fn remove_if_expired(fingerprint: &[u8; 32], seen_until: u64, now_ms: u64) -> bool {
+        let Some(path) = Self::hold_path(fingerprint) else {
+            return false;
+        };
+        let Some(_lock) = Self::lock_hold(&path) else {
+            return false;
+        };
+        seen_until <= now_ms
+            && Self::read_until(&path) == Some(seen_until)
+            && std::fs::remove_file(&path).is_ok()
+    }
+
+    /// Persist `until_ms` as `fingerprint`'s hold, keeping the later of it and
+    /// the deadline already on disk (clamped to the cap from `now_ms`, so a
+    /// skewed file is not carried forward unbounded). Read and write run
+    /// under the credential's flock. Best effort: the in-memory hold still
+    /// covers this process when the write fails.
+    fn persist_until(fingerprint: &[u8; 32], until_ms: u64, now_ms: u64) {
         let Some(path) = Self::hold_path(fingerprint) else {
             return;
         };
-        if let Some(dir) = path.parent()
-            && crate::profile::mkdir_700(dir).is_err()
-        {
+        let Some(_lock) = Self::lock_hold(&path) else {
             return;
-        }
+        };
+        let cap_ms = u64::try_from(Self::cap().as_millis()).unwrap_or(u64::MAX);
+        let existing = Self::read_until(&path).map(|t| t.min(now_ms.saturating_add(cap_ms)));
         let hold = PersistedWalletHold {
             version: WALLET_HOLD_VERSION,
-            until_ms,
+            until_ms: existing.map_or(until_ms, |t| t.max(until_ms)),
         };
+        if existing == Some(hold.until_ms) {
+            return;
+        }
         if let Ok(bytes) = serde_json::to_vec(&hold) {
             let _ = crate::profile::atomic_write_600(&path, bytes);
         }
@@ -583,7 +629,8 @@ impl WalletHolds {
 
     /// Hold `bearer`'s `/credits` read for `retry_after`, at least
     /// [`WALLET_HOLD_FLOOR`] (and at most the scheduler's retry cap), in
-    /// memory and, for the persistent store, on disk.
+    /// memory and, for the persistent store, on disk. Never shortens a hold
+    /// already in force.
     pub(crate) fn hold(&self, bearer: &str, now_ms: u64, retry_after: Option<Duration>) {
         let wait = retry_after
             .unwrap_or(WALLET_HOLD_FLOOR)
@@ -593,10 +640,11 @@ impl WalletHolds {
         let fingerprint = Self::fingerprint(bearer);
         if let Ok(mut map) = self.map.lock() {
             map.retain(|_, t| *t > now_ms);
-            map.insert(fingerprint, until);
+            let held = map.entry(fingerprint).or_insert(until);
+            *held = (*held).max(until);
         }
         if self.persist {
-            Self::persist_until(&fingerprint, until);
+            Self::persist_until(&fingerprint, until, now_ms);
         }
     }
 }

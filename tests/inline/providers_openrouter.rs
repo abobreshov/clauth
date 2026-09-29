@@ -925,13 +925,22 @@ fn the_wallet_only_leg_honours_the_hold() {
 
 // ── the persisted /credits hold (across processes) ─────────────────────────────
 
-/// Every hold file under `~/.tollgate/holds/`.
+/// Every hold file under `~/.tollgate/holds/` (the `.json` deadlines, not
+/// their `.lock` siblings).
 fn hold_files() -> Vec<std::path::PathBuf> {
     let dir = crate::profile::tollgate_dir().unwrap().join("holds");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    entries.map(|e| e.unwrap().path()).collect()
+    entries
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect()
+}
+
+/// The deadline persisted for `bearer`, read raw (no expiry, no clamp).
+fn persisted_raw(bearer: &str) -> Option<u64> {
+    WalletHolds::read_until(&WalletHolds::hold_path(&WalletHolds::fingerprint(bearer)).unwrap())
 }
 
 /// A `/credits` 429 is written to disk (0600, under a 0700 dir, no key in
@@ -959,6 +968,7 @@ fn a_persisted_credits_hold_binds_a_second_process_until_it_expires() {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&files[0]), 0o600);
+        assert_eq!(mode(&files[0].with_extension("lock")), 0o600);
         assert_eq!(mode(files[0].parent().unwrap()), 0o700);
     }
 
@@ -1019,4 +1029,115 @@ fn a_persisted_hold_is_clamped_and_a_foreign_file_is_ignored() {
 
     std::fs::write(&path, "{not json").unwrap();
     assert_eq!(WalletHolds::persistent().remaining(INFERENCE, 0), None);
+}
+
+/// Two stores sharing one wallet key (two monitors, or a monitor and the
+/// profile scheduler, each under its own flock) never let a shorter 429 cut
+/// a longer persisted hold short: the later deadline stays on disk.
+#[test]
+fn a_shorter_persisted_hold_never_replaces_a_longer_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let long = WalletHolds::persistent();
+    long.hold(MANAGEMENT, 0, Some(Duration::from_secs(900)));
+    assert_eq!(persisted_raw(MANAGEMENT), Some(900_000));
+
+    // Another process, a minute later, sees a floor-length 429.
+    let short = WalletHolds::persistent();
+    short.hold(MANAGEMENT, 60_000, None);
+    assert_eq!(
+        persisted_raw(MANAGEMENT),
+        Some(900_000),
+        "the longer hold stays"
+    );
+    assert_eq!(
+        WalletHolds::persistent().remaining(MANAGEMENT, 400_000),
+        Some(Duration::from_secs(500)),
+        "a third process still waits out the longer Retry-After"
+    );
+
+    // Within one process the in-memory hold is never shortened either.
+    let one = WalletHolds::default();
+    one.hold(INFERENCE, 0, Some(Duration::from_secs(900)));
+    one.hold(INFERENCE, 0, None);
+    assert_eq!(one.remaining(INFERENCE, 0), Some(Duration::from_secs(900)));
+
+    // A later deadline still extends it.
+    short.hold(MANAGEMENT, 800_000, None);
+    assert_eq!(persisted_raw(MANAGEMENT), Some(1_100_000));
+}
+
+/// The interleaving the per-credential flock closes: a reader sees an
+/// expired deadline, another process renews the hold before the reader's
+/// removal runs, and the removal — a compare-and-remove under the flock —
+/// leaves the renewed hold in place. A removal whose read is still current
+/// does remove the file.
+#[test]
+fn a_stale_expired_read_cannot_delete_a_newer_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let fp = WalletHolds::fingerprint(MANAGEMENT);
+    WalletHolds::persistent().hold(MANAGEMENT, 0, None);
+    let floor_ms = u64::try_from(WALLET_HOLD_FLOOR.as_millis()).unwrap();
+    let now = floor_ms + 1;
+
+    // The reader's unlocked read: expired.
+    let seen = persisted_raw(MANAGEMENT).unwrap();
+    assert!(seen <= now);
+
+    // Before its removal, another process takes a fresh 429.
+    WalletHolds::persistent().hold(MANAGEMENT, now, Some(Duration::from_secs(600)));
+    let renewed = now + 600_000;
+    assert_eq!(persisted_raw(MANAGEMENT), Some(renewed));
+
+    // The reader's removal of what it saw: refused, the new hold survives.
+    assert!(!WalletHolds::remove_if_expired(&fp, seen, now));
+    assert_eq!(persisted_raw(MANAGEMENT), Some(renewed));
+    assert_eq!(
+        WalletHolds::persistent().remaining(MANAGEMENT, now),
+        Some(Duration::from_secs(600))
+    );
+
+    // A removal still matching the file, once expired, removes it; the lock
+    // file stays for the next contender.
+    assert!(
+        !WalletHolds::remove_if_expired(&fp, renewed, now),
+        "not yet expired"
+    );
+    assert!(WalletHolds::remove_if_expired(&fp, renewed, renewed));
+    assert!(hold_files().is_empty(), "{:?}", hold_files());
+    let lock = WalletHolds::hold_path(&fp).unwrap().with_extension("lock");
+    assert!(lock.exists());
+}
+
+/// Threads standing in for processes (each its own store, its own open of
+/// the flock) hammer `hold` and `remaining` on one credential, some reading
+/// at a time when the shorter holds have already expired: the file ends at
+/// the longest deadline taken, and a fresh store honours it.
+#[test]
+fn concurrent_holds_on_one_credential_end_at_the_longest_deadline() {
+    let _home = crate::testutil::HomeSandbox::new();
+    const THREADS: u64 = 8;
+    const ROUNDS: u64 = 40;
+    let reader_now = 400_000;
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            scope.spawn(move || {
+                let store = WalletHolds::persistent();
+                for r in 0..ROUNDS {
+                    // 300 s .. 619 s; the longest (900 s) is the one extra thread.
+                    let secs = 300 + (t * ROUNDS + r) % 600;
+                    store.hold(MANAGEMENT, 0, Some(Duration::from_secs(secs)));
+                    let _ = WalletHolds::persistent().remaining(MANAGEMENT, reader_now);
+                }
+            });
+        }
+        scope.spawn(|| {
+            WalletHolds::persistent().hold(MANAGEMENT, 0, Some(Duration::from_secs(900)));
+        });
+    });
+    assert_eq!(persisted_raw(MANAGEMENT), Some(900_000));
+    assert_eq!(
+        WalletHolds::persistent().remaining(MANAGEMENT, reader_now),
+        Some(Duration::from_secs(500))
+    );
+    assert_eq!(hold_files().len(), 1, "{:?}", hold_files());
 }
