@@ -4383,6 +4383,11 @@ pub(crate) fn scan_auto_switch(
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
 ) {
+    // Guest mode: the global account is upstream clauth's, so no global switch
+    // (or wrap-off) is ever armed. Per-session rotation has its own scan.
+    if crate::identity::upstream_active() {
+        return;
+    }
     // Skip when a previous decision is still pending. Each lock is acquired
     // and dropped before the next — never two leaf mutexes at once.
     {

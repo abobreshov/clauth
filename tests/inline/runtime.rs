@@ -10913,3 +10913,73 @@ fn session_home_predicates_are_anchored_to_tollgates_root() {
         &home.join("elsewhere/profiles/work/runtime")
     ));
 }
+
+/// Guest mode (plan §4.0): with upstream clauth's `~/.clauth` present and no
+/// completed import, a per-session start still builds its runtime under
+/// `~/.tollgate` and links the profile's own chain there, and nothing it or its
+/// session does reaches the global files upstream owns — a session-side edit
+/// to its runtime `settings.json` / `.claude.json` is never synced back.
+#[cfg(unix)]
+#[test]
+fn a_guest_session_writes_only_its_runtime_and_never_syncs_back_to_the_base() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+            .expect("fake upstream data dir");
+        let claude_home = fake_claude_home(tmp.path());
+        let live_creds = claude_home.join(".credentials.json");
+        let base_settings = claude_home.join("settings.json");
+        let global_json = tmp.path().join(".claude.json");
+        fs::write(&live_creds, CREDS_V1).expect("write live creds");
+        fs::write(&base_settings, br#"{"theme":"dark"}"#).expect("write settings");
+        fs::write(&global_json, br#"{"numStartups":1}"#).expect("write .claude.json");
+        assert!(crate::identity::upstream_active());
+        let globals = || {
+            [&live_creds, &base_settings, &global_json]
+                .map(|p| (fs::read(p).expect("read global"), p.is_symlink()))
+        };
+        let before = globals();
+
+        let profile = configured_profile("guest");
+        let canonical = tmp
+            .path()
+            .join(".tollgate")
+            .join("profiles")
+            .join("guest")
+            .join("credentials.json");
+        fs::create_dir_all(canonical.parent().expect("canonical parent"))
+            .expect("mkdir profile dir");
+        fs::write(&canonical, CREDS_V2).expect("write canonical");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+        assert!(
+            runtime.starts_with(tmp.path().join(".tollgate")),
+            "the runtime lives under tollgate's own data dir"
+        );
+        assert_eq!(
+            fs::read(runtime.join(".credentials.json")).expect("runtime creds"),
+            CREDS_V2,
+            "the session runs on the profile's own chain"
+        );
+        assert_eq!(globals(), before, "acquire wrote no global file");
+
+        // The session edits its own copies; the watchdog's sync legs then run.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        let rt_settings = runtime.join("settings.json");
+        let rt_json = runtime.join(".claude.json");
+        fs::write(&rt_settings, br#"{"theme":"light"}"#).expect("edit runtime settings");
+        fs::write(&rt_json, br#"{"numStartups":9}"#).expect("edit runtime .claude.json");
+        set_mtime(&rt_settings, later);
+        set_mtime(&rt_json, later);
+        crate::settings_sync::sync_once().expect("settings sync");
+        crate::claude_json::sync_once().expect(".claude.json sync");
+        drop(rt);
+
+        assert_eq!(
+            globals(),
+            before,
+            "guest mode never writes a session's edits back to the base"
+        );
+    });
+}

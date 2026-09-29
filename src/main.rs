@@ -201,6 +201,13 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
+            // Guest mode's refusal is a complete sentence that already names
+            // the tool and the way forward; an `Error:` debug chain around it
+            // adds nothing.
+            if e.downcast_ref::<crate::identity::GuestRefusal>().is_some() {
+                errln!("{}", crate::identity::GUEST_REFUSAL);
+                return 1;
+            }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
             errln!("Error: {e:?}");
@@ -400,6 +407,9 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
             no_config,
             yes,
         } => {
+            // Guest mode: herdr's config is shared with upstream clauth's
+            // plugin, and plan §4.0 leaves it untouched until an import.
+            crate::identity::refuse_in_guest_mode()?;
             // The knob lives in profiles.toml (`AppState.herdr`), so the
             // row the plugin writes matches the TUI's setting. A missing
             // or unreadable file answers the default, never an error.
@@ -1140,6 +1150,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 /// outcome.
 fn cmd_capture(profile: &str) -> Result<()> {
     platform::init();
+    crate::identity::refuse_in_guest_mode()?;
     let mut config = load_config()?;
     let name = profile.trim();
     let became_active = actions::capture_current_login(&mut config, name)?;
@@ -1707,6 +1718,12 @@ fn cmd_enable(name: &str) -> Result<()> {
 fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
+    // Guest mode: a claude switch relinks upstream clauth's live slot, so it
+    // refuses up front. A codex name still resolves below: its switch moves
+    // only our own marker once `~/.codex/auth.json` is left alone.
+    if config.canonical_name(name).is_some() {
+        crate::identity::refuse_in_guest_mode()?;
+    }
     let Some(canonical) = config.canonical_name(name) else {
         // Not a claude name — a codex profile switches its own harness's
         // active slot, with no live install to perform (session-boundary).

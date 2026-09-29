@@ -266,6 +266,9 @@ fn switch_profile_synced(
 /// its decision and dispatch share one state hold), keeping the config guard
 /// outer, the ranked order.
 pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
+    // Guest mode: the live slot and `settings.json` are upstream clauth's. The
+    // refusal comes before any snapshot or relink, and before the flock.
+    crate::identity::refuse_in_guest_mode()?;
     with_state_lock(|held| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
@@ -316,6 +319,7 @@ pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) 
 /// Same lock shape as [`switch_profile`]: guard first, dropped before the
 /// gated republish.
 pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName) -> Result<()> {
+    crate::identity::refuse_in_guest_mode()?;
     #[allow(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
@@ -343,6 +347,7 @@ pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName
 /// Same lock shape as [`switch_profile`]: guard first, dropped before the
 /// gated republish.
 pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileName) -> Result<()> {
+    crate::identity::refuse_in_guest_mode()?;
     #[allow(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
@@ -369,6 +374,8 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
 /// prime the 5h window. No token rotation — stale chains rotate lazily on first use.
 pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> Result<()> {
+    // Guest mode refuses before the AUTH-1 gate below can spend a refresh.
+    crate::identity::refuse_in_guest_mode()?;
     let outgoing = config.state.active_profile.as_ref().cloned();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
@@ -505,7 +512,13 @@ impl SwitchError {
     pub(crate) fn deep_refusal(&self) -> Option<String> {
         match self {
             Self::Refused(_) => None,
-            Self::Failed(e) => e.downcast_ref::<DeepRefusal>().map(|r| r.0.clone()),
+            Self::Failed(e) => e
+                .downcast_ref::<DeepRefusal>()
+                .map(|r| r.0.clone())
+                .or_else(|| {
+                    e.downcast_ref::<crate::identity::GuestRefusal>()
+                        .map(ToString::to_string)
+                }),
         }
     }
 }
@@ -549,6 +562,12 @@ pub(crate) fn switch_profile_noninteractive(
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
 ) -> std::result::Result<(Option<String>, String), SwitchError> {
+    // Guest mode: an authored refusal, ahead of the AUTH-1 gate's refresh.
+    if crate::identity::upstream_active() {
+        return Err(SwitchError::Refused(
+            crate::identity::GUEST_REFUSAL.to_string(),
+        ));
+    }
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
@@ -648,6 +667,8 @@ pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
 /// outer of the state flock) and receives the did-anything-change answer so
 /// it can gate its own republish.
 pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
+    // Wrap-off clears the live slot, which guest mode leaves to upstream.
+    crate::identity::refuse_in_guest_mode()?;
     with_state_lock(|held| {
         if config.state.active_profile.is_none() {
             return Ok(false);
@@ -700,6 +721,9 @@ pub(crate) fn outgoing_env_keys(config: &AppConfig) -> Vec<String> {
 }
 
 fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHeld) -> Result<()> {
+    // Backstop: every caller already refused, but `settings.json` and
+    // `~/.claude.json` below are upstream's in guest mode.
+    crate::identity::refuse_in_guest_mode()?;
     // Captured before `active_profile` is reassigned.
     let prev_env_keys = outgoing_env_keys(config);
     let profile = config.find(name).context("profile not found")?;
@@ -1089,7 +1113,9 @@ pub(crate) fn rename_profile(
 
         save_app_state(&config.state)?;
 
-        if was_active {
+        // Guest mode: the live slot is upstream's, so nothing of ours is
+        // linked there to follow the rename.
+        if was_active && !crate::identity::upstream_active() {
             link_profile_credentials(new)?;
         }
         Ok(())
@@ -1141,7 +1167,9 @@ pub(crate) fn delete_profile(
         // plaintext settings.json with the profile record already gone. A blank
         // profile clears its endpoint/key/model env so the key can't linger and
         // the next session doesn't route to a dead endpoint.
-        if was_active {
+        // Guest mode wired nothing into the live slot or `settings.json`
+        // (both upstream's), so there is nothing to unwire.
+        if was_active && !crate::identity::upstream_active() {
             clear_claude_credentials()?;
             let blank = Profile::new(name.to_string(), None, None);
             apply_profile_to_claude_settings(&blank, &active_env_keys)?;
@@ -1214,6 +1242,11 @@ pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathB
 /// a DIFFERENT tollgate profile's store; `None` when there is nothing of ours to
 /// move (a regular file, no slot, a foreign link, or already pointing here).
 fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
+    // Guest mode: `~/.codex/auth.json` is upstream clauth's to manage; the
+    // codex switch moves only our own marker.
+    if crate::identity::upstream_active() {
+        return Ok(None);
+    }
     // Resolved the way the capture and the delete resolve it: inside a
     // `tollgate start` session CODEX_HOME names the session home, and the
     // operator's real slot is still the default one.
@@ -1315,6 +1348,10 @@ pub(crate) fn delete_codex_profile(
 /// linked exactly as it would have from any other shell, so that is the one
 /// checked — the ownership predicate is what makes the fallback safe.
 fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
+    // Guest mode never adopted the slot, so there is nothing of ours to detach.
+    if crate::identity::upstream_active() {
+        return Ok(None);
+    }
     let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
     let slot = operator.join("auth.json");
     let Ok(target) = std::fs::read_link(&slot) else {
@@ -1365,6 +1402,10 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
 /// [`codex_login_capture`] with the capture time injected, so the re-stamp is
 /// pinnable.
 pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()> {
+    // Guest mode: the capture adopts `~/.codex/auth.json` (a global file
+    // upstream clauth shares), and a copy without the adopt is a second
+    // carrier of one chain. `--browser` mints a fresh chain instead.
+    crate::identity::refuse_in_guest_mode()?;
     let trimmed = validate_name_chars(name)?.to_string();
     let operator = codex_operator_home()?;
     match codex_operator_store_mode(&operator).as_deref() {
@@ -1978,6 +2019,8 @@ pub(crate) struct CaptureSnapshot {
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
+    // Guest mode: whatever the live slot holds is upstream clauth's.
+    crate::identity::refuse_in_guest_mode()?;
     // A live slot linked into another tool's store (upstream clauth's) holds
     // that tool's refresh chain: a capture copies it into a second carrier.
     crate::claude::refuse_foreign_slot_link(&crate::claude::claude_credentials_path()?)?;
@@ -2009,6 +2052,9 @@ pub(crate) fn snapshot_is_empty(snapshot: &CaptureSnapshot) -> bool {
 /// whether the new profile became the active account: the first one
 /// auto-activates, any later one needs an explicit switch.
 pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Result<bool> {
+    // Guest mode: the live login is upstream clauth's refresh chain, and a
+    // capture would make a second carrier of it. Only an import may take it.
+    crate::identity::refuse_in_guest_mode()?;
     let name = name.trim();
     if let Some(existing) = config.canonical_name(name) {
         bail!(
@@ -2063,7 +2109,9 @@ pub(crate) fn capture_into_profile(
         // for this name (e.g. a delete-then-relogin of a revoked account).
         config.set_auth_broken(&name, false);
 
-        if config.state.active_profile.is_none() {
+        // Guest mode never auto-activates: activating links the live slot and
+        // rewrites `settings.json`, both upstream clauth's until an import.
+        if config.state.active_profile.is_none() && !crate::identity::upstream_active() {
             // BEFORE `set_active`, like `finish_switch`: once the marker names
             // the incoming profile the helper answers with its keys, which
             // strips nothing that was already in the file.
@@ -2113,7 +2161,9 @@ pub(crate) fn create_profile_from_login(
         save_profile(&profile)?;
         config.add(profile);
 
-        if config.state.active_profile.is_none() {
+        // Guest mode never auto-activates: activating links the live slot and
+        // rewrites `settings.json`, both upstream clauth's until an import.
+        if config.state.active_profile.is_none() && !crate::identity::upstream_active() {
             // BEFORE `set_active`, like `finish_switch`: once the marker names
             // the incoming profile the helper answers with its keys, which
             // strips nothing that was already in the file.
@@ -2286,7 +2336,10 @@ pub(crate) fn overwrite_captured_profile(
         // from before `save_profile` — nothing above this line touches the
         // flag, but the check must describe the profile as committed.
         let disabled = config.find(name).is_some_and(Profile::is_disabled);
-        if config.state.active_profile.is_none() && !disabled {
+        // Guest mode: neither arm below may touch the live slot or
+        // `settings.json` (upstream's), so a reauth only rewrites the store.
+        let guest = crate::identity::upstream_active();
+        if !guest && config.state.active_profile.is_none() && !disabled {
             // BEFORE `set_active`, like `finish_switch`: once the marker names
             // the incoming profile the helper answers with its keys, which
             // strips nothing that was already in the file.
@@ -2302,7 +2355,7 @@ pub(crate) fn overwrite_captured_profile(
             //
             let profile = config.find(name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
-        } else if was_active {
+        } else if !guest && was_active {
             // The overwritten profile is (and stays) the active one: unlike a
             // brand-new capture, `save_profile` just rewrote credentials.json
             // in place (or removed it, if the snapshot had none — a third-
@@ -2392,7 +2445,10 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         }
 
         if was_active {
-            clear_claude_credentials()?;
+            // Guest mode: the live slot is upstream's; only our marker moves.
+            if !crate::identity::upstream_active() {
+                clear_claude_credentials()?;
+            }
             config.state.set_active(None, held);
             save_app_state(&config.state)?;
         }

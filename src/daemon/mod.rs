@@ -601,8 +601,24 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     let config = load_config()?;
     let interval = config.state.refresh_interval_ms;
     let body = build_status(&config, interval, None, include_disabled);
-    outln!("{}", serde_json::to_string_pretty(&body)?);
+    outln!(
+        "{}",
+        serde_json::to_string_pretty(&with_guest_mode(
+            serde_json::to_value(&body)?,
+            crate::identity::upstream_active(),
+        ))?
+    );
     Ok(())
+}
+
+/// `tollgate status --json`'s additive `guest_mode` field (plan §4.0): whether
+/// upstream clauth owns `~/.claude` on this machine. Added to the one-shot
+/// print only, so the published `status.json` and the API schema are unchanged.
+pub(crate) fn with_guest_mode(mut body: serde_json::Value, guest: bool) -> serde_json::Value {
+    if let Some(map) = body.as_object_mut() {
+        map.insert("guest_mode".to_string(), serde_json::Value::Bool(guest));
+    }
+    body
 }
 
 /// Republish `~/.tollgate/status.json` from a process that is not the daemon, so a

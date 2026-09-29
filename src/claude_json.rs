@@ -136,6 +136,10 @@ pub(crate) fn home_oauth_account_uuid() -> Option<AccountId> {
 /// as the sync winner; a pointless touch here would make home win the next
 /// tick and stomp a runtime copy's own fields.
 pub(crate) fn strip_home_oauth_account() -> Result<()> {
+    // Guest mode: `~/.claude.json` is upstream clauth's (plan §4.0).
+    if crate::identity::upstream_active() {
+        return Ok(());
+    }
     let path = home_dir()?.join(".claude.json");
     let Ok(bytes) = std::fs::read(&path) else {
         return Ok(()); // missing — never create

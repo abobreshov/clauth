@@ -1976,6 +1976,8 @@ fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) 
 /// Windows). Refuses to overwrite a non-matching regular file — that would silently
 /// drop a CC re-login the user hasn't resolved yet.
 pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
+    // Guest mode: the live slot is upstream clauth's (plan §4.0).
+    crate::identity::refuse_in_guest_mode()?;
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         refuse_foreign_slot_link(&link)?;
@@ -2036,6 +2038,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
 }
 
 pub(crate) fn clear_claude_credentials() -> Result<()> {
+    crate::identity::refuse_in_guest_mode()?;
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         refuse_foreign_slot_link(&link)?;
@@ -2240,6 +2243,11 @@ pub(crate) fn apply_profile_to_claude_settings(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<()> {
+    // Guest mode: `~/.claude/settings.json` is upstream clauth's. Per-session
+    // runtimes build their own copy (`build_claude_settings_json`), untouched.
+    if crate::identity::upstream_active() {
+        return Ok(());
+    }
     with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, prev_env_keys))
 }
 
@@ -2566,6 +2574,7 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
 /// captured it into neither. Refusing costs an adopt; the alternative costs the
 /// login.
 pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) -> Result<()> {
+    crate::identity::refuse_in_guest_mode()?;
     with_state_lock(|held| {
         snapshot_active_credentials_unchecked(config, active, held)?;
         anyhow::ensure!(
@@ -2581,6 +2590,12 @@ fn snapshot_active_credentials_unchecked(
     active: &ProfileName,
     held: &StateLockHeld,
 ) -> Result<()> {
+    // Guest mode: the live file is upstream clauth's login, and storing it here
+    // would make a second carrier of its refresh chain. Every snapshot flavor
+    // (the TUI's exit and tick legs included) passes this sink.
+    if crate::identity::upstream_active() {
+        return Ok(());
+    }
     // CLA-SPLIT: a profile whose live slot holds its static session token carries
     // nothing to snapshot, and capturing the live file into `profile.credentials`
     // would clobber the tollgate-private usage OAuth pair. The guard lives at this
@@ -2634,6 +2649,7 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
 
 /// Re-link `.credentials.json` to `name`'s stored credentials, overwriting the live path.
 pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
+    crate::identity::refuse_in_guest_mode()?;
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         refuse_foreign_slot_link(&link)?;
@@ -2708,6 +2724,11 @@ pub(crate) fn refuse_foreign_slot_link(link: &Path) -> Result<()> {
 /// upstream clauth's link would copy its refresh chain into a regular file, a
 /// second carrier of one single-use chain.
 pub(crate) fn detach_credentials_link() -> Result<()> {
+    // Guest mode: nothing of ours is linked there to detach (a TUI exit leg,
+    // so a silent skip rather than a refusal).
+    if crate::identity::upstream_active() {
+        return Ok(());
+    }
     with_state_lock(|_held| {
         let path = claude_credentials_path()?;
         let Ok(meta) = path.symlink_metadata() else {

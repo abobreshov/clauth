@@ -1876,6 +1876,10 @@ pub(crate) struct App {
     /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
     /// row. Read-only after construction — the mode is decided once at launch.
     pub(crate) herdr_mode: bool,
+    /// Guest mode ([`crate::identity::upstream_active`]) at launch: upstream
+    /// clauth owns `~/.claude`, so the header carries a `[ guest ]` pill.
+    /// Decided once by `tui::run` via [`App::with_guest_mode`].
+    pub(crate) guest_mode: bool,
     pub(crate) modals: Vec<Modal>,
     /// First help-modal row on screen (↑↓ scrolls). Reset when the modal opens.
     pub(crate) help_scroll: u16,
@@ -2404,6 +2408,7 @@ impl App {
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
+            guest_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
@@ -2524,6 +2529,12 @@ impl App {
         crate::usage::current_key_rejected_names(&broken, &cfg.profiles)
             .into_iter()
             .collect()
+    }
+
+    /// Set the guest-mode flag the header's `[ guest ]` pill reads.
+    pub(crate) fn with_guest_mode(mut self, guest_mode: bool) -> Self {
+        self.guest_mode = guest_mode;
+        self
     }
 
     /// Landing, applied at construction (before the first paint). The FIRST
@@ -9773,6 +9784,11 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 /// rides the heal the way `install` reads it, so the row written matches the
 /// `delegate_row_text` set in the TUI.
 fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
+    // Guest mode: herdr's config is shared with upstream clauth's plugin.
+    if crate::identity::upstream_active() {
+        app.toast(ToastKind::Danger, crate::identity::GUEST_REFUSAL);
+        return;
+    }
     let delegate_row_text = app.config().state.herdr.delegate_row_text;
     match crate::herdr::heal(
         path,
@@ -11193,6 +11209,12 @@ fn poll_credentials_divergence(app: &mut App) {
     // that row's own onboarding window.
     if app.tab == Tab::Setup {
         app.refresh_unsaved_live_login();
+    }
+    // Guest mode: the live slot is upstream clauth's, so it never "diverges"
+    // from one of our profiles in a way this TUI may resolve.
+    if app.guest_mode {
+        app.divergence_pending = None;
+        return;
     }
     let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         app.divergence_pending = None;

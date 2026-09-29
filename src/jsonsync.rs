@@ -113,6 +113,11 @@ struct Member {
 /// `operator_file` is the one member Claude Code owns (the copy under the
 /// operator's home rather than under `~/.tollgate`); see [`write_member`] for why
 /// it is written differently.
+///
+/// In guest mode ([`crate::identity::upstream_active`]) the operator file is a
+/// read-only source: it still competes as the winner, so an edit there reaches
+/// every runtime copy, but it is never written back. Upstream clauth owns it
+/// until an import.
 pub(crate) fn sync_paths(
     paths: &[PathBuf],
     operator_file: Option<&Path>,
@@ -153,8 +158,12 @@ pub(crate) fn sync_paths(
         .map(|(i, _)| i)
         .expect("members is non-empty");
 
+    let operator_read_only = operator_file.is_some() && crate::identity::upstream_active();
     for i in 0..members.len() {
         if i == winner {
+            continue;
+        }
+        if operator_read_only && operator_file == Some(members[i].path.as_path()) {
             continue;
         }
         let merged = merge_member(&members[winner].obj, &members[i].obj, &rule);

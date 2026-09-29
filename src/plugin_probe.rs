@@ -310,6 +310,8 @@ pub(crate) fn global_claude_json_path() -> Option<PathBuf> {
 /// fresh map there would replace the whole file, every other server and the
 /// account identity included.
 pub(crate) fn wire_mcp_server() -> Result<()> {
+    // Guest mode: `~/.claude.json` is upstream clauth's until an import.
+    crate::identity::refuse_in_guest_mode()?;
     let path = home_dir()?.join(".claude.json");
     let mut root: Map<String, Value> = match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {

@@ -42,6 +42,9 @@ pub(crate) struct TollgatePlugin;
 /// both go through here, so `Scope::User` + `Source::Embedded` live in one
 /// place and the copy-paste hint they replace has no other home to drift into.
 pub(crate) fn install() -> anyhow::Result<Outcome> {
+    // Guest mode: the Claude Code plugin registry is shared with upstream
+    // clauth, which owns every global Claude Code file until an import.
+    crate::identity::refuse_in_guest_mode()?;
     Ok(TollgatePlugin::install(Scope::User, Source::Embedded)?)
 }
 
@@ -54,6 +57,10 @@ pub(crate) fn install() -> anyhow::Result<Outcome> {
 /// through a dead runtime tree dangles even when tollgate's own registration is
 /// healthy, so neither leg gates the other.
 pub(crate) fn self_heal() -> anyhow::Result<()> {
+    // Guest mode: the heal is a no-op (plan §4.0), quietly, since it is a hook.
+    if crate::identity::upstream_active() {
+        return Ok(());
+    }
     if let Some(line) = self_heal_line()? {
         crate::out::outln!("{line}");
     }
@@ -84,6 +91,13 @@ pub(crate) struct RepointOutcome {
 /// dies converges it. Rewrites and skips both name themselves in the line;
 /// `changed` separates the two for call sites that rate-limit reporting.
 pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
+    // Guest mode: `installed_plugins.json` is shared with upstream clauth.
+    if crate::identity::upstream_active() {
+        return Ok(RepointOutcome {
+            line: None,
+            changed: false,
+        });
+    }
     let Ok(tollgate) = crate::profile::tollgate_dir() else {
         return Ok(RepointOutcome {
             line: None,
@@ -205,6 +219,9 @@ pub(crate) fn reset_skip_report_for_test() {
 /// becomes a line only when the heal changed something. Split from
 /// [`self_heal`] so a test can pin the contract without a terminal.
 pub(crate) fn self_heal_line() -> anyhow::Result<Option<String>> {
+    if crate::identity::upstream_active() {
+        return Ok(None);
+    }
     let outcome = TollgatePlugin::self_heal()?;
     Ok((!matches!(outcome, Outcome::NoOp)).then(|| format!("tollgate self-heal: {outcome}")))
 }
@@ -218,6 +235,10 @@ pub(crate) fn self_heal_line() -> anyhow::Result<Option<String>> {
 /// nothing. A heal failure is logged and never fails the start: the session
 /// still launches, and the hook (once the plugin loads again) keeps trying.
 pub(crate) fn preflight() {
+    // Guest mode: no registry write of any kind before a start.
+    if crate::identity::upstream_active() {
+        return;
+    }
     match repoint_registry() {
         Ok(outcome) => {
             if let Some(line) = outcome.line {
@@ -327,6 +348,10 @@ impl HealThrottle {
 /// — never `out::outln!`: `tollgate mcp`'s stdout is a JSON-RPC stream, and one
 /// stray line corrupts the session.
 pub(crate) fn heal_detached() {
+    // Guest mode: the heal is a no-op; nothing is spawned or written.
+    if crate::identity::upstream_active() {
+        return;
+    }
     match detached_repoint_line() {
         Ok(Some(line)) => crate::logline::logline!("{line}"),
         Ok(None) => {}

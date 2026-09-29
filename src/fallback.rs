@@ -2546,6 +2546,11 @@ pub(crate) fn auto_switch_if_needed(
     config: &crate::profile::ConfigHandle,
     active_burn_pct_per_hour: Option<f64>,
 ) -> Result<Option<SwitchAction>> {
+    // Guest mode: the global account is upstream clauth's to switch. A silent
+    // stay-put, since this runs unattended.
+    if crate::identity::upstream_active() {
+        return Ok(None);
+    }
     #[allow(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"

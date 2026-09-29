@@ -104,6 +104,89 @@ pub(crate) const UPSTREAM_HERDR_PLUGIN_ID: &str = "clauth";
 /// The upstream tool's Claude Code plugin key.
 pub(crate) const UPSTREAM_CC_PLUGIN: &str = "clauth@clauth";
 
+/// The import journal's file name under the data dir (`~/.tollgate`). The
+/// `import clauth` transaction (plan §4.0, M0–M8) writes it; a top-level
+/// `"state": "complete"` is what ends guest mode.
+pub(crate) const IMPORT_JOURNAL_FILE: &str = "import-journal.json";
+
+/// The one sentence every user-facing global mutation answers with in guest
+/// mode ([`upstream_active`]).
+pub(crate) const GUEST_REFUSAL: &str = concat!(
+    tool_name!(),
+    ": upstream clauth manages ~/.claude on this machine (guest mode). Use '",
+    tool_name!(),
+    " start <profile>' for a per-session account, or import clauth first (not yet available)."
+);
+
+/// Guest mode (plan §4.0, the "guest mode (pre-import)" coexistence row): the
+/// upstream tool's data dir (`~/.clauth`) exists and this tool has not completed
+/// an import of it. Upstream then owns every global file the two share —
+/// `~/.claude/.credentials.json`, `~/.claude/settings.json`, `~/.claude.json`,
+/// `~/.codex/auth.json`, the Claude Code plugin registry, the herdr config — so
+/// this tool writes none of them: user-facing global mutations refuse with
+/// [`GUEST_REFUSAL`], background legs skip their global writes, and per-session
+/// runtimes under `~/.tollgate` keep working.
+///
+/// Resolved through [`crate::profile::home_dir`], so a test's
+/// `testutil::HomeSandbox` decides it. In test builds a caller with no sandbox
+/// alive answers `false` rather than panicking there: the existing suite calls
+/// gated functions on scratch paths with no home at all, and "no upstream
+/// install" is what every one of them assumes.
+pub(crate) fn upstream_active() -> bool {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return false;
+    }
+    let Ok(home) = crate::profile::home_dir() else {
+        return false;
+    };
+    if !home.join(UPSTREAM_DATA_DIR_NAME).exists() {
+        return false;
+    }
+    !import_completed(&home.join(DATA_DIR_NAME).join(IMPORT_JOURNAL_FILE))
+}
+
+/// Whether the import journal at `path` records a completed import: a JSON
+/// object whose top-level `state` is `"complete"`. A missing, unreadable or
+/// unparseable journal, and any other state (a `pre` phase, a rolled-back
+/// import), is not one — guest mode stays on.
+fn import_completed(path: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("state")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s == "complete")
+        })
+        .unwrap_or(false)
+}
+
+/// The refusal a user-facing global mutation raises in guest mode. Its own
+/// type so the CLI prints the sentence as-is (`main::exit_code`) and a remote
+/// surface can reflect it as a refusal rather than a failure.
+#[derive(Debug)]
+pub(crate) struct GuestRefusal;
+
+impl std::fmt::Display for GuestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(GUEST_REFUSAL)
+    }
+}
+
+impl std::error::Error for GuestRefusal {}
+
+/// `Err(GuestRefusal)` in guest mode, `Ok` otherwise: the one-line gate a
+/// user-facing global mutation opens with.
+pub(crate) fn refuse_in_guest_mode() -> anyhow::Result<()> {
+    if upstream_active() {
+        return Err(GuestRefusal.into());
+    }
+    Ok(())
+}
+
 /// The `owner` half of [`REPO_SLUG`].
 pub(crate) fn repo_owner() -> &'static str {
     REPO_SLUG
@@ -121,3 +204,7 @@ pub(crate) fn repo_name() -> &'static str {
 #[cfg(test)]
 #[path = "../tests/inline/identity.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/inline/guest_mode.rs"]
+mod guest_mode_tests;

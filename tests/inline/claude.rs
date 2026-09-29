@@ -4588,6 +4588,17 @@ fn link_slot_into_upstream(home: &std::path::Path) -> std::path::PathBuf {
     let slot = claude_credentials_path().expect("slot");
     std::fs::create_dir_all(slot.parent().expect("dir")).expect("mkdir");
     std::os::unix::fs::symlink(&store, &slot).expect("link slot");
+    // A staged `~/.clauth` alone would switch guest mode on, whose refusal
+    // fires first (`identity::upstream_active`, pinned in its own tests). A
+    // completed import turns it off, so these tests pin the foreign-link layer
+    // on its own: the one still standing if a link into upstream's store
+    // outlives an import.
+    let journal = home
+        .join(crate::identity::DATA_DIR_NAME)
+        .join(crate::identity::IMPORT_JOURNAL_FILE);
+    std::fs::create_dir_all(journal.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&journal, br#"{"state":"complete"}"#).expect("write journal");
+    assert!(!crate::identity::upstream_active());
     store
 }
 

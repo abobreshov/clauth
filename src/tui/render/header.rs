@@ -230,10 +230,33 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `[ herdr ]` context tag, between the brand and the version. It is the
     // first span this row sheds, so it renders only while it still leaves room
     // for the chip — brand and version never clip.
+    // `[ guest ]` pill (plan §4.0 guest mode: upstream clauth owns `~/.claude`),
+    // right after the brand. It outranks the herdr tag for the room left
+    // beside the chip, since it explains why global actions refuse.
+    let mut tag_at = 1;
+    if app.guest_mode {
+        const GUEST_LEAD: &str = "  [ ";
+        const GUEST_WORD: &str = "guest";
+        const GUEST_CLOSE: &str = " ]";
+        let guest_w =
+            GUEST_LEAD.chars().count() + GUEST_WORD.chars().count() + GUEST_CLOSE.chars().count();
+        if used + guest_w + chip_w + CONTENT_GAP <= info_width {
+            row0.splice(
+                1..1,
+                [
+                    Span::styled(GUEST_LEAD, theme::dim()),
+                    Span::styled(GUEST_WORD, theme::label().fg(theme::warning_color())),
+                    Span::styled(GUEST_CLOSE, theme::dim()),
+                ],
+            );
+            used += guest_w;
+            tag_at = 4;
+        }
+    }
     if app.herdr_mode {
         let tag = "  [ herdr ]";
         if used + tag.chars().count() + chip_w + CONTENT_GAP <= info_width {
-            row0.insert(1, Span::styled(tag, theme::dim()));
+            row0.insert(tag_at, Span::styled(tag, theme::dim()));
             used += tag.chars().count();
         }
     }

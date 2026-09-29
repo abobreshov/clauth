@@ -242,3 +242,41 @@ fn the_chip_renders_without_a_daemon_and_the_tag_only_in_herdr_mode() {
         "the chip renders with the daemon absent: {row0:?}"
     );
 }
+
+/// Guest mode (plan §4.0) puts a `[ guest ]` pill beside the brand: brackets in
+/// TEXT_DIM, the word in the warning color, ahead of the herdr tag. It sheds
+/// before the chip, so brand + version never clip.
+#[test]
+fn guest_mode_shows_a_pill_beside_the_brand_ahead_of_the_herdr_tag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_mode(true).with_guest_mode(true);
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+
+    let (row0, buf) = row0_render(&app, 100);
+    assert!(
+        row0.starts_with(&format!("tollgate  [ guest ]  [ herdr ] v{VERSION}")),
+        "the pill sits beside the brand, the tag after it: {row0:?}"
+    );
+    assert!(row0.trim_end().ends_with("[ daemon ]"), "{row0:?}");
+    let col = row0.find("[ guest ]").expect("pill renders");
+    assert_eq!(
+        buf.content[10 + col].fg,
+        super::theme::text_dim_color(),
+        "the pill's bracket is chrome"
+    );
+    assert_eq!(
+        buf.content[10 + col + 2].fg,
+        super::theme::warning_color(),
+        "the pill's word carries the warning color"
+    );
+
+    // Narrow: the row sheds the pill rather than the version.
+    let narrow = 10 + ("tollgate".len() + format!(" v{VERSION}").len() + 3) as u16;
+    let (row0, _) = row0_render(&app, narrow);
+    assert!(!row0.contains("guest"), "{row0:?}");
+    assert!(row0.contains(&format!("v{VERSION}")), "{row0:?}");
+
+    // Off by default: a plain launch never shows it.
+    let (row0, _) = row0_render(&app_with_mode(false), 100);
+    assert!(!row0.contains("guest"), "{row0:?}");
+}

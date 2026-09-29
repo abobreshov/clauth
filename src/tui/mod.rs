@@ -31,7 +31,9 @@ pub(crate) fn run(config: AppConfig, herdr_mode: bool) -> Result<()> {
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool) -> Result<()> {
-    let mut application = app::App::new(config).with_herdr_mode(herdr_mode);
+    let mut application = app::App::new(config)
+        .with_herdr_mode(herdr_mode)
+        .with_guest_mode(crate::identity::upstream_active());
     // Non-blocking reconcile: fast path runs inline; verdict sequenced via
     // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile
     // settles — neither blocks the first paint.
