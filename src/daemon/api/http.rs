@@ -39,6 +39,10 @@ pub(crate) struct Request {
     pub(crate) query: String,
     /// The `Authorization: Bearer <token>` value, if one was presented.
     pub(crate) bearer: Option<String>,
+    /// The `Host` value, trimmed, when one was sent. A second `Host` header is
+    /// a malformed request (RFC 9112 §3.2). The local agent API checks it
+    /// against loopback names on TCP, the DNS-rebinding guard.
+    pub(crate) host: Option<String>,
     /// The `If-None-Match` value, verbatim including its quotes. It is compared
     /// against a tag this server produced, so any normalizing would have to be
     /// done identically on both sides to be worth doing; the status routes —
@@ -277,6 +281,7 @@ impl<S: Read> RequestReader<S> {
         };
 
         let mut bearer = None;
+        let mut host: Option<String> = None;
         let mut if_none_match = None;
         let mut content_length: Option<usize> = None;
         let mut close_requested = false;
@@ -304,6 +309,19 @@ impl<S: Read> RequestReader<S> {
                     .ok()
                     .and_then(strip_bearer)
                     .map(str::to_string);
+            }
+            if header.name.eq_ignore_ascii_case("host") {
+                // One Host per request: two is how a proxy and this server
+                // come to disagree about where the request was sent.
+                if host.is_some() {
+                    return Err(RequestError::Malformed);
+                }
+                host = Some(
+                    std::str::from_utf8(header.value)
+                        .map_err(|_| RequestError::Malformed)?
+                        .trim()
+                        .to_string(),
+                );
             }
             if header.name.eq_ignore_ascii_case("if-none-match") {
                 // Kept verbatim, quotes included: it is compared against a tag
@@ -368,6 +386,7 @@ impl<S: Read> RequestReader<S> {
             path,
             query,
             bearer,
+            host,
             if_none_match,
             body,
             // HTTP/1.1 persists by default; HTTP/1.0 does not unless asked.
@@ -754,6 +773,7 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",

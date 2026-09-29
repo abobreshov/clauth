@@ -14,7 +14,7 @@ use crate::daemon::api::http::{ErrorBody, Request, Response};
 use crate::daemon::api::routes::decode_segment;
 use crate::usage::collect::{CollectOpts, collect};
 use crate::usage::observation::{
-    AccountObservation, AuthKind, SCHEMA_VERSION, SourceId, sanitize_message,
+    AccountObservation, AuthKind, SCHEMA_VERSION, SourceId, redact_credentials, sanitize_message,
 };
 use crate::usage::report::UsageReport;
 
@@ -59,12 +59,61 @@ pub(crate) fn route_of(path: &str) -> Option<Route> {
     })
 }
 
-/// Answer one request. The token is checked before anything else on TCP, so
-/// an unauthenticated caller learns nothing about which paths exist; the unix
-/// door is trusted by its filesystem permissions.
+/// Whether a `Host` value names this machine's loopback: `localhost` or a
+/// loopback IP literal (`127.0.0.1`, any of 127.0.0.0/8, `[::1]`), each with an
+/// optional numeric port. Anything else is a name a browser resolved to
+/// loopback (DNS rebinding) or a request meant for another server.
+pub(crate) fn loopback_host(raw: &str) -> bool {
+    let raw = raw.trim();
+    let (host, port) = if let Some(rest) = raw.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port = match after {
+            "" => None,
+            _ => match after.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return false,
+            },
+        };
+        match inside.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) if ip.is_loopback() => return port.is_none_or(valid_port),
+            _ => return false,
+        }
+    } else {
+        match raw.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (raw, None),
+        }
+    };
+    let named = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    named && port.is_none_or(valid_port)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
+/// Answer one request. On TCP the `Host` is checked first (a browser tricked by
+/// DNS rebinding into calling loopback still sends the attacker's name, so it
+/// is refused whatever token it carries), then the token, so an unauthenticated
+/// caller learns nothing about which paths exist; the unix door is trusted by
+/// its filesystem permissions and may send any `Host` or none.
 pub(crate) fn handle(ctx: &Ctx, req: &Request, door: Door) -> Response {
-    if door == Door::Tcp && !super::token_matches(&ctx.token_path, req.bearer.as_deref()) {
-        return Response::unauthorized();
+    if door == Door::Tcp {
+        match req.host.as_deref() {
+            None => return Response::error(400, "host_required"),
+            Some(host) if !loopback_host(host) => {
+                return Response::error(421, "misdirected_request");
+            }
+            Some(_) => {}
+        }
+        if !super::token_matches(&ctx.token_path, req.bearer.as_deref()) {
+            return Response::unauthorized();
+        }
     }
     let Some(route) = route_of(&req.path) else {
         return Response::error(404, "not_found");
@@ -456,62 +505,165 @@ fn providers() -> Response {
     get,
     path = "/v1/status",
     responses(
-        (status = 200, description = "the `~/.tollgate/status.json` feed (built on the spot when no daemon has published one)", body = crate::daemon::StatusBody),
+        (status = 200, description = "the `~/.tollgate/status.json` feed, redacted (built on the spot when no daemon has published a parseable one)", body = crate::daemon::StatusBody),
         (status = 401, description = R401, body = ErrorBody),
         (status = 405, description = R405, body = ErrorBody),
-        (status = 503, description = "no feed on disk and the config does not load (`status_unavailable`)", body = ErrorBody)
+        (status = 503, description = "no parseable feed on disk and the config does not load (`status_unavailable`)", body = ErrorBody)
     ),
     security(("bearer" = []))
 )]
 fn status(ctx: &Ctx) -> Response {
-    // The daemon's published feed, passed through untouched (a torn file does
-    // not parse and falls through to the rebuild).
-    if let Some((body, etag)) = crate::daemon::api::routes::read_feed_tagged(&ctx.status_path) {
-        // Untouched unless a profile's endpoint needs redacting; then the
-        // redacted copy goes out untagged, since the tag names the file's bytes.
-        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body)
-            && redact_status(&mut value)
-        {
-            return Response::serialize(200, &value);
+    // The daemon's published feed, parsed; a torn or unparseable file falls
+    // through to the rebuild. Never passed through as bytes: whatever is on
+    // disk is parsed, redacted and re-serialised, so the file's contents reach
+    // an agent only through [`redact_status`].
+    let published = std::fs::read(&ctx.status_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let mut value = match published {
+        Some(value) => value,
+        None => {
+            // Read-only: a poll must not create dirs, retighten modes or adopt
+            // a staged rotation (`load_config` does all three).
+            let Ok(config) = crate::profile::load_config_read_only() else {
+                return Response::error(503, "status_unavailable");
+            };
+            let body =
+                crate::daemon::build_status(&config, config.state.refresh_interval_ms, None, false);
+            match serde_json::to_value(&body) {
+                Ok(value) => value,
+                Err(_) => return Response::error(500, "internal"),
+            }
         }
-        return Response::raw_json_tagged(200, body, etag);
-    }
-    let Ok(config) = crate::profile::load_config() else {
-        return Response::error(503, "status_unavailable");
     };
-    let body = crate::daemon::build_status(&config, config.state.refresh_interval_ms, None, false);
-    match serde_json::to_value(&body) {
-        Ok(mut value) => {
-            redact_status(&mut value);
-            Response::serialize(200, &value)
+    redact_status(&mut value);
+    match serde_json::to_vec(&value) {
+        // Tagged off the bytes actually served, never the file's.
+        Ok(bytes) => {
+            let etag = crate::daemon::api::routes::etag_for(&bytes);
+            Response::raw_json_tagged(200, bytes, etag)
         }
         Err(_) => Response::error(500, "internal"),
     }
 }
 
-/// Every `profiles[].base_url` of a status body through [`redact_endpoint`],
-/// the rule the observation routes apply to `endpoint`. `true` when anything
-/// changed.
-pub(crate) fn redact_status(body: &mut serde_json::Value) -> bool {
-    let Some(profiles) = body
-        .get_mut("profiles")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return false;
-    };
-    let mut changed = false;
-    for p in profiles {
-        if let Some(slot) = p.get_mut("base_url")
-            && let Some(raw) = slot.as_str()
-        {
-            let clean = redact_endpoint(raw);
-            if clean != raw {
-                *slot = serde_json::Value::String(clean);
-                changed = true;
+/// Keys whose string values are the handles an agent looks accounts up by
+/// (profile names, a chain of them). Kept verbatim, as the observation routes
+/// keep ids and labels: a profile name is operator-chosen, never a key, and a
+/// long one is the same shape a token is.
+const STATUS_HANDLE_KEYS: &[&str] = &[
+    "name",
+    "active_profile",
+    "active_codex_profile",
+    "pending_switch",
+    "fallback_chain",
+    "codex_fallback_chain",
+];
+
+/// Whether a JSON key names a credential, so its string value is dropped
+/// whatever it looks like.
+fn credential_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        key.as_str(),
+        "api_key"
+            | "apikey"
+            | "x_api_key"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "session_token"
+            | "bearer"
+            | "authorization"
+            | "cookie"
+            | "password"
+            | "secret"
+            | "client_secret"
+            | "credentials"
+    ) || key.ends_with("_token")
+        || key.ends_with("_secret")
+        || key.ends_with("_password")
+        || key.ends_with("_api_key")
+}
+
+/// An absolute path with every token-shaped segment masked, the rule
+/// [`redact_endpoint`] applies to a URL's path.
+fn redact_path(raw: &str) -> String {
+    raw.split('/')
+        .map(|segment| {
+            if segment.is_empty() || redact_credentials(segment) == segment {
+                segment.to_string()
+            } else {
+                "[redacted]".to_string()
             }
-        }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Free text from the status feed with every credential-shaped word masked: a
+/// URL through [`redact_endpoint`] (userinfo, query, token-shaped segments), a
+/// path segment by segment, the word after `Bearer`, and any other word through
+/// [`redact_credentials`]. Control characters are dropped and whitespace
+/// collapsed, as [`sanitize_message`] does.
+fn redact_text(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_next = false;
+    for word in cleaned.split_whitespace() {
+        out.push(if redact_next {
+            "[redacted]".to_string()
+        } else if word.contains("://") {
+            redact_endpoint(word)
+        } else if word.starts_with('/') || word.starts_with('~') {
+            redact_path(word)
+        } else {
+            redact_credentials(word)
+        });
+        redact_next = word.eq_ignore_ascii_case("bearer");
     }
-    changed
+    out.join(" ")
+}
+
+fn redact_status_value(value: &mut serde_json::Value, key: Option<&str>) -> bool {
+    match value {
+        serde_json::Value::String(raw) => {
+            let clean = if key.is_some_and(credential_key) {
+                "[redacted]".to_string()
+            } else if key.is_some_and(|k| STATUS_HANDLE_KEYS.contains(&k)) {
+                return false;
+            } else {
+                redact_text(raw)
+            };
+            if clean == *raw {
+                return false;
+            }
+            *raw = clean;
+            true
+        }
+        // An array's elements are values of the key that holds it.
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            redact_status_value(item, key) | changed
+        }),
+        serde_json::Value::Object(map) => map.iter_mut().fold(false, |changed, (k, v)| {
+            redact_status_value(v, Some(k.as_str())) | changed
+        }),
+        _ => false,
+    }
+}
+
+/// Mask everything credential-shaped anywhere in a status body: the value of
+/// any credential-named key, and every credential-shaped word of every other
+/// string (`profiles[].base_url` included, through [`redact_endpoint`]), bar
+/// the [`STATUS_HANDLE_KEYS`] handles. The status feed's producers carry no
+/// credential; this is the second line, applied on the way out of the process
+/// the way [`redact`] is for observations. `true` when anything changed.
+pub(crate) fn redact_status(body: &mut serde_json::Value) -> bool {
+    redact_status_value(body, None)
 }
 
 /// The local API's OpenAPI document.

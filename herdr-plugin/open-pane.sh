@@ -37,6 +37,19 @@ width_mode=$(tollgate herdr config get popup_width 2>/dev/null || printf 'fit')
 read_focused_pane() {
     snap=$("$herdr_bin" api snapshot 2>/dev/null) || snap=''
     focused=$(printf '%s' "$snap" | sed -n 's/.*"focused_pane_id":"\([^"]*\)".*/\1/p')
+    focused=$(pane_id_or_empty "$focused")
+}
+
+# Prints $1 when it is a herdr pane id ([A-Za-z0-9:_-], e.g. `wP:p68`), else
+# nothing. The fit arm splices the focused id into a sed program, where a `/`,
+# `.`, `*`, `[` or `\` would rewrite the program (GNU sed's `e` runs a shell
+# command), so an id is only ever used after this check; a failed one reads as
+# no focused pane, the same as a failed snapshot.
+pane_id_or_empty() {
+    case "$1" in
+        '' | *[!A-Za-z0-9:_-]*) ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 # Whether the knob picked a split placement: splits open real panes, so the
@@ -76,6 +89,7 @@ case "$width_mode" in
                 || neighbor_out=''
             neighbor=$(printf '%s' "$neighbor_out" |
                 sed -n 's/.*"neighbor_pane_id":"\([^"]*\)".*/\1/p')
+            neighbor=$(pane_id_or_empty "$neighbor")
             target="${neighbor:-$focused}"
         fi
         if [ -n "$target" ]; then

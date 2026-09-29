@@ -125,6 +125,7 @@ fn ws_request(method: &str, path: &str, bearer: &str) -> Request {
         path: path.to_string(),
         query: String::new(),
         bearer: Some(bearer.to_string()),
+        host: None,
         if_none_match: None,
         body: Vec::new(),
         keep_alive: true,

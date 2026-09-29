@@ -211,6 +211,7 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         path: path.to_string(),
         query: query.to_string(),
         bearer: bearer.map(str::to_string),
+        host: None,
         if_none_match: None,
         body: body.as_bytes().to_vec(),
         keep_alive: true,

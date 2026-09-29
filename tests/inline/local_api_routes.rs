@@ -18,6 +18,7 @@ fn req(method: &str, path: &str, query: &str, bearer: Option<&str>) -> Request {
         path: path.to_string(),
         query: query.to_string(),
         bearer: bearer.map(str::to_string),
+        host: Some("127.0.0.1:8454".to_string()),
         if_none_match: None,
         body: Vec::new(),
         keep_alive: false,
@@ -360,8 +361,8 @@ fn the_usage_envelope_redacts_a_profiles_endpoint() {
 }
 
 /// `/v1/status` redacts `profiles[].base_url` too, whether it rebuilds the
-/// feed or passes the daemon's through; a feed with nothing to redact still
-/// goes out byte for byte with its tag.
+/// feed or re-serialises the daemon's; a feed with nothing to redact
+/// re-serialises to the same bytes (key order is preserved), tagged.
 #[test]
 fn the_status_route_redacts_profile_endpoints() {
     let _home = HomeSandbox::new();
@@ -388,9 +389,10 @@ fn the_status_route_redacts_profile_endpoints() {
         !served_text.contains("deadbeef"),
         "passed through: {served_text}"
     );
-    assert!(
-        served.etag.is_none(),
-        "a rewritten feed is not tagged as the file"
+    assert_eq!(
+        served.etag.as_deref(),
+        Some(crate::daemon::api::routes::etag_for(&served.body).as_str()),
+        "a rewritten feed is tagged as what is served, not as the file"
     );
 
     std::fs::write(&ctx.status_path, text.as_bytes()).unwrap();
@@ -401,4 +403,181 @@ fn the_status_route_redacts_profile_endpoints() {
         "a clean feed passes through untouched"
     );
     assert!(clean.etag.is_some());
+}
+
+/// Nothing on disk reaches an agent unredacted: a published feed whose only
+/// credential-shaped values sit OUTSIDE `profiles[].base_url` (a credential
+/// key, a `Bearer` in free text, a key in an error, a URL's query in an
+/// unexpected field, a token-shaped path segment) is parsed, masked and
+/// re-serialised, never passed through. Handles and paths survive.
+#[test]
+fn the_status_route_never_passes_the_feed_through_raw() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx();
+    std::fs::create_dir_all(ctx.status_path.parent().unwrap()).unwrap();
+    let long_name = "a-very-long-profile-name-for-the-work-account";
+    let feed = serde_json::json!({
+        "schema": 1,
+        "active_profile": long_name,
+        "codex_fallback_chain": [long_name],
+        "gateway": {
+            "config": "/home/u/.tollgate/gateway/config.yaml",
+            "reason": "exited: Authorization: Bearer abcdefabcdef leaked",
+        },
+        "profiles": [{
+            "name": long_name,
+            "base_url": "https://api.example.com/v1",
+            "api_key": "short",
+            "nested": { "refresh-token": "rt-plain", "extra_secret": "xyz" },
+            "fetch_status": "failed: sk-ant-api03-abcdefghijklmnopqrstuv rejected",
+            "note": "see https://api.example.com/x?key=querysecret",
+            "store": "/home/u/.tollgate/profiles/0123456789abcdef0123456789abcdef0123/x.json",
+            "fetched_at": "2026-09-29T12:00:00.000Z",
+        }],
+    });
+    let raw = serde_json::to_vec(&feed).unwrap();
+    std::fs::write(&ctx.status_path, &raw).unwrap();
+
+    let resp = handle(&ctx, &req("GET", "/v1/status", "", None), Door::Unix);
+    assert_eq!(resp.status, 200);
+    assert_ne!(resp.body, raw, "the file's bytes are not what is served");
+    let text = String::from_utf8(resp.body.clone()).unwrap();
+    for secret in [
+        "abcdefabcdef",
+        "short",
+        "rt-plain",
+        "xyz",
+        "sk-ant-api03",
+        "querysecret",
+        "0123456789abcdef0123456789abcdef0123",
+    ] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let body = body(&resp);
+    assert_eq!(body["active_profile"], long_name, "handles are kept");
+    assert_eq!(body["codex_fallback_chain"][0], long_name);
+    assert_eq!(body["profiles"][0]["name"], long_name);
+    assert_eq!(
+        body["gateway"]["config"], "/home/u/.tollgate/gateway/config.yaml",
+        "an ordinary path is kept"
+    );
+    assert_eq!(
+        body["profiles"][0]["base_url"],
+        "https://api.example.com/v1"
+    );
+    assert_eq!(
+        body["profiles"][0]["fetched_at"],
+        "2026-09-29T12:00:00.000Z"
+    );
+    assert_eq!(body["profiles"][0]["api_key"], "[redacted]");
+    assert_eq!(
+        body["profiles"][0]["store"],
+        "/home/u/.tollgate/profiles/[redacted]/x.json"
+    );
+    assert_eq!(
+        resp.etag.as_deref(),
+        Some(crate::daemon::api::routes::etag_for(&resp.body).as_str())
+    );
+}
+
+/// The redactor has no false positives on what tollgate itself publishes: a
+/// rebuilt status body (long profile names included) comes out unchanged.
+#[test]
+fn the_status_redactor_leaves_a_clean_body_alone() {
+    let _home = HomeSandbox::new();
+    let long_name = "a-very-long-profile-name-for-the-work-account";
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        long_name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-placeholder-not-a-key".to_string()),
+    ))
+    .unwrap();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "solo".to_string(),
+        None,
+        None,
+    ))
+    .unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        active_profile: Some(long_name.into()),
+        profiles: vec![long_name.into(), "solo".into()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let config = crate::profile::load_config_read_only().unwrap();
+    let built = crate::daemon::build_status(&config, config.state.refresh_interval_ms, None, false);
+    let mut value = serde_json::to_value(&built).unwrap();
+    let before = value.clone();
+    assert!(!redact_status(&mut value), "{value:#}");
+    assert_eq!(value, before);
+}
+
+#[test]
+fn only_loopback_hosts_pass() {
+    for ok in [
+        "localhost",
+        "localhost:8454",
+        "LocalHost:1",
+        "127.0.0.1",
+        "127.0.0.1:8454",
+        "127.1.2.3:80",
+        "[::1]",
+        "[::1]:8454",
+        " localhost:8454 ",
+    ] {
+        assert!(loopback_host(ok), "{ok}");
+    }
+    for bad in [
+        "",
+        "evil.example",
+        "evil.example:8454",
+        "localhost.evil.example",
+        "127.0.0.1.nip.io",
+        "10.0.0.1:8454",
+        "0.0.0.0:8454",
+        "::1",
+        "[::1",
+        "[::1]x",
+        "[::2]:8454",
+        "[127.0.0.1]",
+        "localhost:",
+        "localhost:99999",
+        "localhost:80:80",
+        "localhost:+80",
+        "user@localhost",
+    ] {
+        assert!(!loopback_host(bad), "{bad}");
+    }
+}
+
+/// On TCP the Host is checked before the token: a rebound page with a stolen
+/// token still gets 421, a caller with no Host a 400, and the socket door
+/// ignores the Host entirely.
+#[test]
+fn tcp_checks_the_host_before_the_token() {
+    let _home = HomeSandbox::new();
+    let token = super::super::ensure_token().unwrap();
+    let ctx = ctx();
+    let with = |host: Option<&str>, bearer: Option<&str>| Request {
+        host: host.map(str::to_string),
+        ..req("GET", "/v1/health", "", bearer)
+    };
+    let evil = handle(
+        &ctx,
+        &with(Some("evil.example:8454"), Some(&token)),
+        Door::Tcp,
+    );
+    assert_eq!(evil.status, 421);
+    assert_eq!(body(&evil)["error"], "misdirected_request");
+    let evil_no_token = handle(&ctx, &with(Some("evil.example"), None), Door::Tcp);
+    assert_eq!(evil_no_token.status, 421);
+    let missing = handle(&ctx, &with(None, Some(&token)), Door::Tcp);
+    assert_eq!(missing.status, 400);
+    assert_eq!(body(&missing)["error"], "host_required");
+    let ok = handle(&ctx, &with(Some("localhost:8454"), Some(&token)), Door::Tcp);
+    assert_eq!(ok.status, 200);
+    let unix = handle(&ctx, &with(Some("evil.example"), None), Door::Unix);
+    assert_eq!(unix.status, 200);
+    let unix = handle(&ctx, &with(None, None), Door::Unix);
+    assert_eq!(unix.status, 200);
 }

@@ -3380,7 +3380,23 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
     }
 }
 
+/// Whether a profile load may repair what it finds on disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoadMode {
+    /// The entry-point load: adopts (writes) a staged rotation sidecar and
+    /// deletes it, and rewrites a drifted `config.toml`.
+    Repair,
+    /// Reads only. A staged sidecar the repairing load would adopt is used in
+    /// memory, so both loads describe the same account, but nothing is
+    /// written, renamed, deleted or locked.
+    ReadOnly,
+}
+
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, LoadMode::Repair)
+}
+
+fn load_profile_with(name: &ProfileName, mode: LoadMode) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -3401,7 +3417,10 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         None
     };
     // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
-    let credentials = recover_pending_credentials(name, credentials);
+    let credentials = match mode {
+        LoadMode::Repair => recover_pending_credentials(name, credentials),
+        LoadMode::ReadOnly => adoptable_pending_credentials(name).or(credentials),
+    };
 
     let base_url = effective_base_url(
         config.base_url,
@@ -3478,7 +3497,9 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         third_party_usage,
     };
 
-    maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    if mode == LoadMode::Repair {
+        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    }
 
     Ok(profile)
 }
@@ -3763,6 +3784,36 @@ pub(crate) fn clear_staged_credentials(name: &ProfileName) {
     }
 }
 
+/// The staged rotation sidecar [`recover_pending_credentials`] would adopt, read
+/// without writing or removing anything: `Some` when a sidecar exists, parses,
+/// carries an OAuth block and is at least as new as `credentials.json` (commit
+/// failed or process died mid-save), `None` for no sidecar or a stale one.
+fn adoptable_pending_credentials(name: &ProfileName) -> Option<ClaudeCredentials> {
+    let pending_path = profile_credentials_pending_path(name).ok()?;
+    let pending_meta = pending_path.symlink_metadata().ok()?;
+    let bytes = std::fs::read(&pending_path).ok()?;
+    let pending: ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
+    pending.claude_ai_oauth.as_ref()?; // must carry an oauth block to matter
+    let cred_path = profile_credentials_path(name).ok()?;
+    // Clean success → credentials.json strictly newer → discard.
+    // Failed/interrupted commit → sidecar newer, tied, or no
+    // credentials.json at all → adopt. A tie means staging and committing
+    // landed in one mtime tick; of the two ways to be wrong, dropping a
+    // rotation that may never have landed is the unrecoverable one.
+    //
+    // The committed side's WRITE time, not its raw mtime: a per-session swap
+    // stamps a store it repoints to without writing it, and reading that
+    // stamp as a commit discards a sidecar staged moments earlier.
+    let adopt = match crate::profile_cache::effective_write_time(&cred_path) {
+        Some(cred_mtime) => pending_meta
+            .modified()
+            .map(|p| p >= cred_mtime)
+            .unwrap_or(true),
+        None => true,
+    };
+    adopt.then_some(pending)
+}
+
 /// Adopt the rotation sidecar when it's at least as new as `credentials.json`
 /// (commit failed or process died mid-save). A stale sidecar is discarded.
 fn recover_pending_credentials(
@@ -3772,44 +3823,23 @@ fn recover_pending_credentials(
     let Ok(pending_path) = profile_credentials_pending_path(name) else {
         return loaded;
     };
-    let Ok(pending_meta) = pending_path.symlink_metadata() else {
+    if pending_path.symlink_metadata().is_err() {
         return loaded; // no sidecar — the common case
-    };
-    let recovered = (|| -> Option<ClaudeCredentials> {
-        let bytes = std::fs::read(&pending_path).ok()?;
-        let pending: ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
-        pending.claude_ai_oauth.as_ref()?; // must carry an oauth block to matter
-        let cred_path = profile_credentials_path(name).ok()?;
-        // Clean success → credentials.json strictly newer → discard.
-        // Failed/interrupted commit → sidecar newer, tied, or no
-        // credentials.json at all → adopt. A tie means staging and committing
-        // landed in one mtime tick; of the two ways to be wrong, dropping a
-        // rotation that may never have landed is the unrecoverable one.
-        //
-        // The committed side's WRITE time, not its raw mtime: a per-session swap
-        // stamps a store it repoints to without writing it, and reading that
-        // stamp as a commit discards a sidecar staged moments earlier.
-        let adopt = match crate::profile_cache::effective_write_time(&cred_path) {
-            Some(cred_mtime) => pending_meta
-                .modified()
-                .map(|p| p >= cred_mtime)
-                .unwrap_or(true),
-            None => true,
-        };
-        if !adopt {
-            return None;
-        }
+    }
+    let recovered = adoptable_pending_credentials(name);
+    if let Some(pending) = &recovered
+        && let Ok(cred_path) = profile_credentials_path(name)
+    {
         // Through the preserving serializer, not the staged bytes: staging holds
         // the rotated login alone, so writing it raw would drop every non-login
         // block the store carries. One of the two writes that reach the store
         // without going through `save_profile` (the tier backfill above is the
         // other).
         let _ = with_state_lock(|_held| {
-            let body = serialize_credentials_preserving_extra(&pending, &cred_path)?;
+            let body = serialize_credentials_preserving_extra(pending, &cred_path)?;
             atomic_write_600(&cred_path, body).map_err(Into::into)
         });
-        Some(pending)
-    })();
+    }
     let _ = std::fs::remove_file(&pending_path);
     recovered.or(loaded)
 }
@@ -3826,6 +3856,23 @@ pub(crate) fn load_config() -> Result<AppConfig> {
         .profiles
         .iter()
         .map(load_profile)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AppConfig { state, profiles })
+}
+
+/// [`load_config`] for a caller answering a read-only question (the local agent
+/// API, the MCP `usage` tool, `tollgate usage`): the same roster and profiles,
+/// but nothing on disk changes. No directory is created, no mode is tightened,
+/// no staged rotation is adopted or deleted (one [`load_config`] would adopt is
+/// used in memory, so both describe the same account), no `config.toml` is
+/// rewritten and no lock file is created. The repairs stay with the entry
+/// points that call [`load_config`].
+pub(crate) fn load_config_read_only() -> Result<AppConfig> {
+    let state = load_app_state()?;
+    let profiles = state
+        .profiles
+        .iter()
+        .map(|name| load_profile_with(name, LoadMode::ReadOnly))
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }

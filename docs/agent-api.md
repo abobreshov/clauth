@@ -94,7 +94,13 @@ these optional filters:
   `405 {"ok":false,"error":"method_not_allowed"}`.
 - **Errors:** an unknown path gets `404 {"ok":false,"error":"not_found"}`.
   Over TCP, a missing or wrong token gets `401` with
-  `WWW-Authenticate: Bearer`, and this check comes before routing.
+  `WWW-Authenticate: Bearer`, and this check comes before routing. Before
+  that, the `Host` header must name loopback (`localhost`, `127.0.0.1` or
+  `[::1]`, any port): any other name gets
+  `421 {"ok":false,"error":"misdirected_request"}` whatever token it carries,
+  which is what stops a DNS-rebinding web page, and no `Host` at all gets
+  `400 {"ok":false,"error":"host_required"}`. The unix socket takes any
+  `Host`, or none.
 - **Headers:** responses are `application/json` with `Cache-Control: no-store`.
   No CORS headers are sent, because the API is not meant for browsers.
 - **Limits:**
@@ -112,7 +118,7 @@ these optional filters:
 | `GET /v1/accounts/{id}` | `{schema_version, account: AccountObservation}`, or `404 account_not_found` |
 | `GET /v1/usage` | `{schema_version, generated_at, guest_mode, accounts}`, the same envelope as `tollgate usage --json` |
 | `GET /v1/providers` | `{schema_version, providers: [{source, display_name, auth_kinds, configured, accounts}]}` |
-| `GET /v1/status` | the `~/.tollgate/status.json` feed, with an `ETag`; built on the spot when no daemon has written it |
+| `GET /v1/status` | the `~/.tollgate/status.json` feed, parsed and redacted (never the file's raw bytes), with an `ETag` of the body served; built on the spot when no daemon has written a parseable one |
 | `GET /v1/openapi.json` | the OpenAPI 3.1 document for all of the above |
 
 **Filters.** `/v1/accounts` and `/v1/usage` take these query parameters. Values

@@ -169,7 +169,7 @@ fn a_success_keeps_the_connection_for_the_next_request() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let pipelined = format!(
-        "GET /v1/health HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n{}",
+        "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n{}",
         request("GET", "/v1/providers", Some(&token))
     );
     stream.write_all(pipelined.as_bytes()).unwrap();
@@ -585,4 +585,302 @@ fn a_socket_that_cannot_be_bound_leaves_tcp_serving() {
     drop(server);
     assert!(path.exists());
     drop(squatter);
+}
+
+// ── Read-only: a poll changes nothing on disk ─────────────────────────────────
+
+/// Every node under `root`: relative path, kind, mode, mtime and a digest of
+/// its bytes (a link's target), sorted. Two equal digests mean nothing was
+/// created, removed, rewritten, retouched or chmodded in between.
+#[cfg(unix)]
+fn tree_digest(root: &Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let meta = path.symlink_metadata().unwrap();
+            let rel = path.strip_prefix(root).unwrap().display().to_string();
+            let content = if meta.file_type().is_symlink() {
+                format!("-> {}", std::fs::read_link(&path).unwrap().display())
+            } else if meta.is_file() {
+                hex::encode(sha2::Sha256::digest(std::fs::read(&path).unwrap()))
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "{rel} mode={:o} mtime={}.{} {content}",
+                meta.mode(),
+                meta.mtime(),
+                meta.mtime_nsec()
+            ));
+            if meta.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The repairs `load_config` makes on every entry point, all set up at once: a
+/// staged rotation sidecar newer than its commit (adopted = `credentials.json`
+/// rewritten and the sidecar deleted), a `config.toml` whose canonical form
+/// differs (rewritten), and a file with group/other bits (chmodded).
+#[cfg(unix)]
+fn seed_everything_a_repairing_load_would_touch() -> crate::profile::ProfileName {
+    use std::os::unix::fs::PermissionsExt;
+    let name = crate::profile::ProfileName::from("solo");
+    let pair = |access: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut solo = Profile::new("solo".to_string(), None, None);
+    solo.credentials = Some(pair("committed"));
+    save_profile(&solo).unwrap();
+    crate::profile::stage_rotated_credentials(&name, &pair("staged")).unwrap();
+    let cred = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+    let pending = crate::profile::profile_subpath(&name, "credentials.json.pending").unwrap();
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred, now - Duration::from_secs(60));
+    crate::testutil::set_mtime(&pending, now);
+
+    save_profile(&Profile::new("drift".to_string(), None, None)).unwrap();
+    let drift = crate::profile::profile_subpath(&"drift".into(), "config.toml").unwrap();
+    std::fs::write(&drift, "preferred_days = [\"Saturday\"]\n").unwrap();
+
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "drift".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let state = crate::profile::tollgate_dir()
+        .unwrap()
+        .join("profiles.toml");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644)).unwrap();
+    name
+}
+
+/// Every `GET /v1/*` over TCP leaves the sandbox home byte-identical, down to
+/// modes and mtimes, even with a pending rotation sidecar, a drifted
+/// `config.toml` and a loose mode on disk: the collector and the status
+/// rebuild load through `load_config_read_only`, never `load_config`. The
+/// staged pair is still what the read-only load describes, so both loads agree
+/// on the account.
+#[cfg(unix)]
+#[test]
+fn every_get_leaves_the_home_byte_identical_even_with_a_pending_sidecar() {
+    let home = HomeSandbox::new();
+    let name = seed_everything_a_repairing_load_would_touch();
+    let server = serve(false);
+    let token = token();
+    let before = tree_digest(home.home());
+
+    for path in [
+        "/v1/health",
+        "/v1/accounts",
+        "/v1/accounts?all=1",
+        "/v1/accounts/claude:solo",
+        "/v1/usage",
+        "/v1/providers",
+        "/v1/status",
+        "/v1/openapi.json",
+    ] {
+        let reply = tcp(&server, "GET", path, Some(&token));
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+    }
+    assert_eq!(
+        tree_digest(home.home()),
+        before,
+        "a GET changed something under the home"
+    );
+
+    let read_only = crate::profile::load_config_read_only().unwrap();
+    let refresh = |config: &crate::profile::AppConfig| {
+        config
+            .find(&name)
+            .and_then(|p| p.credentials.clone())
+            .and_then(|c| c.claude_ai_oauth.clone())
+            .and_then(|o| o.refresh_token.clone())
+    };
+    assert_eq!(
+        refresh(&read_only).as_deref(),
+        Some("staged-refresh"),
+        "the read-only load sees the pair a repairing load would adopt"
+    );
+    assert_eq!(
+        tree_digest(home.home()),
+        before,
+        "and wrote nothing doing it"
+    );
+    let repaired = crate::profile::load_config().unwrap();
+    assert_eq!(refresh(&repaired), refresh(&read_only), "both loads agree");
+    assert_ne!(
+        tree_digest(home.home()),
+        before,
+        "the repairing load did repair: the fixture exercises every repair"
+    );
+}
+
+// ── Host: the DNS-rebinding guard ─────────────────────────────────────────────
+
+fn with_host(host: Option<&str>, bearer: &str) -> String {
+    let host = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+    format!(
+        "GET /v1/health HTTP/1.1\r\n{host}Authorization: Bearer {bearer}\r\nConnection: close\r\n\r\n"
+    )
+}
+
+fn tcp_raw(server: &Server, raw: &str) -> Reply {
+    let stream = TcpStream::connect(server.tcp_addr().unwrap()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    exchange(stream, raw)
+}
+
+/// A page on `evil.example` whose name was rebound to 127.0.0.1 reaches the
+/// port, but its requests carry `Host: evil.example`: refused 421 even with
+/// the right token. A missing Host on TCP is a 400; every loopback spelling,
+/// with or without the port, is served.
+#[test]
+fn tcp_refuses_a_non_loopback_host_even_with_the_token() {
+    let _home = HomeSandbox::new();
+    let server = serve(false);
+    let token = token();
+    let port = server.tcp_addr().unwrap().port();
+
+    for host in [
+        "evil.example".to_string(),
+        format!("evil.example:{port}"),
+        format!("localhost.evil.example:{port}"),
+        format!("127.0.0.1.nip.io:{port}"),
+        "[::2]".to_string(),
+        format!("127.0.0.1:{port}x"),
+        String::new(),
+    ] {
+        let reply = tcp_raw(&server, &with_host(Some(&host), &token));
+        assert_eq!(reply.status, 421, "Host {host:?}: {}", reply.body);
+        assert_eq!(reply.json()["error"], "misdirected_request", "{host:?}");
+        assert!(reply.head.starts_with("HTTP/1.1 421 Misdirected Request"));
+    }
+
+    let missing = tcp_raw(&server, &with_host(None, &token));
+    assert_eq!(missing.status, 400, "{}", missing.body);
+    assert_eq!(missing.json()["error"], "host_required");
+
+    let twice = tcp_raw(
+        &server,
+        &format!(
+            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n\
+             Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(twice.status, 400, "two Host headers are malformed");
+
+    for host in [
+        "localhost".to_string(),
+        format!("localhost:{port}"),
+        format!("LOCALHOST:{port}"),
+        "127.0.0.1".to_string(),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        "[::1]".to_string(),
+    ] {
+        let reply = tcp_raw(&server, &with_host(Some(&host), &token));
+        assert_eq!(reply.status, 200, "Host {host:?}: {}", reply.body);
+    }
+}
+
+/// The unix door is not a browser's: any Host, or none, is served.
+#[cfg(unix)]
+#[test]
+fn the_unix_socket_takes_any_host_or_none() {
+    use std::os::unix::net::UnixStream;
+    let _home = HomeSandbox::new();
+    let server = serve(true);
+    let path = server.socket().unwrap().to_path_buf();
+    for host in [Some("evil.example"), None] {
+        let reply = exchange(UnixStream::connect(&path).unwrap(), &with_host(host, "x"));
+        assert_eq!(reply.status, 200, "{host:?}: {}", reply.body);
+    }
+}
+
+// ── The socket's directory ────────────────────────────────────────────────────
+
+/// A data dir left group/other-readable is tightened to 0700 before the bind,
+/// so no other user can traverse to the node in the window between `bind` and
+/// its `chmod`.
+#[cfg(unix)]
+#[test]
+fn a_loose_data_dir_is_tightened_before_the_socket_is_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::tollgate_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = serve(true);
+    assert!(server.socket().is_some(), "{:?}", server.socket_error());
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+/// A symlinked data dir puts the socket wherever the link points: refused.
+/// With TCP up the refusal is the socket error and TCP still serves; alone it
+/// is the start's error.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_data_dir_is_refused_for_the_socket() {
+    let home = HomeSandbox::new();
+    let elsewhere = home.home().join("elsewhere");
+    crate::profile::mkdir_700(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, crate::profile::tollgate_dir().unwrap()).unwrap();
+
+    let server = serve(true);
+    assert_eq!(server.socket(), None);
+    let err = server.socket_error().expect("the socket is refused");
+    assert!(err.contains("symlink"), "{err}");
+    assert!(!elsewhere.join(SOCKET_FILE).exists());
+    assert_eq!(
+        tcp(&server, "GET", "/v1/health", Some(&token())).status,
+        200
+    );
+    drop(server);
+
+    let err = start(StartOpts {
+        listen: None,
+        unix_socket: true,
+        status_path: PathBuf::from("/nonexistent"),
+    })
+    .err()
+    .expect("socket-only start fails")
+    .to_string();
+    assert!(err.contains("symlink"), "{err}");
+}
+
+/// A directory another uid owns is refused, and left exactly as it was.
+/// Needs a directory this user does not own: `/` when not running as root.
+#[cfg(unix)]
+#[test]
+fn a_data_dir_owned_by_another_user_is_refused() {
+    use std::os::unix::fs::MetadataExt;
+    let root = Path::new("/");
+    let meta = root.symlink_metadata().unwrap();
+    if effective_uid() == 0 || meta.uid() == effective_uid() {
+        return; // no foreign-owned directory to test against
+    }
+    let err = secure_socket_dir(root).unwrap_err().to_string();
+    assert!(err.contains("owned by uid"), "{err}");
+    assert_eq!(root.symlink_metadata().unwrap().mode(), meta.mode());
 }
