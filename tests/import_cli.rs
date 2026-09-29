@@ -274,6 +274,93 @@ fn dry_run_succeeds_on_a_read_only_bind_and_changes_nothing() {
     assert_eq!(snapshot(home.path()), before);
 }
 
+/// Every global edit in reach of the read-only dry-run: an upstream `clauth`
+/// on `PATH` that leaves a sentinel if anything ever runs it, and a fake
+/// herdr that lists upstream's plugin and prints its config dir, with
+/// upstream's marked block in herdr's config. Paths are baked in.
+fn global_fixture(home: &Path) -> (PathBuf, PathBuf) {
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sentinel = home.join("RAN-CLAUTH");
+    write_script(
+        &bin.join("clauth"),
+        &format!("touch '{}'\nexit 0\n", sentinel.display()),
+    );
+    let herdr_dir = home.join("fakeherdr");
+    std::fs::create_dir_all(&herdr_dir).unwrap();
+    let herdr = herdr_dir.join("herdr");
+    let cfg = home.join(".config/herdr/plugins/config");
+    write_script(
+        &herdr,
+        &format!(
+            r#"case "$1 $2" in
+  "plugin list") echo '{{"id":"cli:plugin","result":{{"plugins":[{{"plugin_id":"clauth","enabled":true,"source":{{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123"}}}}],"type":"plugin_list"}}}}' ;;
+  "plugin config-dir") echo '{}'/"$3" ;;
+esac
+exit 0
+"#,
+            cfg.display()
+        ),
+    );
+    std::fs::create_dir_all(home.join(".config/herdr")).unwrap();
+    std::fs::write(
+        home.join(".config/herdr/config.toml"),
+        "# clauth herdr plugin\n[[keys.bind]]\nkey = \"prefix+c\"\n",
+    )
+    .unwrap();
+    (herdr, sentinel)
+}
+
+fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The read-only proof with G1–G4 all in reach: the dry-run plans upstream's
+/// herdr uninstall (G2) and the plugin-off edit (G1), reads herdr's state
+/// through herdr, and still writes nothing and runs no upstream binary.
+#[test]
+fn dry_run_plans_the_global_edits_on_a_read_only_bind_and_runs_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    fixture(home.path());
+    let (herdr, sentinel) = global_fixture(home.path());
+    let Some(mut cmd) = bwrap(home.path()) else {
+        eprintln!("skipped: bubblewrap is not usable here");
+        return;
+    };
+    let before = snapshot(home.path());
+    let out = cmd
+        .args(["--setenv", "PATH"])
+        .arg(format!(
+            "{}:{}:/usr/bin:/bin",
+            bin_dir().display(),
+            home.path().join("bin").display()
+        ))
+        .args(["--setenv", "HERDR_BIN_PATH"])
+        .arg(&herdr)
+        .arg(bin())
+        .args(["import", "clauth", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ids: Vec<&str> = report["global_edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|g| g["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"G1") && ids.contains(&"G2"), "{ids:?}");
+    assert!(!sentinel.exists(), "the dry-run ran upstream's binary");
+    assert_eq!(snapshot(home.path()), before);
+}
+
 /// Without a sandbox, the dry-run on a writable home still leaves every
 /// byte, inode, mode, size and mtime as it was. (Outside a pid namespace the
 /// scan may see live sessions and block, exit 3; either way nothing moves.)
