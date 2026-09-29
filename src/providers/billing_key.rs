@@ -193,6 +193,21 @@ pub(crate) fn scrub_helper_env(command: &mut std::process::Command) {
     scrub_billing_env(command);
 }
 
+/// A new [`std::process::Command`] for `program` with [`scrub_helper_env`]
+/// already applied — the one constructor every helper spawn goes through,
+/// the platform-only ones included (`/usr/bin/security`, `ps`, `tasklist`,
+/// `taskkill`, `powershell`). Those sites sit behind `cfg(target_os = …)`
+/// gates a Linux build never compiles, so each builds its command here (or
+/// through a portable builder that calls this) rather than scrubbing inline:
+/// the scrub is then the same Linux-tested code on every platform, and a
+/// gated site cannot forget it. The scrub runs first, so an `env` the caller
+/// layers on afterwards (`ps`'s `LC_ALL`) still wins.
+pub(crate) fn helper_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    scrub_helper_env(&mut command);
+    command
+}
+
 #[cfg(test)]
 #[path = "../../tests/inline/providers_billing_key.rs"]
 mod tests;

@@ -84,7 +84,7 @@ macro_rules! census_log {
 }
 
 /// Apple's Keychain CLI. Absolute path so a hostile `PATH` can't shim it.
-const SECURITY_BIN: &str = "/usr/bin/security";
+const SECURITY_BIN: &str = crate::platform::SECURITY_BIN;
 
 /// Wall-clock ceiling for a single `security` invocation before it is killed
 /// (TECH-3). A stuck keychain (an unanswered "Always Allow" ACL prompt, a locked
@@ -498,7 +498,7 @@ fn read_raw_at_witnessing(
     account: &str,
     on_spawn: impl FnOnce(u32) -> Result<()>,
 ) -> Result<Option<String>> {
-    let mut cmd = Command::new(SECURITY_BIN);
+    let mut cmd = crate::platform::security_command();
     cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
     let output = run_with_deadline_witnessing(cmd, security_deadline(), None, on_spawn)
         .with_context(|| format!("failed to run {SECURITY_BIN} find-generic-password"))?;
@@ -1038,7 +1038,7 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
     // refusing, so the transport is chosen by size, not by preference.
     let output = match put_transport(line.len(), json.len())? {
         PutTransport::Stdin => {
-            let mut cmd = Command::new(SECURITY_BIN);
+            let mut cmd = crate::platform::security_command();
             cmd.arg("-i");
             run_with_deadline(cmd, security_deadline(), Some(&line))
         }
@@ -1051,7 +1051,7 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
             );
             // No `security_quote` here: argv words reach `security` verbatim, so
             // the `-i` tokenizer's escaping would be written INTO the password.
-            let mut cmd = Command::new(SECURITY_BIN);
+            let mut cmd = crate::platform::security_command();
             cmd.args([
                 "add-generic-password",
                 "-U",
@@ -1090,7 +1090,7 @@ fn delete_at_witnessing(
     if crate::identity::guest_refuses_keychain_service(service) {
         return Err(crate::identity::GuestRefusal.into());
     }
-    let mut cmd = Command::new(SECURITY_BIN);
+    let mut cmd = crate::platform::security_command();
     cmd.args(["delete-generic-password", "-s", service, "-a", account]);
     let output = run_with_deadline_witnessing(cmd, security_deadline(), None, on_spawn)
         .with_context(|| format!("failed to run {SECURITY_BIN} delete-generic-password"))?;
@@ -1247,7 +1247,7 @@ pub(crate) fn census_namespaced_items() {
 /// the macOS version — so it is held only long enough for the pure parser to
 /// read the service attributes and is never logged or carried on an error.
 fn dump_keychain() -> Result<String> {
-    let mut cmd = Command::new(SECURITY_BIN);
+    let mut cmd = crate::platform::security_command();
     cmd.arg("dump-keychain");
     let output = run_with_deadline(cmd, security_deadline(), None)
         .with_context(|| format!("failed to run {SECURITY_BIN} dump-keychain"))?;

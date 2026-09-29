@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 
 use super::{
@@ -431,8 +431,18 @@ pub(crate) fn fetch_openrouter_wallet_held(
 /// [`fetch_openrouter_wallet`] over [`LiveHttp`], projected to
 /// [`ThirdPartyStats`] (the monitor source's live leg).
 pub(crate) fn fetch_wallet_stats(billing_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
-    let usage =
-        fetch_openrouter_wallet_held(billing_key, &LiveHttp, &WALLET_HOLDS, wall_clock_ms())?;
+    wallet_stats_with(billing_key, &LiveHttp, &WALLET_HOLDS, wall_clock_ms())
+}
+
+/// [`fetch_wallet_stats`] over any transport and hold store: the live leg
+/// and the tests share it.
+pub(crate) fn wallet_stats_with(
+    billing_key: &str,
+    http: &dyn OpenRouterHttp,
+    holds: &WalletHolds,
+    now_ms: u64,
+) -> Result<ThirdPartyStats, ThirdPartyError> {
+    let usage = fetch_openrouter_wallet_held(billing_key, http, holds, now_ms)?;
     Ok(stats(&usage, crate::usage::now_epoch_secs()))
 }
 
@@ -442,44 +452,159 @@ pub(crate) const WALLET_HOLD_FLOOR: Duration = Duration::from_secs(5 * 60);
 
 /// A per-credential `/credits` backoff (plan §4.2: a 429 is honoured). The
 /// wallet leg of a fetch fails soft (a note, the key meters kept), so the
-/// fetch-level hold never sees its 429 and a successful `/key` read would
-/// otherwise re-send `/credits` on every poll. Keyed by a SHA-256 of the
-/// credential, never the credential; held in memory only.
+/// fetch-level hold never sees its 429 — a monitor's partial success even
+/// clears its own cache hold — and a successful `/key` read would otherwise
+/// re-send `/credits` on every poll. Keyed by a SHA-256 of the credential,
+/// never the credential.
+///
+/// The live store is [`WalletHolds::persistent`]: besides the in-memory map,
+/// each hold is written to `~/.tollgate/holds/openrouter-credits-<hex>.json`
+/// (atomic, 0600), and every read consults that file, so the daemon, a
+/// forced `tollgate monitor refresh` and any other process back off one
+/// wallet together. The write lands under the fetch's own single-flight
+/// flock (a monitor's `<id>.lock`, the profile fetch lease); the file holds
+/// one deadline, so a torn write is impossible and the newest 429 wins.
 #[derive(Debug, Default)]
-pub(crate) struct WalletHolds(Mutex<HashMap<[u8; 32], u64>>);
+pub(crate) struct WalletHolds {
+    map: Mutex<HashMap<[u8; 32], u64>>,
+    /// Mirror every hold to `~/.tollgate/holds/` and honour the ones there.
+    persist: bool,
+}
+
+/// Bumped when the persisted hold's shape changes; another version reads as
+/// no hold.
+const WALLET_HOLD_VERSION: u32 = 1;
+/// Largest persisted hold file read.
+const MAX_WALLET_HOLD_BYTES: u64 = 4096;
+
+/// One persisted `/credits` hold: nothing but the deadline.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedWalletHold {
+    version: u32,
+    until_ms: u64,
+}
 
 impl WalletHolds {
-    fn fingerprint(bearer: &str) -> [u8; 32] {
-        use sha2::Digest as _;
-        sha2::Sha256::digest(bearer.trim().as_bytes()).into()
+    /// The store the live fetches share: in memory and on disk.
+    pub(crate) fn persistent() -> Self {
+        Self {
+            map: Mutex::default(),
+            persist: true,
+        }
     }
 
-    /// How much longer `bearer`'s `/credits` read is held, if at all.
+    /// Domain-separated, so the name a hold file carries is not a bare
+    /// SHA-256 of the key anything else might also publish.
+    fn fingerprint(bearer: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"tollgate/openrouter-credits-hold\0");
+        hasher.update(bearer.trim().as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// The longest hold ever honoured: the scheduler's retry cap, never less
+    /// than the floor. A persisted deadline further out (a skewed clock, a
+    /// hand edit) is clamped to it.
+    fn cap() -> Duration {
+        Duration::from_millis(crate::usage::MAX_RETRY_AFTER_MS).max(WALLET_HOLD_FLOOR)
+    }
+
+    /// `~/.tollgate/holds/openrouter-credits-<hex>.json` for `fingerprint`.
+    fn hold_path(fingerprint: &[u8; 32]) -> Option<std::path::PathBuf> {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for b in fingerprint {
+            let _ = write!(hex, "{b:02x}");
+        }
+        let dir = crate::profile::tollgate_dir().ok()?.join("holds");
+        Some(dir.join(format!("openrouter-credits-{hex}.json")))
+    }
+
+    /// The persisted deadline for `fingerprint`, when one is in force at
+    /// `now_ms`. An expired file is removed; an unreadable one reads as none.
+    fn persisted_until(fingerprint: &[u8; 32], now_ms: u64) -> Option<u64> {
+        use std::io::Read as _;
+        let path = Self::hold_path(fingerprint)?;
+        let file = std::fs::File::open(&path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_WALLET_HOLD_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_WALLET_HOLD_BYTES {
+            return None;
+        }
+        let hold = serde_json::from_slice::<PersistedWalletHold>(&bytes)
+            .ok()
+            .filter(|h| h.version == WALLET_HOLD_VERSION)?;
+        if hold.until_ms <= now_ms {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some(hold.until_ms)
+    }
+
+    /// Write `until_ms` as `fingerprint`'s persisted hold. Best effort: the
+    /// in-memory hold still covers this process when the write fails.
+    fn persist_until(fingerprint: &[u8; 32], until_ms: u64) {
+        let Some(path) = Self::hold_path(fingerprint) else {
+            return;
+        };
+        if let Some(dir) = path.parent()
+            && crate::profile::mkdir_700(dir).is_err()
+        {
+            return;
+        }
+        let hold = PersistedWalletHold {
+            version: WALLET_HOLD_VERSION,
+            until_ms,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&hold) {
+            let _ = crate::profile::atomic_write_600(&path, bytes);
+        }
+    }
+
+    /// How much longer `bearer`'s `/credits` read is held, if at all: the
+    /// later of this process's hold and the persisted one.
     pub(crate) fn remaining(&self, bearer: &str, now_ms: u64) -> Option<Duration> {
-        let map = self.0.lock().ok()?;
-        let until = *map.get(&Self::fingerprint(bearer))?;
-        (until > now_ms).then(|| Duration::from_millis(until - now_ms))
+        let fingerprint = Self::fingerprint(bearer);
+        let in_memory = self
+            .map
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&fingerprint).copied());
+        let on_disk = self
+            .persist
+            .then(|| Self::persisted_until(&fingerprint, now_ms))
+            .flatten();
+        let until = in_memory.into_iter().chain(on_disk).max()?;
+        (until > now_ms).then(|| Duration::from_millis(until - now_ms).min(Self::cap()))
     }
 
     /// Hold `bearer`'s `/credits` read for `retry_after`, at least
-    /// [`WALLET_HOLD_FLOOR`] (and at most the scheduler's retry cap).
+    /// [`WALLET_HOLD_FLOOR`] (and at most the scheduler's retry cap), in
+    /// memory and, for the persistent store, on disk.
     pub(crate) fn hold(&self, bearer: &str, now_ms: u64, retry_after: Option<Duration>) {
-        let cap = Duration::from_millis(crate::usage::MAX_RETRY_AFTER_MS);
         let wait = retry_after
             .unwrap_or(WALLET_HOLD_FLOOR)
             .max(WALLET_HOLD_FLOOR)
-            .min(cap.max(WALLET_HOLD_FLOOR));
+            .min(Self::cap());
         let until = now_ms.saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
-        if let Ok(mut map) = self.0.lock() {
+        let fingerprint = Self::fingerprint(bearer);
+        if let Ok(mut map) = self.map.lock() {
             map.retain(|_, t| *t > now_ms);
-            map.insert(Self::fingerprint(bearer), until);
+            map.insert(fingerprint, until);
+        }
+        if self.persist {
+            Self::persist_until(&fingerprint, until);
         }
     }
 }
 
-/// The process-wide wallet holds the live fetches share, so a profile and a
-/// monitor reading the same wallet with the same key back off together.
-static WALLET_HOLDS: LazyLock<WalletHolds> = LazyLock::new(WalletHolds::default);
+/// The wallet holds every live fetch shares — persisted, so a profile and a
+/// monitor reading the same wallet with the same key back off together
+/// across processes as well as within one.
+static WALLET_HOLDS: LazyLock<WalletHolds> = LazyLock::new(WalletHolds::persistent);
 
 fn wall_clock_ms() -> u64 {
     crate::usage::now_ms()
@@ -528,6 +653,24 @@ pub(super) fn fetch(
     api_key: &str,
     billing_key_env: Option<&str>,
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
+    fetch_stats_with(
+        api_key,
+        billing_key_env,
+        &LiveHttp,
+        &WALLET_HOLDS,
+        wall_clock_ms(),
+    )
+}
+
+/// [`fetch`] over any transport and hold store: the scheduler's live leg and
+/// the tests share it.
+pub(crate) fn fetch_stats_with(
+    api_key: &str,
+    billing_key_env: Option<&str>,
+    http: &dyn OpenRouterHttp,
+    holds: &WalletHolds,
+    now_ms: u64,
+) -> Result<ThirdPartyStats, ThirdPartyError> {
     let mut pre_notes = Vec::new();
     let billing_key = billing_key_env.and_then(|name| {
         let value = super::billing_key::resolve(name);
@@ -538,13 +681,8 @@ pub(super) fn fetch(
         }
         value
     });
-    let mut usage = fetch_openrouter_usage_held(
-        api_key,
-        billing_key.as_deref(),
-        &LiveHttp,
-        &WALLET_HOLDS,
-        wall_clock_ms(),
-    )?;
+    let mut usage =
+        fetch_openrouter_usage_held(api_key, billing_key.as_deref(), http, holds, now_ms)?;
     drop(billing_key);
     pre_notes.extend(usage.notes);
     usage.notes = pre_notes.iter().map(|n| sanitize_message(n)).collect();

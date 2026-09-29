@@ -22,7 +22,7 @@ Only the newest commit on the `feat/tollgate` branch (0.1.0 at the time of writi
 
 - **At rest.** Credentials live under `~/.tollgate`, every file `0600` and every directory `0700` on Unix, written atomically. API keys for launchable profiles are in each profile's `config.toml`; OAuth chains in its `credentials.json` / `auth.json`.
 - **Monitoring keys by name only.** `monitors.toml` and a profile's `billing_key_env` hold environment variable NAMES. Values are read from the fetching process's environment, used for one read, and never written, logged, printed or put in argv. Secret-shaped keys, key-shaped values and process variables (`PATH`, `HOME`, …) are refused where a name goes; parse errors redact quoted values.
-- **Scrubbed from children.** Every named variable is removed from each `claude` / `codex` session tollgate spawns; the shunt gateway does not inherit the monitoring-only ones.
+- **Scrubbed from children.** Every named variable is removed from each `claude` / `codex` session tollgate spawns and from every helper it runs (`notify-send`, the browser opener, herdr, git, `/usr/bin/security`, `ps`, `tasklist`, `taskkill`, `powershell`, …); the shunt gateway does not inherit the monitoring-only ones.
 - **One credential slot per purpose.** Inference keys reach Claude Code only through `apiKeyHelper`; a management key goes only to OpenRouter's `/api/v1/credits`; presets can carry only five non-secret env switches.
 - **Borrowed, never refreshed.** For a `nous` monitor tollgate reads Hermes' Nous access token while it is unexpired and nothing else from that file; it never refreshes, locks or writes it.
 - **Redacted reads.** `tollgate usage --json`, the local agent API and the MCP `usage` tool strip endpoint userinfo, queries and key-shaped path segments, and replace token-like words in free text. `tollgate list` and `tollgate status --json` do not yet redact `base_url`.
@@ -53,6 +53,7 @@ Per-profile state lives under `~/.tollgate/`. Nothing under upstream's `~/.claut
 | `~/.tollgate/tls.json` | which directory holds the REST API's lego certificate; written with the platform default the first time `tollgate daemon --listen` starts. Not a secret — a path, no key material | `0600` |
 | `~/.tollgate/monitors.toml` | monitoring-only accounts: ids, kinds, labels, budgets, and the NAMES of the env vars holding their keys. Never a key | `0600` |
 | `~/.tollgate/monitors/<id>.json` | one monitor's last reading, its 429 hold, its sent-alert keys and a non-secret fingerprint of its target. Never a credential | file `0600`, dir `0700` |
+| `~/.tollgate/holds/openrouter-credits-<hash>.json` | an OpenRouter `/credits` 429 hold: its deadline alone, named by a domain-separated SHA-256 of the wallet credential. Never a credential; removed once expired | file `0600`, dir `0700` |
 | `~/.tollgate/profiles/<name>/config.toml` `billing_key_env` | the NAME of an env var holding a monitoring-only key; the value is never stored | `0600` |
 | `~/.tollgate/api-token` | the local agent API's bearer token, 64 hex characters | `0600` |
 | `~/.tollgate/api.sock` | the local agent API's unix socket; no token needed, so its mode is the access control | `0600` |

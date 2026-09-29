@@ -21,6 +21,23 @@ pub(crate) fn installed_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Apple's Keychain CLI, by absolute path so a hostile `PATH` can't shim it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // spawned on macOS alone
+pub(crate) const SECURITY_BIN: &str = "/usr/bin/security";
+
+/// A new `/usr/bin/security` command for the macOS Keychain legs
+/// (`keychain.rs`): every `find` / `add` / `delete-generic-password` and the
+/// census `dump-keychain` builds its command here. Scrubbed of every
+/// monitoring and billing key
+/// ([`crate::providers::billing_key::helper_command`]): the Keychain CLI is a
+/// helper, not a session, and a management key has no business in its env.
+/// Defined outside the macOS-gated `keychain` module so the Linux suite pins
+/// the scrub the macOS build spawns with.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // spawned on macOS alone
+pub(crate) fn security_command() -> std::process::Command {
+    crate::providers::billing_key::helper_command(SECURITY_BIN)
+}
+
 /// Open `url` in the operator's default browser. Used by the interactive OAuth
 /// login (`oauth_login`) to launch the authorize page. Detached (stdio nulled)
 /// so it never blocks or leaks output into tollgate's own stdout/stderr.

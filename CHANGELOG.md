@@ -69,9 +69,9 @@ First release of tollgate, a hard fork of [clauth](https://github.com/uwuclxdy/c
 
 The pre-release review and how each finding was settled: [docs/tollgate-code-review-0.1.0.md](docs/tollgate-code-review-0.1.0.md). Beyond the guest-mode changes above:
 
-- Helper processes (`notify-send`, the browser opener, herdr, git, the terminal spawn, plugin probes) start with monitoring and billing keys scrubbed from their environment.
+- Helper processes (`notify-send`, the browser opener, herdr, git, the terminal spawn, plugin probes, and the macOS / Windows-only `/usr/bin/security`, `ps`, `tasklist`, `taskkill` and `powershell`) start with monitoring and billing keys scrubbed from their environment.
 - Key-bearing provider GETs follow no redirect, cap bodies at 2 MiB and have a 20 s end-to-end deadline; the shared usage agent has the same deadline.
-- An OpenRouter wallet read with a management key no longer decides the inference account's availability, and a `/credits` 429 holds that wallet for its `Retry-After` (at least 5 minutes).
+- An OpenRouter wallet read with a management key no longer decides the inference account's availability, and a `/credits` 429 holds that wallet for its `Retry-After` (at least 5 minutes). The hold is kept in `~/.tollgate/holds/`, so every process honours it: the daemon, profile fetches and a forced `tollgate monitor refresh`, which still re-reads `/key`.
 - Credential redaction also catches keys embedded in punctuation, such as JSON strings.
 - The local agent API's GETs no longer repair anything on disk, `/v1/status` is always parsed and fully redacted, TCP requests must carry a loopback `Host` (421 otherwise), and the socket's directory is checked and tightened before bind.
 - The herdr plugin scripts no longer pass a pane id into `sed` or session paths through `xargs`.
@@ -83,8 +83,6 @@ The pre-release review and how each finding was settled: [docs/tollgate-code-rev
 - **Old credential links survive guest mode.** A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before `~/.clauth` appeared is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - **Guest sessions still share some of `~/.claude`.** With real links, the top-level entries other than `plugins/`, `projects/`, `settings.json` and `.credentials.json` (`CLAUDE.md`, `todos/`, `history.jsonl`, …) stay linked and writable. An isolated guest session's transcripts are still rescued into `~/.claude/projects`, and `sessions` / `resume` do not list the guest store.
 - **macOS guest Keychain guard not built on macOS yet.** The default-item refusal is tested on Linux through its predicate; `keychain.rs` itself has not been compiled for macOS since the change.
-- **Some platform-only helpers keep the full environment.** `ps`, `tasklist`, `powershell` and `/usr/bin/security` (Windows and macOS only) are not scrubbed of monitoring keys.
-- **The OpenRouter wallet hold is per process.** A `/credits` 429 hold lives in memory, so a separate CLI process (a manual `monitor refresh`) does not see the daemon's.
 - **`list` and `status --json` show `base_url` unredacted.** `usage --json` and the agent API redact it.
 - **`tollgate api serve` leaves `api.sock` behind on SIGTERM.** The next start replaces the stale socket.
 - **herdr `--display-agent` scope unverified.** Whether the `border label` knob's label is scoped to one pane is not verified against herdr 0.9.

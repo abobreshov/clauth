@@ -926,3 +926,30 @@ fn an_upstream_refresher_parks_the_fetch_lease() {
         std::fs::remove_file(&path).expect("rm");
     }
 }
+
+/// The daemon-identity and kill helpers the non-Linux builds spawn (`ps`,
+/// `tasklist`, `taskkill`) inherit no monitoring or billing key: each is
+/// built through the shared scrubbed constructor, pinned here on Linux.
+#[test]
+fn the_platform_process_helpers_are_scrubbed() {
+    let _home = HomeSandbox::new();
+    let mut monitor = crate::usage::monitor::config::MonitorConfig::new(
+        "orm",
+        crate::usage::monitor::config::MonitorKind::OpenRouter,
+    );
+    monitor.api_key_env = Some("MONITOR_INFERENCE".into());
+    monitor.billing_key_env = Some("MONITOR_MGMT".into());
+    crate::usage::monitor::config::add(&monitor).unwrap();
+
+    for (program, cmd) in [
+        ("ps", ps_command_line_command(7)),
+        ("tasklist", tasklist_command(7)),
+        ("taskkill", taskkill_command(7)),
+    ] {
+        assert_eq!(cmd.get_program(), program);
+        let env = crate::testutil::env_overrides(&cmd);
+        for name in ["MONITOR_INFERENCE", "MONITOR_MGMT"] {
+            assert_eq!(env.get(name), Some(&None), "{name} rides into {program}");
+        }
+    }
+}

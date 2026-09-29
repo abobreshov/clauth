@@ -922,3 +922,101 @@ fn the_wallet_only_leg_honours_the_hold() {
     );
     assert!(http.urls().is_empty(), "nothing is sent while held");
 }
+
+// ── the persisted /credits hold (across processes) ─────────────────────────────
+
+/// Every hold file under `~/.tollgate/holds/`.
+fn hold_files() -> Vec<std::path::PathBuf> {
+    let dir = crate::profile::tollgate_dir().unwrap().join("holds");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries.map(|e| e.unwrap().path()).collect()
+}
+
+/// A `/credits` 429 is written to disk (0600, under a 0700 dir, no key in
+/// name or body), and a second process — a fresh store with an empty map —
+/// reads `/key` alone inside the hold, through the scheduler's own entry;
+/// past the `Retry-After` it reads `/credits` again and the file is gone.
+#[test]
+fn a_persisted_credits_hold_binds_a_second_process_until_it_expires() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0: u64 = 1_000_000;
+    let retry = 10 * 60;
+    let daemon = WalletHolds::persistent();
+    let http = Recorder::new(vec![body(KEY_LIMITED), rate_limited(retry)]);
+    fetch_stats_with(INFERENCE, None, &http, &daemon, t0).unwrap();
+    assert_eq!(http.urls(), [KEY_URL, CREDITS_URL]);
+
+    let files = hold_files();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let raw = std::fs::read_to_string(&files[0]).unwrap();
+    for text in [raw.as_str(), &files[0].to_string_lossy()] {
+        assert!(!text.contains(INFERENCE), "the key reaches disk: {text}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&files[0]), 0o600);
+        assert_eq!(mode(files[0].parent().unwrap()), 0o700);
+    }
+
+    // Another process: nothing in memory, the hold read from disk.
+    let cli = WalletHolds::persistent();
+    let inside = t0 + 60_000;
+    assert_eq!(
+        cli.remaining(INFERENCE, inside),
+        Some(Duration::from_secs(retry - 60))
+    );
+    let http = Recorder::new(vec![body(KEY_LIMITED)]);
+    let st = fetch_stats_with(INFERENCE, None, &http, &cli, inside).unwrap();
+    assert_eq!(http.urls(), [KEY_URL], "no /credits inside the hold");
+    assert!(st.is_available, "the key meters still refresh");
+
+    // A memory-only store (the tests' default) never sees the file.
+    assert_eq!(WalletHolds::default().remaining(INFERENCE, inside), None);
+
+    // Past the Retry-After: `/credits` again, and the expired file is removed.
+    let after = t0 + retry * 1000 + 1;
+    let later = WalletHolds::persistent();
+    let http = Recorder::new(vec![body(KEY_LIMITED), body(CREDITS_FUNDED)]);
+    fetch_stats_with(INFERENCE, None, &http, &later, after).unwrap();
+    assert_eq!(http.urls(), [KEY_URL, CREDITS_URL]);
+    assert!(hold_files().is_empty(), "{:?}", hold_files());
+}
+
+/// The wallet-only leg reads the persisted hold too: a second process sends
+/// nothing and answers `RateLimited` with the time left.
+#[test]
+fn the_wallet_only_leg_honours_a_persisted_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let http = Recorder::new(vec![rate_limited(600)]);
+    let err = wallet_stats_with(MANAGEMENT, &http, &WalletHolds::persistent(), 0).unwrap_err();
+    assert!(matches!(err, ThirdPartyError::RateLimited { .. }));
+
+    let http = Recorder::new(Vec::new());
+    let err =
+        wallet_stats_with(MANAGEMENT, &http, &WalletHolds::persistent(), 300_000).unwrap_err();
+    assert!(
+        matches!(err, ThirdPartyError::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(300)),
+        "{err:?}"
+    );
+    assert!(http.urls().is_empty(), "nothing is sent while held");
+}
+
+/// A persisted deadline past the retry cap (a skewed clock, a hand edit) is
+/// honoured for the cap at most; a torn or foreign file reads as no hold.
+#[test]
+fn a_persisted_hold_is_clamped_and_a_foreign_file_is_ignored() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let holds = WalletHolds::persistent();
+    holds.hold(INFERENCE, 0, Some(Duration::from_secs(600)));
+    let path = hold_files().pop().unwrap();
+    std::fs::write(&path, r#"{"version":1,"until_ms":18446744073709551615}"#).unwrap();
+    let fresh = WalletHolds::persistent();
+    assert_eq!(fresh.remaining(INFERENCE, 0), Some(WalletHolds::cap()));
+
+    std::fs::write(&path, "{not json").unwrap();
+    assert_eq!(WalletHolds::persistent().remaining(INFERENCE, 0), None);
+}

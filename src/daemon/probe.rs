@@ -495,9 +495,8 @@ fn poll_until<T>(wait: Duration, poll: Duration, mut done: impl FnMut() -> Optio
 #[cfg(unix)]
 pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
-    let mut cmd = std::process::Command::new("kill");
+    let mut cmd = crate::providers::billing_key::helper_command("kill");
     cmd.args(["-s", signal, &pid.to_string()]);
-    crate::providers::billing_key::scrub_helper_env(&mut cmd);
     // A soft-pass refusal (a dead pid's ESRCH) is expected noise: silence it.
     // The hard pass stays loud — its failure is the diagnosis the generic
     // wedged-process bail lacks.
@@ -515,13 +514,41 @@ pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     // hard pass only runs when that first kill failed, so it keeps stderr as
     // the wedged-process diagnosis. stdout never carries anything the caller
     // reads (taskkill prints its SUCCESS line there).
-    let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/PID", &pid.to_string(), "/F"]);
+    let mut cmd = taskkill_command(pid);
     cmd.stdout(Stdio::null());
     if !hard {
         cmd.stderr(Stdio::null());
     }
     cmd.status().is_ok()
+}
+
+/// The force-kill Windows' [`terminate_pid`] runs. Built on every platform so
+/// the Linux suite pins its scrub: a helper inherits no monitoring or billing
+/// key ([`crate::providers::billing_key::helper_command`]).
+#[cfg_attr(not(windows), allow(dead_code))] // spawned on Windows alone
+pub(super) fn taskkill_command(pid: u32) -> std::process::Command {
+    let mut cmd = crate::providers::billing_key::helper_command("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/F"]);
+    cmd
+}
+
+/// The `ps` the macOS/BSD [`pid_is_tollgate_daemon`] reads argv through,
+/// scrubbed like every helper and built on every platform for the same reason
+/// as [`taskkill_command`].
+#[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))] // spawned off Linux unix alone
+pub(super) fn ps_command_line_command(pid: u32) -> std::process::Command {
+    let mut cmd = crate::providers::billing_key::helper_command("ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "command="]);
+    cmd
+}
+
+/// The `tasklist` the Windows [`pid_is_tollgate_daemon`] reads the image
+/// name through, scrubbed and portable like [`taskkill_command`].
+#[cfg_attr(not(windows), allow(dead_code))] // spawned on Windows alone
+pub(super) fn tasklist_command(pid: u32) -> std::process::Command {
+    let mut cmd = crate::providers::billing_key::helper_command("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    cmd
 }
 
 /// Confirm `pid` is still a running `tollgate daemon` before `--replace` signals
@@ -552,10 +579,7 @@ fn pid_is_tollgate_daemon(pid: u32) -> bool {
     // macOS/BSD: `ps -p <pid> -o command=` prints the full argv, space-joined. A
     // missing pid prints nothing; a failed `ps` reads false so a broken probe
     // never green-lights a signal.
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    else {
+    let Ok(out) = ps_command_line_command(pid).output() else {
         return false;
     };
     if !out.status.success() {
@@ -572,10 +596,7 @@ fn pid_is_tollgate_daemon(pid: u32) -> bool {
     // process). It can't tell the daemon from another tollgate subcommand here — a
     // documented residual on Windows, where the recycle window is a handful of
     // instructions wide. A failed probe reads false: never signal unverified.
-    let Ok(out) = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-    else {
+    let Ok(out) = tasklist_command(pid).output() else {
         return false;
     };
     // An exact image-name match on the CSV's first field, never a substring:
