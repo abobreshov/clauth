@@ -3327,3 +3327,226 @@ fn the_accounts_scrollbar_counts_the_codex_rows() {
         "seven rows overflow a 5-row list: thumb 5*5/7 = 3 rows at offset 0, then track"
     );
 }
+
+// ── read-only rows: upstream clauth accounts and monitors ────────────────────
+
+/// 2026-09-29T12:00:00Z, just after the upstream fixture's `generated_at`.
+const UPSTREAM_NOW_MS: u64 = 1_790_683_200_000;
+
+/// Plant the upstream status fixture as `~/.clauth/status.json` in the
+/// sandbox HOME and read it back through the collector the Usage tab uses.
+fn upstream_extras(
+    home: &crate::testutil::HomeSandbox,
+) -> Vec<crate::usage::observation::AccountObservation> {
+    let dir = home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME);
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.clauth");
+    std::fs::write(
+        dir.join("status.json"),
+        include_str!("../fixtures/upstream_status.json"),
+    )
+    .expect("write the status fixture");
+    let codex = crate::codex_profiles::CodexState::default();
+    let ctx = crate::usage::collect::CollectCtx {
+        config: None,
+        codex: &codex,
+        now_ms: UPSTREAM_NOW_MS,
+        interval_ms: 300_000,
+        guest_mode: true,
+        include_disabled: false,
+    };
+    let extras =
+        crate::tui::app::usage_extras_from(&ctx, &[], crate::usage::collect::UPSTREAM_SOURCES);
+    assert_eq!(extras.len(), 4, "fixture control: four upstream accounts");
+    extras
+}
+
+/// A monitoring-only account with one monthly pool.
+fn monitor_extra() -> crate::usage::observation::AccountObservation {
+    use crate::usage::observation::{
+        AccountObservation, AuthKind, Origin, QuotaWindow, SourceId, WindowScope, account_id,
+    };
+    let mut obs = AccountObservation::new(
+        account_id(Origin::Monitor, "oll"),
+        SourceId::OllamaCloud,
+        AuthKind::ApiKey,
+        Origin::Monitor,
+        "oll",
+    );
+    obs.plan = Some("pro".into());
+    let mut month = QuotaWindow::new("month", "30d", WindowScope::Shared);
+    month.used_pct = Some(71.0);
+    obs.windows.push(month);
+    obs
+}
+
+fn overview_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app))
+        .expect("draw");
+    term.backend().buffer().clone()
+}
+
+fn overview_text(app: &App, width: u16, height: u16) -> Vec<String> {
+    crate::testutil::buffer_rows(&overview_buffer(app, width, height))
+}
+
+fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a str {
+    rows.iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| panic!("no row with {needle:?}:\n{}", rows.join("\n")))
+}
+
+/// The owner's report: guest mode, no tollgate profile, upstream's accounts
+/// on the Usage tab — the Overview must list them too, read-only, instead of
+/// claiming there are no accounts.
+#[test]
+fn guest_overview_lists_upstream_accounts_read_only() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(vec![], None, vec![]));
+    crate::tui::app::set_usage_extras(&mut app, upstream_extras(&home));
+    let rows = overview_text(&app, 110, 16);
+    let text = rows.join("\n");
+
+    assert!(!text.contains("no accounts yet"), "{text}");
+    assert!(
+        text.contains(
+            "no tollgate accounts yet · n to add one · showing 4 clauth accounts read-only"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("clauth (read-only)"), "{text}");
+    assert!(
+        !text.contains("monitors"),
+        "no monitor group without monitors"
+    );
+    assert!(text.contains("4 clauth"), "the meta counts them: {text}");
+    for label in [
+        "work (clauth)",
+        "side (clauth)",
+        "ds (clauth)",
+        "gpt (clauth)",
+    ] {
+        assert!(text.contains(label), "{label}: {text}");
+    }
+    // The lead metric: bracketed mini bar + share, the weekly under 7d.
+    let work = row_with(&rows, "work (clauth)");
+    assert!(work.contains('●'), "upstream's active mark: {work}");
+    assert!(work.contains("Max 20x"), "{work}");
+    assert!(work.contains('[') && work.contains("42%"), "{work}");
+    assert!(work.contains("62%"), "{work}");
+    assert!(
+        !row_with(&rows, "side (clauth)").contains('●'),
+        "only the active account wears the dot"
+    );
+    // Nothing selected explicitly: the first read-only row takes the cursor.
+    assert!(work.contains('❯'), "{work}");
+}
+
+/// Own profiles first, then the `clauth (read-only)` group, then `monitors`;
+/// the selection stays on the profile until the cursor moves.
+#[test]
+fn read_only_groups_follow_the_own_profiles() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("mine", 95.0, 10.0, 3_600)],
+        Some("mine"),
+        vec![],
+    ));
+    let mut extras = vec![monitor_extra()];
+    extras.extend(upstream_extras(&home));
+    crate::tui::app::set_usage_extras(&mut app, extras);
+    let rows = overview_text(&app, 110, 20);
+    let text = rows.join("\n");
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{text}"))
+    };
+
+    assert!(!text.contains("no tollgate accounts yet"), "{text}");
+    assert!(at("mine") < at("clauth (read-only)"));
+    assert!(at("clauth (read-only)") < at("work (clauth)"));
+    assert!(at("gpt (clauth)") < at("monitors"));
+    assert!(at("monitors") < at("oll "));
+    assert!(text.contains("1 claude · 4 clauth · 1 monitor"), "{text}");
+    assert!(row_with(&rows, "mine").contains('❯'), "{text}");
+    assert!(!row_with(&rows, "work (clauth)").contains('❯'), "{text}");
+    // A monthly lead names itself after the columns.
+    let oll = row_with(&rows, "oll ");
+    assert!(oll.contains("71%") && oll.contains("(30d)"), "{oll}");
+
+    // The cursor on a read-only row moves the highlight off the profile.
+    app.usage_extra_cursor = Some(2); // side (clauth)
+    let rows = overview_text(&app, 110, 20);
+    assert!(row_with(&rows, "side (clauth)").contains('❯'));
+    assert!(!row_with(&rows, "mine").contains('❯'));
+}
+
+/// The rows are dimmed — only the upstream `●` keeps its hue.
+#[test]
+fn read_only_rows_render_dim() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(config_with(
+        vec![profile("mine", 95.0, 10.0, 3_600)],
+        Some("mine"),
+        vec![],
+    ));
+    crate::tui::app::set_usage_extras(&mut app, upstream_extras(&home));
+    let buf = overview_buffer(&app, 110, 16);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let (y, row) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, r)| r.contains("work (clauth)"))
+        .expect("work row");
+    let y = u16::try_from(y).unwrap();
+    let chars: Vec<char> = row.chars().collect();
+    let fg_at = |x: usize| buf[(u16::try_from(x).unwrap(), y)].fg;
+    let dim = theme::dim().fg.expect("dim has a colour");
+    let name = row
+        .find("work (clauth)")
+        .map(|b| row[..b].chars().count())
+        .unwrap();
+    for x in name..name + "work (clauth)".chars().count() {
+        assert_eq!(fg_at(x), dim, "name cell {x} is dim: {row}");
+    }
+    let pct = chars.iter().position(|&c| c == '%').expect("a share");
+    assert_eq!(fg_at(pct), dim, "the share is dim: {row}");
+    let fill = chars
+        .iter()
+        .position(|&c| c == '█' || c == '░')
+        .expect("a bar");
+    assert_eq!(fg_at(fill), dim, "the bar is dim: {row}");
+    let dot = chars.iter().position(|&c| c == '●').expect("active dot");
+    assert_eq!(fg_at(dot), theme::accent_2_color());
+}
+
+/// The codex-only filter hides the read-only rows with the claude ones: the
+/// cursor and its keys are bound to those.
+#[test]
+fn the_codex_filter_hides_the_read_only_rows() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("mine", 95.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+    crate::tui::app::set_usage_extras(&mut app, upstream_extras(&home));
+    app.harness_filter = crate::tui::app::HarnessFilter::Codex;
+    let text = overview_text(&app, 110, 16).join("\n");
+    assert!(!text.contains("clauth (read-only)"), "{text}");
+    assert!(!text.contains("work (clauth)"), "{text}");
+}
+
+/// No read-only rows: the empty state is the one it always was.
+#[test]
+fn without_read_only_rows_the_empty_state_is_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(vec![], None, vec![]));
+    let text = overview_text(&app, 90, 12).join("\n");
+    assert!(text.contains("no accounts yet"), "{text}");
+    assert!(text.contains("n to create one"), "{text}");
+    assert!(!text.contains("tollgate accounts"), "{text}");
+}

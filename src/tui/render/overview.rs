@@ -12,7 +12,8 @@ use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
     NO_DATA, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split,
-    is_past_reset, reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
+    is_past_reset, reset_in_secs_at, reset_resume, spinner_frame, spinner_style,
+    window_summary_spans_bracketed, window_summary_spans_bracketed_at,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -25,6 +26,10 @@ use crate::fallback::{
 };
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
+use crate::usage::derive::{format_money, lead_window};
+use crate::usage::observation::{
+    AccountObservation, MoneyKind, Origin, QuotaWindow, WINDOW_SESSION, WINDOW_WEEKLY,
+};
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
     selected_next_refresh, switch_grade_kick_lifts,
@@ -80,7 +85,59 @@ fn harness_counts(app: &App) -> String {
     if codex_n > 0 {
         terms.push(format!("{codex_n} codex"));
     }
+    let (upstream_n, monitor_n) = extra_counts(app);
+    if upstream_n > 0 {
+        terms.push(format!("{upstream_n} clauth"));
+    }
+    if monitor_n > 0 {
+        terms.push(format!("{monitor_n} monitor"));
+    }
     terms.join(" · ")
+}
+
+/// How many read-only rows the Overview lists: (upstream-clauth, monitors).
+fn extra_counts(app: &App) -> (usize, usize) {
+    let upstream = app
+        .usage_extras
+        .iter()
+        .filter(|o| o.origin == Origin::Upstream)
+        .count();
+    (upstream, app.usage_extras.len() - upstream)
+}
+
+/// The Overview's read-only rows as shown: [`App::overview_extras`]'s display
+/// order, empty while the harness filter hides the claude rows (the cursor and
+/// every key it arms are bound to those).
+fn shown_extras(app: &App) -> Vec<usize> {
+    if app.harness_filter.shows_claude() {
+        app.overview_extras()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The line that replaces `no accounts yet` when tollgate has no profile of
+/// its own but read-only rows are listed: what `n` does, and what the rows
+/// below are.
+fn extras_hint_line(app: &App) -> Line<'static> {
+    let (upstream_n, monitor_n) = extra_counts(app);
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut shown: Vec<String> = Vec::new();
+    if upstream_n > 0 {
+        shown.push(plural(upstream_n, "clauth account", "clauth accounts"));
+    }
+    if monitor_n > 0 {
+        shown.push(plural(monitor_n, "monitor", "monitors"));
+    }
+    Line::from(vec![
+        Span::styled("  no tollgate accounts yet · ", theme::dim()),
+        Span::styled("n", theme::accent()),
+        Span::styled(
+            format!(" to add one · showing {} read-only", shown.join(" + ")),
+            theme::dim(),
+        ),
+    ])
 }
 
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -102,13 +159,32 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         &[]
     };
-    if app.config().profiles.is_empty() && codex.is_empty() {
+    let extras = shown_extras(app);
+    let no_own = app.config().profiles.is_empty() && codex.is_empty();
+    if no_own && extras.is_empty() {
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
 
-    let [header_area, list_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    // With no account of its own but read-only rows to list, one hint line
+    // above the table stands in for the empty state.
+    let (header_area, list_area) = if no_own {
+        let [hint_area, header_area, list_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(inner);
+        frame.render_widget(
+            Paragraph::new(extras_hint_line(app)).style(theme::base()),
+            hint_area,
+        );
+        (header_area, list_area)
+    } else {
+        let [header_area, list_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        (header_area, list_area)
+    };
 
     let widths = OverviewWidths::new(list_area.width, app);
     let header = overview_header(&widths, any_deepseek(app));
@@ -119,6 +195,12 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         Vec::new()
     };
+    // A selection resting on a read-only row highlights no profile.
+    let selected_extra = if extras.is_empty() {
+        None
+    } else {
+        app.overview_selected_extra()
+    };
     let sel = app.profile_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
     let mut rows: Vec<ListItem<'_>> = items
@@ -126,7 +208,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .enumerate()
         .map(|(row, item)| match item {
             MainItemKind::Profile(idx) => {
-                let selected = row == sel;
+                let selected = row == sel && selected_extra.is_none();
                 let line = render_overview_row(app, *idx, &widths, selected, focused);
                 ListItem::new(select_line(line, selected, focused, width))
             }
@@ -148,11 +230,49 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             rows.push(ListItem::new(render_codex_row(row, &widths)));
         }
     }
+    // The read-only rows: upstream clauth's accounts, then monitors, each
+    // group under its own caption. The cursor lands on them (⏎ opens the Usage
+    // tab there) but no account action does — see `read_only_hint`.
+    let mut list_sel = sel;
+    let now = now_epoch_secs();
+    let reset_fmt = ResetFmt::from_state(&app.config().state);
+    for (caption, upstream) in [("clauth (read-only)", true), ("monitors", false)] {
+        let group: Vec<usize> = extras
+            .iter()
+            .copied()
+            .filter(|&i| (app.usage_extras[i].origin == Origin::Upstream) == upstream)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        if !rows.is_empty() {
+            rows.push(ListItem::new(Line::from("")));
+        }
+        rows.push(ListItem::new(Line::from(vec![Span::styled(
+            format!("  {caption}"),
+            theme::dim(),
+        )])));
+        for i in group {
+            let selected = selected_extra == Some(i);
+            if selected {
+                list_sel = rows.len();
+            }
+            let line = render_extra_row(
+                &app.usage_extras[i],
+                &widths,
+                selected,
+                focused,
+                reset_fmt,
+                now,
+            );
+            rows.push(ListItem::new(select_line(line, selected, focused, width)));
+        }
+    }
 
     let total = rows.len();
     let list = List::new(rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(sel));
+    state.select(Some(list_sel));
     frame.render_stateful_widget(list, list_area, &mut state);
 
     let viewport = list_area.height as usize;
@@ -201,11 +321,19 @@ const GAP_MIN: usize = 2;
 impl OverviewWidths {
     fn new(width: u16, app: &App) -> Self {
         let total = width as usize;
+        // The read-only rows' labels share the name column; with none shown
+        // this is the profile names alone, as before.
+        let extras = shown_extras(app);
         let max_name = app
             .config()
             .profiles
             .iter()
             .map(|p| p.name.chars().count())
+            .chain(
+                extras
+                    .iter()
+                    .map(|&i| app.usage_extras[i].label.chars().count()),
+            )
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
@@ -462,6 +590,125 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
         spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
     Line::from(spans)
+}
+
+/// One read-only row (an upstream-clauth account or a monitor), in the claude
+/// columns and dimmed whole: name, plan, then the lead metric as the claude
+/// rows draw a window — mini bar, `%`, countdown — in the 5h column (the
+/// session window when there is one, with the weekly one under `7d`), or the
+/// lead balance when the account publishes no window. The upstream `●` keeps
+/// its hue: which account clauth has live is the one fact these rows are
+/// here to tell. The timer and live slots stay blank — nothing here polls.
+fn render_extra_row(
+    obs: &AccountObservation,
+    widths: &OverviewWidths,
+    selected: bool,
+    focused: bool,
+    reset_fmt: ResetFmt,
+    now: i64,
+) -> Line<'static> {
+    let dim_all = |mut spans: Vec<Span<'static>>| {
+        for s in &mut spans {
+            s.style = theme::dim();
+        }
+        spans
+    };
+    let mut spans = vec![
+        if selected && focused {
+            Span::styled("❯ ", theme::accent().bold())
+        } else {
+            Span::raw("  ")
+        },
+        if obs.active {
+            Span::styled("●", Style::default().fg(theme::accent_2_color()))
+        } else {
+            Span::raw(" ")
+        },
+        Span::raw(" "),
+    ];
+    let (nt, np) = fixed_split(&obs.label, widths.name);
+    spans.push(Span::styled(
+        nt,
+        bold_when(theme::dim(), selected && focused),
+    ));
+    spans.push(Span::raw(np));
+    spans.push(gap(widths));
+    spans.push(match obs.plan.as_deref() {
+        Some(plan) => Span::styled(fixed(plan, widths.kind), theme::dim()),
+        None => Span::styled(fixed(NO_DATA, widths.kind), theme::faint()),
+    });
+    spans.push(narrow_gap(widths));
+    spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
+
+    let session = obs.window(WINDOW_SESSION);
+    let lead = session.or_else(|| lead_window(&obs.windows, now));
+    let weekly = session.and(obs.window(WINDOW_WEEKLY));
+    let cell = |window: Option<&QuotaWindow>, w: usize, include_bar: bool| {
+        let usage = window.and_then(extra_usage_window);
+        let past = usage
+            .as_ref()
+            .and_then(|u| reset_in_secs_at(u, now))
+            .is_some_and(|s| s <= 0);
+        dim_all(window_summary_spans_bracketed_at(
+            usage.as_ref(),
+            w,
+            include_bar,
+            None,
+            reset_fmt,
+            past,
+            now,
+        ))
+    };
+    let five_spans = match lead {
+        Some(_) => cell(lead, widths.five_hour, true),
+        None => match extra_lead_money(obs) {
+            Some(money) => vec![Span::styled(
+                fixed(&format!("[{money}]"), widths.five_hour),
+                theme::dim(),
+            )],
+            None => vec![Span::styled(NO_DATA.to_string(), theme::faint())],
+        },
+    };
+    let pad_to = |spans: &mut Vec<Span<'static>>, cells: Vec<Span<'static>>, w: usize| {
+        let len: usize = cells.iter().map(|s| s.content.chars().count()).sum();
+        spans.extend(cells);
+        spans.push(Span::raw(" ".repeat(w.saturating_sub(len))));
+    };
+    pad_to(&mut spans, five_spans, widths.five_hour);
+    // A lead that is not the 5h window names itself in the 7d cell it leaves
+    // empty, so a monthly pool never reads as a 5h reading. (After the columns
+    // would be clipped: the gaps already widen to the row's full width.)
+    if widths.seven_day > 0 {
+        spans.push(gap(widths));
+        let seven = match (weekly, lead.filter(|w| w.id != WINDOW_SESSION)) {
+            (Some(_), _) => cell(weekly, widths.seven_day, widths.seven_day >= 18),
+            (None, Some(w)) => vec![Span::styled(
+                fixed(&format!("({})", w.label), widths.seven_day),
+                theme::dim(),
+            )],
+            (None, None) => Vec::new(),
+        };
+        pad_to(&mut spans, seven, widths.seven_day);
+    }
+    Line::from(spans)
+}
+
+/// A read-only window as the [`UsageWindow`] the claude-row cells draw;
+/// `None` when the source publishes no share (a dash, never a fabricated 0%).
+fn extra_usage_window(w: &QuotaWindow) -> Option<UsageWindow> {
+    Some(UsageWindow {
+        utilization: w.used_pct?,
+        resets_at: w.resets_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+/// The first additive balance or limit figure (`$13.67`) of a read-only
+/// account that publishes no window.
+fn extra_lead_money(obs: &AccountObservation) -> Option<String> {
+    obs.money
+        .iter()
+        .find(|m| m.additive && matches!(m.kind, MoneyKind::Balance | MoneyKind::Limit))
+        .map(|m| format_money(&m.amount, &m.currency))
 }
 
 /// Whether the profile's PROVIDER is on peak-rate hours right now, sampled off
