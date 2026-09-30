@@ -147,12 +147,16 @@ pub(crate) fn handle(ctx: &Ctx, req: &Request, door: Door) -> Response {
 /// profile name is operator-chosen, never a key.
 pub(crate) fn redact(obs: &mut AccountObservation) {
     obs.plan = obs.plan.as_deref().map(sanitize_message);
+    obs.note = obs.note.as_deref().map(sanitize_message);
     obs.endpoint = obs.endpoint.as_deref().map(redact_endpoint);
     if let Some(f) = obs.failure.as_mut() {
         f.message = sanitize_message(&f.message);
     }
     for w in &mut obs.windows {
         w.label = sanitize_message(&w.label);
+        for share in &mut w.attribution {
+            share.label = sanitize_message(&share.label);
+        }
     }
     for m in &mut obs.money {
         m.label = sanitize_message(&m.label);
@@ -269,7 +273,6 @@ impl ImportBlock {
 pub(crate) struct AccountsBody {
     schema_version: u32,
     /// `AccountObservation` objects (see `tollgate usage --json`), redacted.
-    #[schema(value_type = Vec<Object>)]
     accounts: Vec<AccountObservation>,
     /// Every running `tollgate start` session, with where it is in a switch
     /// (requested, committed, served). Additive under schema version 1.
@@ -281,7 +284,6 @@ pub(crate) struct AccountsBody {
 pub(crate) struct AccountBody {
     schema_version: u32,
     /// One `AccountObservation`, redacted.
-    #[schema(value_type = Object)]
     account: AccountObservation,
     /// The running sessions whose committed or served member is this account.
     live_sessions: Vec<LiveSessionView>,
@@ -294,7 +296,6 @@ pub(crate) struct UsageBody {
     /// RFC 3339 instant the report was assembled.
     generated_at: String,
     guest_mode: bool,
-    #[schema(value_type = Vec<Object>)]
     accounts: Vec<AccountObservation>,
 }
 
@@ -345,6 +346,8 @@ pub(crate) const CATALOG: &[SourceId] = &[
     SourceId::Alibaba,
     SourceId::Grok,
     SourceId::Antigravity,
+    SourceId::OpenaiApi,
+    SourceId::GoogleAi,
     SourceId::Generic,
     SourceId::UpstreamClauth,
 ];
@@ -354,9 +357,10 @@ pub(crate) const CATALOG: &[SourceId] = &[
 pub(crate) fn auth_kinds(source: SourceId) -> &'static [AuthKind] {
     use AuthKind::{ApiKey, Hybrid, NativeLogin, ReadOnly, Subscription};
     match source {
-        SourceId::AnthropicOauth | SourceId::Codex | SourceId::Grok | SourceId::Antigravity => {
-            &[Subscription]
-        }
+        SourceId::AnthropicOauth => &[Subscription],
+        SourceId::Codex | SourceId::Grok | SourceId::Antigravity => &[Subscription, NativeLogin],
+        SourceId::OpenaiApi => &[ApiKey, ReadOnly],
+        SourceId::GoogleAi => &[ApiKey],
         SourceId::Ollama | SourceId::Hermes => &[NativeLogin],
         SourceId::OllamaCloud => &[ApiKey, ReadOnly],
         SourceId::OpenRouter => &[ApiKey, Hybrid, ReadOnly],

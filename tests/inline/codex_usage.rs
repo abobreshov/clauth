@@ -307,3 +307,71 @@ fn a_401_from_the_usage_endpoint_is_reported_as_its_status() {
     assert!(matches!(err, FetchError::Status(401)), "got {err:?}");
     assert_eq!(handle.join().expect("join stub").len(), 1);
 }
+#[test]
+fn map_usage_parses_credits_spend_control_and_additional_limits() {
+    let info = map_usage(
+        include_str!("../fixtures/monitors/codex-additive.json"),
+        1900000000,
+    )
+    .expect("fixture");
+    let credits = info.codex_credits.as_ref().expect("credits");
+    assert_eq!(credits.balance.as_deref(), Some("12.3400"));
+    assert_eq!(credits.unlimited, Some(false));
+    assert_eq!(credits.has_credits, Some(true));
+    assert_eq!(info.codex_spend_control_reached, Some(true));
+    assert_eq!(info.codex_additional_windows.len(), 2);
+    let window = &info.codex_additional_windows[0];
+    assert_eq!(window.used_pct, Some(33.));
+    assert_eq!(window.resets_at.map(|t| t.secs()), Some(1900000900));
+    assert!(!window.chain_eligible);
+    let mut observation = super::super::observation::AccountObservation::new(
+        "codex:test".into(),
+        super::super::observation::SourceId::Codex,
+        super::super::observation::AuthKind::NativeLogin,
+        super::super::observation::Origin::Monitor,
+        "Test",
+    );
+    super::super::project::apply_codex_usage(&mut observation, &info, 1900000000);
+    assert_eq!(observation.windows.len(), 3);
+    assert_eq!(observation.money[0].currency, "CREDITS");
+    assert_eq!(observation.money[0].amount.as_str(), "12.3400");
+    assert_eq!(
+        observation.failure.as_ref().map(|f| f.kind),
+        Some(super::super::observation::FailureKind::QuotaExhausted)
+    );
+}
+#[test]
+fn codex_profile_output_unchanged_without_additive_fields() {
+    let info=map_usage(r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":12,"limit_window_seconds":18000}}}"#,100).expect("fixture");
+    let serialized = serde_json::to_value(&info).expect("serialization");
+    assert!(serialized.get("codex_credits").is_none());
+    assert!(serialized.get("codex_spend_control_reached").is_none());
+    assert!(serialized.get("codex_additional_windows").is_none());
+    assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(12.));
+}
+#[test]
+fn codex_unlimited_credit_pool_is_never_fabricated_as_money() {
+    let info = map_usage(
+        r#"{"credits":{"balance":"0","unlimited":true,"has_credits":true}}"#,
+        100,
+    )
+    .expect("fixture");
+    let mut obs = super::super::observation::AccountObservation::new(
+        "codex:test".into(),
+        super::super::observation::SourceId::Codex,
+        super::super::observation::AuthKind::Subscription,
+        super::super::observation::Origin::Profile,
+        "Test",
+    );
+    super::super::project::apply_codex_usage(&mut obs, &info, 100);
+    assert!(obs.money.is_empty());
+}
+#[test]
+fn codex_numeric_credits_preserve_exact_wire_decimal() {
+    let info =
+        map_usage(r#"{"credits":{"balance":9007199254740993.123400}}"#, 100).expect("fixture");
+    assert_eq!(
+        info.codex_credits.unwrap().balance.as_deref(),
+        Some("9007199254740993.123400")
+    );
+}

@@ -13,7 +13,7 @@ fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(std::iter::once("tollgate").chain(args.iter().copied()))
 }
 
-fn add_args(args: &[&str]) -> MonitorAddArgs {
+fn add_args(args: &[&str]) -> Box<MonitorAddArgs> {
     let mut full = vec!["monitor", "add"];
     full.extend_from_slice(args);
     match parse(&full).unwrap().command {
@@ -176,4 +176,78 @@ fn list_rows_judge_freshness_by_the_monitors_own_ttl() {
         "fast: {:?}",
         rows[1].observation.freshness
     );
+}
+
+#[test]
+fn monitor_add_grok_preset_fills_defaults() {
+    let m = add_args(&["grok"]).to_config().unwrap();
+    assert_eq!(m.kind, MonitorKind::Grok);
+    assert_eq!(m.tool_home.as_deref(), Some("~/.grok"));
+    assert_eq!(m.ttl_secs, Some(300));
+}
+#[test]
+fn monitor_add_codex_native_and_agy_aliases() {
+    assert_eq!(
+        add_args(&["codex-native"]).to_config().unwrap().kind,
+        MonitorKind::CodexNative
+    );
+    let m = add_args(&["agy", "--id", "agy-two"]).to_config().unwrap();
+    assert_eq!(m.id, "agy-two");
+    assert_eq!(m.via.as_deref(), Some("keyring"));
+}
+#[test]
+fn preset_id_collision_suggests_id_flag() {
+    let _home = HomeSandbox::new();
+    run(MonitorCommand::Add(add_args(&["grok"]))).unwrap();
+    assert!(
+        run(MonitorCommand::Add(add_args(&["grok"])))
+            .unwrap_err()
+            .to_string()
+            .contains("--id grok-2")
+    );
+}
+#[test]
+fn kind_form_is_unchanged() {
+    let m = add_args(&["custom", "--kind", "nous"]).to_config().unwrap();
+    assert_eq!(m.id, "custom");
+    assert!(m.label.is_none());
+}
+#[test]
+fn presets_respect_explicit_flags_and_admin_alias() {
+    let m = add_args(&[
+        "openai",
+        "--id",
+        "project",
+        "--api-key-env",
+        "PROJECT_KEY",
+        "--admin-key-env",
+        "ADMIN_KEY",
+        "--label",
+        "Project",
+    ])
+    .to_config()
+    .unwrap();
+    assert_eq!(m.id, "project");
+    assert_eq!(m.api_key_env.as_deref(), Some("PROJECT_KEY"));
+    assert_eq!(m.billing_key_env.as_deref(), Some("ADMIN_KEY"));
+    assert_eq!(m.label.as_deref(), Some("Project"));
+    let m = add_args(&["nous-key", "--probe", "--probe-model", "synthetic:free"])
+        .to_config()
+        .unwrap();
+    assert!(m.probe);
+    assert_eq!(m.ttl_secs, Some(1800));
+}
+#[test]
+fn detect_and_capture_flags_parse() {
+    parse(&[
+        "monitor",
+        "detect",
+        "--json",
+        "--explain",
+        "--apply",
+        "--yes",
+    ])
+    .unwrap();
+    parse(&["monitor", "refresh", "grok", "--capture", "/tmp/shapes"]).unwrap();
+    assert!(parse(&["monitor", "detect", "--yes"]).is_err());
 }

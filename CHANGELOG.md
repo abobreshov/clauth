@@ -49,6 +49,16 @@
 - The MCP `switch_profile` tool refuses a Hermes name with the relaunch hint.
 - CI runs the `needs sqlite3` tests in a job that installs it, and a `hermes_projector_real` job runs the real projector against the PyYAML and python-dotenv versions Hermes 0.19.0 pins. The fixtures include anchors, `<<:` merge keys hiding a route, and every dotenv form.
 
+### Native monitors and secret store
+
+- Added read-only Grok, Antigravity (Linux Secret Service), and native Codex monitors. Borrowed tokens are never refreshed; expired or undated tokens make no network call. Managed Codex store symlinks are refused.
+- Added monitor presets, offline `monitor detect --explain`, and private `monitor refresh --capture DIR` structure dumps. Detection never executes a CLI or reads a keyring secret.
+- Added `secret set|list|rm` with hidden input, an atomic private store, environment-first lookup (`--prefer-store` reverses it), and stored-name child environment scrubbing.
+
+### API-key monitors
+
+- Lane 4 slice 2: OpenAI and Google key health, separate hourly OpenAI admin costs, opt-in free Nous probes, Codex credit/spend/additional quota fields, health cards and typed OpenAPI observations. The agy CLI runner remains owner-gated.
+
 ### Fixed
 
 - `list` and `status --json` redact credentials in profile `base_url` values, matching the local agent API.

@@ -39,6 +39,7 @@ os_info = "3.15"
 # key never routes through argv / shell history / process listings. Cross-
 # platform; no transitive deps beyond libc (already in the tree).
 rpassword = "7.5.4"
+zeroize = "1"
 # Local wall-clock stamps on the TUI's reset countdowns (`resets in 40m
 # (21:20)`, issue #39) — std has no timezone. chrono already compiles in the
 # tree via rmcp → schemars; only the `clock` feature is new, which adds
@@ -152,3 +153,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }

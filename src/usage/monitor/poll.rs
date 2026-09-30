@@ -54,6 +54,7 @@ pub(crate) fn poll_detached() {
         return;
     }
     LAST_SCAN_MS.store(now, Ordering::Relaxed);
+    crate::secrets::reload_if_changed();
     let monitors = match super::config::load() {
         Ok(m) => m,
         Err(e) => {

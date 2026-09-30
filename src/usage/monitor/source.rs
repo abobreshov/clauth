@@ -15,6 +15,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::usage::fetch::{FetchError, UsageInfo};
+pub(crate) use crate::usage::keyed_http::{Auth, Method, Request};
 use serde::{Deserialize, Serialize};
 
 use super::config::{MonitorConfig, MonitorKind};
@@ -44,6 +46,13 @@ impl Secret {
     }
 }
 
+impl Drop for Secret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret([redacted])")
@@ -56,6 +65,9 @@ impl fmt::Debug for Secret {
 /// environment right now.
 #[derive(Debug)]
 pub(crate) struct MonitorTarget {
+    pub(crate) cfg: MonitorConfig,
+    pub(crate) home: PathBuf,
+    pub(crate) previous: Option<Reading>,
     pub(crate) provider: Option<Provider>,
     /// `billing_key_env`'s value when set and present, else `api_key_env`'s.
     pub(crate) key: Option<Secret>,
@@ -87,7 +99,7 @@ pub(crate) type EnvReader<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// The process environment, the production [`EnvReader`].
 pub(crate) fn process_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    crate::secrets::resolve(name)
 }
 
 /// Resolve `cfg` against the environment and `home`.
@@ -118,6 +130,9 @@ pub(crate) fn resolve_target(
         }
     };
     MonitorTarget {
+        cfg: cfg.clone(),
+        home: home.to_path_buf(),
+        previous: None,
         provider: cfg.typed_provider(),
         key,
         key_env,
@@ -154,6 +169,24 @@ impl MonitorTarget {
 /// cannot read).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub(crate) struct Reading {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key_health: Option<crate::usage::observation::KeyHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) probe_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) probe_model_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_hold_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) costs_observed_at: Option<i64>,
     pub(crate) plan: Option<String>,
     pub(crate) windows: Vec<QuotaWindow>,
     pub(crate) money: Vec<MoneyMeter>,
@@ -179,6 +212,11 @@ pub(crate) trait UsageSource: Sync {
 pub(crate) fn source_for(kind: MonitorKind) -> &'static dyn UsageSource {
     match kind {
         MonitorKind::Nous => &super::nous::NousSource,
+        MonitorKind::Grok => &super::grok::GrokSource,
+        MonitorKind::Antigravity => &super::antigravity::AntigravitySource,
+        MonitorKind::CodexNative => &super::codex_native::CodexNativeSource,
+        MonitorKind::Openai => &super::openai::OpenaiSource,
+        MonitorKind::GoogleAi => &super::google_ai::GoogleAiSource,
         MonitorKind::OllamaCloud | MonitorKind::OpenRouter | MonitorKind::Provider => {
             &ProviderSource
         }
@@ -196,6 +234,11 @@ pub(crate) fn skeleton(cfg: &MonitorConfig, target: &MonitorTarget) -> AccountOb
         cfg.display_label(),
     );
     obs.disabled = !cfg.enabled;
+    obs.note = match cfg.kind {
+        MonitorKind::Openai => Some(super::openai::NOTE.into()),
+        MonitorKind::GoogleAi => Some(super::google_ai::NOTE.into()),
+        _ => None,
+    };
     obs
 }
 
@@ -267,6 +310,7 @@ impl UsageSource for ProviderSource {
             money: scratch.money,
             best_effort: scratch.best_effort,
             verdict: scratch.failure,
+            ..Reading::default()
         })
     }
 }
@@ -339,12 +383,35 @@ fn retry_at(after: Option<Duration>, target: &MonitorTarget) -> Option<Timestamp
 pub(crate) struct HttpReply {
     pub(crate) status: u16,
     pub(crate) body: String,
+    pub(crate) headers: Vec<(String, String)>,
     /// `retry-after`, delta-seconds form.
     pub(crate) retry_after_secs: Option<u64>,
 }
 
 /// The network seam. Production is [`LiveHttp`]; tests pass a fake.
 pub(crate) trait MonitorHttp: Sync {
+    fn send(&self, kind: MonitorKind, req: &Request<'_>) -> Result<HttpReply, Failure>;
+    fn codex_usage(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+    ) -> Result<UsageInfo, FetchError>;
+    /// Capture callers receive the raw response through the same read-only leg.
+    fn codex_usage_captured(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+        capture: &crate::usage::codex::RawCapture<'_>,
+    ) -> Result<UsageInfo, FetchError> {
+        let usage = self.codex_usage(token, account, fedramp, now)?;
+        let body = serde_json::to_string(&usage).map_err(|_| FetchError::Parse)?;
+        capture(200, &body, &[]);
+        Ok(usage)
+    }
     /// `GET url` with `Authorization: Bearer <token>`.
     fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure>;
     /// A typed provider's usage fetch with `key`.
@@ -366,45 +433,252 @@ pub(crate) const NOUS_PORTAL_ORIGIN: &str = "https://portal.nousresearch.com";
 /// nothing else — the borrowed token is never sent to the inference API or
 /// any other origin. Userinfo, ports, `..` and query-smuggled paths are
 /// refused.
+#[cfg(test)]
 pub(crate) fn bearer_url_allowed(url: &str) -> bool {
-    let Some(path) = url.strip_prefix(NOUS_PORTAL_ORIGIN) else {
-        return false;
-    };
-    if !path.starts_with('/') || path.contains("..") || path.contains(['@', '#', '\\']) {
+    let token = Secret::new("allowlist-test");
+    request_allowed(
+        MonitorKind::Nous,
+        &Request {
+            method: Method::Get,
+            url,
+            auth: Auth::Bearer(&token),
+            extra: &[],
+            json_body: None,
+        },
+    )
+}
+
+/// Exhaustive credential-bearing monitor request allowlist.
+pub(crate) fn request_allowed(kind: MonitorKind, req: &Request<'_>) -> bool {
+    let url = req.url;
+    if url.contains(['@', '#', '\\']) || url.contains("..") {
         return false;
     }
-    let path = path.split('?').next().unwrap_or("");
-    path == "/api/oauth/account"
-        || path
-            .strip_prefix("/api/billing/")
-            .is_some_and(|rest| !rest.is_empty())
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((host, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    if host.contains(':') {
+        return false;
+    }
+    let tail = format!("/{tail}");
+    let (path, query) = tail.split_once('?').unwrap_or((&tail, ""));
+    if host.contains('%') || path.contains('%') {
+        return false;
+    }
+    let bearer = matches!(req.auth, Auth::Bearer(_));
+    match kind {
+        MonitorKind::Nous => {
+            (req.method == Method::Get
+                && bearer
+                && host == "portal.nousresearch.com"
+                && query.is_empty()
+                && (path == "/api/oauth/account"
+                    || path
+                        .strip_prefix("/api/billing/")
+                        .is_some_and(|p| !p.is_empty())))
+                || (host == "inference-api.nousresearch.com"
+                    && query.is_empty()
+                    && ((req.method == Method::Get
+                        && matches!(req.auth, Auth::None)
+                        && path == "/v1/models")
+                        || (req.method == Method::Post
+                            && bearer
+                            && path == "/v1/chat/completions")))
+        }
+        MonitorKind::Grok => {
+            req.method == Method::Get
+                && bearer
+                && host == "cli-chat-proxy.grok.com"
+                && req.extra.iter().any(|(n, v)| {
+                    n.eq_ignore_ascii_case("X-XAI-Token-Auth") && *v == "xai-grok-cli"
+                })
+                && matches!(
+                    (path, query),
+                    ("/v1/billing", "format=credits")
+                        | ("/v1/user", "include=subscription")
+                        | ("/v1/settings", "")
+                )
+        }
+        MonitorKind::Antigravity => {
+            req.method == Method::Post
+                && bearer
+                && query.is_empty()
+                && matches!(
+                    host,
+                    "daily-cloudcode-pa.googleapis.com" | "cloudcode-pa.googleapis.com"
+                )
+                && matches!(
+                    path,
+                    "/v1internal:retrieveUserQuotaSummary" | "/v1internal:loadCodeAssist"
+                )
+        }
+        MonitorKind::Openai => {
+            req.method == Method::Get
+                && bearer
+                && host == "api.openai.com"
+                && ((path == "/v1/models" && query.is_empty())
+                    || (path == "/v1/organization/costs" && costs_query_allowed(query)))
+        }
+        MonitorKind::GoogleAi => {
+            req.method == Method::Get
+                && matches!(req.auth, Auth::GoogApiKey(_))
+                && host == "generativelanguage.googleapis.com"
+                && path == "/v1beta/models"
+                && query == "pageSize=1"
+        }
+        MonitorKind::CodexNative
+        | MonitorKind::OllamaCloud
+        | MonitorKind::OpenRouter
+        | MonitorKind::Provider => false,
+    }
+}
+
+/// Opaque costs cursors accept unreserved and base64 characters only.
+/// Encode their reserved characters as data, never as another query parameter.
+pub(crate) fn encode_cost_cursor(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.len() > 256
+        || raw.contains("..")
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.~+/=".contains(&b))
+    {
+        return None;
+    }
+    let mut encoded = String::new();
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || b"_-.~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").ok()?;
+        }
+    }
+    Some(encoded)
+}
+fn cost_cursor_allowed(encoded: &str) -> bool {
+    if encoded.is_empty() || encoded.len() > 768 {
+        return false;
+    }
+    let bytes = encoded.as_bytes();
+    let mut cursor = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let Some(pair) = bytes.get(index + 1..index + 3) else {
+                return false;
+            };
+            let Some(high) = char::from(pair[0]).to_digit(16) else {
+                return false;
+            };
+            let Some(low) = char::from(pair[1]).to_digit(16) else {
+                return false;
+            };
+            cursor.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            cursor.push(bytes[index]);
+            index += 1;
+        }
+    }
+    std::str::from_utf8(&cursor)
+        .ok()
+        .and_then(encode_cost_cursor)
+        .is_some()
+}
+fn costs_query_allowed(query: &str) -> bool {
+    if query.is_empty() || query.len() > 1024 {
+        return false;
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for parameter in query.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            return false;
+        };
+        if !names.insert(name) {
+            return false;
+        }
+        let allowed = match name {
+            "start_time" | "limit" => {
+                !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+            }
+            "bucket_width" => value == "1d",
+            "page" => cost_cursor_allowed(value),
+            _ => false,
+        };
+        if !allowed {
+            return false;
+        }
+    }
+    ["start_time", "bucket_width", "limit"]
+        .iter()
+        .all(|name| names.contains(name))
 }
 
 /// The real network.
 pub(crate) struct LiveHttp;
 
 impl MonitorHttp for LiveHttp {
-    fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure> {
-        if !bearer_url_allowed(url) {
+    fn send(&self, kind: MonitorKind, req: &Request<'_>) -> Result<HttpReply, Failure> {
+        if !request_allowed(kind, req) {
             return Err(Failure::new(
                 FailureKind::Unavailable,
                 "refused: that URL is not on the monitoring allowlist",
             ));
         }
-        guard_test_network(url);
-        // The shared key-bearing transport (plan §4.2): no redirect is ever
-        // followed, the body is capped at 2 MiB, and the call has an
-        // end-to-end deadline so a stalled body cannot freeze the poll.
-        let reply = crate::usage::keyed_http::get_bearer(url, token.expose())
+        guard_test_network(req.url);
+        let reply = crate::usage::keyed_http::send(crate::usage::keyed_http::agent(), req)
             .ok_or_else(|| Failure::new(FailureKind::Unavailable, "could not reach the source"))?;
-        let body = reply
-            .body
-            .ok_or_else(|| Failure::new(FailureKind::Unavailable, "could not read the response"))?;
         Ok(HttpReply {
             status: reply.status,
-            body,
+            headers: reply.headers,
+            body: reply.body.ok_or_else(|| {
+                Failure::new(FailureKind::Unavailable, "could not read the response")
+            })?,
             retry_after_secs: reply.retry_after.map(|d| d.as_secs()),
         })
+    }
+    fn codex_usage(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+    ) -> Result<UsageInfo, FetchError> {
+        guard_test_network("codex usage");
+        crate::usage::codex::fetch_codex_usage(token.expose(), account, fedramp, now)
+    }
+    fn codex_usage_captured(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+        capture: &crate::usage::codex::RawCapture<'_>,
+    ) -> Result<UsageInfo, FetchError> {
+        guard_test_network("codex usage capture");
+        crate::usage::codex::fetch_codex_usage_captured(
+            token.expose(),
+            account,
+            fedramp,
+            now,
+            capture,
+        )
+    }
+    fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure> {
+        self.send(
+            MonitorKind::Nous,
+            &Request {
+                method: Method::Get,
+                url,
+                auth: Auth::Bearer(token),
+                extra: &[],
+                json_body: None,
+            },
+        )
     }
 
     fn third_party(
@@ -437,6 +711,12 @@ fn guard_test_network(what: &str) {
 #[cfg(test)]
 pub(crate) struct FakeHttp {
     pub(crate) calls: std::sync::Mutex<Vec<String>>,
+    pub(crate) codex_raw_reply: Option<HttpReply>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) send_reply:
+        Box<dyn Fn(MonitorKind, &Request<'_>) -> Result<HttpReply, Failure> + Sync>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) codex_reply: Box<dyn Fn() -> Result<UsageInfo, FetchError> + Sync>,
     #[allow(clippy::type_complexity)]
     pub(crate) bearer_reply: Box<dyn Fn(&str) -> Result<HttpReply, Failure> + Sync>,
     #[allow(clippy::type_complexity)]
@@ -449,6 +729,9 @@ impl FakeHttp {
     pub(crate) fn offline() -> Self {
         Self {
             calls: std::sync::Mutex::new(Vec::new()),
+            codex_raw_reply: None,
+            send_reply: Box::new(|_, req| panic!("unexpected request {}", req.url)),
+            codex_reply: Box::new(|| panic!("unexpected codex fetch")),
             bearer_reply: Box::new(|url| panic!("unexpected bearer GET {url}")),
             stats_reply: Box::new(|| panic!("unexpected provider fetch")),
         }
@@ -463,6 +746,7 @@ impl FakeHttp {
                     status,
                     body: body.clone(),
                     retry_after_secs: None,
+                    headers: Vec::new(),
                 })
             }),
             ..Self::offline()
@@ -486,7 +770,70 @@ impl FakeHttp {
 
 #[cfg(test)]
 impl MonitorHttp for FakeHttp {
+    fn send(&self, kind: MonitorKind, req: &Request<'_>) -> Result<HttpReply, Failure> {
+        assert!(
+            request_allowed(kind, req),
+            "request not allowlisted: {}",
+            req.url
+        );
+        let auth = match req.auth {
+            Auth::None => "none".to_string(),
+            Auth::Bearer(t) => format!("bearer:{}", t.expose()),
+            Auth::GoogApiKey(t) => format!("google:{}", t.expose()),
+        };
+        self.calls.lock().unwrap().push(format!(
+            "{} {} auth={auth} headers={:?}",
+            if req.method == Method::Get {
+                "GET"
+            } else {
+                "POST"
+            },
+            req.url,
+            req.extra
+        ));
+        (self.send_reply)(kind, req)
+    }
+    fn codex_usage(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        _: i64,
+    ) -> Result<UsageInfo, FetchError> {
+        self.calls.lock().unwrap().push(format!(
+            "CODEX bearer={} account={account:?} fedramp={fedramp}",
+            token.expose()
+        ));
+        (self.codex_reply)()
+    }
+
+    fn codex_usage_captured(
+        &self,
+        token: &Secret,
+        account: Option<&str>,
+        fedramp: bool,
+        now: i64,
+        capture: &crate::usage::codex::RawCapture<'_>,
+    ) -> Result<UsageInfo, FetchError> {
+        if let Some(raw) = &self.codex_raw_reply {
+            capture(raw.status, &raw.body, &raw.headers);
+        }
+        self.codex_usage(token, account, fedramp, now)
+    }
     fn get_bearer(&self, url: &str, token: &Secret) -> Result<HttpReply, Failure> {
+        assert!(
+            request_allowed(
+                MonitorKind::Nous,
+                &Request {
+                    method: Method::Get,
+                    url,
+                    auth: Auth::Bearer(token),
+                    extra: &[],
+                    json_body: None,
+                }
+            ),
+            "bearer request not allowlisted: {url}"
+        );
         if let Ok(mut c) = self.calls.lock() {
             c.push(format!("GET {url} bearer={}", token.expose()));
         }

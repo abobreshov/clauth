@@ -37,7 +37,20 @@ fn dump_prints_the_document_and_leaves_home_empty() {
         .expect("run tollgate daemon --dump-openapi");
     assert_eq!(out.status.code(), Some(0), "the dump exits 0");
 
+    assert_eq!(
+        out.stdout,
+        include_bytes!("fixtures/local_api_openapi.json"),
+        "the served schema differs from the reviewed OpenAPI dump"
+    );
     let document: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let properties = &document["components"]["schemas"]["AccountObservation"]["properties"];
+    assert!(properties.get("key_health").is_some());
+    assert!(properties.get("note").is_some());
+    assert!(
+        document["components"]["schemas"]["QuotaWindow"]["properties"]
+            .get("attribution")
+            .is_some()
+    );
     assert!(
         document["openapi"]
             .as_str()

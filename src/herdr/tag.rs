@@ -135,11 +135,10 @@ pub(crate) fn resolve_tag(
             })
         }
         None => {
-            let PaneAgent::Native(sources) = kind else {
-                // claude and codex resolve through the live-session join;
-                // with no profile the script's own answer (clear, or `which`)
-                // stands.
-                return None;
+            let sources = match kind {
+                PaneAgent::Codex => &[SourceId::Codex][..],
+                PaneAgent::Native(sources) => sources,
+                _ => return None,
             };
             let obs = native_match(accounts, sources)?;
             Some(format_tag(&obs.label, obs, now_secs))
@@ -173,7 +172,8 @@ pub(crate) fn native_match<'a>(
         !o.disabled
             && o.origin != Origin::HermesProfile
             && sources.contains(&o.source)
-            && (o.source != SourceId::Nous || o.auth == AuthKind::NativeLogin)
+            && (!matches!(o.source, SourceId::Nous | SourceId::Codex)
+                || o.auth == AuthKind::NativeLogin)
     });
     let only = candidates.next()?;
     candidates.next().is_none().then_some(only)

@@ -1166,6 +1166,7 @@ fn devices_parses_its_five_verbs() {
 fn revoking_an_unknown_device_exits_one_naming_it() {
     let _home = crate::testutil::HomeSandbox::new();
     let err = dispatch(Cli {
+        prefer_store: false,
         theme: None,
         tab: None,
         command: Some(Command::Devices {
@@ -1520,6 +1521,7 @@ fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
     assert_eq!(words, ["strat", "acme"]);
 
     let err = dispatch(Cli {
+        prefer_store: false,
         theme: None,
         tab: None,
         command: Some(Command::External(vec!["strat".into(), "acme".into()])),
@@ -1534,6 +1536,7 @@ fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
 fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
     let _home = crate::testutil::HomeSandbox::new();
     let err = dispatch(Cli {
+        prefer_store: false,
         theme: None,
         tab: None,
         command: Some(Command::Daemon {

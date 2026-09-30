@@ -547,6 +547,27 @@ fn ago(secs: i64) -> String {
 /// The stale / not-fetched line and the failure line, when they apply.
 pub(crate) fn status_lines(obs: &AccountObservation, ctx: &CardCtx) -> Vec<CardLine> {
     let mut rows = Vec::new();
+    if let Some(health) = &obs.key_health {
+        let ink = match health.state {
+            super::observation::KeyHealthState::Valid => Ink::Text,
+            super::observation::KeyHealthState::Unknown => Ink::Dim,
+            _ => Ink::Danger,
+        };
+        rows.push(indented(vec![Seg::new(
+            format!(
+                "key {} · {}",
+                health.state.display_name(),
+                ago(ctx.now_secs.saturating_sub(health.checked_at.secs()).max(0))
+            ),
+            ink,
+        )]));
+    }
+    if let Some(note) = &obs.note {
+        rows.push(indented(vec![Seg::new(
+            super::observation::sanitize_message(note),
+            Ink::Dim,
+        )]));
+    }
     match obs.freshness {
         Freshness::Fresh => {}
         Freshness::Stale { since } => {

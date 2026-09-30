@@ -1,0 +1,3380 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "tollgate",
+    "description": "Monitor and manage AI subscriptions and spending across providers (Claude, Codex, Ollama Cloud, Nous/Hermes, OpenRouter, …); switch accounts; herdr and agent APIs. CLI + TUI.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/chain/order": {
+      "post": {
+        "tags": [
+          "chain"
+        ],
+        "summary": "`POST /api/v1/chain/order` — replace the fallback chain order.",
+        "operationId": "order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChainOrderBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "the new order landed; canonical member names in that order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChainOrderOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no parseable member list (`bad_request`), or the list is not a permutation of the chain (`chain_order_invalid`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "a chain edit or a switch is already in flight (`edit_in_progress`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`), or the edit failed (`edit_failed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the state flock is held (`state_locked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/chain/threshold": {
+      "post": {
+        "tags": [
+          "chain"
+        ],
+        "summary": "`POST /api/v1/chain/threshold` — set one member's fallback threshold.",
+        "operationId": "threshold",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChainThresholdBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "the threshold landed; the canonical profile name and the stored value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChainThresholdOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no parseable fields, or the threshold is not finite or outside 0..=100 (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the profile is not stored (`profile_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "a chain edit or a switch is already in flight (`edit_in_progress`), or the profile is not a chain member (`not_a_member`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`), or the edit failed (`edit_failed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the state flock is held (`state_locked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/chain/wrap-off": {
+      "post": {
+        "tags": [
+          "chain"
+        ],
+        "summary": "`POST /api/v1/chain/wrap-off` — set the chain-global wrap-off behaviour.",
+        "operationId": "wrap_off",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChainWrapOffBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "the wrap-off flag landed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChainWrapOffOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no parseable wrap_off (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "a chain edit or a switch is already in flight (`edit_in_progress`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`), or the edit failed (`edit_failed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the state flock is held (`state_locked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [],
+        "summary": "`GET /api/v1/events` — the server-sent-events stream.",
+        "operationId": "events",
+        "responses": {
+          "200": {
+            "description": "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/gateway": {
+      "get": {
+        "tags": [
+          "gateway"
+        ],
+        "operationId": "gateway",
+        "responses": {
+          "200": {
+            "description": "the managed gateway's slot, the object the status feed publishes as its gateway field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewaySlot"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "tags": [],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "the build's version and the feed schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": [],
+        "summary": "`GET /api/v1/openapi.json` — this API's own contract.",
+        "operationId": "openapi_document",
+        "responses": {
+          "200": {
+            "description": "the OpenAPI document for this API",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read, or the document failed to serialize (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/pair": {
+      "post": {
+        "tags": [],
+        "summary": "`POST /api/v1/pair` — redeem the live pairing code for a device token.",
+        "description": "Every failed redemption (a wrong code, a spent one, an expired one, none\nlive) answers the same `403 pairing_refused`, so a guesser learns nothing\nabout the host's state from the answer. A body that holds no code at all is\n`400 bad_request` and costs no attempt: it is judged before the pairing is\nread. The token rides this one response and no log line.",
+        "operationId": "pair",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "the device is paired; the token rides this one response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no code (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "the code did not pair a device (`pairing_refused`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "pairing failed (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the state flock is held (`state_locked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/panes": {
+      "get": {
+        "tags": [
+          "panes"
+        ],
+        "summary": "`GET /api/v1/panes` — every herdr pane with the tollgate sessions inside it.",
+        "description": "Joined on process ids, never on the `tokens.tollgate` tag. Herdr absent\nanswers 200 with `present: false`, the one fixed sentence naming the state,\nand no panes — never an error. At most `1 + N` herdr calls at 2 s each,\nwhere `N` is the pane count.",
+        "operationId": "panes",
+        "responses": {
+          "200": {
+            "description": "every herdr pane on this host with the tollgate sessions running inside it, joined on process ids (the foreground process group leader is the pane's own session, as is a listed `tollgate` running `start` or `resume` under a wrapper; any other listed process is a delegate; the display tag never joins; on Windows herdr lists only the pane's agent root, so no session joins there); at most 1 + N herdr calls at 2 s each",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PanesBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/panes/{id}/keys": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "`POST /api/v1/panes/{id}/keys` — press keys in a pane, the way a blocked\nagent gets its answer without the terminal mirror.",
+        "operationId": "keys",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "herdr's pane id, as `GET /api/v1/panes` lists it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeysBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "herdr pressed the keys in that pane, in order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no key list of 1 to 32 names, each 1 to 32 chars of letters, digits, dash, plus and underscore (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no pane with that id in herdr's default session; an id not shaped like herdr's workspace:pane ids (each half an alphanumeric, then alphanumerics, dashes or underscores) answers this before herdr is asked (`pane_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "herdr refused the keys, a name it does not know included, recorded in daemon.log (`herdr_refused`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "herdr is not installed, or no server answered on its socket (`herdr_unavailable`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/panes/{id}/prompt": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "`POST /api/v1/panes/{id}/prompt` — submit a prompt to the agent in a pane.",
+        "description": "`herdr agent prompt <pane> <text>` without `--wait`: the answer says herdr\naccepted the submission, and the events stream carries what the agent does\nwith it.",
+        "operationId": "prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "herdr's pane id, as `GET /api/v1/panes` lists it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromptBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "herdr accepted the prompt for the agent in that pane",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no non-empty text, or a text carrying a NUL (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no pane with that id in herdr's default session, or no agent in it; an id not shaped like herdr's workspace:pane ids (each half an alphanumeric, then alphanumerics, dashes or underscores) answers this before herdr is asked (`pane_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the agent is waiting on a prompt of its own (`agent_blocked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "herdr refused the prompt for another reason, recorded in daemon.log (`herdr_refused`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "herdr is not installed, or no server answered on its socket (`herdr_unavailable`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "`GET /api/v1/sessions` — a page of the transcript index, newest first.",
+        "description": "The walk lists every transcript from filenames and mtimes alone, the cursor\nand limit cut the page, and only the rows on it are previewed (a bounded\nhead and tail read each) and stamped with their owner — so the whole-store\nindex `tollgate sessions` builds is never paid per request.",
+        "operationId": "sessions",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "rows per page, 1..=200 (default 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 200,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "the `next_before` of an earlier page; absent for the newest page",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `tollgate sessions --json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionsBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a limit outside 1..=200, or a before that no earlier page issued (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "create"
+        ],
+        "summary": "`POST /api/v1/sessions` — create a herdr pane running an agent.",
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "the pane was created and the agent started; `agent_status` is herdr's answer read back after the start, `null` for a `pane run` (a tollgate profile)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no parseable cwd, or a cwd that is not an absolute existing directory, both a profile and a kind, a profile whose name is not shaped like one, a kind outside 1..=32 ascii lowercase letters or digits, or a workspace outside 1..=32 chars of letters, digits or colons (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), a view-only device (`control_required`), session creation off in profiles.toml (`session_creation_off`), or a device without the sessions grant (`sessions_grant_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the profile is not stored in the claude or codex roster (`profile_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the named workspace, or the default when none is named, does not exist (`workspace_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read, or profiles.toml or a roster does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "herdr refused the creation for another reason, recorded in daemon.log (`herdr_refused`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "herdr is not installed, or no server answered on its socket (`herdr_unavailable`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{id}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "`GET /api/v1/sessions/{id}` — a page of one transcript's records, paged\nbackward from the file's end by byte offset.",
+        "description": "The id is looked up among the stems the walk yields, never joined onto a\nstore path, so an id spelled as a path can only answer 404. The page is\nbounded by records and by bytes ([`PAGE_MAX_BYTES`]), and a record longer\nthan the byte bound is served alone, never cut.",
+        "operationId": "session_history",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the session id: the transcript filename stem, as the listing's `id` and a pane's `agent_session_id` name it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "records per page, 1..=500 (default 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 500,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "the `next_before` of an earlier page, a byte offset; absent for the newest page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the last records whose lines end at or before the cursor, oldest first, each one Claude Code transcript record verbatim; at most 4 MiB of records unless the page's one record is larger",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a limit outside 1..=500, or a before that is not a byte offset (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no readable transcript of that id in the shared store or a live isolated store (`session_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [],
+        "summary": "`GET /api/v1/status` — the same body `~/.tollgate/status.json` carries.",
+        "description": "Served straight off disk in the common case. The main loop already rewrites\nthat file atomically every tick, so passing the bytes through takes no lock,\nduplicates no serialization, and cannot drift from the documented schema.\n`?all=1` and a missing file both fall back to building a body here, which is\nthe same `build_status` the file itself came from.\n\nConditional, and optionally BLOCKING: `?wait=` with a matching\n`If-None-Match` holds the request open until the feed's content actually\nchanges. That is what turns a client's account display from\n\"correct within its poll interval\" into \"correct within a round trip\", and\nwith `POST /api/v1/switch` republishing the file itself, a switch made through\nthe API wakes every waiting reader immediately.\n\n`?all=1` never waits: it builds its body from config rather than the file,\nso there is no file to watch for it — but it is still conditional off its\nbuilt body's tag, so a roster that has not moved answers 304.",
+        "operationId": "status",
+        "parameters": [
+          {
+            "name": "all",
+            "in": "query",
+            "description": "include disabled accounts (`all=1`)",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "hold the request until the feed changes, at most 60 seconds, only with a matching If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "maximum": 60,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "an `ETag` from an earlier answer; a match answers 304 or, with `wait`, holds the request",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the status feed",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "the feed's entity tag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusBody"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "the feed has not changed",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "the feed's entity tag"
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read, or the status body failed to serialize (`internal`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/switch": {
+      "post": {
+        "tags": [],
+        "summary": "`POST /api/v1/switch` — relink the global active profile.",
+        "description": "A thin wrapper over [`switch_profile_noninteractive`], the same action the\nMCP `switch` tool calls. That is deliberate and load-bearing: the AUTH-1\ngate (never install credentials a refresh has rejected), the disabled-target\nrefusal, and the divergence policy all live inside it, so this endpoint\ncannot drift into a weaker switch than the rest of tollgate performs.",
+        "operationId": "switch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "the switch landed; the profile left behind and the one now active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitchOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the body held no parseable profile (`bad_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "no bearer, or one matching no paired device (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the profile is not stored (`profile_not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the device list does not read (`internal`), or the switch failed (`switch_failed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the state flock is held (`state_locked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "control"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountObservation": {
+        "type": "object",
+        "description": "Everything tollgate can say about one account at read time.\n\nCore fields always serialise (an absent `Option` is `null`, an empty list\nis `[]`). Additive health and note fields are omitted when absent.",
+        "required": [
+          "id",
+          "source",
+          "auth",
+          "label",
+          "provider",
+          "active",
+          "disabled",
+          "origin",
+          "freshness",
+          "windows",
+          "money",
+          "best_effort"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable account id, `<namespace>:<name>`:\n`claude:<profile>` (a `profiles.toml` profile of any provider),\n`codex:<profile>` (a `codex-profiles.toml` profile),\n`monitor:<id>` (a monitoring-only account with no profile — an\nunbound management key, an Ollama monitor key),\n`upstream:<profile>` (an account upstream clauth owns, read-only),\n`hermes:<profile>` (a `hermes-profiles.toml` Hermes home).\nBuild it with [`account_id`]."
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceId",
+            "description": "Which integration produced the figures."
+          },
+          "auth": {
+            "$ref": "#/components/schemas/AuthKind",
+            "description": "How the account authenticates."
+          },
+          "label": {
+            "type": "string",
+            "description": "Human name: the profile name, or a monitor's configured label."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Provider display name (`Anthropic`, `OpenRouter`, `OpenAI`), from\n[`SourceId::display_name`] unless the producer knows better."
+          },
+          "plan": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The plan / tier label (`Max 5x`, `plus`, `pro-legacy`), provider value\nfirst, else a user-configured label; `None` when neither exists."
+          },
+          "key_health": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyHealth"
+              }
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "active": {
+            "type": "boolean",
+            "description": "This account is the one the harness is using now (the global active\nprofile of its roster)."
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "The operator disabled this profile (hidden from the chain and polling)."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/Origin",
+            "description": "Where the account is defined."
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The inference endpoint for an api-key account, `None` for a\nfirst-party subscription. Never carries a credential."
+          },
+          "freshness": {
+            "$ref": "#/components/schemas/Freshness",
+            "description": "How current the figures are. Separate from [`Self::failure`]: stale\nfigures stay visible (plan §3.2)."
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Failure",
+                "description": "The last known reason the account cannot be read or cannot serve."
+              }
+            ]
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuotaWindow"
+            },
+            "description": "Quota windows, lead-first where the source knows an order."
+          },
+          "money": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MoneyMeter"
+            },
+            "description": "Money meters: balances, spend, caps, budgets."
+          },
+          "estimate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LocalEstimate",
+                "description": "A local cost estimate, only when attribution is exact."
+              }
+            ]
+          },
+          "banked_resets": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Banked early-reset passes the account can spend (codex\n`rate_limit_reset_credits`); `None` when the source has no such thing."
+          },
+          "best_effort": {
+            "type": "boolean",
+            "description": "The figures come from a best-effort scanner rather than a typed\nintegration; readers should say so."
+          },
+          "observed_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When the provider produced the figures shown (the fetch that wrote the\ncache). `None` when nothing dates them."
+              }
+            ]
+          },
+          "checked_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When tollgate last TRIED to read the account, successful or not. Only a\nlive scheduler knows this; cache readers leave it `None`."
+              }
+            ]
+          }
+        }
+      },
+      "AgentOk": {
+        "type": "object",
+        "description": "The answer both routes carry once herdr accepted the request.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Amount": {
+        "type": "string",
+        "description": "An exact, signed decimal amount of money.\n\n**Representation: the canonical decimal string** (`\"13.67\"`, `\"-5.71\"`,\n`\"0.000123456789\"`), not integer micro-units. Providers hand money over as\ndecimal strings (DeepSeek, Nous, Ollama `activity.cost`) or as JSON numbers\nwith more than six fractional digits (OpenRouter per-request spend), and\nmicro-units would round both; a string carries whatever precision arrived.\nIt is also the JSON shape money APIs use, so `usage --json` readers get a\nstring they can hand to their own decimal type.\n\nCanonical form: optional `-`, the integer digits with no leading zeros\n(`\"0\"` for none), then `.` and the fractional digits exactly as given\n(trailing zeros kept — `\"1132.60\"` stays `\"1132.60\"`). A zero is never\nnegative. Comparison ([`Ord`], [`PartialEq`]) is NUMERIC, so `\"1.5\"` equals\n`\"1.50\"`; the string is kept as given for display fidelity.\n\nDeserialises from a JSON string or number; always serialises as a string."
+      },
+      "Answerer": {
+        "type": "string",
+        "description": "What answered `/health` on the bind port of a [`GatewayState::Foreign`]\ngateway.",
+        "enum": [
+          "shunt",
+          "not_shunt",
+          "no_answer"
+        ]
+      },
+      "AuthKind": {
+        "type": "string",
+        "description": "How an account authenticates.",
+        "enum": [
+          "subscription",
+          "api_key",
+          "hybrid",
+          "native_login",
+          "read_only"
+        ]
+      },
+      "ChainOrderBody": {
+        "type": "object",
+        "description": "The one field `POST /api/v1/chain/order` accepts.",
+        "required": [
+          "members"
+        ],
+        "properties": {
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ChainOrderOk": {
+        "type": "object",
+        "description": "The answer a successful reorder carries: the canonical member names in the\nnew order.",
+        "required": [
+          "ok",
+          "members"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ChainThresholdBody": {
+        "type": "object",
+        "description": "The fields `POST /api/v1/chain/threshold` accepts.",
+        "required": [
+          "profile",
+          "threshold"
+        ],
+        "properties": {
+          "profile": {
+            "type": "string"
+          },
+          "threshold": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "ChainThresholdOk": {
+        "type": "object",
+        "description": "The answer a successful threshold edit carries: the canonical profile name\nand the stored value.",
+        "required": [
+          "ok",
+          "profile",
+          "threshold"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "threshold": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "ChainWrapOffBody": {
+        "type": "object",
+        "description": "The one field `POST /api/v1/chain/wrap-off` accepts.",
+        "required": [
+          "wrap_off"
+        ],
+        "properties": {
+          "wrap_off": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ChainWrapOffOk": {
+        "type": "object",
+        "description": "The answer a successful wrap-off edit carries.",
+        "required": [
+          "ok",
+          "wrap_off"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "wrap_off": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "One error body for every refused or failed answer, so a client generates a\nsingle error shape. `reason` rides only the refusals that carry one —\ntoday's `error()` answers have no `reason` key at all — so it is skipped\nwhen `None`, never serialized as `null`.",
+        "required": [
+          "ok",
+          "error"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ExitReport": {
+        "type": "object",
+        "description": "How a gateway process ended.",
+        "required": [
+          "code",
+          "signal"
+        ],
+        "properties": {
+          "code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The exit code, `null` for a process a signal ended."
+          },
+          "signal": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The signal that ended it, `null` for an exit code (and always on\nWindows)."
+          }
+        }
+      },
+      "Failure": {
+        "type": "object",
+        "description": "Why an account cannot be read, or cannot serve.",
+        "required": [
+          "kind",
+          "message"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/FailureKind"
+          },
+          "message": {
+            "type": "string",
+            "description": "One human sentence, passed through [`sanitize_message`] — never a raw\nprovider body, never a credential."
+          },
+          "retry_after": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When a retry can succeed (a 429's `retry-after`), when known."
+              }
+            ]
+          }
+        }
+      },
+      "FailureKind": {
+        "type": "string",
+        "description": "The failure taxonomy (plan §4.1).",
+        "enum": [
+          "auth_required",
+          "rate_limited",
+          "quota_exhausted",
+          "unavailable",
+          "invalid_response",
+          "console_expired",
+          "subscription_inactive"
+        ]
+      },
+      "Fallback": {
+        "type": "object",
+        "description": "The `fallback` object for a profile: chain membership (`position` is\n1-based), the utilization threshold auto-switch rotates away at, and whether\nthis member is currently armed (`armed` = in the chain AND active). Field\norder is the published key order.",
+        "required": [
+          "position",
+          "threshold",
+          "armed"
+        ],
+        "properties": {
+          "position": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "threshold": {
+            "type": "number",
+            "format": "double"
+          },
+          "armed": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Freshness": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Read within the source's staleness threshold.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "fresh"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Past the threshold (or undatable). `since` is when the shown figures\nwere read; `None` when nothing dates them.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "since": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Timestamp"
+                  }
+                ]
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "stale"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Nothing has ever been read.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "not_fetched"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How current an observation's figures are. `{\"state\": \"fresh\"}`,\n`{\"state\": \"stale\", \"since\": \"…\"}`, `{\"state\": \"not_fetched\"}`."
+      },
+      "GatewaySlot": {
+        "type": "object",
+        "description": "The `gateway` slot: `status.json`'s top-level object and the body of\n`GET /api/v1/gateway`. Paths, a port, a pid, versions and states only:\nnever an env value, a token or a file's content.",
+        "required": [
+          "state",
+          "config",
+          "binary",
+          "port",
+          "pid",
+          "version",
+          "answerer",
+          "floor",
+          "restarts",
+          "last_exit",
+          "reason",
+          "since"
+        ],
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/GatewayState"
+          },
+          "config": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The adopted config, `null` with no record."
+          },
+          "binary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The binary the gateway runs as: the record's path, else `shunt`,\nlooked up on `PATH`."
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The port the gateway binds, or the port a foreign answerer holds.",
+            "minimum": 0
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The pid of the gateway tollgate spawned, while one runs.",
+            "minimum": 0
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The version `/health` reported: tollgate's gateway's, or a shunt-shaped\nforeign answerer's."
+          },
+          "answerer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Answerer",
+                "description": "What answered on the port of a `foreign` gateway."
+              }
+            ]
+          },
+          "floor": {
+            "type": "string",
+            "description": "The oldest shunt tollgate supervises."
+          },
+          "restarts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Restarts after an exit tollgate did not ask for, since the daemon\nstarted.",
+            "minimum": 0
+          },
+          "last_exit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExitReport",
+                "description": "How the last gateway process ended, `null` before any has."
+              }
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why a `misconfigured` gateway cannot start."
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 UTC stamp of when `state` last changed; `null` without a\nsupervisor."
+          }
+        }
+      },
+      "GatewayState": {
+        "type": "string",
+        "description": "The managed gateway's state, a closed set.",
+        "enum": [
+          "absent",
+          "disabled",
+          "no_config",
+          "yaml_refused",
+          "misconfigured",
+          "binary_missing",
+          "foreign",
+          "starting",
+          "healthy",
+          "unhealthy",
+          "below_floor",
+          "restarting",
+          "stopping",
+          "unobserved"
+        ]
+      },
+      "HealthBody": {
+        "type": "object",
+        "description": "`GET /api/v1/health` — the build's version and the feed schema, so a client\nrefuses a daemon newer than it knows.",
+        "required": [
+          "ok",
+          "version",
+          "schema"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HerdrState": {
+        "type": "object",
+        "description": "What this route knows about herdr itself. `reason` is the one fixed sentence\nnaming the absent state, omitted when herdr is present.",
+        "required": [
+          "present"
+        ],
+        "properties": {
+          "present": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "HermesProfileEntry": {
+        "type": "object",
+        "description": "One Hermes profile in `status.json` (hermes spec D-H12). There is no\n`active_hermes_profile`: Hermes has no global slot, and a Hermes home is\nlaunched by name.",
+        "required": [
+          "name",
+          "provider",
+          "model",
+          "mode",
+          "live"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string",
+            "description": "`nous`, `openrouter` or `ollama-cloud`."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model passed as `-m` at launch, when the roster sets one."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`account` or `pool`."
+          },
+          "live": {
+            "type": "boolean",
+            "description": "A `tollgate start` (or `hermes auth`) holds the home now."
+          }
+        }
+      },
+      "HistoryBody": {
+        "type": "object",
+        "description": "`GET /api/v1/sessions/{id}`'s answer.",
+        "required": [
+          "ok",
+          "id",
+          "records",
+          "next_before",
+          "malformed"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoryRecord"
+            },
+            "description": "The page's records in file order, oldest first."
+          },
+          "next_before": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The `before` of the page of older records, `null` when nothing older\nremains.",
+            "minimum": 0
+          },
+          "malformed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Lines in the page's range that were not a JSON object (a torn last line\nmid-write, a blank line), skipped rather than served.",
+            "minimum": 0
+          }
+        }
+      },
+      "HistoryRecord": {
+        "type": "object",
+        "description": "One record of a transcript page.",
+        "required": [
+          "offset",
+          "record"
+        ],
+        "properties": {
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The byte offset the record's line starts at.",
+            "minimum": 0
+          },
+          "record": {
+            "type": "object",
+            "description": "One Claude Code transcript record, verbatim."
+          }
+        }
+      },
+      "KeyHealth": {
+        "type": "object",
+        "required": [
+          "state",
+          "checked_at"
+        ],
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/KeyHealthState"
+          },
+          "checked_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "KeyHealthState": {
+        "type": "string",
+        "description": "The latest API-key health check, independent of quota or spend figures.",
+        "enum": [
+          "valid",
+          "invalid",
+          "blocked",
+          "out_of_credits",
+          "spend_capped",
+          "unknown"
+        ]
+      },
+      "KeysBody": {
+        "type": "object",
+        "description": "The one field `POST /api/v1/panes/{id}/keys` accepts.",
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "herdr's key names in press order, 1..=32 of them, each 1..=32 chars of\nletters, digits, `-`, `+` and `_` (`y`, `enter`, `esc`, `ctrl+c`);\nherdr decides which names exist."
+          }
+        }
+      },
+      "LocalEstimate": {
+        "type": "object",
+        "description": "A local cost estimate (token ledger × price table), only when every token\nis attributable to this account.",
+        "required": [
+          "amount",
+          "currency",
+          "basis"
+        ],
+        "properties": {
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "period": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Period"
+              }
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "description": "One phrase naming the inputs (`token ledger × ai-pricelog`)."
+          }
+        }
+      },
+      "ModelCount": {
+        "type": "object",
+        "description": "Requests made to one model inside a window.",
+        "required": [
+          "model",
+          "requests"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "MoneyKind": {
+        "type": "string",
+        "enum": [
+          "balance",
+          "spend",
+          "limit",
+          "budget"
+        ]
+      },
+      "MoneyMeter": {
+        "type": "object",
+        "description": "One money figure.\n\n`amount` semantics depend on `kind`:\n- `balance`: what is left to spend (negative = debt). `limit` = the pool's\n  size when the source publishes one.\n- `spend`: what was spent in `period`. `limit` = the cap on that spend.\n- `limit`: what is LEFT under a cap (`limit_remaining`); `limit` = the cap.\n- `budget`: a user-configured budget's remaining amount; `limit` = the budget.",
+        "required": [
+          "meter_id",
+          "label",
+          "kind",
+          "amount",
+          "currency",
+          "scope",
+          "scope_origin",
+          "additive"
+        ],
+        "properties": {
+          "meter_id": {
+            "type": "string",
+            "description": "Stable per source: `wallet`, `wallet.granted`, `wallet.topped_up`,\n`subscription`, `top_up`, `rollover`, `total_usable`, `spend.daily`,\n`spend.weekly`, `spend.monthly`, `spend.lifetime`, `spend.extra`,\n`key_limit`, `byok.*`, `window.<label>`."
+          },
+          "label": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MoneyKind"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "currency": {
+            "type": "string",
+            "description": "ISO-4217-style code, upper case (`USD`, `CNY`)."
+          },
+          "limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Amount"
+              }
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/MoneyScope"
+          },
+          "scope_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider id of the scope (org / account), for de-dup. `None` never\nde-dups."
+          },
+          "scope_origin": {
+            "$ref": "#/components/schemas/ScopeOrigin"
+          },
+          "additive": {
+            "type": "boolean",
+            "description": "`false` for a derived total that must never be summed with its parts."
+          },
+          "period": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Period"
+              }
+            ]
+          }
+        }
+      },
+      "MoneyScope": {
+        "type": "string",
+        "description": "Whose money a meter describes.",
+        "enum": [
+          "key",
+          "profile",
+          "workspace",
+          "organization"
+        ]
+      },
+      "Origin": {
+        "type": "string",
+        "description": "Where an account is defined; also its [`AccountObservation::id`] namespace.",
+        "enum": [
+          "profile",
+          "codex_profile",
+          "monitor",
+          "upstream",
+          "hermes_profile"
+        ]
+      },
+      "PairBody": {
+        "type": "object",
+        "description": "The one field `POST /api/v1/pair` accepts.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "PairOk": {
+        "type": "object",
+        "description": "The answer a successful pairing carries: the device's name and tier, and the\none-time token the device keeps from here.",
+        "required": [
+          "ok",
+          "name",
+          "tier",
+          "token"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tier": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "PaneEntry": {
+        "type": "object",
+        "description": "One pane, in herdr's own order, with its tollgate sessions.",
+        "required": [
+          "pane_id",
+          "workspace_id",
+          "tab_id",
+          "title",
+          "agent",
+          "agent_status",
+          "cwd",
+          "focused",
+          "tag",
+          "foreground_process_group_id",
+          "sessions",
+          "agent_session_id"
+        ],
+        "properties": {
+          "pane_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          },
+          "tab_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`terminal_title_stripped`, `null` when herdr has no title."
+          },
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent herdr associates with the pane, `null` when none."
+          },
+          "agent_status": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pane's cwd, `null` when herdr has none."
+          },
+          "focused": {
+            "type": "boolean"
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `tokens.tollgate` display tag, `null` when absent; never used to join."
+          },
+          "foreground_process_group_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The pane's foreground process group, `null` when its `process-info` did\nnot answer (the pane closed between the two calls) or when the pane has\nno foreground job.",
+            "minimum": 0
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PaneSession"
+            }
+          },
+          "agent_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent's own session id herdr detected in the pane (`agent_session`\nof kind `id`), the id `GET /api/v1/sessions/{id}` pages; `null` when\nherdr detected none."
+          }
+        }
+      },
+      "PaneSession": {
+        "type": "object",
+        "description": "One tollgate session running inside a pane.",
+        "required": [
+          "session_id",
+          "profile",
+          "state",
+          "kind",
+          "follows_chain",
+          "isolated",
+          "cwd"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string",
+            "description": "The member the session's requests authenticate as: for an api-key hot\nswap the member its key helper last served, which trails the\ncommitted one until the session's next request; else the member the\nsession currently holds, else its launch profile."
+          },
+          "state": {
+            "$ref": "#/components/schemas/SwapState",
+            "description": "Where the session is in a switch: `requested`, `swapping` (committed,\nnot served yet), `stalled` (its key helper failed) or `served`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SessionKind"
+          },
+          "follows_chain": {
+            "type": "boolean"
+          },
+          "isolated": {
+            "type": "boolean"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The session's cwd, `null` when the row has none."
+          }
+        }
+      },
+      "PanesBody": {
+        "type": "object",
+        "description": "`GET /api/v1/panes`'s answer.",
+        "required": [
+          "ok",
+          "herdr",
+          "panes"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "herdr": {
+            "$ref": "#/components/schemas/HerdrState"
+          },
+          "panes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PaneEntry"
+            }
+          }
+        }
+      },
+      "Period": {
+        "type": "object",
+        "description": "The period a spend meter covers: `[start, end)`.",
+        "required": [
+          "kind",
+          "derived"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/PeriodKind"
+          },
+          "start": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              }
+            ]
+          },
+          "end": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              }
+            ]
+          },
+          "derived": {
+            "type": "boolean",
+            "description": "The bounds were derived by tollgate, not published by the provider."
+          }
+        }
+      },
+      "PeriodKind": {
+        "type": "string",
+        "enum": [
+          "daily",
+          "weekly",
+          "monthly",
+          "lifetime",
+          "custom"
+        ]
+      },
+      "ProfileEntry": {
+        "type": "object",
+        "description": "One `profiles[]` entry of the published `status.json` body — the shape both\nthe writer ([`build_profile_entries`], serialized by [`build_status`]) and\nthe reader (`tollgate list`'s table rows) derive from, so a reader's field\naccess cannot drift from what the writer emits. Contract: wiki/Daemon.md.",
+        "required": [
+          "name",
+          "active",
+          "rolling_token",
+          "provider",
+          "base_url",
+          "tier",
+          "harness",
+          "has_live_session",
+          "auth_status",
+          "fetch_status",
+          "stale",
+          "fetched_at",
+          "next_refresh_at",
+          "auto_start",
+          "auto_start_queue",
+          "bell_threshold",
+          "fallback",
+          "windows",
+          "third_party"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Active-profile marker source. The active profile is always kept, disabled\nor not: the top-level `active_profile` field names it unconditionally,\nand a reader resolves that name against `profiles[]`."
+          },
+          "rolling_token": {
+            "type": "boolean",
+            "description": "Additive (CLA-ROLL): what the sidecar actually HOLDS — the same content\nclassification the TUI renders, not the config flag. The two part ways\nexactly when honesty matters: a dead chain degrades the sidecar onto its\nstatic mint while the flag stays on, and the flag would promise readers\na re-stamp for a mint nobody is going to re-stamp. While true, the\nsidecar's hours-scale countdown is routine maintenance (daemon re-stamps\non rotation and on the freshness timer); while false it is a real\ncredential clock. Readers key their token-row rendering off this so a\nrolling token never displays as an expiring mint — nor the reverse."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Display provider label: a recognised third-party name, else `anthropic`."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The third-party endpoint, `None` for the default Anthropic one."
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human tier label for an anthropic account (`Max 5x`); `None` for\nthird-party/api-key profiles."
+          },
+          "harness": {
+            "type": "string",
+            "description": "Additive (schema stays 1): which harness this profile belongs to,\n`claude` or `codex`. Membership of a state file is the authority\n(decision 1) and names are globally unique (decision 2), so one flat\n`profiles[]` still reads unambiguously — a reader that predates codex\nignores the field and sees the claude accounts it always saw, because\ncodex entries are appended after them."
+          },
+          "has_live_session": {
+            "type": "boolean",
+            "description": "A live `tollgate start` session runs for this profile."
+          },
+          "auth_status": {
+            "type": "string",
+            "description": "`ok` / `expired` / `broken` (see [`auth_status_str`])."
+          },
+          "fetch_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Freshness: a live daemon's verdict or the cache-mtime derivation; `None`\nwhen there is no cache at all."
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Additive: true when this reading is distrusted, by\neither arm — a deep-slot stuck RateLimited, or reading age past\n`stale_after_ms(interval)` (the stuck arm needs the live stores and is\n`false` single-shot). Readers dim it / show a \"stuck\" cue instead of\ntreating it as current truth."
+          },
+          "fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 UTC stamp of when the published figures were last fetched\n(OAuth: the body's `fetched_at`; third-party: the cache write);\n`None` when there is no cache or the body is undated."
+          },
+          "next_refresh_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is\npending (a spent skipped account, or no cache)."
+          },
+          "auto_start": {
+            "type": "boolean"
+          },
+          "auto_start_queue": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QueueEntry",
+                "description": "Additive: this profile's slot in the interleaved\nauto-start queue, `None`/`null` when it holds none — the toggle is off,\nit never opted into `auto_start`, or it cannot open a window.\n`default` so a reader stays additive-tolerant of an older writer."
+              }
+            ]
+          },
+          "bell_threshold": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "fallback": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Fallback",
+                "description": "The chain-membership object (`position` / `threshold` / `armed`), `None`\nwhen not a chain member."
+              }
+            ]
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Window"
+            },
+            "description": "The 5h/7d usage rows: an OAuth account's own windows, or an api-key\naccount's provider-derived ones. Empty when the cache behind them\nholds none."
+          },
+          "third_party": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ThirdPartyAvailability",
+                "description": "The third-party availability object (`available`), `None` for OAuth\naccounts."
+              }
+            ]
+          }
+        }
+      },
+      "PromptBody": {
+        "type": "object",
+        "description": "The one field `POST /api/v1/panes/{id}/prompt` accepts.",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The prompt, non-empty."
+          }
+        }
+      },
+      "QueueEntry": {
+        "type": "object",
+        "description": "One profile's `auto_start_queue` object in `status.json`: the 1-based slot,\nand the queue's shared next-open ESTIMATE — the queue gates globally, so the\nstamp is when the NEXT window opens, whoever opens it, and a window opened\nout of band moves it as soon as the gate takes that opening up\n([`crate::usage::queue_anchor`]). `next_open_at` is `null` only when no anchor is\nderivable yet (cold history); an anchored-but-due queue publishes\n`anchor + gap` even once that instant is past — readers compare it to now,\nexactly as wiki/Daemon.md contracts.",
+        "required": [
+          "position",
+          "next_open_at"
+        ],
+        "properties": {
+          "position": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "next_open_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "QuotaWindow": {
+        "type": "object",
+        "description": "One rolling or calendar quota window.",
+        "required": [
+          "id",
+          "label",
+          "exhausted",
+          "scope",
+          "chain_eligible",
+          "breakdown"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable per source: [`WINDOW_SESSION`], [`WINDOW_WEEKLY`],\n`weekly:<model>`, [`WINDOW_MONTH`], or a slug of the provider's label."
+          },
+          "label": {
+            "type": "string",
+            "description": "Short human label (`5h`, `7d`, `7d opus`, `30d`)."
+          },
+          "used_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Share consumed, percent, UNCLAMPED; `None` when not published."
+          },
+          "exhausted": {
+            "type": "boolean",
+            "description": "The provider says (or the figure proves) this window is spent."
+          },
+          "resets_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When the window resets; `None` when the source gives no time."
+              }
+            ]
+          },
+          "window_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Nominal length, for pace; `None` for a calendar / unknown window.",
+            "minimum": 0
+          },
+          "scope": {
+            "$ref": "#/components/schemas/WindowScope"
+          },
+          "chain_eligible": {
+            "type": "boolean",
+            "description": "Whether today's fallback chain judges this window (the 5h / 7d fold)."
+          },
+          "used": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Absolute amount consumed, in the provider's own unit (tokens, calls),\nwhen published."
+          },
+          "limit": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Absolute ceiling in the same unit, when published."
+          },
+          "breakdown": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelCount"
+            },
+            "description": "Per-model request counts inside this window (Ollama); informational."
+          },
+          "attribution": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Share"
+            }
+          }
+        }
+      },
+      "ScopeOrigin": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The inference credential's own provider response.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "provider"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A separate monitoring credential; `bound` once proven to be the same\naccount as the profile's key.",
+            "required": [
+              "bound",
+              "kind"
+            ],
+            "properties": {
+              "bound": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "monitoring_credential"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Only a user-configured label groups it; never merged.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "user_label"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Who vouches for a meter's scope. `{\"kind\": \"provider\"}`,\n`{\"kind\": \"monitoring_credential\", \"bound\": true}`, `{\"kind\": \"user_label\"}`."
+      },
+      "SessionCreateBody": {
+        "type": "object",
+        "description": "The body `POST /api/v1/sessions` accepts.",
+        "required": [
+          "cwd"
+        ],
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "description": "Absolute path to the directory the pane's shell starts in."
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A tollgate profile (claude or codex roster); mutually exclusive with\n`kind`. Neither means bare `claude`."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A herdr agent kind; mutually exclusive with `profile`."
+          },
+          "workspace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The herdr workspace the tab lands in, when named."
+          }
+        }
+      },
+      "SessionCreated": {
+        "type": "object",
+        "description": "The answer a created session carries.",
+        "required": [
+          "ok",
+          "workspace_id",
+          "tab_id",
+          "pane_id",
+          "agent_status"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "type": "string"
+          },
+          "tab_id": {
+            "type": "string"
+          },
+          "pane_id": {
+            "type": "string"
+          },
+          "agent_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "herdr's `agent_status` read back after the agent call; `null` for the\n`pane run` arm (a tollgate profile), whose readiness herdr detects later\nand `/events` carries."
+          }
+        }
+      },
+      "SessionKind": {
+        "type": "string",
+        "description": "How a session's pid matched the pane.",
+        "enum": [
+          "session",
+          "delegate"
+        ]
+      },
+      "SessionRow": {
+        "type": "object",
+        "description": "One row of the transcript index: the fields `tollgate sessions --json`\nemits minus its `tokens`/`cost`, plus the store the transcript lives in.",
+        "required": [
+          "id",
+          "last_ran_profile",
+          "workspace",
+          "updated",
+          "first_message",
+          "last_message",
+          "store"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The transcript filename stem, the id `GET /api/v1/sessions/{id}` pages."
+          },
+          "last_ran_profile": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The profile the session last ran under, `null` when unknown."
+          },
+          "workspace": {
+            "type": "string",
+            "description": "The `cwd` off the transcript head, empty when it records none."
+          },
+          "updated": {
+            "type": "string",
+            "description": "The transcript's mtime, ISO-8601 UTC (`+00:00`)."
+          },
+          "first_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first user message, redacted and cut like `tollgate sessions --json`,\n`null` when the head held none."
+          },
+          "last_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last user message, redacted and cut the same way, `null` when the\ntail held none."
+          },
+          "store": {
+            "type": "string",
+            "description": "`global`, `guest` for guest mode's own store, or `isolated:<profile>`\nfor a live isolated run's own store."
+          }
+        }
+      },
+      "SessionsBody": {
+        "type": "object",
+        "description": "`GET /api/v1/sessions`'s answer.",
+        "required": [
+          "ok",
+          "sessions",
+          "next_before"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionRow"
+            },
+            "description": "Newest first: `updated` descending, then `id` ascending."
+          },
+          "next_before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `before` of the next page, `null` when this page ends the index."
+          }
+        }
+      },
+      "Share": {
+        "type": "object",
+        "required": [
+          "label",
+          "used_pct"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "used_pct": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "SourceId": {
+        "type": "string",
+        "description": "Which integration an observation's figures came from. Serialises as\n[`SourceId::as_str`] (`anthropic_oauth`, `ollama_cloud`, `openrouter`, …).",
+        "enum": [
+          "anthropic_oauth",
+          "codex",
+          "ollama",
+          "ollama_cloud",
+          "openrouter",
+          "nous",
+          "hermes",
+          "deepseek",
+          "zai",
+          "minimax",
+          "alibaba",
+          "grok",
+          "antigravity",
+          "openai_api",
+          "google_ai",
+          "generic",
+          "upstream_clauth"
+        ]
+      },
+      "StatusBody": {
+        "type": "object",
+        "description": "The full `status.json` body. Field order is the published key order, and\neach `Option` field emits a present key holding `null` when absent.",
+        "required": [
+          "schema",
+          "generated_at",
+          "active_profile",
+          "pending_switch",
+          "wrap_off",
+          "active_codex_profile",
+          "refresh_interval_ms",
+          "gateway",
+          "profiles"
+        ],
+        "properties": {
+          "schema": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "active_profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_switch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wrap_off": {
+            "type": "boolean"
+          },
+          "active_codex_profile": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Additive per-harness slots (decision 10): the top-level\n`active_profile` / `wrap_off` above stay the CLAUDE ones, so nothing\nthat reads them today changes meaning. `default` so a reader stays\nadditive-tolerant of an older writer."
+          },
+          "codex_fallback_chain": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "codex_wrap_off": {
+            "type": "boolean"
+          },
+          "refresh_interval_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tollgate_version": {
+            "type": "string",
+            "description": "The daemon that wrote this feed. A reader can tell an old daemon —\none with no codex support at all — from a new one reporting an empty\ncodex roster, which are otherwise byte-identical."
+          },
+          "gateway": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GatewaySlot",
+                "description": "Additive: the managed shunt gateway, the object `GET /api/v1/gateway`\nserves. `default` so a reader stays additive-tolerant of an older\nwriter."
+              }
+            ]
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileEntry"
+            }
+          },
+          "hermes_profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HermesProfileEntry"
+            },
+            "description": "Additive: the Hermes roster. Its own list, never appended to\n`profiles[]`: a Hermes home has no windows, tier or auth grade for a\n`ProfileEntry` to carry. `default` so a reader stays additive-tolerant\nof an older writer."
+          }
+        }
+      },
+      "SwapState": {
+        "type": "string",
+        "description": "Where a session is in a switch.",
+        "enum": [
+          "requested",
+          "swapping",
+          "stalled",
+          "served"
+        ]
+      },
+      "SwitchBody": {
+        "type": "object",
+        "description": "The one field `POST /api/v1/switch` accepts.",
+        "required": [
+          "profile"
+        ],
+        "properties": {
+          "profile": {
+            "type": "string"
+          }
+        }
+      },
+      "SwitchOk": {
+        "type": "object",
+        "description": "The answer a successful switch carries: the profile left behind and the one\nnow active. `previous` is `None` exactly when there was no active profile to\nleave, which today's wire answers as `null` — so the `Option` is serialized,\nnever skipped.",
+        "required": [
+          "ok",
+          "previous",
+          "active"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "previous": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "active": {
+            "type": "string"
+          }
+        }
+      },
+      "ThirdPartyAvailability": {
+        "type": "object",
+        "description": "The third-party availability object (`available`), for api-key accounts\nwhose figures live in `third_party_cache.json`; `None` for OAuth accounts.",
+        "required": [
+          "available"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Timestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "A UTC instant with one-second resolution, as epoch seconds. Serialises as an\nRFC 3339 string (`2026-09-29T10:00:00+00:00`, the spelling every other\ntollgate feed uses via [`crate::usage::epoch_secs_to_iso`]) and parses any\nRFC 3339 offset back."
+      },
+      "Window": {
+        "type": "object",
+        "description": "One published window row — the `{label, utilization_pct, resets_at}`\nspelling of a 5h, 7d, or per-model weekly window. Both writers\n([`usage_windows`] → the daemon's `status.json` feed and the MCP payloads)\nand the reader (`tollgate list`'s 5h/7d columns) derive from this one struct,\nso a reader's key spelling cannot drift from what a writer emits.",
+        "required": [
+          "label",
+          "utilization_pct",
+          "resets_at"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "utilization_pct": {
+            "type": "number",
+            "format": "double"
+          },
+          "resets_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "WindowScope": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The account's shared pool across models (Anthropic 5h / 7d).",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "shared"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "An account-wide counter that is not the shared pool (OpenRouter free\ndaily requests, a provider's 30d ceiling).",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "account"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Limited to these models.",
+            "required": [
+              "models",
+              "kind"
+            ],
+            "properties": {
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "model"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One product surface (e.g. a coding plan).",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "product"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a window's counter covers. `{\"kind\": \"shared\"}`,\n`{\"kind\": \"model\", \"models\": [\"opus\"]}`, …"
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Authorization: Bearer <device token>"
+      }
+    }
+  }
+}

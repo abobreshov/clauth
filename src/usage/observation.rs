@@ -59,7 +59,8 @@ pub(crate) const WEEKLY_WINDOW_SECS: u64 = 7 * 86_400;
 /// RFC 3339 string (`2026-09-29T10:00:00+00:00`, the spelling every other
 /// tollgate feed uses via [`crate::usage::epoch_secs_to_iso`]) and parses any
 /// RFC 3339 offset back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, utoipa::ToSchema)]
+#[schema(value_type = String, format = DateTime)]
 pub(crate) struct Timestamp(pub(crate) i64);
 
 impl Timestamp {
@@ -124,7 +125,8 @@ impl<'de> Deserialize<'de> for Timestamp {
 /// `"1.50"`; the string is kept as given for display fidelity.
 ///
 /// Deserialises from a JSON string or number; always serialises as a string.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, utoipa::ToSchema)]
+#[schema(value_type = String)]
 pub(crate) struct Amount(String);
 
 impl Amount {
@@ -361,7 +363,7 @@ impl Serialize for Amount {
 
 impl<'de> Deserialize<'de> for Amount {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
+        #[derive(Deserialize, utoipa::ToSchema)]
         #[serde(untagged)]
         enum Raw {
             Str(String),
@@ -377,13 +379,44 @@ impl<'de> Deserialize<'de> for Amount {
     }
 }
 
+/// The latest API-key health check, independent of quota or spend figures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum KeyHealthState {
+    Valid,
+    Invalid,
+    Blocked,
+    OutOfCredits,
+    SpendCapped,
+    Unknown,
+}
+
+impl KeyHealthState {
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+            Self::Blocked => "blocked",
+            Self::OutOfCredits => "out of credits",
+            Self::SpendCapped => "spend capped",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub(crate) struct KeyHealth {
+    pub(crate) state: KeyHealthState,
+    pub(crate) checked_at: Timestamp,
+}
+
 // ── The observation ────────────────────────────────────────────────────────────
 
 /// Everything tollgate can say about one account at read time.
 ///
-/// Every field always serialises (an absent `Option` is `null`, an empty list
-/// is `[]`), so the JSON key set is stable for readers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Core fields always serialise (an absent `Option` is `null`, an empty list
+/// is `[]`). Additive health and note fields are omitted when absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct AccountObservation {
     /// Stable account id, `<namespace>:<name>`:
     /// `claude:<profile>` (a `profiles.toml` profile of any provider),
@@ -406,6 +439,10 @@ pub(crate) struct AccountObservation {
     /// The plan / tier label (`Max 5x`, `plus`, `pro-legacy`), provider value
     /// first, else a user-configured label; `None` when neither exists.
     pub(crate) plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key_health: Option<KeyHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
     /// This account is the one the harness is using now (the global active
     /// profile of its roster).
     pub(crate) active: bool,
@@ -458,6 +495,8 @@ impl AccountObservation {
             label: label.into(),
             provider: source.display_name().to_string(),
             plan: None,
+            key_health: None,
+            note: None,
             active: false,
             disabled: false,
             origin,
@@ -494,7 +533,7 @@ pub(crate) fn account_id(origin: Origin, name: &str) -> String {
 
 /// Which integration an observation's figures came from. Serialises as
 /// [`SourceId::as_str`] (`anthropic_oauth`, `ollama_cloud`, `openrouter`, …).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SourceId {
     /// Anthropic subscription OAuth (`/api/oauth/usage`).
@@ -519,6 +558,8 @@ pub(crate) enum SourceId {
     Alibaba,
     Grok,
     Antigravity,
+    OpenaiApi,
+    GoogleAi,
     /// An unrecognised api-key endpoint read by the best-effort scanner.
     Generic,
     /// Upstream clauth's own caches, read-only.
@@ -543,6 +584,8 @@ impl SourceId {
             Self::Alibaba => "alibaba",
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
+            Self::OpenaiApi => "openai_api",
+            Self::GoogleAi => "google_ai",
             Self::Generic => "generic",
             Self::UpstreamClauth => "upstream_clauth",
         }
@@ -564,6 +607,8 @@ impl SourceId {
             Self::Alibaba => "Alibaba",
             Self::Grok => "Grok",
             Self::Antigravity => "Antigravity",
+            Self::OpenaiApi => "OpenAI API",
+            Self::GoogleAi => "Google AI Studio",
             Self::Generic => "generic",
             Self::UpstreamClauth => "clauth",
         }
@@ -586,7 +631,7 @@ impl SourceId {
 }
 
 /// How an account authenticates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuthKind {
     /// A subscription login tollgate holds (claude OAuth, codex ChatGPT).
@@ -602,7 +647,7 @@ pub(crate) enum AuthKind {
 }
 
 /// Where an account is defined; also its [`AccountObservation::id`] namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Origin {
     /// `~/.tollgate/profiles.toml` (`claude:`).
@@ -633,7 +678,7 @@ impl Origin {
 
 /// How current an observation's figures are. `{"state": "fresh"}`,
 /// `{"state": "stale", "since": "…"}`, `{"state": "not_fetched"}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum Freshness {
     /// Read within the source's staleness threshold.
@@ -646,7 +691,7 @@ pub(crate) enum Freshness {
 }
 
 /// Why an account cannot be read, or cannot serve.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct Failure {
     pub(crate) kind: FailureKind,
     /// One human sentence, passed through [`sanitize_message`] — never a raw
@@ -668,7 +713,7 @@ impl Failure {
 }
 
 /// The failure taxonomy (plan §4.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureKind {
     /// The credential is dead; only a re-login / new key clears it.
@@ -819,7 +864,7 @@ fn redact_embedded(word: &str, mut after_bearer: bool) -> (String, bool) {
 // ── Quota windows ──────────────────────────────────────────────────────────────
 
 /// One rolling or calendar quota window.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct QuotaWindow {
     /// Stable per source: [`WINDOW_SESSION`], [`WINDOW_WEEKLY`],
     /// `weekly:<model>`, [`WINDOW_MONTH`], or a slug of the provider's label.
@@ -844,6 +889,8 @@ pub(crate) struct QuotaWindow {
     pub(crate) limit: Option<f64>,
     /// Per-model request counts inside this window (Ollama); informational.
     pub(crate) breakdown: Vec<ModelCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) attribution: Vec<Share>,
 }
 
 impl QuotaWindow {
@@ -861,13 +908,20 @@ impl QuotaWindow {
             used: None,
             limit: None,
             breakdown: Vec::new(),
+            attribution: Vec::new(),
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub(crate) struct Share {
+    pub(crate) label: String,
+    pub(crate) used_pct: f64,
+}
+
 /// What a window's counter covers. `{"kind": "shared"}`,
 /// `{"kind": "model", "models": ["opus"]}`, …
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WindowScope {
     /// The account's shared pool across models (Anthropic 5h / 7d).
@@ -882,7 +936,7 @@ pub(crate) enum WindowScope {
 }
 
 /// Requests made to one model inside a window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct ModelCount {
     pub(crate) model: String,
     pub(crate) requests: u64,
@@ -898,7 +952,7 @@ pub(crate) struct ModelCount {
 /// - `spend`: what was spent in `period`. `limit` = the cap on that spend.
 /// - `limit`: what is LEFT under a cap (`limit_remaining`); `limit` = the cap.
 /// - `budget`: a user-configured budget's remaining amount; `limit` = the budget.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct MoneyMeter {
     /// Stable per source: `wallet`, `wallet.granted`, `wallet.topped_up`,
     /// `subscription`, `top_up`, `rollover`, `total_usable`, `spend.daily`,
@@ -947,7 +1001,7 @@ impl MoneyMeter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MoneyKind {
     Balance,
@@ -957,7 +1011,7 @@ pub(crate) enum MoneyKind {
 }
 
 /// Whose money a meter describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MoneyScope {
     /// This api key only.
@@ -970,7 +1024,7 @@ pub(crate) enum MoneyScope {
 
 /// Who vouches for a meter's scope. `{"kind": "provider"}`,
 /// `{"kind": "monitoring_credential", "bound": true}`, `{"kind": "user_label"}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ScopeOrigin {
     /// The inference credential's own provider response.
@@ -983,7 +1037,7 @@ pub(crate) enum ScopeOrigin {
 }
 
 /// The period a spend meter covers: `[start, end)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct Period {
     pub(crate) kind: PeriodKind,
     pub(crate) start: Option<Timestamp>,
@@ -1004,7 +1058,7 @@ impl Period {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PeriodKind {
     Daily,
@@ -1016,7 +1070,7 @@ pub(crate) enum PeriodKind {
 
 /// A local cost estimate (token ledger × price table), only when every token
 /// is attributable to this account.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct LocalEstimate {
     pub(crate) amount: Amount,
     pub(crate) currency: String,

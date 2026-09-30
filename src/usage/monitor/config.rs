@@ -71,6 +71,13 @@ pub(crate) enum MonitorKind {
     /// Any other typed provider, named by `provider = "<Provider variant>"`.
     #[value(name = "provider")]
     Provider,
+    Grok,
+    Antigravity,
+    #[value(name = "codex_native")]
+    CodexNative,
+    Openai,
+    #[value(name = "google_ai")]
+    GoogleAi,
 }
 
 impl MonitorKind {
@@ -81,6 +88,11 @@ impl MonitorKind {
             Self::OllamaCloud => "ollama_cloud",
             Self::OpenRouter => "openrouter",
             Self::Provider => "provider",
+            Self::Grok => "grok",
+            Self::Antigravity => "antigravity",
+            Self::CodexNative => "codex_native",
+            Self::Openai => "openai",
+            Self::GoogleAi => "google_ai",
         }
     }
 }
@@ -113,6 +125,16 @@ pub(crate) struct MonitorConfig {
     /// login. Default `~/.hermes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) hermes_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) probe_model: Option<String>,
+    #[serde(default)]
+    pub(crate) probe: bool,
     /// A monthly budget in USD: adds a `budget.monthly` Budget meter and
     /// grades it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +166,11 @@ impl MonitorConfig {
             api_key_env: None,
             billing_key_env: None,
             hermes_home: None,
+            tool_home: None,
+            auth_entry: None,
+            via: None,
+            probe_model: None,
+            probe: false,
             budget_usd_month: None,
             alert_pct: None,
             ttl_secs: None,
@@ -159,18 +186,36 @@ impl MonitorConfig {
     /// Refresh cadence, ms.
     pub(crate) fn ttl_ms(&self) -> u64 {
         self.ttl_secs
-            .unwrap_or(DEFAULT_TTL_SECS)
-            .max(MIN_TTL_SECS)
+            .unwrap_or(self.default_ttl())
+            .max(self.ttl_floor())
             .saturating_mul(1000)
     }
 
+    pub(crate) fn ttl_floor(&self) -> u64 {
+        match self.kind {
+            MonitorKind::Grok | MonitorKind::CodexNative => 120,
+            MonitorKind::Antigravity if self.via.as_deref() == Some("cli") => 900,
+            MonitorKind::Antigravity | MonitorKind::Openai | MonitorKind::GoogleAi => 300,
+            MonitorKind::Nous if self.probe => 900,
+            _ => MIN_TTL_SECS,
+        }
+    }
+    pub(crate) fn default_ttl(&self) -> u64 {
+        match self.kind {
+            MonitorKind::Grok | MonitorKind::CodexNative => 300,
+            MonitorKind::Antigravity => 600,
+            MonitorKind::Openai | MonitorKind::GoogleAi => 900,
+            MonitorKind::Nous if self.probe => 1800,
+            _ => DEFAULT_TTL_SECS,
+        }
+    }
     /// The typed provider a `provider` / `openrouter` monitor reads.
     pub(crate) fn typed_provider(&self) -> Option<Provider> {
         match self.kind {
             MonitorKind::OpenRouter => Some(Provider::OpenRouter),
             MonitorKind::OllamaCloud => Some(Provider::OllamaCloud),
             MonitorKind::Provider => self.provider.as_deref().and_then(parse_provider),
-            MonitorKind::Nous => None,
+            _ => None,
         }
     }
 
@@ -182,17 +227,35 @@ impl MonitorConfig {
         )
     }
 
+    pub(crate) fn tool_home_in(&self, home: &Path) -> PathBuf {
+        expand_home(
+            self.tool_home
+                .as_deref()
+                .unwrap_or(if self.kind == MonitorKind::Grok {
+                    "~/.grok"
+                } else {
+                    "~/.codex"
+                }),
+            home,
+        )
+    }
+
     /// The non-secret identity of what this monitor reads. A cache written
     /// under a different fingerprint describes another target and is
     /// discarded.
     pub(crate) fn fingerprint(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.kind.as_str(),
             self.provider.as_deref().unwrap_or(""),
             self.api_key_env.as_deref().unwrap_or(""),
             self.billing_key_env.as_deref().unwrap_or(""),
             self.hermes_home.as_deref().unwrap_or(""),
+            self.tool_home.as_deref().unwrap_or(""),
+            self.auth_entry.as_deref().unwrap_or(""),
+            self.via.as_deref().unwrap_or(""),
+            self.probe,
+            self.probe_model.as_deref().unwrap_or(""),
         )
     }
 
@@ -259,6 +322,67 @@ impl MonitorConfig {
                 self.kind.as_str()
             );
         }
+        for (field, present, allowed) in [
+            (
+                "tool_home",
+                self.tool_home.is_some(),
+                matches!(self.kind, MonitorKind::Grok | MonitorKind::CodexNative),
+            ),
+            (
+                "auth_entry",
+                self.auth_entry.is_some(),
+                self.kind == MonitorKind::Grok,
+            ),
+            (
+                "via",
+                self.via.is_some(),
+                self.kind == MonitorKind::Antigravity,
+            ),
+            (
+                "probe",
+                self.probe,
+                self.kind == MonitorKind::Nous && self.api_key_env.is_some(),
+            ),
+            (
+                "probe_model",
+                self.probe_model.is_some(),
+                self.kind == MonitorKind::Nous,
+            ),
+        ] {
+            if present && !allowed {
+                bail!(
+                    "monitor '{id}': {field} is not valid with kind = {:?}",
+                    self.kind.as_str()
+                );
+            }
+        }
+        if self
+            .tool_home
+            .as_ref()
+            .is_some_and(|h| !(h.starts_with('/') || h == "~" || h.starts_with("~/")))
+        {
+            bail!("monitor '{id}': tool_home must be absolute or start with ~/");
+        }
+        if self
+            .via
+            .as_ref()
+            .is_some_and(|v| v != "keyring" && v != "cli")
+        {
+            bail!("monitor '{id}': via must be keyring or cli");
+        }
+        if self.kind == MonitorKind::Antigravity
+            && self.via.as_deref() == Some("cli")
+            && !super::antigravity::AGY_CLI_OWNER_GATE_RECORDED
+        {
+            bail!("monitor '{id}': via = \"cli\" is disabled until the owner records gate AGY-CLI");
+        }
+        if self
+            .probe_model
+            .as_ref()
+            .is_some_and(|m| !m.ends_with(":free") || m.chars().any(char::is_control))
+        {
+            bail!("monitor '{id}': probe_model must end in :free");
+        }
         if let Some(b) = &self.budget_usd_month
             && *b <= Amount::zero()
         {
@@ -270,9 +394,12 @@ impl MonitorConfig {
             bail!("monitor '{id}': alert_pct must be in (0, 100]");
         }
         if let Some(t) = self.ttl_secs
-            && t < MIN_TTL_SECS
+            && t < self.ttl_floor()
         {
-            bail!("monitor '{id}': ttl_secs must be at least {MIN_TTL_SECS}");
+            bail!(
+                "monitor '{id}': ttl_secs must be at least {}",
+                self.ttl_floor()
+            );
         }
         Ok(())
     }
@@ -603,11 +730,18 @@ fn to_table(m: &MonitorConfig) -> toml_edit::Table {
         ("api_key_env", &m.api_key_env),
         ("billing_key_env", &m.billing_key_env),
         ("hermes_home", &m.hermes_home),
+        ("tool_home", &m.tool_home),
+        ("auth_entry", &m.auth_entry),
+        ("via", &m.via),
+        ("probe_model", &m.probe_model),
     ];
     for (k, v) in strings {
         if let Some(v) = v {
             t[k] = value(v.clone());
         }
+    }
+    if m.probe {
+        t["probe"] = value(true);
     }
     if let Some(b) = &m.budget_usd_month {
         // A string keeps the decimal exact.

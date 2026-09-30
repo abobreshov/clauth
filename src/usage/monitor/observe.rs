@@ -64,6 +64,10 @@ pub(crate) fn observe_monitor(
         .filter(|at| now_ms.saturating_sub(*at) <= STALE_RETENTION_MS);
     if let (Some(at), Some(reading)) = (observed, cache.reading.as_ref()) {
         obs.plan = reading.plan.clone();
+        obs.key_health = reading.key_health.clone();
+        if reading.note.is_some() {
+            obs.note = reading.note.clone();
+        }
         obs.windows = reading
             .windows
             .iter()

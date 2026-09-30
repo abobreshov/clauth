@@ -2123,6 +2123,9 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             spend,
             codex_limit_reached: None,
             codex_reset_credits: None,
+            codex_credits: None,
+            codex_spend_control_reached: None,
+            codex_additional_windows: Vec::new(),
             open_at: None,
             fetched_at: None,
         });

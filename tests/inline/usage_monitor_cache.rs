@@ -391,3 +391,238 @@ fn remove_deletes_the_cache_and_lock() {
     assert!(!cache_path("or").unwrap().exists());
     assert!(load("or").is_none());
 }
+
+#[test]
+fn key_health_rate_limit_verdict_is_cached_and_holds_for_retry_after() {
+    use crate::usage::observation::KeyHealthState;
+    let _home = HomeSandbox::new();
+    let mut m = MonitorConfig::new("google-key", MonitorKind::GoogleAi);
+    m.api_key_env = Some("OR_KEY".into());
+    let mut http = FakeHttp::offline();
+    http.send_reply = Box::new(|_, _| {
+        Ok(super::super::source::HttpReply {
+            status: 429,
+            body: "{}".into(),
+            headers: vec![],
+            retry_after_secs: Some(1800),
+        })
+    });
+    let cache = refreshed(refresh_one(&m, &deps(&http, T0), true).unwrap());
+    assert!(cache.failure.is_none());
+    assert_eq!(cache.hold_until_ms, Some(T0 + 1_800_000));
+    let reading = cache.reading.as_ref().unwrap();
+    assert_eq!(
+        reading.key_health.as_ref().unwrap().state,
+        KeyHealthState::Unknown
+    );
+    assert_eq!(
+        reading.verdict.as_ref().unwrap().kind,
+        FailureKind::RateLimited
+    );
+    assert!(
+        reading
+            .note
+            .as_ref()
+            .unwrap()
+            .contains("spend and quota not available")
+    );
+    assert!(matches!(
+        refresh_one(&m, &deps(&http, T0 + 1000), true).unwrap(),
+        RefreshOutcome::Held(_)
+    ));
+    assert_eq!(http.calls().len(), 1);
+}
+// Slice-1 review: exercise the real cache floor, not only the source's hint.
+#[test]
+fn agy_rate_limit_cache_hold_has_a_fifteen_minute_floor() {
+    use crate::usage::monitor::antigravity::{KeyringMetadata, KeyringProbe, with_test_keyring};
+    struct Probe;
+    impl KeyringProbe for Probe {
+        fn has_owner(&self) -> Result<bool, Failure> {
+            Ok(true)
+        }
+        fn metadata(&self) -> Result<KeyringMetadata, Failure> {
+            Ok(KeyringMetadata {
+                unlocked: 1,
+                locked: 0,
+            })
+        }
+        fn secret(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, Failure> {
+            Ok(zeroize::Zeroizing::new(
+                br#"{"access_token":"FIXTURE","expiry":2000000000}"#.to_vec(),
+            ))
+        }
+    }
+    let _home = HomeSandbox::new();
+    let monitor = MonitorConfig::new("agy", MonitorKind::Antigravity);
+    let mut http = FakeHttp::offline();
+    // Deliver a short RateLimited hint directly through the transport seam.
+    // This deliberately bypasses the source's own 900-second normalization,
+    // proving the cache itself enforces its independent fifteen-minute floor.
+    http.send_reply = Box::new(|_, _| {
+        let mut failure = Failure::new(FailureKind::RateLimited, "fixture rate limit");
+        failure.retry_after = Some(crate::usage::observation::Timestamp::from_secs(
+            (T0 / 1000 + 1) as i64,
+        ));
+        Err(failure)
+    });
+    let cache = with_test_keyring(std::rc::Rc::new(Probe), || {
+        refreshed(refresh_one(&monitor, &deps(&http, T0), false).unwrap())
+    });
+    assert_eq!(
+        cache.failure.as_ref().unwrap().kind,
+        FailureKind::RateLimited
+    );
+    assert!(cache.hold_until_ms.unwrap() >= T0 + 15 * 60_000);
+    assert!(matches!(
+        refresh_one(&monitor, &deps(&http, T0 + 15 * 60_000 - 1), true).unwrap(),
+        RefreshOutcome::Held(_)
+    ));
+    assert!(!is_due(&monitor, Some(&cache), T0 + 15 * 60_000 - 1));
+    assert!(is_due(&monitor, Some(&cache), T0 + 15 * 60_000));
+    assert_eq!(http.calls().len(), 2);
+}
+
+#[test]
+fn admin_costs_retry_does_not_hold_the_plain_key_health_poll() {
+    let _home = HomeSandbox::new();
+    let mut monitor = MonitorConfig::new("openai", MonitorKind::Openai);
+    monitor.api_key_env = Some("PLAIN".into());
+    monitor.billing_key_env = Some("ADMIN".into());
+    let env = |name: &str| Some(format!("FIXTURE-{name}"));
+    let mut http = FakeHttp::offline();
+    http.send_reply = Box::new(|_, request| {
+        Ok(super::super::source::HttpReply {
+            status: if request.url.contains("/costs") {
+                429
+            } else {
+                200
+            },
+            body: "{}".into(),
+            headers: vec![],
+            retry_after_secs: Some(7200),
+        })
+    });
+    let at = |now_ms| RefreshDeps {
+        http: &http,
+        notifier: None,
+        env: &env,
+        now_ms,
+    };
+    let first = refreshed(refresh_one(&monitor, &at(T0), true).unwrap());
+    assert!(first.failure.is_none());
+    assert!(first.hold_until_ms.is_none());
+    let reading = first.reading.as_ref().unwrap();
+    assert!(reading.verdict.is_none());
+    assert_eq!(
+        reading.costs_failure.as_ref().unwrap().kind,
+        FailureKind::RateLimited
+    );
+    assert_eq!(reading.costs_hold_until, Some((T0 / 1000 + 7200) as i64));
+    let second = refreshed(refresh_one(&monitor, &at(T0 + 3_700_000), false).unwrap());
+    assert!(second.hold_until_ms.is_none());
+    assert_eq!(
+        http.calls().len(),
+        3,
+        "models must still poll, costs must wait"
+    );
+    assert!(http.calls()[2].contains("/v1/models"));
+    refreshed(refresh_one(&monitor, &at(T0 + 7_200_000), true).unwrap());
+    assert_eq!(
+        http.calls().len(),
+        5,
+        "costs retry only after its own deadline"
+    );
+}
+
+#[test]
+fn successful_exhausted_grok_reading_is_polled_at_its_normal_ttl() {
+    let home = HomeSandbox::new();
+    let tool = home.home().join(".grok");
+    std::fs::create_dir(&tool).unwrap();
+    std::fs::write(
+        tool.join("auth.json"),
+        r#"{"https://auth.x.ai::fixture":{"key":"TOKEN-CANARY","expires_at":2000000000}}"#,
+    )
+    .unwrap();
+    let monitor = MonitorConfig::new("grok", MonitorKind::Grok);
+    let mut http = FakeHttp::offline();
+    http.send_reply = Box::new(|_, request| {
+        Ok(super::super::source::HttpReply {
+        status: 200,
+        body: if request.url.contains("/billing") {
+            r#"{"creditUsagePercent":100,"currentPeriod":{"start":1789990000,"end":2000000000}}"#
+        } else {r#"{"subscriptionTier":"SuperGrok"}"#}.into(),
+        headers: vec![], retry_after_secs: None,
+    })
+    });
+    let first = refreshed(refresh_one(&monitor, &deps(&http, T0), false).unwrap());
+    assert_eq!(
+        first
+            .reading
+            .as_ref()
+            .unwrap()
+            .verdict
+            .as_ref()
+            .unwrap()
+            .kind,
+        FailureKind::QuotaExhausted
+    );
+    assert!(first.hold_until_ms.is_none());
+    let next = T0 + monitor.ttl_ms();
+    assert!(is_due(&monitor, Some(&first), next));
+    assert!(matches!(
+        refresh_one(&monitor, &deps(&http, next), false).unwrap(),
+        RefreshOutcome::Refreshed(_)
+    ));
+    assert_eq!(http.calls().len(), 4);
+}
+
+#[test]
+fn persisted_costs_only_hold_is_removed_before_the_next_health_poll() {
+    use crate::usage::observation::{KeyHealth, KeyHealthState, Timestamp};
+    let _home = HomeSandbox::new();
+    let mut monitor = MonitorConfig::new("old-openai", MonitorKind::Openai);
+    monitor.api_key_env = Some("PLAIN".into());
+    monitor.billing_key_env = Some("ADMIN".into());
+    let mut failure = Failure::new(FailureKind::RateLimited, "OpenAI costs rate limited");
+    failure.retry_after = Some(Timestamp((T0 / 1000 + 7200) as i64));
+    let mut old = MonitorCache::empty(&monitor);
+    old.checked_at_ms = Some(T0);
+    old.observed_at_ms = Some(T0);
+    old.hold_until_ms = Some(T0 + 7_200_000);
+    old.reading = Some(Reading {
+        key_health: Some(KeyHealth {
+            state: KeyHealthState::Valid,
+            checked_at: Timestamp((T0 / 1000) as i64),
+        }),
+        costs_at: Some((T0 / 1000) as i64),
+        costs_failure: Some(failure.clone()),
+        verdict: Some(failure),
+        ..Reading::default()
+    });
+    save(&old).unwrap();
+    let http = FakeHttp {
+        send_reply: Box::new(|_, req| {
+            assert!(req.url.ends_with("/v1/models"));
+            Ok(super::super::source::HttpReply {
+                status: 200,
+                body: "{}".into(),
+                headers: vec![],
+                retry_after_secs: None,
+            })
+        }),
+        ..FakeHttp::offline()
+    };
+    let env = |_: &str| Some("KEY-CANARY".into());
+    let deps = RefreshDeps {
+        http: &http,
+        notifier: None,
+        env: &env,
+        now_ms: T0 + 3_700_000,
+    };
+    let new = refreshed(refresh_one(&monitor, &deps, false).unwrap());
+    assert!(new.hold_until_ms.is_none());
+    assert!(new.reading.as_ref().unwrap().verdict.is_none());
+    assert_eq!(http.calls().len(), 1);
+}

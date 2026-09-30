@@ -674,3 +674,15 @@ fn native_match_ignores_hermes_profiles() {
         "a profile does not make the native match ambiguous either"
     );
 }
+
+#[test]
+fn a_profileless_codex_pane_falls_back_only_to_native_login() {
+    let profile = obs(Origin::CodexProfile, "managed", SourceId::Codex);
+    let mut native = obs(Origin::Monitor, "codex-native", SourceId::Codex);
+    native.auth = AuthKind::NativeLogin;
+    native.windows.push(window("session", 25.0));
+    assert!(resolve_tag(std::slice::from_ref(&profile), None, "codex", None, NOW).is_none());
+    let tag = resolve_tag(&[profile, native.clone()], None, "codex", None, NOW).unwrap();
+    assert_eq!(tag.text, "codex-native 25%");
+    assert!(resolve_tag(&[native.clone(), native], None, "codex", None, NOW).is_none());
+}

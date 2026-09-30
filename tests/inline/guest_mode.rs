@@ -572,3 +572,78 @@ fn a_guest_b_swap_and_relaunch_leave_every_operator_tree_byte_identical() {
         "a guest B session wrote into an operator tree"
     );
 }
+
+#[test]
+fn native_monitors_and_secrets_leave_guest_operator_files_unchanged() {
+    use crate::usage::monitor::{cli::preset, config, source};
+    let sb = HomeSandbox::new();
+    stage_upstream(sb.home());
+    assert!(upstream_active());
+    let grok_home = sb.home().join(".grok");
+    std::fs::create_dir_all(&grok_home).unwrap();
+    std::fs::write(grok_home.join("auth.json"), r#"{"https://auth.x.ai::test":{"key":"TOKEN-CANARY","expires_at":1,"refresh_token":"REFRESH-CANARY"}}"#).unwrap();
+    std::fs::write(grok_home.join("auth.json.lock"), "LOCK-CANARY").unwrap();
+    let before = global_files(sb.home());
+    let grok_before = std::fs::read(grok_home.join("auth.json")).unwrap();
+    for name in ["grok", "agy", "codex-native"] {
+        let m = preset(name).unwrap();
+        config::add(&m).unwrap();
+        let target = source::resolve_target(&m, sb.home(), 1_900_000_000, &|_| None);
+        let result = source::source_for(m.kind).fetch(&target, &source::FakeHttp::offline());
+        assert!(result.is_err());
+    }
+    let dir = crate::profile::tollgate_dir().unwrap();
+    crate::profile::atomic_write_600(&dir.join("secrets.env"), "LANE4_GUEST_KEY=TOKEN-CANARY\n")
+        .unwrap();
+    crate::secrets::dispatch(crate::secrets::SecretCommand::List { json: true }).unwrap();
+    assert_eq!(
+        crate::secrets::resolve("LANE4_GUEST_KEY").as_deref(),
+        Some("TOKEN-CANARY")
+    );
+    crate::secrets::dispatch(crate::secrets::SecretCommand::Rm {
+        name: "LANE4_GUEST_KEY".into(),
+        yes: true,
+    })
+    .unwrap();
+    assert_eq!(global_files(sb.home()), before);
+    assert_eq!(
+        std::fs::read(grok_home.join("auth.json")).unwrap(),
+        grok_before
+    );
+    assert_eq!(
+        std::fs::read(grok_home.join("auth.json.lock")).unwrap(),
+        b"LOCK-CANARY"
+    );
+}
+// Slice-1 review: refusal must also apply on the active guest path.
+#[cfg(unix)]
+#[test]
+fn guest_codex_native_refuses_upstream_profile_store_symlink() {
+    use crate::usage::monitor::{
+        codex_native::CodexNativeSource,
+        config::{MonitorConfig, MonitorKind},
+        source::{FakeHttp, UsageSource, resolve_target},
+    };
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    assert!(upstream_active());
+    let upstream = home.home().join(".clauth/profiles/operator/auth.json");
+    std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+    std::fs::write(&upstream, UPSTREAM_CODEX_AUTH).unwrap();
+    let global = home.home().join(".codex/auth.json");
+    std::fs::remove_file(&global).unwrap();
+    std::os::unix::fs::symlink(&upstream, &global).unwrap();
+    let cfg = MonitorConfig::new("native", MonitorKind::CodexNative);
+    let target = resolve_target(&cfg, home.home(), 1900000000, &|_| None);
+    let http = FakeHttp::offline();
+    let failure = CodexNativeSource.fetch(&target, &http).unwrap_err();
+    assert_eq!(
+        failure.kind,
+        crate::usage::observation::FailureKind::Unavailable
+    );
+    assert!(failure.message.contains("upstream:operator"));
+    assert!(http.calls().is_empty());
+    assert_eq!(std::fs::read(&upstream).unwrap(), UPSTREAM_CODEX_AUTH);
+    assert_eq!(std::fs::read_link(&global).unwrap(), upstream);
+    assert!(upstream_active());
+}

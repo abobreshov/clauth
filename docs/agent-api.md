@@ -148,7 +148,8 @@ Disabled accounts are always found by direct lookup.
 ### An AccountObservation
 
 The schema is `src/usage/observation.rs`, `schema_version` 1. Every key is
-always present: an absent value is `null`, an empty list is `[]`.
+always present for core fields: an absent value is `null`, an empty list is `[]`.
+Additive `key_health`, `note`, and window `attribution` are omitted when absent.
 
 ```json
 {
@@ -181,6 +182,17 @@ always present: an absent value is `null`, an empty list is `[]`.
 
 **Reading it:**
 
+- **`key_health`**, when present, is `{state, checked_at}`. Its states are
+  `valid`, `invalid`, `blocked`, `out_of_credits`, `spend_capped`, and `unknown`;
+  `checked_at` is an RFC 3339 instant. It reports the key check independently
+  of spend or quota. A Google AI key can be valid while publishing neither.
+- **`note`** explains a source's fixed limitations, such as the absence of an
+  API-key spend endpoint. Cards show both key health and this note.
+- **Window `attribution`**, when present, is an array of `{label, used_pct}`
+  shares of one shared pool. Shares are not separate quota windows.
+- **`openai_api`** and **`google_ai`** identify the key-monitor sources.
+  OpenAI admin credentials read only organization costs; inference credentials
+  read only model metadata. Google keys use a header, never a URL query.
 - **Money** amounts are exact decimal **strings** (`"12.50"`); parse them as
   decimals, not floats. For a `limit` meter, `amount` is what is left and
   `limit` is the cap.

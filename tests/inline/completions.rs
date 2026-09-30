@@ -1269,3 +1269,17 @@ fn completions_offer_hermes_names_for_start_delete_and_hermes_subcommands() {
     ));
     assert!(ZSH.contains(r#"[[ "${words[2]}" == (start|delete) ]] && hermes="#));
 }
+
+#[test]
+fn fish_monitor_kind_has_one_registration_with_kind_values() {
+    let lines: Vec<_> = FISH
+        .lines()
+        .filter(|line| {
+            line.contains("__fish_seen_subcommand_from monitor")
+                && (line.contains("-l kind ") || line.contains("-a --kind "))
+        })
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("-l kind -x"));
+    assert!(lines[0].contains("codex_native"));
+}
