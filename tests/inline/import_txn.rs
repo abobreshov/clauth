@@ -787,3 +787,68 @@ fn a_crash_at_every_step_of_a_regular_slot_import_resumes_to_the_uninterrupted_t
         }
     }
 }
+
+/// Review lens credentials #3, the mid-op crash test 42 does not reach: a
+/// session-token profile's `move_relink` of a regular slot crashed after the
+/// store moved but before the slot was renamed to its temp. The rollback
+/// leaves the untouched live file exactly as it is (never replaces it with a
+/// link), and a resume finishes the step.
+#[test]
+fn a_crash_between_the_store_move_and_the_slot_rename_never_destroys_the_live_file() {
+    fn fixture(env: &Env) -> std::path::PathBuf {
+        env.tree.roster(&["s"], Some("s")).static_token("s");
+        let slot = env.p(".claude/.credentials.json");
+        let live = serde_json::json!({
+            "claudeAiOauth": {"accessToken": fixture_access("s", 9), "refreshToken": "FIXTURE-RT-live-only"},
+            "mcpOAuth": {"srv": {"accessToken": "FIXTURE-MCP-LIVE-ONLY"}}
+        });
+        std::fs::write(&slot, live.to_string()).expect("slot");
+        slot
+    }
+    fn crash_mid_relink(env: &Env) {
+        let seq = survey(&Options::default())
+            .plan
+            .expect("plan")
+            .entries
+            .iter()
+            .find(|e| e.op == Op::MoveRelink)
+            .expect("relink")
+            .seq;
+        env.seams
+            .set(|s| s.crash = Some((seq, CrashPoint::BeforeOp)));
+        run(&Options::default()).expect_err("crashes");
+        env.seams.set(|s| s.crash = None);
+        // The half the crash let through: the store moved, the slot not.
+        std::fs::rename(
+            store(env, "s", "session-token.json"),
+            tstore(env, "s", "session-token.json"),
+        )
+        .expect("store moved");
+    }
+    for resume in [false, true] {
+        let env = Env::new();
+        let slot = fixture(&env);
+        let (live_ino, live_bytes) = (ino(&slot), std::fs::read(&slot).expect("slot"));
+        let sidecar = ino(&store(&env, "s", "session-token.json"));
+        crash_mid_relink(&env);
+        if resume {
+            txn::resume().expect("resumes");
+            assert_eq!(
+                std::fs::read_link(&slot).expect("link"),
+                tstore(&env, "s", "session-token.json")
+            );
+            assert_eq!(
+                ino(&tstore(&env, "s", "quarantine/credentials.json.live")),
+                live_ino
+            );
+        } else {
+            super::rollback::rollback(&Options::default()).expect("rolls back");
+            let meta = std::fs::symlink_metadata(&slot).expect("slot");
+            assert!(meta.file_type().is_file(), "the live file stays a file");
+            assert_eq!(ino(&slot), live_ino);
+            assert_eq!(std::fs::read(&slot).expect("slot"), live_bytes);
+            assert_eq!(ino(&store(&env, "s", "session-token.json")), sidecar);
+        }
+        assert_no_temp(&env.snapshot(), &format!("resume={resume}"));
+    }
+}

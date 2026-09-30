@@ -257,6 +257,8 @@ fn the_child_env_scrubs_xdg_claude_config_dir_and_gh_tokens() {
         "HERMES_INFERENCE_PROVIDER",
         "HERMES_MODEL",
         "HERMES_INFERENCE_MODEL",
+        // Review lens credentials #8: Hermes refreshes `$CODEX_HOME/auth.json`.
+        "CODEX_HOME",
         "MY_CUSTOM",
     ] {
         assert_eq!(env.get(key), Some(&None), "{key} must be scrubbed");
@@ -973,4 +975,26 @@ fn daemon_never_executes_hermes_python_or_mise() {
         "no mise, hermes or python: {:?}",
         recorded(&bin)
     );
+}
+
+/// Review lens credentials #7. An anthropic alias as the roster's own model
+/// (`hermes new --model anthropic:…`) is refused like the same value in the
+/// argv, and a roster that already holds one is refused at `start`'s
+/// preflight: `start` would pass it as `-m`, past the argv scan.
+#[test]
+fn an_anthropic_alias_as_the_roster_model_is_refused_on_every_route() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let _fx = fixture(&sb);
+    let mut o = opts("nm", Provider::Nous);
+    o.model = Some("anthropic:claude-opus-4".to_string());
+    let err = new_profile(&o, &mut |_| unreachable!()).unwrap_err();
+    assert!(err.to_string().contains("-m"), "{err}");
+    assert!(HermesState::load().unwrap().profiles().is_empty());
+    // A roster written before the guard (or by hand) holds one.
+    new_profile(&opts("nm", Provider::Nous), &mut |_| unreachable!()).unwrap();
+    let mut profile = HermesState::load().unwrap().profiles()[0].clone();
+    profile.model = Some("anthropic:claude-opus-4".to_string());
+    let err = preflight_explain("nm", &profile, &[]).unwrap_err();
+    assert!(err.to_string().contains("-m"), "{err}");
 }

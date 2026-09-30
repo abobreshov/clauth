@@ -154,6 +154,11 @@ pub(crate) struct Facts {
     /// Which global edit or retire step the entry is (`G1`…`G4`, `r1`…`r4`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) step: Option<String>,
+    /// `capture` under `--adopt-live` / `move_relink` of a regular slot:
+    /// where the superseded login is kept (the profile's own `quarantine/`)
+    /// instead of being unlinked, so a revert puts it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quarantine: Option<PathBuf>,
 }
 
 /// Upstream's herdr plugin as `herdr plugin list --json` listed it (G2):

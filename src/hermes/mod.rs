@@ -295,6 +295,7 @@ pub(crate) fn preflight_explain(
     let paths = HermesPaths::for_name(name)?;
     shape_guards(name, &paths)?;
     guards::g5_argv(name, profile.provider.as_str(), args)?;
+    guards::g5_model(name, profile.provider.as_str(), profile.model.as_deref())?;
     let install = resolve_install(name)?;
     guards::g6_hsp_env(name, &install.hsp)
 }
@@ -307,6 +308,7 @@ pub(crate) fn preflight(name: &str, profile: &HermesProfile, verb: Verb<'_>) -> 
     shape_guards(name, &paths)?;
     if let Verb::Start(args) = verb {
         guards::g5_argv(name, profile.provider.as_str(), args)?;
+        guards::g5_model(name, profile.provider.as_str(), profile.model.as_deref())?;
     }
     let install = resolve_install(name)?;
     guards::g6_hsp_env(name, &install.hsp)?;
@@ -494,6 +496,7 @@ pub(crate) fn new_profile(
     refuse_on_windows()?;
     let (mode, auth, key_env) = new_binding(opts)?;
     let name = validate_new_name(&opts.name)?;
+    guards::g5_model(&name, opts.provider.as_str(), opts.model.as_deref())?;
 
     // Step 3: the key, before any lock.
     let key = match key_env {

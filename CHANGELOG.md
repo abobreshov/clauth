@@ -13,6 +13,7 @@
 - `tollgate plugin install` and `tollgate plugin uninstall`. The uninstall removes only `tollgate@tollgate` and `mcpServers.tollgate`, under the owned-keys guard in every mode.
 - `GET /v1/health` and `GET /v1/status` carry `import: {state, completed_at}`; the TUI's guest-mode footer and the guest refusal name `tollgate import clauth --dry-run`.
 - The name check spans the claude, codex and Hermes rosters and names the one that holds the name; an unreadable `hermes-profiles.toml` blocks the import like the other two rosters. Hermes homes are never read, moved or rolled back.
+- Review hardening (credentials): `--adopt-live` keeps the store it supersedes in the profile's `quarantine/` and a rollback restores the regular slot and the store byte for byte; a slot holding another profile's login (`live_is_other_profile`) or an older login than the store (`live_older_than_store`) is refused even with `--adopt-live`, at import and at rollback. A session-token profile's discarded live copy is quarantined too, and a crash between the store move and the slot rename no longer turns the live file into a link. A `clauth` on `PATH` that resolves to tollgate itself is never retired (`upstream_binary_is_tollgate`). A crashed copy's own `.<name>.tmp.*` no longer blocks the rollback as `pending_rotation`; its revert sweeps it. Hermes children lose an inherited `CODEX_HOME`, and an anthropic alias as a Hermes profile's `--model` is refused.
 
 ### Moving a live session: API-key hot swap and relaunch in place
 

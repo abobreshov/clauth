@@ -82,7 +82,10 @@ The numbers are per command. The shared prep PR (hot-swap spec §8) replaces the
 - `dev_build_exe`: `this tollgate is <exe>, not the installed binary on PATH; run the installed tollgate so the rewritten helper points at it`
 - `upstream_offpath_build` (warning): `upstream clauth build <path> is not on PATH and is not retired; do not run it (or 'cargo run' on the mommy branch) until R2's start-time reconcile ships`
 - `cross_device`: `<src> and <dst> are on different filesystems; a credential is never copied`
-- `claude_live_diverged`: `~/.claude/.credentials.json holds a login that differs from profile '<p>'; pass --adopt-live to import it as '<p>' (the stored chain is discarded)`
+- `claude_live_diverged`: `~/.claude/.credentials.json holds a login that differs from profile '<p>'; pass --adopt-live to import it as '<p>' (the stored chain is kept in its quarantine/)`
+- `live_is_other_profile`: the diverged slot holds another stored profile's login (refresh or access token); refused even under `--adopt-live` (review lens credentials #1)
+- `live_older_than_store`: under `--adopt-live`, the slot's `expiresAt` is older than the store's it would supersede
+- `upstream_binary_is_tollgate`: a `clauth` on `PATH` resolves to this tollgate (by path or inode) or to a file not named `clauth`; F1 never retires it (review lens credentials #2)
 - `codex_second_carrier`: `~/.codex/auth.json is a copy of profile '<p>''s chain; relink it with 'clauth' first`
 - Confirmation: `import <n> claude and <m> codex profiles and make the <k> global edits above? [y/N]`
 - Non-TTY: `tollgate import clauth: refusing to change files without --yes on a non-interactive stdin` (exit 2)
@@ -298,10 +301,15 @@ Claude `~/.claude/.credentials.json`, classified at M-1 and again at M4:
   `.credentials.json`-shaped (it carries a refresh token), so renaming it onto the sidecar would change
   `sidecar_kind_of` (`claude.rs:226-240`: a refresh token classifies as `Misfilled`) and with it the install
   source, and M8's install-source assert would fail. Instead verify that the live access token equals the
-  sidecar's static token, then repoint the slot at the moved store and discard the live copy. This is journaled
-  as `move_relink` with `prior.live_regular = {ino, sha256}`; the live file is renamed to the entry's temp path
-  first and unlinked last. **Diverged** → blocker `claude_live_diverged` unless `--adopt-live`, which runs
-  `capture` on a `credentials.json` source; on a `session-token.json` source it refuses
+  sidecar's static token, then repoint the slot at the moved store and keep the live copy in the profile's
+  `quarantine/credentials.json.live` (its `mcpOAuth` and any refresh token exist nowhere else). This is journaled
+  as `move_relink` with `prior.live_regular = {ino, sha256}` and `after.quarantine`; the live file is renamed to
+  the entry's temp path first and into the quarantine last, and a revert renames it back to the slot. A revert
+  that finds the slot still the live inode (the store moved, the slot not yet) leaves the slot alone. **Diverged** → blocker `claude_live_diverged` unless `--adopt-live`, which runs
+  `capture` on a `credentials.json` source, parking the superseded store in
+  `quarantine/credentials.json.superseded` (`after.quarantine`) instead of unlinking it, so a revert restores the
+  regular slot and the store byte for byte; a slot holding another stored profile's chain refuses
+  `live_is_other_profile`, and one older than the store refuses `live_older_than_store`, `--adopt-live` or not; on a `session-token.json` source it refuses
   `live_diverged_on_static_token` (tollgate cannot tell which one the owner wants).
   Unparseable → `live_unclassifiable`. Needs `st_dev(~/.claude) == st_dev(~/.tollgate)` else `cross_device`.
 - **Regular file, no upstream active**: its refresh token equals some upstream store's → treat as Same for that
@@ -369,12 +377,15 @@ them either: 0.16.0 never reads `MIGRATED`. F2 removes their adopt target. The r
 ### 4.10 Rollback (`src/import/rollback.rs`)
 Preconditions: journal `complete`, `in_progress` or `rolling_back` (resume), or `pre` (undo pre only); M-1 process
 scan with the same roles (a `tollgate` other than self, any `claude`, any `codex` when codex was imported, any
-`clauth` shim run); `*.pending`/stray temps in imported tollgate profiles → `pending_rotation`; the claude slot
+`clauth` shim run); `*.pending`/chain staging temps (`.credentials.json.tmp.*`, `.session-token*.tmp.*`, `.auth*.json.tmp.*`) in
+imported tollgate profiles → `pending_rotation` (a copy's own `.<name>.tmp.*` is swept by its revert instead); the claude slot
 linked to a profile created after import → `live_slot_on_new_profile` (remedy `tollgate switch <imported>`);
 upstream src paths must be absent (else `destination_exists`). Take the fence, `state:"rolling_back"`, then:
 1. `retire` entries in reverse (§4.11 undo). 2. `main` entries in reverse **except** `retire_bin`: live slots first
-   become symlinks to the restored upstream stores (a tollgate-detached regular slot: Same → symlink, Diverged →
-   `--adopt-live` capture onto the store, else refuse); carriers renamed back — the **current** dst file, whatever
+   become symlinks to the restored upstream stores (a tollgate-detached regular slot: Same → symlink, its bytes kept in
+   `quarantine/credentials.json.rollback-live` when they differ from the store's; Diverged → `--adopt-live`
+   capture onto the store, the superseded store kept in `quarantine/credentials.json.rollback-superseded`,
+   refused when the slot holds another imported profile's chain or is older than the store; else refuse); carriers renamed back — the **current** dst file, whatever
    its inode after tollgate rotations (journaled ino is audit only); copies deleted only when journaled `copy*`
    (`copy_tree` deletes only `created` names); roster entries for imported names removed (post-import profiles
    stay); `~/.tollgate/profiles/<dst>` removed only when no carrier-shaped file remains; F2 restored from
@@ -521,7 +532,9 @@ Part 2 (`import_edits.rs`, `import_retire.rs`, `tests/import_cli.rs`, existing s
 65. `a_guest_conversation_is_listed_and_resumable_after_import` (`tollgate sessions` lists it from `~/.claude/projects`; `--resume <id>` finds it with guest mode off; listed once) · 66. `guest_refusal_names_the_import_command`
 67. `a_full_reference_import_then_rollback_leaves_every_file_tollgate_restores_byte_identical` (`.reference()`, both
     slot shapes; `~/.claude`, `~/.claude.json`, `~/.codex`, herdr `config.toml`, `installed_plugins.json`,
-    `.bashrc`). herdr's `plugins.json`, `.plugins.lock` and `plugins/` are **excluded**: herdr rewrites them on
+    `.bashrc`). Byte identity of the slot itself holds for the **symlink** slot only: a Same regular slot is
+    captured (I4) and comes back as a link to its restored store, which then sits on the slot's old inode. An
+    `--adopt-live` capture restores the regular slot byte for byte (tests in `import_slots.rs`). herdr's `plugins.json`, `.plugins.lock` and `plugins/` are **excluded**: herdr rewrites them on
     reinstall (install timestamps, a fresh checkout). The test asserts only that the reinstall argv names the
     recorded commit. This is the documented herdr residual.
 

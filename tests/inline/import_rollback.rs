@@ -264,3 +264,32 @@ fn rollback_refuses_a_live_slot_on_a_post_import_profile() {
     );
     assert_eq!(env.journal().state, "complete", "nothing was reversed");
 }
+
+/// Review lens credentials #5. A crashed copy's own staging file (a
+/// `.config.toml.tmp.*` holding a copy of an API key) never blocks the
+/// rollback as a `pending_rotation` — only a chain's staging file does — and
+/// the copy's revert sweeps it, so the profile dir goes too.
+#[test]
+fn a_crashed_copy_temp_is_swept_by_the_rollback_not_reported_as_a_staged_chain() {
+    let env = Env::new();
+    env.tree.reference().api_key("k");
+    run_ok();
+    let temp = env.p(".tollgate/profiles/k/.config.toml.tmp.4242.7");
+    std::fs::write(&temp, "api_key = \"FIXTURE-KEY-k\"\n").expect("temp");
+    rollback(&Options::default()).expect("rolls back");
+    assert!(!temp.exists(), "the copy's temp is swept");
+    assert!(!env.p(".tollgate/profiles/k").exists(), "the dir goes too");
+
+    // A chain's staging file still refuses.
+    drop(env);
+    let env = Env::new();
+    env.tree.reference();
+    run_ok();
+    std::fs::write(
+        env.p(".tollgate/profiles/personal/.credentials.json.tmp.4242.7"),
+        fixture_oauth_body("personal", 3),
+    )
+    .expect("chain temp");
+    let e = rollback(&Options::default()).expect_err("a staged chain refuses");
+    assert_eq!(blocked_codes(&e), ["pending_rotation"]);
+}

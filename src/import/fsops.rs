@@ -338,7 +338,41 @@ pub(crate) fn is_carrier_shaped(name: &str) -> bool {
             | "auth.quarantine.json"
             | ".credentials.json"
     ) || name.ends_with(".pending")
-        || is_stray_temp(name)
+        || is_carrier_temp(name)
+}
+
+/// A stray temp that stages a CHAIN (`.credentials.json.tmp.*`,
+/// `.session-token*.tmp.*`, `.auth*.json.tmp.*`): the ones a rotation may
+/// still need. Any other `.<name>.tmp.*` (a copy's own staging file, a
+/// `config.toml` write) holds nothing a later rotation adopts.
+pub(crate) fn is_carrier_temp(name: &str) -> bool {
+    if !is_stray_temp(name) {
+        return false;
+    }
+    let base = name[1..].split(".tmp.").next().unwrap_or("");
+    base == "credentials.json"
+        || base.starts_with("session-token")
+        || (base.starts_with("auth") && base.ends_with(".json"))
+}
+
+/// Remove every crashed atomic write's staging sibling of `dst`
+/// (`.<dst name>.tmp.*`), the import's own copy leftovers.
+pub(crate) fn remove_temp_siblings(dst: &Path) -> Result<()> {
+    let Some(name) = dst.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return Ok(());
+    };
+    let prefix = format!(".{name}.tmp.");
+    let Ok(rd) = std::fs::read_dir(parent(dst)) else {
+        return Ok(());
+    };
+    for entry in rd.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix)
+            && lmeta(&entry.path()).is_some_and(|m| m.is_file)
+        {
+            remove_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// A crashed atomic write's staging file (`.<name>.tmp.<…>`), which may hold

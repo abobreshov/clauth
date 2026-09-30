@@ -279,6 +279,23 @@ fn upstream_bins(paths: &Paths, uid: u32) -> (Vec<BinRecord>, Vec<Finding>, Vec<
         let Some(meta) = fsops::lmeta(&canonical).filter(|m| m.is_file) else {
             continue;
         };
+        // A `clauth` that resolves to this very binary (a compatibility
+        // alias) or to anything not named `clauth` is not upstream's: F1
+        // would rename tollgate itself and put the shim in its place.
+        if let Some(why) = not_upstream(&canonical, &meta) {
+            blockers.push(
+                Finding::new(
+                    "upstream_binary_is_tollgate",
+                    format!(
+                        "{} resolves to {} ({why}), not upstream's clauth; remove that alias, then retry",
+                        paths.tilde(&cand),
+                        paths.tilde(&canonical)
+                    ),
+                )
+                .with_path(paths.tilde(&cand)),
+            );
+            continue;
+        }
         #[cfg(test)]
         assert!(
             canonical.starts_with(
@@ -320,6 +337,24 @@ fn upstream_bins(paths: &Paths, uid: u32) -> (Vec<BinRecord>, Vec<Finding>, Vec<
         ));
     }
     (bins, blockers, warnings)
+}
+
+/// Why the resolved `clauth` at `canonical` is not upstream's binary: it is
+/// this tollgate (by path or by inode), or it is not named `clauth` at all.
+fn not_upstream(canonical: &Path, meta: &fsops::Meta) -> Option<&'static str> {
+    if let Some(exe) = seams::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if exe == canonical {
+            return Some("this tollgate binary");
+        }
+        if fsops::lmeta(&exe).is_some_and(|m| m.dev == meta.dev && m.ino == meta.ino) {
+            return Some("a hard link to this tollgate binary");
+        }
+    }
+    let named_clauth = canonical
+        .file_name()
+        .is_some_and(|n| n == crate::identity::UPSTREAM_NAME);
+    (!named_clauth).then_some("a file not named clauth")
 }
 
 /// The off-`PATH` upstream builds (spec §4.9): every uid-owned executable
@@ -792,25 +827,33 @@ pub(crate) fn plan(s: &Survey) -> Result<Plan> {
         for item in items.iter().filter(|i| i.action == Action::Move) {
             plan_carrier(&mut pl, prof.name.as_str(), item);
         }
-        if let ClaudePlan::Capture { profile, live_ino } = &s.claude.plan
+        if let ClaudePlan::Capture {
+            profile,
+            live_ino,
+            adopt,
+        } = &s.claude.plan
             && *profile == prof.name
         {
             let slot = p.claude_slot();
             let store = p.upstream_profile(profile).join("credentials.json");
+            let dst = dst_dir.join("credentials.json");
+            let store_ino = fsops::lmeta(&store).map(|m| m.ino);
             pl.push(
                 Op::Capture,
                 Some(slot.clone()),
-                Some(dst_dir.join("credentials.json")),
+                Some(dst.clone()),
                 true,
                 Facts {
                     live_ino: Some(*live_ino),
-                    store_ino: fsops::lmeta(&store).map(|m| m.ino),
+                    store_ino,
                     link: Some(slot.clone()),
                     link_target: Some(store),
                     ..Facts::default()
                 },
                 Facts {
                     temp: Some(slots::temp_for(&slot)),
+                    quarantine: (*adopt && store_ino.is_some())
+                        .then(|| quarantine_path(&dst, ADOPT_QUARANTINE)),
                     ..Facts::default()
                 },
             );
@@ -995,6 +1038,9 @@ fn plan_carrier(pl: &mut Planner<'_>, profile: &str, item: &super::inventory::It
                 ino: *live_ino,
                 sha256: live_sha.clone(),
             });
+            // The live copy carries what the long-lived token does not (its
+            // `mcpOAuth`, any refresh token): kept, never unlinked.
+            after.quarantine = Some(quarantine_path(&dst, LIVE_QUARANTINE));
             after.temp = Some(slots::temp_for(&slot));
             prior.link = Some(slot);
         }
@@ -1241,6 +1287,10 @@ fn points_at(link: &Path, target: &Path) -> bool {
     fsops::resolves_to(link, target)
 }
 
+fn dst_of(e: &Entry) -> Result<&Path> {
+    path_of(&e.dst)
+}
+
 fn regular_ino(path: &Path, ino: u64) -> bool {
     fsops::lmeta(path).is_some_and(|m| m.is_file && m.ino == ino)
 }
@@ -1299,8 +1349,17 @@ pub(crate) fn probe(e: &Entry) -> Result<Disk> {
                 Some(ino) => dst_ino == Some(ino),
                 None => dst_ino.is_none(),
             };
+            // Under `--adopt-live` the superseded store is parked first: the
+            // slot untouched, the store's inode in quarantine, `dst` empty.
+            let parked = e.after.quarantine.as_deref().is_some_and(|q| {
+                e.prior
+                    .store_ino
+                    .is_some_and(|ino| fsops::lmeta(q).is_some_and(|m| m.ino == ino))
+            });
             if regular_ino(link, live) && store_ok {
                 Disk::Prior
+            } else if regular_ino(link, live) && dst_ino.is_none() && parked {
+                Disk::Partial
             } else if dst_ino == Some(live) && points_at(link, dst) {
                 Disk::After
             } else if dst_ino == Some(live) && !regular_ino(link, live) {
@@ -1446,6 +1505,34 @@ fn unmove_store(e: &Entry, warnings: &mut Vec<Finding>) -> Result<()> {
     Ok(())
 }
 
+/// The quarantined regular slot a `move_relink` of a session-token profile
+/// keeps.
+pub(crate) const LIVE_QUARANTINE: &str = "credentials.json.live";
+/// The store an `--adopt-live` capture supersedes.
+pub(crate) const ADOPT_QUARANTINE: &str = "credentials.json.superseded";
+
+/// `<dir of store>/quarantine/<name>`: the profile's own quarantine, which
+/// `tollgate delete` sweeps with the rest of the profile.
+pub(crate) fn quarantine_path(store: &Path, name: &str) -> PathBuf {
+    fsops::parent(store).join("quarantine").join(name)
+}
+
+/// Rename `from` into the quarantine path `to` (its dir made 0700), refusing
+/// to overwrite anything already there.
+pub(crate) fn park(from: &Path, to: &Path) -> Result<()> {
+    let dir = fsops::parent(to);
+    if fsops::lmeta(dir).is_none() {
+        fsops::mkdir_one_700(dir)?;
+    }
+    anyhow::ensure!(
+        fsops::lmeta(to).is_none(),
+        "{} already exists; nothing was overwritten",
+        to.display()
+    );
+    fsops::rename(from, to)?;
+    fsops::sync_dirs(&[fsops::parent(from), dir])
+}
+
 #[cfg(unix)]
 fn symlink(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -1486,8 +1573,11 @@ pub(crate) fn apply(e: &Entry) -> Result<()> {
                         symlink(dst, link)?;
                     }
                     if regular_ino(temp, live.ino) {
-                        std::fs::remove_file(temp)
-                            .with_context(|| format!("failed to remove {}", temp.display()))?;
+                        match e.after.quarantine.as_deref() {
+                            Some(q) => park(temp, q)?,
+                            None => std::fs::remove_file(temp)
+                                .with_context(|| format!("failed to remove {}", temp.display()))?,
+                        }
                     }
                 }
             }
@@ -1497,7 +1587,15 @@ pub(crate) fn apply(e: &Entry) -> Result<()> {
             let link = path_of(&e.src)?;
             let dst = path_of(&e.dst)?;
             let temp = path_of(&e.after.temp)?;
-            if regular_ino(link, e.prior.live_ino.unwrap_or(0)) {
+            let live = e.prior.live_ino.unwrap_or(0);
+            if let Some(q) = e.after.quarantine.as_deref()
+                && regular_ino(link, live)
+                && fsops::lmeta(dst).is_some()
+            {
+                // `--adopt-live`: the store the slot supersedes is kept.
+                park(dst, q)?;
+            }
+            if regular_ino(link, live) {
                 fsops::rename(link, dst)?;
                 fsops::chmod(dst, 0o600)?;
             }
@@ -1513,7 +1611,8 @@ pub(crate) fn apply(e: &Entry) -> Result<()> {
             if fsops::lmeta(dst).is_none() {
                 fsops::copy_file_600(src, dst)?;
             }
-            Ok(())
+            // A crashed first pass may have left its staging file behind.
+            fsops::remove_temp_siblings(dst)
         }
         Op::CopyTree => {
             let src = path_of(&e.src)?;
@@ -1615,15 +1714,28 @@ pub(crate) fn revert(e: &Entry, paths: &Paths, warnings: &mut Vec<Finding>) -> R
             let orig = path_of(&e.prior.link_target)?;
             let temp = path_of(&e.after.temp)?;
             unmove_store(e, warnings)?;
-            let restore_live = e
-                .prior
-                .live_regular
-                .as_ref()
-                .is_some_and(|live| regular_ino(temp, live.ino));
-            if restore_live {
-                // A crash left the discarded live copy at the temp path: put it
-                // back byte-identical.
-                fsops::rename(temp, link)?;
+            let live = e.prior.live_regular.as_ref();
+            let quarantined = e.after.quarantine.as_deref();
+            if live.is_some_and(|l| regular_ino(link, l.ino)) {
+                // The store moved but the slot was never touched (a crash or
+                // an error between the two): the live file is still the
+                // original, so it stays exactly as it is.
+                fsops::remove_if_present(temp)?;
+                return fsops::sync_dirs(&[fsops::parent(link)]);
+            }
+            let from = live.and_then(|l| {
+                [Some(temp), quarantined]
+                    .into_iter()
+                    .flatten()
+                    .find(|p| regular_ino(p, l.ino))
+            });
+            if let Some(from) = from {
+                // The discarded live copy (at the temp path after a crash, or
+                // in the profile's quarantine): put it back byte-identical.
+                fsops::rename(from, link)?;
+                if Some(from) == quarantined {
+                    let _ = std::fs::remove_dir(fsops::parent(from));
+                }
             } else {
                 fsops::repoint_link(link, orig, temp)?;
             }
@@ -1635,7 +1747,47 @@ pub(crate) fn revert(e: &Entry, paths: &Paths, warnings: &mut Vec<Finding>) -> R
             let orig = path_of(&e.prior.link_target)?;
             let temp = path_of(&e.after.temp)?;
             let live = e.prior.live_ino.unwrap_or(0);
+            let parked = e
+                .after
+                .quarantine
+                .as_deref()
+                .filter(|q| fsops::lmeta(q).is_some_and(|m| m.is_file));
             if regular_ino(link, live) {
+                // Parked but never captured: the store goes back to `dst`,
+                // where the store's own move back takes it home.
+                if let Some(q) = parked
+                    && fsops::lmeta(dst_of(e)?).is_none()
+                {
+                    fsops::rename(q, dst_of(e)?)?;
+                    let _ = std::fs::remove_dir(fsops::parent(q));
+                }
+                return Ok(());
+            }
+            if let Some(q) = parked {
+                // `--adopt-live`: the captured login (or tollgate's rotation
+                // of it) goes back to being the regular slot, and the
+                // superseded store returns to `dst` for its move back — the
+                // prior shape, byte for byte when nothing rotated.
+                let dst = dst_of(e)?;
+                let slot_is_link = fsops::lmeta(link).is_none_or(|m| m.is_symlink);
+                if slot_is_link && fsops::lmeta(dst).is_some_and(|m| m.is_file) {
+                    fsops::remove_if_present(temp)?;
+                    fsops::rename(dst, link)?;
+                    fsops::rename(q, dst)?;
+                    let _ = std::fs::remove_dir(fsops::parent(q));
+                    return fsops::sync_dirs(&[fsops::parent(link), fsops::parent(dst)]);
+                }
+                warnings.push(
+                    Finding::new(
+                        "quarantine_kept",
+                        format!(
+                            "{} changed after the import, so the login --adopt-live superseded stays in {}",
+                            paths.tilde(link),
+                            paths.tilde(q)
+                        ),
+                    )
+                    .with_path(paths.tilde(q)),
+                );
                 return Ok(());
             }
             if e.prior.store_ino.is_none() {
@@ -1658,7 +1810,11 @@ pub(crate) fn revert(e: &Entry, paths: &Paths, warnings: &mut Vec<Finding>) -> R
             fsops::repoint_link(link, orig, temp)?;
             fsops::remove_if_present(temp)
         }
-        Op::Copy | Op::CopySecret => fsops::remove_if_present(path_of(&e.dst)?),
+        Op::Copy | Op::CopySecret => {
+            let dst = path_of(&e.dst)?;
+            fsops::remove_if_present(dst)?;
+            fsops::remove_temp_siblings(dst)
+        }
         Op::CopyTree => {
             let dst = path_of(&e.dst)?;
             for kept in fsops::remove_created(dst, e.after.created.as_deref().unwrap_or(&[])) {

@@ -89,7 +89,8 @@ fn a_same_regular_live_slot_becomes_the_store_then_a_link() {
 
 /// Test 30a. On a long-lived session-token profile a Same regular slot is
 /// relinked, never captured: the sidecar keeps its inode and stays the
-/// install source, the live copy is gone, and M8's assert passes.
+/// install source, the live copy moves to the profile's quarantine (review
+/// lens credentials #4), and M8's assert passes.
 #[test]
 fn a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured() {
     let env = Env::new();
@@ -108,9 +109,10 @@ fn a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured() {
     assert_eq!(std::fs::read_link(slot(&env)).expect("link"), dst);
     let source = crate::claude::install_source_in(&env.p(".tollgate/profiles/a"));
     assert_eq!(source, dst, "the install source is unchanged");
-    assert!(
-        files_with(&env, "FIXTURE-RT-live-copy").is_empty(),
-        "the live copy is discarded"
+    assert_eq!(
+        files_with(&env, "FIXTURE-RT-live-copy"),
+        [".tollgate/profiles/a/quarantine/credentials.json.live"],
+        "the live copy is kept only in the profile's quarantine"
     );
     assert!(!env.journal().main.iter().any(|e| e.op == Op::Capture));
     assert_eq!(env.journal().state, "complete");
@@ -118,7 +120,8 @@ fn a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured() {
 
 /// Test 31. A regular slot holding some other login refuses unless
 /// `--adopt-live`, which captures it as the profile (the stored chain is
-/// discarded). On a session-token profile it refuses either way.
+/// kept in the profile's quarantine). On a session-token profile it refuses
+/// either way.
 #[test]
 fn a_diverged_regular_live_slot_refuses_without_adopt_live_and_is_captured_with_it() {
     let env = Env::new();
@@ -134,7 +137,7 @@ fn a_diverged_regular_live_slot_refuses_without_adopt_live_and_is_captured_with_
         .expect("refused");
     assert_eq!(
         b.message,
-        "~/.claude/.credentials.json holds a login that differs from profile 'a'; pass --adopt-live to import it as 'a' (the stored chain is discarded)"
+        "~/.claude/.credentials.json holds a login that differs from profile 'a'; pass --adopt-live to import it as 'a' (the stored chain is kept in its quarantine/)"
     );
     let live_ino = ino(&slot(&env));
     let adopt = Options {
@@ -149,9 +152,10 @@ fn a_diverged_regular_live_slot_refuses_without_adopt_live_and_is_captured_with_
             .expect("store")
             .contains(&fixture_refresh("a", 5))
     );
-    assert!(
-        files_with(&env, &fixture_refresh("a", 1)).is_empty(),
-        "the stored chain is discarded"
+    assert_eq!(
+        files_with(&env, &fixture_refresh("a", 1)),
+        [".tollgate/profiles/a/quarantine/credentials.json.superseded"],
+        "the stored chain is kept only in the profile's quarantine"
     );
 
     drop(env);
@@ -349,4 +353,130 @@ fn an_adopted_slot_with_no_store_to_replace_rolls_back_to_the_regular_slot() {
     assert_eq!(ino(&slot(&env)), live);
     assert_eq!(std::fs::read(slot(&env)).expect("slot"), bytes);
     assert!(!env.p(".tollgate/profiles/k").exists());
+}
+
+/// Review lens credentials #1. A regular slot holding ANOTHER stored
+/// profile's login is never adopted onto the active one (that would leave
+/// the chain in two stores), not even under `--adopt-live`; a slot older
+/// than the store it would supersede is refused under `--adopt-live` too.
+#[test]
+fn adopt_live_never_moves_another_profiles_login_or_a_spent_one() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a", "b"], Some("a"))
+        .oauth("a")
+        .oauth("b");
+    let b_body = std::fs::read_to_string(env.p(".clauth/profiles/b/credentials.json")).expect("b");
+    std::fs::write(slot(&env), &b_body).expect("slot holds b");
+    let adopt = Options {
+        adopt_live: true,
+        ..Options::default()
+    };
+    for opts in [Options::default(), adopt.clone()] {
+        let s = survey(&opts);
+        assert!(
+            codes(&s).contains(&"live_is_other_profile".to_string()),
+            "{:?}",
+            codes(&s)
+        );
+        assert!(!codes(&s).contains(&"claude_live_diverged".to_string()));
+    }
+    let before = env.snapshot();
+    assert!(run(&adopt).is_err(), "the import refuses");
+    assert_eq!(
+        env.snapshot().without(is_bookkeeping).0,
+        before.without(is_bookkeeping).0
+    );
+    assert_eq!(
+        files_with(&env, &fixture_refresh("b", 1)).len(),
+        2,
+        "untouched"
+    );
+
+    drop(env);
+    let env = Env::new();
+    env.tree.roster(&["a"], Some("a")).oauth("a");
+    let mut spent: serde_json::Value =
+        serde_json::from_str(&fixture_oauth_body("a", 5)).expect("body");
+    spent["claudeAiOauth"]["expiresAt"] = 1_000_i64.into();
+    regular_slot(&env, &spent);
+    assert!(codes(&survey(&adopt)).contains(&"live_older_than_store".to_string()));
+    assert!(codes(&survey(&Options::default())).contains(&"claude_live_diverged".to_string()));
+}
+
+/// Review lens credentials #1 and #6. `--adopt-live` keeps the store it
+/// supersedes in the profile's `quarantine/` (never unlinked, journaled),
+/// and a rollback puts both back: the slot as the regular file it was, the
+/// store at its path, both on their own inodes and byte for byte — even
+/// when the slot's `mcpOAuth` differs from the store's.
+#[test]
+fn an_adopted_slot_keeps_the_superseded_store_and_rolls_back_byte_identical() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a"], Some("a"))
+        .oauth("a")
+        .live_regular_diverged("a");
+    let mut live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(slot(&env)).expect("slot")).expect("body");
+    live["mcpOAuth"]["srv"]["accessToken"] = "FIXTURE-MCP-slot-only".into();
+    regular_slot(&env, &live);
+    let store = env.p(".clauth/profiles/a/credentials.json");
+    let (slot_ino, slot_bytes) = (ino(&slot(&env)), std::fs::read(slot(&env)).expect("slot"));
+    let (store_ino, store_bytes) = (ino(&store), std::fs::read(&store).expect("store"));
+    let adopt = Options {
+        adopt_live: true,
+        ..Options::default()
+    };
+    run(&adopt).expect("captured");
+    let q = tstore(&env, "a", "quarantine/credentials.json.superseded");
+    assert_eq!(ino(&q), store_ino, "the superseded store is kept");
+    assert_eq!(mode(q.parent().expect("dir")), 0o700);
+    assert_eq!(ino(&tstore(&env, "a", "credentials.json")), slot_ino);
+    let capture = env
+        .journal()
+        .main
+        .into_iter()
+        .find(|e| e.op == Op::Capture)
+        .expect("capture");
+    assert_eq!(capture.after.quarantine.as_deref(), Some(q.as_path()));
+    rollback(&Options::default()).expect("rolls back");
+    let meta = std::fs::symlink_metadata(slot(&env)).expect("slot");
+    assert!(meta.file_type().is_file(), "the slot is regular again");
+    assert_eq!(ino(&slot(&env)), slot_ino);
+    assert_eq!(std::fs::read(slot(&env)).expect("slot"), slot_bytes);
+    assert_eq!(ino(&store), store_ino);
+    assert_eq!(std::fs::read(&store).expect("store"), store_bytes);
+    assert!(!env.p(".tollgate/profiles/a").exists());
+}
+
+/// Review lens credentials #4. On a session-token profile the Same regular
+/// slot's copy is kept in the profile's quarantine (its `mcpOAuth` and
+/// refresh token exist nowhere else), and a rollback puts that inode back
+/// as the regular slot.
+#[test]
+fn a_relinked_session_token_slot_is_quarantined_and_restored_by_rollback() {
+    let env = Env::new();
+    env.tree.roster(&["s"], Some("s")).static_token("s");
+    let live = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": fixture_access("s", 9),
+            "refreshToken": "FIXTURE-RT-live-only",
+        },
+        "mcpOAuth": {"srv": {"accessToken": "FIXTURE-MCP-LIVE-ONLY"}}
+    });
+    regular_slot(&env, &live);
+    let (slot_ino, slot_bytes) = (ino(&slot(&env)), std::fs::read(slot(&env)).expect("slot"));
+    run_ok();
+    let q = tstore(&env, "s", "quarantine/credentials.json.live");
+    assert_eq!(ino(&q), slot_ino, "the live copy is kept, not unlinked");
+    assert_eq!(files_with(&env, "FIXTURE-MCP-LIVE-ONLY").len(), 1);
+    assert_eq!(
+        std::fs::read_link(slot(&env)).expect("link"),
+        tstore(&env, "s", "session-token.json")
+    );
+    rollback(&Options::default()).expect("rolls back");
+    let meta = std::fs::symlink_metadata(slot(&env)).expect("slot");
+    assert!(meta.file_type().is_file(), "the slot is regular again");
+    assert_eq!(ino(&slot(&env)), slot_ino);
+    assert_eq!(std::fs::read(slot(&env)).expect("slot"), slot_bytes);
 }

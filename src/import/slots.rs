@@ -30,9 +30,12 @@ pub(crate) enum ClaudePlan {
         file: String,
     },
     /// A regular slot becomes `profile`'s store, then a link: `capture`.
+    /// `adopt` (a diverged slot under `--adopt-live`): the store it
+    /// supersedes is kept in the profile's `quarantine/`, never unlinked.
     Capture {
         profile: String,
         live_ino: u64,
+        adopt: bool,
     },
     /// A regular slot on a session-token profile: the store moves, the slot
     /// is relinked to it and the live copy discarded (`move_relink` with
@@ -124,6 +127,14 @@ fn is_moved(inv: &Inventory, profile: &str, file: &str) -> bool {
     })
 }
 
+fn is_refused(inv: &Inventory, profile: &str, file: &str) -> bool {
+    inv.items.iter().any(|i| {
+        i.action == Action::Refuse
+            && i.profile.as_deref() == Some(profile)
+            && i.rel == format!("profiles/{profile}/{file}")
+    })
+}
+
 fn read_creds(path: &Path) -> Option<ClaudeCredentials> {
     crate::profile::read_json_file::<ClaudeCredentials>(path).ok()
 }
@@ -177,6 +188,12 @@ pub(crate) fn classify_claude(
                             file: f,
                         },
                     }
+                }
+                // The store is refused for its own reason (`cross_device`, a
+                // hard link, …): that blocker names the fix, and the slot
+                // follows the store once it moves.
+                Some((p, f)) if is_refused(inv, &p, &f) => {
+                    refuse(state, Some(p), ClaudePlan::Untouched)
                 }
                 _ if target.starts_with(&paths.target) => untouched(state),
                 _ => {
@@ -275,8 +292,36 @@ fn classify_regular(
     let on_static = source
         .file_name()
         .is_some_and(|n| n == "session-token.json");
+    if !same {
+        // A diverged slot that is another stored profile's own login is
+        // never adopted onto this one: that would leave the chain in two
+        // stores and supersede this profile's login with it.
+        if let Some(owner) = other_owner(paths, &claude_profiles, &profile, &live) {
+            blockers.push(Finding::new(
+                "live_is_other_profile",
+                format!(
+                    "~/.claude/.credentials.json holds profile '{owner}''s login, not '{profile}''s; relink it with clauth first (--adopt-live never moves one profile's login onto another)"
+                ),
+            ));
+            return refuse(state, Some(profile), ClaudePlan::Untouched);
+        }
+        // A spent login never supersedes a newer one.
+        let stored_exp = read_creds(&source).and_then(|c| c.access_token_expires_at());
+        if let (Some(live_exp), Some(stored_exp)) = (live.access_token_expires_at(), stored_exp)
+            && stored_exp > live_exp
+            && opts.adopt_live
+        {
+            blockers.push(Finding::new(
+                "live_older_than_store",
+                format!(
+                    "~/.claude/.credentials.json holds an older login than profile '{profile}''s store; --adopt-live would replace the newer chain with it, so relink it with clauth first"
+                ),
+            ));
+            return refuse(state, Some(profile), ClaudePlan::Untouched);
+        }
+    }
     match (same, on_static) {
-        (true, false) => capture(state, profile, live_ino),
+        (true, false) => capture(state, profile, live_ino, false),
         (true, true) => {
             let live_sha = fsops::sha256_file(&slot).unwrap_or_default();
             Slot {
@@ -291,12 +336,12 @@ fn classify_regular(
                 },
             }
         }
-        (false, false) if opts.adopt_live => capture(state, profile, live_ino),
+        (false, false) if opts.adopt_live => capture(state, profile, live_ino, true),
         (false, false) => {
             blockers.push(Finding::new(
                 "claude_live_diverged",
                 format!(
-                    "~/.claude/.credentials.json holds a login that differs from profile '{profile}'; pass --adopt-live to import it as '{profile}' (the stored chain is discarded)"
+                    "~/.claude/.credentials.json holds a login that differs from profile '{profile}'; pass --adopt-live to import it as '{profile}' (the stored chain is kept in its quarantine/)"
                 ),
             ));
             refuse(state, Some(profile), ClaudePlan::Untouched)
@@ -313,13 +358,52 @@ fn classify_regular(
     }
 }
 
-fn capture(state: &'static str, profile: String, live_ino: u64) -> Slot<ClaudePlan> {
+fn capture(state: &'static str, profile: String, live_ino: u64, adopt: bool) -> Slot<ClaudePlan> {
     Slot {
         state,
         profile: Some(profile.clone()),
         verdict: "capture",
-        plan: ClaudePlan::Capture { profile, live_ino },
+        plan: ClaudePlan::Capture {
+            profile,
+            live_ino,
+            adopt,
+        },
     }
+}
+
+/// The Claude store files of `dir` a login can live in.
+pub(crate) fn claude_stores(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![dir.join("credentials.json")];
+    let source = crate::claude::install_source_in(dir);
+    if !out.contains(&source) {
+        out.push(source);
+    }
+    out
+}
+
+/// The stored profile other than `target` whose store holds `live`'s chain
+/// (the same non-empty refresh token, or the same access token).
+fn other_owner(
+    paths: &Paths,
+    profiles: &[&str],
+    target: &str,
+    live: &ClaudeCredentials,
+) -> Option<String> {
+    let rt = live.refresh_token().filter(|t| !t.is_empty());
+    let at = live.access_token().filter(|t| !t.is_empty());
+    profiles
+        .iter()
+        .filter(|p| **p != target)
+        .find(|p| {
+            claude_stores(&paths.upstream_profile(p))
+                .iter()
+                .filter_map(|f| read_creds(f))
+                .any(|c| {
+                    (rt.is_some() && c.refresh_token() == rt)
+                        || (at.is_some() && c.access_token() == at)
+                })
+        })
+        .map(|p| (*p).to_string())
 }
 
 fn codex_refresh(path: &Path) -> Option<String> {

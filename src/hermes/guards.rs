@@ -72,6 +72,10 @@ pub(crate) const SCRUB_EXACT: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
+    // Hermes reads and refreshes Codex tokens at `$CODEX_HOME/auth.json`
+    // (`hermes_cli/auth.py`), writing back past the HOME redirect: any
+    // inherited value (a user's, upstream's per-profile codex home) goes.
+    "CODEX_HOME",
 ];
 
 /// Every var with one of these prefixes is scrubbed.
@@ -418,6 +422,15 @@ pub(crate) fn g5_argv(name: &str, provider: &str, args: &[String]) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// G5 on the roster's own model: `start` passes it as `-m`, so an anthropic
+/// alias saved by `hermes new --model` would bypass the argv scan.
+pub(crate) fn g5_model(name: &str, provider: &str, model: Option<&str>) -> Result<()> {
+    match model {
+        Some(m) => g5_argv(name, provider, &["-m".to_string(), m.to_string()]),
+        None => Ok(()),
+    }
 }
 
 /// G6: `$HSP/.env` is loaded into every session (`main.py:654`) and can

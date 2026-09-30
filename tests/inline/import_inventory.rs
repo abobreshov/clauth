@@ -618,3 +618,82 @@ fn import_refuses_a_name_held_by_a_hermes_profile() {
         s.blockers
     );
 }
+
+/// Review lens credentials #2. A `clauth` on `PATH` that resolves to this
+/// tollgate (a compatibility alias, by symlink or hard link) or to a file not
+/// named `clauth` is never an F1 target: the survey refuses with
+/// `upstream_binary_is_tollgate` and plans no `retire_bin`, so tollgate never
+/// renames itself and writes the shim over its own name.
+#[test]
+fn a_clauth_alias_to_tollgate_is_never_retired() {
+    let env = Env::new();
+    env.tree.reference();
+    let bin = env.p("bin");
+    let tollgate = env.tree.tollgate_bin();
+    let before = std::fs::read(&tollgate).expect("tollgate");
+    std::os::unix::fs::symlink(&tollgate, bin.join("clauth")).expect("alias");
+    let (b, t) = (bin.clone(), tollgate.clone());
+    env.seams.set(|s| {
+        s.path_dirs = vec![b];
+        s.current_exe = Some(t);
+    });
+    let s = survey(&Options::default());
+    assert!(
+        codes(&s).contains(&"upstream_binary_is_tollgate".to_string()),
+        "{:?}",
+        codes(&s)
+    );
+    assert!(s.bins.is_empty(), "the alias is no F1 target");
+    assert!(
+        !s.plan
+            .iter()
+            .flat_map(|p| &p.entries)
+            .any(|e| e.op == Op::RetireBin)
+    );
+    assert!(run(&Options::default()).is_err(), "the import refuses");
+    assert_eq!(std::fs::read(&tollgate).expect("tollgate"), before);
+    assert!(
+        !bin.join(format!("clauth-{}.retired", txn::UPSTREAM_VERSION))
+            .exists()
+    );
+
+    // A hard link to this tollgate and a differently named target refuse too.
+    std::fs::remove_file(bin.join("clauth")).expect("rm alias");
+    std::fs::hard_link(&tollgate, bin.join("clauth")).expect("hard link");
+    assert!(
+        codes(&survey(&Options::default())).contains(&"upstream_binary_is_tollgate".to_string())
+    );
+    std::fs::remove_file(bin.join("clauth")).expect("rm link");
+    let other = bin.join("clauth-dev");
+    std::fs::write(&other, "#!/bin/sh\n").expect("other");
+    std::os::unix::fs::symlink(&other, bin.join("clauth")).expect("alias");
+    assert!(
+        codes(&survey(&Options::default())).contains(&"upstream_binary_is_tollgate".to_string())
+    );
+}
+
+/// Review lens credentials #9. A symlinked slot whose store is refused as
+/// `cross_device` is not also reported as `live_link_foreign` (whose
+/// "relink it with clauth first" is the wrong remedy).
+#[test]
+fn a_cross_device_store_does_not_also_call_its_symlinked_slot_foreign() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a"], Some("a"))
+        .oauth("a")
+        .live_symlink("a", "credentials.json");
+    let parent = env.tree.dir("a");
+    env.seams.set(|s| s.foreign_dev = vec![parent]);
+    let s = survey(&Options::default());
+    assert!(
+        codes(&s).contains(&"cross_device".to_string()),
+        "{:?}",
+        codes(&s)
+    );
+    assert!(
+        !codes(&s).contains(&"live_link_foreign".to_string()),
+        "{:?}",
+        codes(&s)
+    );
+    assert_eq!(s.claude.verdict, "refuse");
+}

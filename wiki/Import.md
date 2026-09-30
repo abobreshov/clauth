@@ -56,7 +56,7 @@ Other blockers name their own fix, for example:
 
 - **`pending_rotation`**: a crashed rotation left a staged chain. Run `clauth list` once so upstream adopts it.
 - **`name_collision`**: a tollgate profile already has that name, on the claude, codex or [Hermes](Hermes) roster; the message names which. Pass `--rename <old>=<new>`.
-- **`claude_live_diverged`**: the live slot holds a different login than its profile's store. Pass `--adopt-live` to import the live one; the stored chain is discarded.
+- **`claude_live_diverged`**: the live slot holds a different login than its profile's store. Pass `--adopt-live` to import the live one; the stored chain is kept in the profile's `quarantine/`, and `import rollback` puts both back. A slot holding another profile's login (`live_is_other_profile`) or an older login than the store (`live_older_than_store`) is refused even with `--adopt-live`.
 - **`dev_build_exe`**: you ran a `target/` build instead of the installed `tollgate` on `PATH`. Run the installed one, so the rewritten `apiKeyHelper` points at it.
 - **`unknown_entry`**: `~/.clauth` holds a file the import does not know. It might carry a credential, so nothing is imported.
 
