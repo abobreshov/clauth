@@ -153,7 +153,7 @@ pub(crate) fn survey_at(
         ImportState::Pre | ImportState::InProgress | ImportState::RollingBack if !resuming => {
             s.blockers.push(Finding::new(
                 "journal_pending",
-                "tollgate: an import of clauth was interrupted; run 'tollgate import clauth --resume' or 'tollgate import rollback'",
+                "an import of clauth was interrupted; run 'tollgate import clauth --resume' or 'tollgate import rollback'",
             ));
         }
         ImportState::Unreadable => s.blockers.push(Finding::new(
@@ -220,8 +220,9 @@ pub(crate) fn survey_at(
         s.locks = locks;
         s.blockers.extend(lb);
         // G2 is planned only outside the fence: finding herdr's state runs
-        // herdr, and nothing inside the hold spawns a process (I15).
-        s.g2 = edits::plan_g2(paths, &s.bins, &mut s.warnings);
+        // herdr, and nothing inside the hold spawns a process (I15). The dry
+        // run spawns nothing at all (its "creates no file" promise).
+        s.g2 = edits::plan_g2(paths, &s.bins, &mut s.warnings, mode == Mode::Run);
     }
     s.hash = inventory_hash(paths);
     match plan(&s) {

@@ -278,17 +278,21 @@ pub(crate) enum Command {
     /// bare `tollgate <name>` act under its own verb, repointing the credentials
     /// the global `claude` reads (a codex name moves the codex active marker
     /// instead). Two names address a live session: `tollgate switch <sid>
-    /// <profile>` records the profile as the session's intended member — the
-    /// same registry write the fallback chain's decider makes — and installs
-    /// nothing itself: the session's own executor performs the switch, or
-    /// refuses it with a logged reason (a member whose endpoint, key, or
-    /// models differ from the launch profile's is refused, exactly as the
-    /// chain's own moves are). The session picks the new account up at its
-    /// next request, never before it. For a session started with
+    /// <profile>` asks the session's own executor to move it, and installs
+    /// nothing itself. An OAuth session records the profile as its intended
+    /// member (the same registry write the fallback chain's decider makes);
+    /// the move lands at the session's next request, never before it, or is
+    /// refused with a logged reason. An API-key session hot-swaps its key
+    /// when the target has the same endpoint, model routing and custom env
+    /// (a different key is exactly what it swaps): it prints `committed`,
+    /// then shows swapping… until its key helper has served the new key
+    /// (`--wait` waits for that). Any other target — another endpoint,
+    /// models or env, or a session that cannot hot-swap — is refused with
+    /// the command to use instead: `--relaunch`, which stops the session and
+    /// resumes its conversation under the profile. For a session started with
     /// --with-fallback, the chain's decider can supersede a manual intent on
-    /// its next tick. The sid is the `<pid>-<seq>` of a live
-    /// `tollgate start` session, one row per session under
-    /// ~/.tollgate/live_sessions/.
+    /// its next tick. The sid is the `<pid>-<seq>` of a live `tollgate start`
+    /// session, one row per session under ~/.tollgate/live_sessions/.
     Switch {
         /// Profile to switch the global account to, or a live session id.
         name: String,

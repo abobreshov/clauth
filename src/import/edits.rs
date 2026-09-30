@@ -730,10 +730,17 @@ pub(crate) fn upstream_record(herdr: &Path) -> Option<HerdrRecord> {
 /// Plan G2 (spec §4.8): herdr and an upstream binary must both exist, and
 /// herdr must hold something of upstream's (its plugin, or its marked
 /// config blocks). No herdr or no binary is a skip with a warning.
+///
+/// `spawn` is false for the dry run, which runs no process at all: the real
+/// herdr creates its plugin dirs and `.plugins.lock` when asked for its
+/// config dir or plugin list. The dry run then reads herdr's config from its
+/// default location, read-only, and names G2 "planned at run time" when only
+/// herdr's own plugin list could tell.
 pub(crate) fn plan_g2(
     paths: &Paths,
     bins: &[BinRecord],
     warnings: &mut Vec<Finding>,
+    spawn: bool,
 ) -> Option<(G2Plan, GlobalEdit)> {
     let Some(herdr) = seams::herdr_bin() else {
         warnings.push(Finding::new(
@@ -742,22 +749,50 @@ pub(crate) fn plan_g2(
         ));
         return None;
     };
-    let config = match crate::herdr::config_path(&herdr.to_string_lossy()) {
-        Ok(path) => path,
-        Err(e) => {
-            warnings.push(Finding::new(
-                "herdr_config_unknown",
-                format!("herdr's config path could not be found ({e:#}); G2 skipped"),
-            ));
-            return None;
+    let config = if spawn {
+        match crate::herdr::config_path(&herdr.to_string_lossy()) {
+            Ok(path) => path,
+            Err(e) => {
+                warnings.push(Finding::new(
+                    "herdr_config_unknown",
+                    format!("herdr's config path could not be found ({e:#}); G2 skipped"),
+                ));
+                return None;
+            }
         }
+    } else {
+        herdr_config_without_spawn(paths)
     };
-    let record = upstream_record(&herdr);
+    let record = if spawn { upstream_record(&herdr) } else { None };
     let marked = std::fs::read_to_string(&config)
         .map(|t| t.contains(UPSTREAM_HERDR_MARKER))
         .unwrap_or(false);
-    if record.is_none() && !marked {
+    if record.is_none() && !marked && spawn {
         return None;
+    }
+    if !spawn && !marked {
+        // Only `herdr plugin list` could say whether upstream's plugin is
+        // installed, and the dry run runs nothing.
+        if bins.is_empty() {
+            return None;
+        }
+        let row = GlobalEdit {
+            id: "G2".to_string(),
+            file: paths.tilde(&config),
+            change: format!(
+                "planned at run time: herdr's plugin list is read then (the dry run spawns nothing);                  if herdr lists {}, clauth herdr uninstall --yes runs with the config backed up",
+                crate::identity::UPSTREAM_HERDR_PLUGIN_ID
+            ),
+        };
+        return Some((
+            G2Plan {
+                bin: bins[0].path.clone(),
+                herdr,
+                config,
+                record: None,
+            },
+            row,
+        ));
     }
     let Some(bin) = bins.first() else {
         warnings.push(Finding::new(
@@ -787,6 +822,26 @@ pub(crate) fn plan_g2(
         },
         row,
     ))
+}
+
+/// herdr's `config.toml` without asking herdr: `HERDR_CONFIG_PATH`, else
+/// `$XDG_CONFIG_HOME/herdr/config.toml`, else `~/.config/herdr/config.toml`
+/// (the import runs on Linux only). Tests read the sandbox home only.
+fn herdr_config_without_spawn(paths: &Paths) -> PathBuf {
+    #[cfg(not(test))]
+    {
+        if let Some(explicit) = std::env::var_os("HERDR_CONFIG_PATH").filter(|v| !v.is_empty()) {
+            return PathBuf::from(explicit);
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        {
+            return xdg.join("herdr").join("config.toml");
+        }
+    }
+    paths.home.join(".config").join("herdr").join("config.toml")
 }
 
 /// G2's `pre` entry (planned; nothing run yet), with its config backup.

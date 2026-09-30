@@ -981,7 +981,7 @@ pub(crate) fn attributed_member(row: &LiveSession) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub(crate) struct LiveSessionView {
     pub(crate) session_id: String,
-    /// `claude` or `codex`.
+    /// `claude`, `codex` or `hermes`.
     pub(crate) harness: String,
     pub(crate) start_profile: String,
     /// `oauth`, `api_key` or `relaunch_only`; `null` for a codex row.

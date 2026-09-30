@@ -5461,8 +5461,6 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// The `usage` tool's reply: the local API's redacted `usage --json` envelope
-/// as one compact JSON text block. Blocking cache reads only, like `profiles`.
 /// `switch_profile` with `session`: the session request core off the async
 /// worker (it polls the row for up to five seconds), rendered as prose.
 async fn switch_session_tool(session: String, name: String) -> Result<CallToolResult, ErrorData> {
@@ -5590,6 +5588,8 @@ pub(crate) fn session_switch_payload(session: &str, name: &str) -> serde_json::V
     payload
 }
 
+/// The `usage` tool's reply: the local API's redacted `usage --json` envelope
+/// as one compact JSON text block. Blocking cache reads only, like `profiles`.
 fn usage_tool_result(args: &UsageArgs) -> CallToolResult {
     let report = crate::local_api::routes::usage_report(&crate::usage::collect::CollectOpts {
         include_disabled: args.all.unwrap_or(false),

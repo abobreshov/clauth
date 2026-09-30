@@ -852,3 +852,32 @@ fn a_crash_between_the_store_move_and_the_slot_rename_never_destroys_the_live_fi
         assert_no_temp(&env.snapshot(), &format!("resume={resume}"));
     }
 }
+
+/// Review lens guest-ux #11 and #15. The commit's warnings print once: the
+/// ones the report already listed are not repeated, and a repeat inside the
+/// commit's own list is dropped. The `journal_pending` blocker carries no
+/// second `tollgate:` prefix of its own.
+#[test]
+fn commit_warnings_print_once_and_journal_pending_has_one_prefix() {
+    let w = |c: &str, m: &str| super::Finding::new(c, m.to_string());
+    let shown = vec![w("upstream_binary_absent", "none")];
+    let committed = vec![
+        w("upstream_binary_absent", "none"),
+        w("semantic_undo", "x"),
+        w("semantic_undo", "x"),
+    ];
+    let fresh = super::unseen(&shown, &committed);
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].code, "semantic_undo");
+
+    let env = Env::new();
+    env.tree.reference();
+    std::fs::write(env.paths().journal(), "{\"state\":\"in_progress\"}").expect("journal");
+    let s = survey(&Options::default());
+    let b = s
+        .blockers
+        .iter()
+        .find(|b| b.code == "journal_pending")
+        .expect("blocked");
+    assert!(!b.message.starts_with("tollgate:"), "{}", b.message);
+}

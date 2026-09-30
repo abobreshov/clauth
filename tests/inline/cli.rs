@@ -4583,3 +4583,31 @@ mod hermes_resolution {
         assert_eq!(exit_code(Err(err)), 1);
     }
 }
+
+/// Review lens guest-ux #5. `switch --help` describes the session form as
+/// it behaves: OAuth intent at the next request, the api-key hot swap (a
+/// different key is what it swaps; swapping… until served) and `--relaunch`
+/// for anything else — never "a member whose key differs is refused".
+#[test]
+fn switch_help_describes_the_hot_swap_and_the_relaunch() {
+    let mut cmd = Cli::command();
+    let help = cmd
+        .find_subcommand_mut("switch")
+        .expect("switch subcommand")
+        .render_long_help()
+        .to_string();
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!flat.contains("endpoint, key, or models differ"), "{flat}");
+    for needle in [
+        "hot-swaps its key",
+        "same endpoint, model routing and custom env",
+        "swapping…",
+        "--relaunch",
+        "next request",
+    ] {
+        assert!(
+            flat.contains(needle),
+            "switch --help lacks {needle:?}: {flat}"
+        );
+    }
+}

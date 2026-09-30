@@ -723,3 +723,29 @@ fn the_openapi_document_describes_live_sessions() {
         serde_json::json!(["requested", "swapping", "stalled", "served"])
     );
 }
+
+/// Review lens guest-ux #8. `/v1/accounts/hermes:<n>` lists a live Hermes
+/// session of that profile, as `/v1/accounts` does.
+#[test]
+fn account_by_id_lists_a_live_hermes_session() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_hermes_roster(&["hm-a"]);
+    let mut row = crate::testutil::live_row("4242-5", "hm-a");
+    row.harness = crate::harness::Harness::Hermes;
+    row.follows_chain = false;
+    row.pid = std::process::id();
+    crate::live_sessions::register(&row).unwrap();
+    let resp = handle(
+        &ctx(),
+        &req("GET", "/v1/accounts/hermes:hm-a", "", None),
+        Door::Unix,
+    );
+    assert_eq!(resp.status, 200, "{:?}", body(&resp));
+    let ids: Vec<String> = body(&resp)["live_sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["session_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["4242-5"]);
+}

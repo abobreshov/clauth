@@ -367,7 +367,8 @@ fn show_lists_the_latest_sessions_from_sqlite() {
     assert!(render_show(&s).contains("-- --resume <id>"));
 }
 
-/// The plain list table carries the estimate or the reason there is none.
+/// The plain list table carries the estimate or the reason there is none,
+/// its columns padded to line up (review lens guest-ux #14).
 #[test]
 fn list_renders_the_estimate_or_the_usage_error() {
     let rows = vec![
@@ -394,8 +395,8 @@ fn list_renders_the_estimate_or_the_usage_error() {
     ];
     assert_eq!(
         render_list(&rows),
-        "● a  openrouter  account home  auth env  model m  $0.42 this month\n  b  nous  pool \
-         home  auth pool  usage: sqlite3_missing\n"
+        "● a  openrouter  account home  auth env  model m  $0.42 this month\n  b  nous        \
+         pool home     auth pool  usage: sqlite3_missing\n"
     );
     assert!(render_list(&[]).starts_with("no Hermes profiles"));
 }

@@ -10582,6 +10582,18 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 // Reflect the fresh install in the rows without a version probe.
                 recompute_plugin_checks(app, false);
             }
+            // `claude` is not on PATH: the backend never ran, so this is the
+            // same warning a no-op gets, never a green toast.
+            Err(e)
+                if e.downcast_ref::<crate::plugin_host::ClaudeAbsent>()
+                    .is_some() =>
+            {
+                app.toast(
+                    ToastKind::Warning,
+                    "plugin install made no changes\ninstall claude code first, then try again",
+                );
+                recompute_plugin_checks(app, false);
+            }
             Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
         ConfirmAction::BlankCredentials(name) => {

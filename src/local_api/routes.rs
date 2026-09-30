@@ -495,8 +495,9 @@ fn account(id: &str) -> Response {
 }
 
 /// The live sessions an account's body lists: a Claude Code profile's
-/// committed or served sessions, a codex profile's sessions by launch profile
-/// (a codex row has neither), and none for a monitor or upstream account.
+/// committed or served sessions, a codex or Hermes profile's sessions by
+/// launch profile (such a row has neither), and none for a monitor or
+/// upstream account.
 fn account_live_sessions(account: &AccountObservation) -> Vec<LiveSessionView> {
     use crate::usage::observation::Origin;
     let Some((_, name)) = account.id.split_once(':') else {
@@ -505,6 +506,7 @@ fn account_live_sessions(account: &AccountObservation) -> Vec<LiveSessionView> {
     let harness = match account.origin {
         Origin::Profile => crate::harness::Harness::Claude,
         Origin::CodexProfile => crate::harness::Harness::Codex,
+        Origin::HermesProfile => crate::harness::Harness::Hermes,
         _ => return Vec::new(),
     };
     live_session_views()

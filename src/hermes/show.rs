@@ -121,6 +121,14 @@ pub(crate) fn render_list(rows: &[ListRow]) -> String {
     if rows.is_empty() {
         return "no Hermes profiles; create one with 'tollgate hermes new <name>'\n".to_string();
     }
+    // Padded like `tollgate list`: names, providers and modes line up.
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let provider_w = rows.iter().map(|r| r.provider.len()).max().unwrap_or(0);
+    let mode_w = rows.iter().map(|r| r.mode.len() + 5).max().unwrap_or(0);
     let mut out = String::new();
     for r in rows {
         let estimate = match (&r.estimate_usd, &r.usage_error) {
@@ -128,12 +136,13 @@ pub(crate) fn render_list(rows: &[ListRow]) -> String {
             (None, Some(e)) => format!("  usage: {e}"),
             (None, None) => String::new(),
         };
+        let mode = format!("{} home", r.mode);
         out.push_str(&format!(
-            "{}{}  {}  {} home  auth {}{}{}\n",
+            "{}{:name_w$}  {:provider_w$}  {:mode_w$}  auth {}{}{}\n",
             if r.live { "● " } else { "  " },
             r.name,
             r.provider,
-            r.mode,
+            mode,
             r.auth,
             r.model
                 .as_deref()

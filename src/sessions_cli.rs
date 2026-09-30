@@ -470,9 +470,15 @@ pub(crate) enum WaitOutcome {
 
 /// Poll the row's [`crate::hot_swap::SwapView`] until the helper serves
 /// `generation`, reports a failure for it, or the wait runs out.
+#[cfg(test)]
 pub(crate) fn wait_until_served(sid: &str, generation: u64) -> WaitOutcome {
+    let deadline = std::time::Instant::now() + switch_waits().served;
+    wait_until_served_by(sid, generation, deadline)
+}
+
+/// [`wait_until_served`] against an overall `deadline`.
+fn wait_until_served_by(sid: &str, generation: u64, deadline: std::time::Instant) -> WaitOutcome {
     let waits = switch_waits();
-    let deadline = std::time::Instant::now() + waits.served;
     loop {
         if let Some(row) = crate::live_sessions::get(sid) {
             let ack = crate::live_sessions::read_helper_ack(sid);
@@ -520,9 +526,19 @@ pub(crate) fn run_switch(sid: &str, profile: &str, flags: &SwitchFlags) -> Resul
         current,
         outcome,
     } = &request;
+    let deadline = std::time::Instant::now() + switch_waits().served;
     match outcome {
         RequestOutcome::AlreadyOn => {
             outln!("{}", already_on_line(sid, target));
+            // On an api-key row "already on" compares the COMMITTED member:
+            // `--wait` still waits until the helper serves it.
+            if flags.wait
+                && let Some(row) = crate::live_sessions::get(sid)
+                && row.executor() == crate::hot_swap::Executor::ApiKey
+            {
+                let generation = row.key_generation.unwrap_or(0);
+                return report_served(sid, target, wait_until_served_by(sid, generation, deadline));
+            }
             Ok(())
         }
         RequestOutcome::IntentRecorded => {
@@ -551,36 +567,70 @@ pub(crate) fn run_switch(sid: &str, profile: &str, flags: &SwitchFlags) -> Resul
                 "tollgate: requested '{target}' for session '{sid}'; the session has not \
                  committed it yet (swapping…)"
             );
-            Ok(())
+            if !flags.wait {
+                return Ok(());
+            }
+            // `--wait` keeps waiting for the commit, then for the helper to
+            // serve it, inside the one budget.
+            let waits = switch_waits();
+            loop {
+                if let Some(row) = crate::live_sessions::get(sid)
+                    && row.current_member.as_deref() == Some(target.as_str())
+                {
+                    let generation = row.key_generation.unwrap_or(0);
+                    outln!("{}", committed_lines(sid, target, generation));
+                    return report_served(
+                        sid,
+                        target,
+                        wait_until_served_by(sid, generation, deadline),
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    errln!(
+                        "tollgate: session '{sid}' has not committed '{target}' yet (still \
+                         swapping…); nothing is served from it"
+                    );
+                    return Err(anyhow::Error::new(crate::relaunch::Reported(3)));
+                }
+                std::thread::sleep(waits.commit_poll);
+            }
         }
         RequestOutcome::Committed(generation) => {
             outln!("{}", committed_lines(sid, target, *generation));
             if !flags.wait {
                 return Ok(());
             }
-            match wait_until_served(sid, *generation) {
-                WaitOutcome::Served(n) => {
-                    outln!(
-                        "tollgate: session '{sid}' is served by '{target}' (key generation {n})"
-                    );
-                    Ok(())
-                }
-                WaitOutcome::Stalled(code) => {
-                    errln!(
-                        "tollgate: session '{sid}' is committed to '{target}' but its key helper \
-                         failed ({code}); Claude Code keeps the previous key until it is rejected"
-                    );
-                    Err(anyhow::Error::new(crate::relaunch::Reported(3)))
-                }
-                WaitOutcome::TimedOut => {
-                    errln!(
-                        "tollgate: session '{sid}' is committed to '{target}' but its key helper \
-                         has not served it yet (still swapping…; the session has made no request \
-                         since the commit)"
-                    );
-                    Err(anyhow::Error::new(crate::relaunch::Reported(3)))
-                }
-            }
+            report_served(
+                sid,
+                target,
+                wait_until_served_by(sid, *generation, deadline),
+            )
+        }
+    }
+}
+
+/// What `--wait` prints for a served / stalled / timed-out commit; exit 3
+/// unless served.
+fn report_served(sid: &str, target: &str, outcome: WaitOutcome) -> Result<()> {
+    match outcome {
+        WaitOutcome::Served(n) => {
+            outln!("tollgate: session '{sid}' is served by '{target}' (key generation {n})");
+            Ok(())
+        }
+        WaitOutcome::Stalled(code) => {
+            errln!(
+                "tollgate: session '{sid}' is committed to '{target}' but its key helper \
+                 failed ({code}); Claude Code keeps the previous key until it is rejected"
+            );
+            Err(anyhow::Error::new(crate::relaunch::Reported(3)))
+        }
+        WaitOutcome::TimedOut => {
+            errln!(
+                "tollgate: session '{sid}' is committed to '{target}' but its key helper \
+                 has not served it yet (still swapping…; the session has made no request \
+                 since the commit)"
+            );
+            Err(anyhow::Error::new(crate::relaunch::Reported(3)))
         }
     }
 }

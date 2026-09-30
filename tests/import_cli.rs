@@ -308,13 +308,15 @@ fn global_fixture(home: &Path) -> (PathBuf, PathBuf) {
     write_script(
         &herdr,
         &format!(
-            r#"case "$1 $2" in
+            r#"mkdir -p '{root}/plugins/config/tollgate' && touch '{root}/.plugins.lock'
+case "$1 $2" in
   "plugin list") echo '{{"id":"cli:plugin","result":{{"plugins":[{{"plugin_id":"clauth","enabled":true,"source":{{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123"}}}}],"type":"plugin_list"}}}}' ;;
   "plugin config-dir") echo '{}'/"$3" ;;
 esac
 exit 0
 "#,
-            cfg.display()
+            cfg.display(),
+            root = home.join(".config/herdr").display()
         ),
     );
     std::fs::create_dir_all(home.join(".config/herdr")).unwrap();
@@ -333,8 +335,9 @@ fn write_script(path: &Path, body: &str) {
 }
 
 /// The read-only proof with G1–G4 all in reach: the dry-run plans upstream's
-/// herdr uninstall (G2) and the plugin-off edit (G1), reads herdr's state
-/// through herdr, and still writes nothing and runs no upstream binary.
+/// herdr uninstall (G2) and the plugin-off edit (G1) from herdr's config read
+/// in place (it never spawns herdr), and writes nothing and runs no upstream
+/// binary.
 #[test]
 fn dry_run_plans_the_global_edits_on_a_read_only_bind_and_runs_nothing() {
     let home = tempfile::tempdir().unwrap();
@@ -373,6 +376,55 @@ fn dry_run_plans_the_global_edits_on_a_read_only_bind_and_runs_nothing() {
         .collect();
     assert!(ids.contains(&"G1") && ids.contains(&"G2"), "{ids:?}");
     assert!(!sentinel.exists(), "the dry-run ran upstream's binary");
+    assert_eq!(snapshot(home.path()), before);
+}
+
+/// Review lens guest-ux #1: on a WRITABLE bind, with a herdr that creates
+/// its plugin dirs and `.plugins.lock` whenever it runs (as the real one
+/// does), the dry-run still leaves the home unchanged: it spawns no herdr.
+#[test]
+fn dry_run_on_a_writable_home_spawns_no_herdr_and_creates_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    fixture(home.path());
+    let (herdr, sentinel) = global_fixture(home.path());
+    let Some(mut cmd) = sandbox(home.path(), true) else {
+        eprintln!("skipped: bubblewrap is not usable here");
+        return;
+    };
+    let before = snapshot(home.path());
+    let out = cmd
+        .args(["--setenv", "PATH"])
+        .arg(format!(
+            "{}:{}:/usr/bin:/bin",
+            path_dir().display(),
+            home.path().join("bin").display()
+        ))
+        .args(["--setenv", "HERDR_BIN_PATH"])
+        .arg(&herdr)
+        .arg(bin())
+        .args(["import", "clauth", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        report["global_edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["id"] == "G2"),
+        "{stdout}"
+    );
+    assert!(!sentinel.exists(), "the dry-run ran upstream's binary");
+    assert!(
+        !home.path().join(".config/herdr/.plugins.lock").exists(),
+        "the dry-run ran herdr"
+    );
     assert_eq!(snapshot(home.path()), before);
 }
 
@@ -607,6 +659,13 @@ fn an_interrupted_journal_warns_on_every_command() {
         assert!(stderr.contains(line), "{args:?}: {stderr}");
     }
     let out = tollgate(home.path()).args(["__complete"]).output().unwrap();
+    let (_, stderr) = text(&out);
+    assert!(!stderr.contains("interrupted"), "{stderr}");
+    // Review lens guest-ux #10: the key helper's stderr lands in Claude Code.
+    let out = tollgate(home.path())
+        .args(["__tollgate-api-key", "nobody"])
+        .output()
+        .unwrap();
     let (_, stderr) = text(&out);
     assert!(!stderr.contains("interrupted"), "{stderr}");
 }

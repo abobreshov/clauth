@@ -897,3 +897,31 @@ fn repoint_registry_says_nothing_when_clean() {
         "no write (mtime)"
     );
 }
+
+/// Review lens guest-ux #4. With no `claude` on `PATH`, `plugin install` and
+/// `plugin uninstall` fail naming it, instead of "no changes needed" / "was
+/// not installed" for a step that never ran. `PATH` is pinned to an empty
+/// dir, so the operator's own `claude` is out of reach.
+#[test]
+fn plugin_install_and_uninstall_fail_when_claude_is_not_on_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let empty = home.home().join("empty-bin");
+    std::fs::create_dir_all(&empty).expect("empty bin");
+    let _path = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("PATH", Some(empty.as_os_str())),
+            ("CLAUDE_CONFIG_DIR", None),
+        ],
+    );
+    let err = super::install().expect_err("no claude");
+    assert!(
+        format!("{err:#}").contains("claude is not on PATH; nothing was installed"),
+        "{err:#}"
+    );
+    let err = super::uninstall().expect_err("no claude");
+    assert!(
+        format!("{err:#}").contains("claude is not on PATH"),
+        "{err:#}"
+    );
+}

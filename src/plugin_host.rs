@@ -68,7 +68,57 @@ pub(crate) fn install() -> anyhow::Result<Outcome> {
             dir.display()
         );
     }
-    guarded(|| Ok(TollgatePlugin::install(Scope::User, Source::Embedded)?))
+    let report = guarded(|| {
+        Ok(TollgatePlugin::install_report(
+            Scope::User,
+            Source::Embedded,
+        )?)
+    })?;
+    merged(
+        &report,
+        Some("claude is not on PATH; nothing was installed"),
+    )
+}
+
+/// `claude` is not on `PATH`, so the plugin step never ran: the error
+/// `install` / `uninstall` raise instead of agentgear's silent `NoOp`.
+#[derive(Debug)]
+pub(crate) struct ClaudeAbsent(pub(crate) &'static str);
+
+impl std::fmt::Display for ClaudeAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ClaudeAbsent {}
+
+/// Collapse an agentgear report the way its merged lifecycle methods do (a
+/// failed agent is an error, else the first real change wins), except that
+/// with `absent` set a `claude` agent skipped as not detected is that error
+/// instead of a silent `NoOp`: "no changes needed" would claim an install
+/// that never ran.
+fn merged(
+    report: &agentgear::AgentReport,
+    absent: Option<&'static str>,
+) -> anyhow::Result<Outcome> {
+    use agentgear::{AgentStatus, SkipReason};
+    let mut out = Outcome::NoOp;
+    for result in &report.results {
+        match &result.status {
+            AgentStatus::Failed(detail) => {
+                anyhow::bail!("{}: {detail}", result.agent);
+            }
+            AgentStatus::Skipped(SkipReason::NotDetected) if result.agent == "claude" => {
+                if let Some(why) = absent {
+                    return Err(anyhow::Error::new(ClaudeAbsent(why)));
+                }
+            }
+            AgentStatus::Converged(o) if out == Outcome::NoOp => out = o.clone(),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// What `tollgate plugin uninstall` did.
@@ -102,7 +152,13 @@ pub(crate) fn uninstall() -> anyhow::Result<Uninstalled> {
             dir.display()
         );
     }
-    let plugin = uninstall_plugin()?;
+    let report = uninstall_plugin_report()?;
+    let plugin = merged(
+        &report,
+        Some(
+            "claude is not on PATH, so tollgate@tollgate could not be uninstalled; nothing was changed",
+        ),
+    )?;
     let mcp_entry = crate::plugin_probe::unwire_mcp_server()?;
     Ok(Uninstalled { plugin, mcp_entry })
 }
@@ -111,8 +167,12 @@ pub(crate) fn uninstall() -> anyhow::Result<Uninstalled> {
 /// marketplace, under the owned-keys guard, `mcpServers` left as it is. The
 /// undo of the import's retire step R2, which installed only the plugin.
 pub(crate) fn uninstall_plugin() -> anyhow::Result<Outcome> {
+    merged(&uninstall_plugin_report()?, None)
+}
+
+fn uninstall_plugin_report() -> anyhow::Result<agentgear::AgentReport> {
     crate::guest_write::owned_keys_guarded(&guarded_files(), || {
-        Ok(TollgatePlugin::uninstall(Scope::User)?)
+        Ok(TollgatePlugin::uninstall_report(Scope::User)?)
     })
 }
 

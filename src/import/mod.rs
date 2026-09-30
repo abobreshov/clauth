@@ -617,6 +617,18 @@ fn require_tty_or_yes(yes: bool) -> Result<()> {
     }
 }
 
+/// The warnings of `new` not already in `seen`, each once, by (code, message).
+fn unseen(seen: &[Finding], new: &[Finding]) -> Vec<Finding> {
+    let mut keys: std::collections::BTreeSet<(String, String)> = seen
+        .iter()
+        .map(|w| (w.code.clone(), w.message.clone()))
+        .collect();
+    new.iter()
+        .filter(|w| keys.insert((w.code.clone(), w.message.clone())))
+        .cloned()
+        .collect()
+}
+
 fn print_warnings(warnings: &[Finding]) {
     for w in warnings {
         crate::out::errln!("  warning  {}: {}", w.code, w.message);
@@ -630,7 +642,7 @@ fn print_warnings(warnings: &[Finding]) {
 pub(crate) fn cmd_run(opts: &Options, json: bool, yes: bool, resume: bool) -> Result<()> {
     if resume {
         let committed = txn::resume()?;
-        print_warnings(&committed.warnings);
+        print_warnings(&unseen(&[], &committed.warnings));
         crate::out::outln!("{}", txn::commit_message(&committed));
         return Ok(());
     }
@@ -654,12 +666,19 @@ pub(crate) fn cmd_run(opts: &Options, json: bool, yes: bool, resume: bool) -> Re
         ask(&txn::confirm_question(r), json)
     };
     let committed = txn::run_with(opts, &mut show, &mut confirm)?;
-    print_warnings(&committed.warnings);
+    // The report already listed the survey's warnings; the commit adds its
+    // own on top of the same list (M4 re-surveys), so only the new ones print.
+    let shown: Vec<Finding> = last
+        .as_ref()
+        .map(|r| r.warnings.clone())
+        .unwrap_or_default();
+    let fresh = unseen(&shown, &committed.warnings);
+    print_warnings(&fresh);
     let line = txn::commit_message(&committed);
     if json {
         if let Some(mut r) = last {
             r.journal.state = crate::identity::ImportState::Complete.as_str();
-            r.warnings.extend(committed.warnings.iter().cloned());
+            r.warnings.extend(fresh);
             print_report(&r, true, false)?;
         }
         crate::out::errln!("{line}");

@@ -354,9 +354,26 @@ fn dispatch(cli: Cli) -> Result<()> {
     });
 
     // An interrupted import names itself on every command (spec §2.3),
-    // on stderr. Shell completion's hidden helper is spared: its stderr
-    // lands in the middle of the user's prompt line.
-    if !matches!(cli.command, Some(Command::Complete { .. }))
+    // on stderr. The hidden helpers Claude Code or the shell run are spared
+    // (completion's stderr lands in the prompt line; the key helper, the
+    // plugin hooks and the MCP server's stderr land in Claude Code), and so
+    // is the bare TUI, whose alternate screen would hide it at once.
+    let tui = cli.command.is_none() && {
+        use std::io::IsTerminal as _;
+        std::io::stdout().is_terminal()
+    };
+    if !tui
+        && !matches!(
+            cli.command,
+            Some(
+                Command::Complete { .. }
+                    | Command::ApiKey { .. }
+                    | Command::Mcp
+                    | Command::McpAwaitJob
+                    | Command::HookProfileChangedNote
+                    | Command::SelfHeal
+            )
+        )
         && interrupted_check_allowed()
         && let Ok(paths) = import::Paths::resolve()
         && let Some(line) = import::journal::interrupted_warning(&paths)

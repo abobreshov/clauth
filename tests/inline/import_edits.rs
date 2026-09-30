@@ -613,3 +613,43 @@ fn the_process_scan_never_echoes_an_argument_value() {
     assert!(codes(&s).contains(&"tollgate_process_alive".to_string()));
     assert!(codes(&s).contains(&"process_alive".to_string()));
 }
+
+/// Review lens guest-ux #1. The dry run spawns no herdr (the real one creates
+/// its plugin dirs and `.plugins.lock` when asked for its config dir or its
+/// plugin list): G2 is still planned from herdr's config read in place, and
+/// without upstream's marked block it is named "planned at run time".
+#[test]
+fn the_dry_run_plans_g2_without_spawning_herdr() {
+    let env = Env::new();
+    env.tree.reference();
+    let (herdr, config, _pin) = g2_setup(&env);
+    let report = txn::report(&survey(&Options::default()), "dry_run");
+    let g2 = report
+        .global_edits
+        .iter()
+        .find(|g| g.id == "G2")
+        .expect("G2 planned");
+    assert!(g2.change.contains("herdr uninstall --yes"), "{}", g2.change);
+    assert_eq!(herdr.log(), "", "the dry run ran herdr");
+
+    // No marked block: only herdr's plugin list could tell, so the row says
+    // it is decided at run time, and herdr still never runs.
+    std::fs::write(&config, "theme = \"dark\"\n").expect("unmarked");
+    let report = txn::report(&survey(&Options::default()), "dry_run");
+    let g2 = report
+        .global_edits
+        .iter()
+        .find(|g| g.id == "G2")
+        .expect("G2 row");
+    assert!(
+        g2.change.starts_with("planned at run time"),
+        "{}",
+        g2.change
+    );
+    assert_eq!(herdr.log(), "", "the dry run ran herdr");
+
+    // The real run does ask herdr.
+    let s = txn::survey(&Options::default(), txn::Mode::Run).expect("survey");
+    assert!(s.g2.is_some());
+    assert!(herdr.log().contains("plugin list"), "{}", herdr.log());
+}

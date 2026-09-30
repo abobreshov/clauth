@@ -1344,6 +1344,68 @@ mod hot_swap_switch {
         set_switch_waits(None);
     }
 
+    /// Review lens guest-ux #2. `--wait` never exits 0 without the target
+    /// being served: on `Requested` it keeps waiting for the commit and then
+    /// the serve (exit 3 when neither comes), and on `AlreadyOn` of an
+    /// api-key row (committed, not served) it waits for the serve too.
+    #[test]
+    fn switch_wait_waits_through_requested_and_already_on() {
+        let _sb = HomeSandbox::new();
+        set_switch_waits(Some(SwitchWaits {
+            commit: Duration::from_millis(50),
+            served: Duration::from_millis(300),
+            commit_poll: Duration::from_millis(10),
+            served_poll: Duration::from_millis(10),
+        }));
+        let _marker = b_session("4242-0", "wr-a");
+        write_api_key_profile(&api_key_profile("wr-b", OR, "sk-b"));
+        // What the real executor stamps at commit: the target's marker.
+        let _b_marker = crate::runtime::hold_session_row_marker(
+            &crate::profile::ProfileName::from("wr-b"),
+            false,
+            "4242-0",
+        )
+        .expect("target marker");
+        let wait = SwitchFlags {
+            wait: true,
+            ..SwitchFlags::default()
+        };
+        // Nobody commits: Requested, then exit 3 once the budget runs out.
+        let err = run_switch("4242-0", "wr-b", &wait).expect_err("never committed");
+        assert_eq!(reported(err), 3);
+        // Committed late (after the 50 ms request wait) but never served:
+        // the wait continues through the commit and exits 3.
+        let late = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(120));
+            crate::live_sessions::update_as_session("4242-0", |f| {
+                f.set_current_member("wr-b");
+                f.bump_key_generation();
+            })
+            .expect("commit");
+        });
+        let started = std::time::Instant::now();
+        let err = run_switch("4242-0", "wr-b", &wait).expect_err("committed, not served");
+        late.join().expect("late commit");
+        assert_eq!(reported(err), 3);
+        assert!(started.elapsed() >= Duration::from_millis(120), "it waited");
+        // Already on (committed) wr-b, helper never served it: exit 3.
+        let err = run_switch("4242-0", "wr-b", &wait).expect_err("not served");
+        assert_eq!(reported(err), 3);
+        // Served: exit 0.
+        crate::hot_swap::write_ack_for_test(
+            "4242-0",
+            &crate::hot_swap::HelperAck {
+                version: 1,
+                generation: 1,
+                member: Some("wr-b".to_string()),
+                served_at_ms: Some(crate::usage::now_ms()),
+                last_failure: None,
+            },
+        );
+        run_switch("4242-0", "wr-b", &wait).expect("served");
+        set_switch_waits(None);
+    }
+
     // 47
     #[test]
     fn session_flags_with_one_name_are_usage_errors() {
