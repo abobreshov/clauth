@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["tollgate-v*"]
 
 permissions:
   contents: write      # gh release upload attaches assets to the release
@@ -30,13 +30,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate tag is semver
-        # Tighten the `v*` trigger to strict vX.Y.Z before any build minutes burn: a
-        # typo'd hand-pushed tag would otherwise build all legs and land on the bare
-        # fallback release below. Pre-release suffixes (`v1.2.3-rc1`) need this relaxed.
+        # Tighten the `tollgate-v*` trigger to strict tollgate-vX.Y.Z before any build
+        # minutes burn: a typo'd hand-pushed tag would otherwise build all legs and land
+        # on the bare fallback release below. Pre-release suffixes need this relaxed.
         run: |
-          ver="${GITHUB_REF_NAME#v}"
+          ver="${GITHUB_REF_NAME#tollgate-v}"
           if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::tag '${GITHUB_REF_NAME}' is not vX.Y.Z"; exit 1
+            echo "::error::tag '${GITHUB_REF_NAME}' is not tollgate-vX.Y.Z"; exit 1
           fi
 
   build:

@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [mommy]
+    branches: [feat/tollgate]
     paths-ignore:
       - "**/*.md"
       - wiki/**
@@ -38,7 +38,7 @@ env:
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
-# A `v*` tag push runs release.yml only, never CI: the `on.push.branches` filter
+# A `tollgate-v*` tag push runs release.yml only, never CI: the `on.push.branches` filter
 # already excludes tag refs, and the per-job `if` keeps checks off tag/release refs
 # even if that trigger is later broadened. PRs (refs/pull/*) and branch pushes run.
 jobs:
