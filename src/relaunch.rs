@@ -384,10 +384,19 @@ fn confirm(prepared: &Prepared) -> Result<bool> {
 /// Steps 5-7: write the request, wait for the answer, wait for the new row.
 ///
 /// Two concurrent requests for one session are arbitrated: the request is
-/// published exclusively (a hard link that fails on `EEXIST`), refused while
+/// published exclusively, refused while
 /// another is pending or claimed, and each CLI accepts — and removes — only
 /// the result carrying its own `request_id`.
 pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
+    submit_with_link(prepared, &mut |staging, request| {
+        std::fs::hard_link(staging, request)
+    })
+}
+
+fn submit_with_link(
+    prepared: &Prepared,
+    link: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let sid = prepared.sid.as_str();
     let request = crate::live_sessions::relaunch_path(sid, "")?;
     let result = crate::live_sessions::relaunch_path(sid, "result")?;
@@ -403,9 +412,14 @@ pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
         std::process::id(),
         id.as_deref().unwrap_or("0")
     ));
-    crate::profile::atomic_write_600(&staging, bytes)
+    crate::profile::write_durable_600(&staging, bytes)
         .with_context(|| format!("failed to write {}", staging.display()))?;
-    let published = std::fs::hard_link(&staging, &request);
+    let published = match link(&staging, &request) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            publish_no_replace(&staging, &request)
+        }
+        other => other,
+    };
     let _ = std::fs::remove_file(&staging);
     match published {
         Ok(()) => {}
@@ -415,6 +429,14 @@ pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
         Err(e) => {
             return Err(e).with_context(|| format!("failed to write {}", request.display()));
         }
+    }
+    // A supervisor may have claimed an earlier request after our first
+    // `.taken` check. Withdraw only our own newly published request.
+    if taken.exists() && request_id_of(&taken) != id {
+        if request_id_of(&request) == id {
+            let _ = std::fs::remove_file(&request);
+        }
+        return Err(refuse(sid, busy));
     }
     let ours = |path: &Path| read_result(path).filter(|r| r.request_id == id);
     let limits = deadlines();
@@ -478,6 +500,56 @@ pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
     }
 }
 
+/// Atomic no-replace rename where Linux supports it. The exclusive-create
+/// fallback covers filesystems that reject renameat2 as well as hard links.
+fn publish_no_replace(staging: &Path, request: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let from = std::ffi::CString::new(staging.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let to = std::ffi::CString::new(request.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        #[allow(unsafe_code)]
+        // SAFETY: both C strings are live for the duration of this syscall.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut final_file = opts.open(request)?;
+    let copied = (|| {
+        let mut source = std::fs::File::open(staging)?;
+        std::io::copy(&mut source, &mut final_file)?;
+        final_file.flush()?;
+        final_file.sync_all()
+    })();
+    if copied.is_err() {
+        let _ = std::fs::remove_file(request);
+    }
+    copied
+}
+
 fn read_result(path: &Path) -> Option<RelaunchResult> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
@@ -510,7 +582,8 @@ pub(crate) struct Handoff {
 
 impl Handoff {
     /// Read the three variables and verify them. A missing or mismatched
-    /// `.relaunch.taken` ignores all three (logged); a match removes it.
+    /// `.relaunch.taken` ignores all three (logged). The accepted hand-off is
+    /// consumed after a child spawns, leaving it available for one fallback.
     pub(crate) fn from_env() -> Self {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Self::verify(get(RELAUNCHED_FROM_ENV), get(FALLBACK_ENV), get(NONCE_ENV))
@@ -537,12 +610,17 @@ impl Handoff {
             logline!("tollgate: ignoring a relaunch hand-off whose nonce does not verify");
             return Self::default();
         }
-        if let Ok(taken) = crate::live_sessions::relaunch_path(&from, "taken") {
-            let _ = std::fs::remove_file(taken);
-        }
         Self {
             from: Some(from),
             fallback: fallback.filter(|f| crate::claude::is_profile_name_token(f)),
+        }
+    }
+
+    pub(crate) fn consume(&self) {
+        if let Some(from) = &self.from
+            && let Ok(taken) = crate::live_sessions::relaunch_path(from, "taken")
+        {
+            let _ = std::fs::remove_file(taken);
         }
     }
 }
@@ -587,6 +665,16 @@ pub(crate) fn write_result(
 /// a refusal is answered and the session keeps running (`None`). An accepted
 /// one gets its nonce and a `relaunching` answer.
 pub(crate) fn poll_claim(sid: &str) -> Option<Accepted> {
+    poll_claim_with(sid, &mut nonce, &mut |path, bytes| {
+        crate::profile::atomic_write_600(path, bytes)
+    })
+}
+
+fn poll_claim_with(
+    sid: &str,
+    make_nonce: &mut dyn FnMut() -> Result<String>,
+    stamp: &mut dyn FnMut(&Path, Vec<u8>) -> std::io::Result<()>,
+) -> Option<Accepted> {
     let request = crate::live_sessions::relaunch_path(sid, "").ok()?;
     let taken = crate::live_sessions::relaunch_path(sid, "taken").ok()?;
     std::fs::rename(&request, &taken).ok()?;
@@ -598,9 +686,10 @@ pub(crate) fn poll_claim(sid: &str) -> Option<Accepted> {
             None
         }
         Ok((mut req, transcript)) => {
-            let nonce = match nonce() {
+            let nonce = match make_nonce() {
                 Ok(n) => n,
                 Err(e) => {
+                    let _ = std::fs::remove_file(&taken);
                     write_result(sid, id, "refused", Some(format!("{e:#}")));
                     return None;
                 }
@@ -608,8 +697,9 @@ pub(crate) fn poll_claim(sid: &str) -> Option<Accepted> {
             req.nonce = Some(nonce.clone());
             let stamped = serde_json::to_vec(&req)
                 .map_err(anyhow::Error::from)
-                .and_then(|b| crate::profile::atomic_write_600(&taken, b).map_err(Into::into));
+                .and_then(|b| stamp(&taken, b).map_err(Into::into));
             if let Err(e) = stamped {
+                let _ = std::fs::remove_file(&taken);
                 write_result(sid, id, "refused", Some(format!("{e:#}")));
                 return None;
             }
@@ -820,7 +910,7 @@ pub(crate) fn exec_relaunch_with(
 }
 
 /// The new process's fallback: a start that failed before its child spawned
-/// restarts once on the original profile, without the hand-off variables.
+/// restarts once on the original profile with its verified lineage and nonce.
 pub(crate) fn exec_fallback(orig: &str, claude_args: &[String], error: &anyhow::Error) -> ! {
     errln!("tollgate: {error:#}");
     let last = exec_fallback_with(orig, claude_args, &mut exec);
@@ -841,9 +931,12 @@ pub(crate) fn exec_fallback_with(
     if let Ok(exe) = std::env::current_exe() {
         let mut command = std::process::Command::new(exe);
         command.arg("start").arg(orig).arg("--").args(claude_args);
-        for key in RELAUNCH_ENV_KEYS {
-            command.env_remove(key);
+        for key in [RELAUNCHED_FROM_ENV, NONCE_ENV] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
         }
+        command.env_remove(FALLBACK_ENV);
         let e = exec(&mut command);
         errln!("tollgate: restarting on '{orig}' failed: {e}");
     }

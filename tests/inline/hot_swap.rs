@@ -473,6 +473,7 @@ fn ack(generation: u64, member: &str, served_at: u64) -> HelperAck {
         member: Some(member.to_string()),
         served_at_ms: Some(served_at),
         last_failure: None,
+        launch_class: None,
     }
 }
 
@@ -572,6 +573,32 @@ fn a_failed_helper_run_marks_stalled_with_its_code() {
     assert_eq!(
         SwapView::of(&committed, Some(&older)).state,
         SwapState::Swapping
+    );
+}
+
+#[test]
+fn a_generation_zero_failure_only_ack_is_stalled_everywhere() {
+    let row = b_row("a", "a", 0, 0);
+    let failed = HelperAck {
+        version: 1,
+        generation: 0,
+        member: None,
+        served_at_ms: None,
+        last_failure: Some(HelperFailure {
+            generation: 0,
+            code: "class_differs:endpoint".to_string(),
+            at_ms: 1,
+        }),
+        launch_class: None,
+    };
+    let view = SwapView::of(&row, Some(&failed));
+    assert_eq!(view.state, SwapState::Stalled);
+    assert_eq!(view.stall_code.as_deref(), Some("class_differs:endpoint"));
+    assert!(!view.idle);
+    assert_eq!(view.served_member(), None);
+    assert_eq!(
+        LiveSessionView::of(&row, Some(&failed)).state,
+        SwapState::Stalled
     );
 }
 
@@ -675,6 +702,24 @@ fn a_force_login_setting_in_the_base_or_managed_file_is_gateway_policy() {
     let in_force = gateway_policy_in_force(&claude);
     set_managed_settings_override(None);
     assert!(in_force, "the managed file counts too");
+}
+
+#[test]
+fn unreadable_or_invalid_settings_fail_closed_for_gateway_policy() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("claude dir");
+    std::fs::write(claude.join("settings.json"), b"{").expect("invalid base");
+    assert!(gateway_policy_in_force(&claude));
+    std::fs::remove_file(claude.join("settings.json")).expect("remove base");
+    let managed = home.home().join("managed-settings.json");
+    std::fs::write(&managed, b"{").expect("invalid managed");
+    set_managed_settings_override(Some(managed.clone()));
+    assert!(gateway_policy_in_force(&claude));
+    std::fs::remove_file(&managed).expect("remove managed");
+    std::fs::create_dir(&managed).expect("unreadable managed");
+    assert!(gateway_policy_in_force(&claude));
+    set_managed_settings_override(None);
 }
 
 /// The commit's settings touch moves a regular file's mtime and refuses a

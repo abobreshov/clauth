@@ -614,8 +614,18 @@ pub(crate) fn list_sidecars() -> Vec<Sidecar> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
-            let (sid, suffix) = name.split_once('.')?;
-            let known = SIDECAR_SUFFIXES.contains(&suffix) || suffix.starts_with("helper.tmp.");
+            let hidden_stage = name.starts_with('.');
+            let trimmed = name.trim_start_matches('.');
+            let (sid, suffix) = trimmed.split_once('.')?;
+            let relaunch_stage = hidden_stage
+                && suffix.strip_prefix("relaunch.").is_some_and(|rest| {
+                    rest.split_once('.').is_some_and(|(pid, id)| {
+                        !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty()
+                    })
+                });
+            let known = SIDECAR_SUFFIXES.contains(&suffix)
+                || suffix.starts_with("helper.tmp.")
+                || relaunch_stage;
             (known && is_session_id(sid)).then(|| Sidecar {
                 session_id: sid.to_string(),
                 suffix: suffix.to_string(),

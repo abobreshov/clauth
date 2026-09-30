@@ -3605,6 +3605,37 @@ fn the_live_cell_marks_a_swapping_session() {
     );
 }
 
+#[test]
+fn the_live_cell_marks_a_generation_zero_stall() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    let row =
+        live_row("4242-0", "main", false).with_executor(crate::hot_swap::Executor::ApiKey, None);
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 0,
+            member: None,
+            served_at_ms: None,
+            last_failure: Some(crate::hot_swap::HelperFailure {
+                generation: 0,
+                code: "no_key".into(),
+                at_ms: 1,
+            }),
+            launch_class: None,
+        },
+    );
+    app.live_sessions = crate::live_sessions::LiveTally::of([row]);
+    let widths = OverviewWidths::new(160, &app);
+    let rendered = render_overview_row(&app, 0, &widths, false, false);
+    assert!(live_cell_text(&widths, &rendered).ends_with('…'));
+}
+
 /// The Hermes section renders under its caption in the `All` and `Hermes`
 /// views only, with its count in the panel's title meta, and the estimate
 /// from the usage cache; a Hermes observation never lands among the

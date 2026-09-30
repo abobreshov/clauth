@@ -12236,6 +12236,19 @@ fn poll_never_reaches_swap_to_or_converge_for_a_b_session() {
     assert_eq!(a_swap.a_legs(), 1);
 }
 
+#[test]
+fn api_key_poll_with_missing_class_never_enters_oauth_legs() {
+    let _home = HomeSandbox::new();
+    let a = b_member("missing-class-a");
+    let (mut swap, _launch) = lone_b_session(&a);
+    std::sync::Arc::get_mut(&mut swap)
+        .expect("sole owner")
+        .launch_class = None;
+    swap.poll();
+    assert_eq!(swap.a_legs(), 0);
+    assert_eq!(row_of(&swap).key_generation, Some(0));
+}
+
 // 24
 #[test]
 fn poll_for_an_oauth_session_is_unchanged() {
@@ -12755,7 +12768,7 @@ fn a_stalled_commit_is_warned_once_per_generation_and_an_idle_one_never() {
     swap.poll();
     assert_eq!(
         swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
-        0,
+        u64::MAX,
         "committed and idle: no warning"
     );
     crate::hot_swap::write_ack_for_test(
@@ -12770,12 +12783,49 @@ fn a_stalled_commit_is_warned_once_per_generation_and_an_idle_one_never() {
                 code: "no_key".to_string(),
                 at_ms: crate::usage::now_ms(),
             }),
+            launch_class: None,
         },
     );
     swap.poll();
     assert_eq!(
         swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
         1
+    );
+}
+
+#[test]
+fn a_generation_zero_failure_emits_one_watchdog_line() {
+    let _home = HomeSandbox::new();
+    let a = b_member("st-zero");
+    let (swap, _launch) = lone_b_session(&a);
+    crate::hot_swap::write_ack_for_test(
+        swap.session.as_str(),
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 0,
+            member: None,
+            served_at_ms: None,
+            last_failure: Some(crate::hot_swap::HelperFailure {
+                generation: 0,
+                code: "no_key".into(),
+                at_ms: crate::usage::now_ms(),
+            }),
+            launch_class: row_of(&swap).launch_class,
+        },
+    );
+    let logs = crate::logline::LogLines::new();
+    let capture = logs.capture_here();
+    swap.poll();
+    swap.poll();
+    drop(capture);
+    let lines = logs.snapshot();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("key helper failed (no_key)"))
+            .count(),
+        1,
+        "{lines:?}"
     );
 }
 
@@ -12822,6 +12872,79 @@ fn the_helper_never_serves_a_key_whose_endpoint_left_the_launch_class() {
     let mut out = Vec::new();
     assert!(crate::hot_swap::run_session_helper(swap.session.as_str(), &mut out).is_err());
     assert!(out.is_empty());
+}
+
+#[test]
+fn helper_refuses_a_missing_class_and_checks_an_orphaned_member() {
+    let home = HomeSandbox::new();
+    let a = b_member("orphan-a");
+    let (swap, _launch) = lone_b_session(&a);
+    let sid = swap.session.as_str().to_string();
+    let mut row = row_of(&swap);
+    row.launch_class = None;
+    crate::live_sessions::register(&row).expect("row without class");
+    let mut out = Vec::new();
+    assert!(crate::hot_swap::run_session_helper(&sid, &mut out).is_err());
+    assert!(out.is_empty());
+
+    row.launch_class = crate::hot_swap::LaunchClass::of(&a, true);
+    crate::live_sessions::register(&row).expect("restore class");
+    crate::hot_swap::run_session_helper(&sid, &mut out).expect("seed ack");
+    crate::live_sessions::unregister(&sid).expect("reap row");
+    let moved = crate::testutil::api_key_profile(
+        "orphan-a",
+        "https://api.deepseek.com/anthropic",
+        "sk-deepseek-orphan",
+    );
+    crate::testutil::write_api_key_profile(&moved);
+    out.clear();
+    let e = crate::hot_swap::run_session_helper(&sid, &mut out).expect_err("orphan drift");
+    assert!(format!("{e:#}").contains("class_differs:endpoint"), "{e:#}");
+    assert!(out.is_empty());
+
+    let fallback_sid = "4242-999";
+    let config_dir = home
+        .home()
+        .join(".tollgate/profiles/orphan-a")
+        .join(format!("runtime-{fallback_sid}"));
+    std::fs::create_dir_all(&config_dir).expect("runtime");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[("CLAUDE_CONFIG_DIR", Some(config_dir.as_os_str()))],
+    );
+    out.clear();
+    assert!(crate::hot_swap::run_session_helper(fallback_sid, &mut out).is_err());
+    assert!(out.is_empty(), "fallback without class cannot print a key");
+}
+
+#[test]
+fn helper_refuses_models_and_env_drift_after_commit() {
+    let _home = HomeSandbox::new();
+    let a = b_member("drift-a");
+    let (swap, _launch) = lone_b_session(&a);
+    for (axis, mut changed) in [
+        ("models", {
+            let mut p = a.clone();
+            p.models.opus = Some("other".to_string());
+            p
+        }),
+        ("env", {
+            let mut p = a.clone();
+            p.env.insert("EXTRA".to_string(), "1".to_string());
+            p
+        }),
+    ] {
+        changed.api_key = a.api_key.clone();
+        crate::testutil::write_api_key_profile(&changed);
+        let mut out = Vec::new();
+        let e =
+            crate::hot_swap::run_session_helper(swap.session.as_str(), &mut out).expect_err(axis);
+        assert!(
+            format!("{e:#}").contains(&format!("class_differs:{axis}")),
+            "{e:#}"
+        );
+        assert!(out.is_empty());
+    }
 }
 
 /// Review lens concurrency #2 and #7. The sid re-mint loop skips a sid the

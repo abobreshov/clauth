@@ -536,6 +536,7 @@ fn a_swapping_session_tags_the_served_member_then_the_committed_one_swapping() {
             code: "no_key".into(),
             at_ms: 20,
         }),
+        launch_class: None,
     }));
     let tag = session_tag(&accounts, Some("or-alt"), "claude", Some(&stalled), NOW).expect("a tag");
     assert_eq!(tag.text, "or-main \u{2192} or-alt stalled");
@@ -548,6 +549,7 @@ fn a_swapping_session_tags_the_served_member_then_the_committed_one_swapping() {
         member: Some("or-alt".into()),
         served_at_ms: Some(20),
         last_failure: None,
+        launch_class: None,
     }));
     let tag = session_tag(&accounts, Some("or-main"), "claude", Some(&served), NOW).expect("a tag");
     assert_eq!(

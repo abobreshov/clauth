@@ -158,7 +158,7 @@ dropped; `None` (not B) when the authority has userinfo or there is no `://`. `e
 blank-trimmed `ANTHROPIC_API_KEY`. `workspace_id` stays `null` until P4-OR (None-tolerant).
 
 ### 3.3 Helper ack `live_sessions/<sid>.helper`
-`{"version":1,"generation":N,"member":"<p>","served_at_ms":T,"last_failure":null|{"generation":M,"code":"<code>","at_ms":T2}}`,
+`{"version":1,"generation":N,"member":"<p>","served_at_ms":T,"last_failure":null|{"generation":M,"code":"<code>","at_ms":T2},"launch_class":null|{...}}`,
 replaced only by rename of `<sid>.helper.tmp.<pid>`; torn, foreign or other-version reads as "no ack".
 `generation`/`member`/`served_at_ms` describe the last **successful** run and never regress.
 `last_failure` records the newest failed run (codes: `no_row`, `config_unreadable`, `no_key`,
@@ -325,30 +325,33 @@ No `load_profile`, no state flock, no network; target < 50 ms.
    `member = row.current_member.unwrap_or(start_profile)`; `gen = row.key_generation.unwrap_or(0)`.
    **Row missing** (for example `gc_live_session_rows`, `runtime.rs:1697`, reaped it because the
    supervisor was SIGKILLed while its orphan CC keeps running): serve the `member` of the last
-   successful ack in `<sid>.helper` at its `generation`. No usable ack: parse `CLAUDE_CONFIG_DIR`,
-   which must be exactly `<tollgate_dir>/profiles/<start>/runtime-<sid'>` with a valid profile name and
-   `sid' == --session`, and serve `<start>` at generation 0. Neither → failure `no_row`. Without this,
+   successful ack in `<sid>.helper` at its `generation`, only when the ack also carries the launch
+   class. A missing class fails closed; the `CLAUDE_CONFIG_DIR` start-profile fallback cannot prove
+   the launch endpoint and prints no key. Without the ack fallback,
    a helper failure makes CC run on the stale key until a 401 and then send empty credentials (S1(d)),
    which today's profile-form helper never does.
-2. Read `profiles/<member>/config.toml` once, `toml::from_str` into `{api_key: Option<String>}`;
-   unreadable → failure `config_unreadable`; trim; empty → `no_key`; `validate_api_key`
+2. Read `profiles/<member>/config.toml` once and check its endpoint, models and env against the
+   launch class before printing. An API-key row without a class refuses. Unreadable → failure
+   `config_unreadable`; trim; empty → `no_key`; `validate_api_key`
    (`claude.rs:285`) else `invalid_key`.
 3. `write_api_key` (write + flush, `main.rs:2227`); error → failure `stdout_write`.
 4. Record (HelperAck 1950): `open_state_file(<sid>.helper.lock)`; `try_lock` up to 10 × 20 ms, else
    skip the record (the next run records). Read `<sid>.helper`.
    - Success: if it parses at `version 1` with `generation ≥ gen` and no `last_failure` at a
      generation ≤ `gen`, write nothing. Else write `{generation: gen, member, served_at_ms: now,
-     last_failure: null}`.
+     last_failure: null, launch_class}`.
    - Failure (steps 1–3): keep the parsed success fields as they are (or `generation 0`, no member,
      when there is no ack) and set `last_failure = {generation: gen, code, at_ms: now}`. An existing
-     `last_failure` at a higher generation is not overwritten.
+     `last_failure` at a higher generation is not overwritten. The ack retains the non-secret
+     `launch_class` for a later orphan helper run.
    Writes go to `<sid>.helper.tmp.<pid>` (0600) and `rename` over `<sid>.helper`. Unlock.
 5. Exit 0 after a success whatever step 4 did; exit 1 with nothing on stdout after a failure. The
    profile form and `api_key_for_profile` (`main.rs:2247`) are unchanged.
 
 ### 4.7 `SwapView::of(row, ack, now)` (one function for every surface)
 `committed = (member, key_generation, committed_at)`; `served = ack` success fields (or, when
-`key_generation` is 0 and there is no ack, `committed` itself). The refresh is lazy with no timer
+`key_generation` is 0 and there is no ack, `committed` itself). A failure-only ack has no served
+point, even at generation 0. The refresh is lazy with no timer
 (S1(a)), so the state is keyed on **recorded helper runs**, never on elapsed time:
 - `requested` if `intended_member` is set and differs from `committed.member`;
 - else `served` if `served.generation ≥ committed.generation`;
@@ -387,7 +390,9 @@ fail to parse as a row; it now filters explicitly to `*.json` entries whose stem
    mode, else `~/.claude/projects`). Exactly one → conv; 0 → `no conversation found for the session`;
    > 1 → `<n> conversations match; pass --conversation <id>`.
 4. `cwd` = `row.cwd` must be a dir. The CLI never sees or sends the claude args.
-5. Confirm (§2.1). Write `<sid>.relaunch` (atomic 0600).
+5. Confirm (§2.1). Write a durable staging file and publish `<sid>.relaunch` exclusively
+   (hard link or no-replace rename; exclusive-create copy if neither is available). A competing
+   `.taken` appearing during publish withdraws this request.
 6. Wait ≤ 30 s for `.relaunch.result`: `refused` → reason, exit 1; unclaimed → rename to `.relaunch.cancel`
    (success = nobody claimed), `the session did not answer; it is unchanged`, exit 1.
 7. `relaunching` → wait ≤ 60 s for a live row with `relaunched_from == sid` → success line; else exit 1,
@@ -412,12 +417,12 @@ that CC's Bash tool sees none. Before spawning claude, `start::run` saves the te
    [--with-fallback] <target> -- <in-memory claude args minus --resume/-r/--continue/-c and their
    values> --resume <conv>` in `cwd`, with env `TOLLGATE_RELAUNCHED_FROM=<sid>`,
    `TOLLGATE_RELAUNCH_FALLBACK=<orig>` and `TOLLGATE_RELAUNCH_NONCE=<nonce>`. The new process
-   honours these only when `<sid>.relaunch.taken` parses and its `nonce` equals the variable; it then
-   removes `.taken` and records `relaunched_from`. A mismatch or a missing file ignores all three
+   honours these only when `<sid>.relaunch.taken` parses and its `nonce` equals the variable; it
+   removes `.taken` after spawning and records `relaunched_from`. A mismatch or a missing file ignores all three
    (logged).
 6. `exec` error → `exec` the same with `<orig>`. The new process, on any error before the child
    spawns, with a nonce-verified `TOLLGATE_RELAUNCH_FALLBACK`: print the error and `exec` the
-   original form once, without the relaunch variables. Both failing: stderr `tollgate: relaunch failed; resume with: tollgate start <orig> -- --resume <conv>`, exit 1.
+   original form once, retaining `RELAUNCHED_FROM` and `NONCE` but omitting `FALLBACK`. Both failing: stderr `tollgate: relaunch failed; resume with: tollgate start <orig> -- --resume <conv>`, exit 1.
 Guest mode: the new start is a guest start; the passthrough `--resume` seeds the guest store
 (`start.rs:255`).
 
@@ -514,7 +519,7 @@ network.
 `tests/inline/claude.rs`: 34. `the_session_helper_form_parses_to_a_session_target`; 35. `a_session_helper_with_extra_tokens_or_a_bad_sid_is_not_ours`;
 36. `profile_name_from_helper_resolves_a_session_target_through_the_row`. `settings_sync.rs`: 37. `a_session_helper_never_syncs_into_the_base_or_a_sibling`.
 `tests/inline/cli.rs`: 38. `the_session_helper_prints_the_committed_members_key_and_acks_its_generation`; 39. `an_older_generation_never_overwrites_a_newer_ack`;
-40. `a_failed_print_writes_no_ack_but_records_last_failure`; 40a. `a_reaped_row_still_serves_the_last_acked_member` (then the start profile from `CLAUDE_CONFIG_DIR`; a mismatched sid there fails `no_row`); 41. `the_session_helper_takes_no_state_flock_and_calls_no_load_profile` (no `.lock` created; cfg(test) probe);
+40. `a_failed_print_writes_no_ack_but_records_last_failure`; 40a. `a_reaped_row_still_serves_the_last_acked_member` (with its recorded class; config-dir fallback without a class refuses); 41. `the_session_helper_takes_no_state_flock_and_calls_no_load_profile` (no `.lock` created; cfg(test) probe);
 42. `the_helper_flags_conflict_and_one_is_required`.
 `tests/inline/sessions_cli.rs`: 43. `switch_on_a_b_session_prints_committed_then_swapping`; 44. `switch_pre_check_refuses_a_different_class_without_writing_intent`;
 45. `switch_on_a_relaunch_only_session_names_the_reason_and_the_relaunch_command`; 46. `switch_wait_exits_3_when_never_served` (and on `stalled`, naming the code);

@@ -819,6 +819,7 @@ fn a_swapping_session_joins_on_its_served_member_with_its_state() {
             member: Some("or-alt".to_string()),
             served_at_ms: Some(20),
             last_failure: None,
+            launch_class: None,
         },
     );
     let served = answer();

@@ -398,6 +398,7 @@ mod session_form {
                 member: Some("mc-b".to_string()),
                 served_at_ms: Some(crate::usage::now_ms()),
                 last_failure: None,
+                launch_class: None,
             },
         );
         let payload = session_switch_payload("self", "mc-b");
@@ -424,6 +425,7 @@ mod session_form {
                     code: "no_key".to_string(),
                     at_ms: crate::usage::now_ms(),
                 }),
+                launch_class: None,
             },
         );
         let payload = session_switch_payload("4242-0", "mc-b");

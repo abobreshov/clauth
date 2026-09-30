@@ -300,6 +300,7 @@ pub(crate) fn run(
             None => return Err(e),
         },
     };
+    handoff.consume();
     supervise(spawned, name, claude_args, isolation)
 }
 

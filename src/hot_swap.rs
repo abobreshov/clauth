@@ -686,12 +686,17 @@ const GATEWAY_KEYS: &[&str] = &[
 
 /// Whether a settings file carries a `forceLogin*` key.
 pub(crate) fn settings_force_login(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
+        return true;
     };
+    if !value.is_object() {
+        return true;
+    }
     GATEWAY_KEYS.iter().any(|k| value.get(*k).is_some())
 }
 
@@ -804,6 +809,8 @@ pub(crate) struct HelperAck {
     pub(crate) served_at_ms: Option<u64>,
     #[serde(default)]
     pub(crate) last_failure: Option<HelperFailure>,
+    #[serde(default)]
+    pub(crate) launch_class: Option<LaunchClass>,
 }
 
 /// Parse an ack. Torn, foreign (not a regular file) or other-version bytes
@@ -912,25 +919,27 @@ impl SwapView {
             generation: row.key_generation.unwrap_or(0),
             at_ms: row.committed_at,
         };
-        // No successful ack: the launch member at generation 0 is what the
-        // session was built to serve (and, at generation 0, is committed).
-        let served = ack
-            .and_then(|a| {
-                Some(SwapPoint {
-                    member: a.member.clone()?,
-                    generation: a.generation,
-                    at_ms: a.served_at_ms,
-                })
-            })
-            .unwrap_or_else(|| SwapPoint {
+        // Only an absent ack implies the launch member was served at gen 0.
+        // A failure-only ack records that the helper ran but served no key.
+        let served = match ack {
+            Some(a) => a.member.as_ref().map(|member| SwapPoint {
+                member: member.clone(),
+                generation: a.generation,
+                at_ms: a.served_at_ms,
+            }),
+            None => Some(SwapPoint {
                 member: row.start_profile.clone(),
                 generation: 0,
                 at_ms: None,
-            });
+            }),
+        };
         let failure = ack.and_then(|a| a.last_failure.as_ref());
         let (state, stall_code) = if requested.is_some() {
             (SwapState::Requested, None)
-        } else if served.generation >= committed.generation {
+        } else if served
+            .as_ref()
+            .is_some_and(|s| s.generation >= committed.generation)
+        {
             (SwapState::Served, None)
         } else if let Some(f) = failure.filter(|f| f.generation >= committed.generation) {
             (SwapState::Stalled, Some(f.code.clone()))
@@ -947,7 +956,7 @@ impl SwapView {
             requested_member: requested,
             idle: state == SwapState::Swapping && !ran_since,
             committed: Some(committed),
-            served: Some(served),
+            served,
             state,
             stall_code,
         }
@@ -1093,18 +1102,24 @@ fn helper_target(sid: &str) -> Result<(String, u64, Option<LaunchClass>), &'stat
         if row.executor() != Executor::ApiKey {
             return Ok((row.start_profile, 0, None));
         }
-        let class = row.launch_class.clone();
+        let class = row.launch_class.clone().ok_or("class_missing")?;
         let member = row.current_member.unwrap_or(row.start_profile);
-        return Ok((member, row.key_generation.unwrap_or(0), class));
+        return Ok((member, row.key_generation.unwrap_or(0), Some(class)));
     }
     if let Some(ack) = crate::live_sessions::read_helper_ack(sid)
         && let Some(member) = ack.member
     {
-        return Ok((member, ack.generation, None));
+        return Ok((
+            member,
+            ack.generation,
+            Some(ack.launch_class.ok_or("class_missing")?),
+        ));
     }
-    start_profile_of_config_dir(sid)
-        .map(|start| (start, 0, None))
-        .ok_or("no_row")
+    Err(if start_profile_of_config_dir(sid).is_some() {
+        "class_missing"
+    } else {
+        "no_row"
+    })
 }
 
 /// The `<start>` of a `CLAUDE_CONFIG_DIR` that is exactly
@@ -1179,8 +1194,16 @@ fn helper_key(member: &str, class: Option<&LaunchClass>) -> Result<String, &'sta
 
 /// What one helper run did, for the ack.
 enum RunOutcome {
-    Served { member: String, generation: u64 },
-    Failed { generation: u64, code: &'static str },
+    Served {
+        member: String,
+        generation: u64,
+        class: Option<LaunchClass>,
+    },
+    Failed {
+        generation: u64,
+        code: &'static str,
+        class: Option<LaunchClass>,
+    },
 }
 
 /// `tollgate __tollgate-api-key --session <sid>`: print the committed
@@ -1194,16 +1217,26 @@ pub(crate) fn run_session_helper(sid: &str, out: &mut dyn std::io::Write) -> Res
         Err(code) => RunOutcome::Failed {
             generation: 0,
             code,
+            class: None,
         },
         Ok((member, generation, class)) => match helper_key(&member, class.as_ref()) {
-            Err(code) => RunOutcome::Failed { generation, code },
+            Err(code) => RunOutcome::Failed {
+                generation,
+                code,
+                class,
+            },
             Ok(key) => {
                 let printed = out.write_all(key.as_bytes()).and_then(|()| out.flush());
                 match printed {
-                    Ok(()) => RunOutcome::Served { member, generation },
+                    Ok(()) => RunOutcome::Served {
+                        member,
+                        generation,
+                        class,
+                    },
                     Err(_) => RunOutcome::Failed {
                         generation,
                         code: "stdout_write",
+                        class,
                     },
                 }
             }
@@ -1252,11 +1285,16 @@ fn record_run(sid: &str, outcome: &RunOutcome) {
     let existing = read_helper_ack_at(&ack_path);
     let now = crate::usage::now_ms();
     let next = match outcome {
-        RunOutcome::Served { member, generation } => {
+        RunOutcome::Served {
+            member,
+            generation,
+            class,
+        } => {
             let generation = *generation;
             let current = existing.as_ref().is_some_and(|a| {
                 a.generation >= generation
                     && a.member.is_some()
+                    && a.launch_class == *class
                     && a.last_failure
                         .as_ref()
                         .is_none_or(|f| f.generation > generation)
@@ -1270,6 +1308,7 @@ fn record_run(sid: &str, outcome: &RunOutcome) {
                     member: None,
                     served_at_ms: None,
                     last_failure: None,
+                    launch_class: None,
                 });
                 // The success fields never regress: an N-1 run finishing
                 // after N leaves N's standing.
@@ -1277,6 +1316,7 @@ fn record_run(sid: &str, outcome: &RunOutcome) {
                     ack.generation = generation;
                     ack.member = Some(member.clone());
                     ack.served_at_ms = Some(now);
+                    ack.launch_class = class.clone();
                 }
                 if ack
                     .last_failure
@@ -1288,13 +1328,18 @@ fn record_run(sid: &str, outcome: &RunOutcome) {
                 Some(ack)
             }
         }
-        RunOutcome::Failed { generation, code } => {
+        RunOutcome::Failed {
+            generation,
+            code,
+            class,
+        } => {
             let mut ack = existing.clone().unwrap_or(HelperAck {
                 version: 1,
                 generation: 0,
                 member: None,
                 served_at_ms: None,
                 last_failure: None,
+                launch_class: None,
             });
             let newer_standing = ack
                 .last_failure
@@ -1308,6 +1353,9 @@ fn record_run(sid: &str, outcome: &RunOutcome) {
                     code: (*code).to_string(),
                     at_ms: now,
                 });
+                if ack.launch_class.is_none() {
+                    ack.launch_class = class.clone();
+                }
                 Some(ack)
             }
         }
