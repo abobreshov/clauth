@@ -1116,7 +1116,9 @@ pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
     if let Err(e) = crate::usage::hermes_local::refresh(name, Some(&launch.install.version)) {
         logline!("tollgate: hermes '{name}': usage read at teardown failed: {e:#}");
     }
-    if crate::hermes::post_session_anthropic_rows(
+    if let Some(warning) = crate::hermes::post_session_state_db_skip_warning(&launch.paths.home) {
+        errln!("{warning}");
+    } else if crate::hermes::post_session_anthropic_rows(
         &launch.paths.home,
         run_start,
         std::env::var_os("PATH").as_deref(),
@@ -1139,10 +1141,7 @@ pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
         .and_then(|p| p.symlink_metadata().ok())
         .map(|m| m.file_type().is_symlink());
     if hermes_credentials_changed(creds_before, creds_after) {
-        errln!(
-            "tollgate: WARNING — ~/.claude/.credentials.json changed during this Hermes session \
-             (a regular file appeared or replaced the credentials link)"
-        );
+        errln!("{HERMES_CREDENTIALS_WARNING}");
     }
     drop(marker);
 
@@ -1156,6 +1155,9 @@ pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
 fn hermes_credentials_changed(before: Option<bool>, after: Option<bool>) -> bool {
     matches!(before, None | Some(true)) && after == Some(false)
 }
+
+const HERMES_CREDENTIALS_WARNING: &str = "tollgate: WARNING — ~/.claude/.credentials.json \
+     changed during this Hermes session (a non-symlink path appeared or replaced the credentials link)";
 
 #[cfg(test)]
 #[path = "../tests/inline/start.rs"]

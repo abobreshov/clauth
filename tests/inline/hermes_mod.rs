@@ -200,7 +200,18 @@ fn new_refuses_unsafe_homes_and_install_env_before_hermes_runs() {
             Ok(TEST_KEY.into())
         })
         .unwrap_err();
-        assert!(!err.to_string().is_empty(), "{hazard}");
+        let why = err.to_string();
+        match hazard {
+            "anthropic_key" | "claude_token" => {
+                assert!(why.contains(".env routes to anthropic"), "{hazard}: {why}");
+            }
+            "child_claude" => {
+                assert!(why.contains("holds '.claude'"), "{hazard}: {why}");
+                assert!(fx.calls().is_empty(), "projector ran before G2a");
+            }
+            "hsp_env" => assert!(why.contains("/.env exists; Hermes loads it"), "{why}"),
+            _ => unreachable!(),
+        }
         assert!(fx.hermes_calls().is_empty(), "{hazard}: Hermes ran");
     }
 }
@@ -216,6 +227,63 @@ fn explain_checks_the_child_home() {
     let profile = find_profile("or-main").unwrap();
     let err = preflight_explain("or-main", &profile, &[]).unwrap_err();
     assert!(err.to_string().contains(".claude"), "{err}");
+}
+
+#[test]
+fn explain_names_a_missing_child_home_without_a_fake_entry() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let _fx = fixture(&sb);
+    new_openrouter("or-main");
+    let paths = HermesPaths::for_name("or-main").unwrap();
+    std::fs::remove_dir_all(&paths.child_home).unwrap();
+    let profile = find_profile("or-main").unwrap();
+    let err = preflight_explain("or-main", &profile, &[]).unwrap_err();
+    assert!(err.to_string().contains("child home is missing"), "{err}");
+    assert!(!err.to_string().contains("holds '.'"), "{err}");
+}
+
+#[test]
+fn unresolved_install_prints_complete_auxiliary_pin_hints() {
+    const CHILD: &str = "TOLLGATE_PIN_HINT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let sb = HomeSandbox::new();
+        new_profile(&opts("or-main", Provider::Openrouter), &mut |_| {
+            Ok(TEST_KEY.into())
+        })
+        .unwrap();
+        let _ = sb;
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hermes::tests::unresolved_install_prints_complete_auxiliary_pin_hints",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("tollgate: finish by hand: HOME=").count(),
+        guards::HERMES_AUX_TASKS.len(),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" HERMES_HOME="), "{stderr}");
+    assert!(
+        stderr.contains(" 'hermes' config set auxiliary.vision.provider openrouter"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -694,17 +762,27 @@ fn post_session_check_refuses_symlinked_state_db() {
     std::fs::write(home.join("real.db"), "sentinel").unwrap();
     symlink(home.join("real.db"), home.join("state.db")).unwrap();
     let sqlite = bin.join("sqlite3");
+    let invocation = home.join("sqlite-was-run");
     std::fs::write(
         &sqlite,
-        "#!/bin/sh\necho '[{\"billing_provider\":\"anthropic\"}]'\n",
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\necho '[{{\"billing_provider\":\"anthropic\",\"last_seen\":123}}]'\n",
+            invocation.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&sqlite, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let warning = post_session_state_db_skip_warning(&home).expect("symlink warning");
+    assert!(
+        warning.contains("state.db") && warning.contains("symlink"),
+        "{warning}"
+    );
     assert!(!post_session_anthropic_rows(
         &home,
-        0,
-        Some(bin.as_os_str()),
+        100,
+        Some(bin.as_os_str())
     ));
+    assert!(!invocation.exists(), "sqlite3 followed the symlink");
 }
 
 /// `hermes key` rewrites the one line and the roster fingerprint, and

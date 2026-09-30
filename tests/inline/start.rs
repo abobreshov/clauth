@@ -30,6 +30,8 @@ fn hermes_credentials_warning_catches_a_file_created_from_absence() {
     assert!(hermes_credentials_changed(Some(true), Some(false)));
     assert!(!hermes_credentials_changed(None, None));
     assert!(!hermes_credentials_changed(Some(false), Some(false)));
+    assert!(HERMES_CREDENTIALS_WARNING.contains("non-symlink path"));
+    assert!(!HERMES_CREDENTIALS_WARNING.contains("regular file"));
 }
 
 #[cfg(unix)]

@@ -296,7 +296,12 @@ pub(crate) fn preflight_explain(
     shape_guards(name, &paths)?;
     match home::audit_child_home(&paths.child_home)? {
         home::ChildHomeVerdict::Ok => {}
-        home::ChildHomeVerdict::Missing => return Err(m_child_home(name, &paths, ".")),
+        home::ChildHomeVerdict::Missing => {
+            return Err(refuse(format!(
+                "tollgate: hermes '{name}': child home is missing at {}; 'tollgate start {name}' can backfill it",
+                paths.child_home.display()
+            )));
+        }
         home::ChildHomeVerdict::Foreign(entry) => {
             return Err(m_child_home(name, &paths, &entry));
         }
@@ -411,6 +416,9 @@ fn g2a_child_home(name: &str, paths: &HermesPaths, _rotation: &RotationGuard) ->
 fn audit_config_set_boundary(name: &str, paths: &HermesPaths, install: &Install) -> Result<()> {
     shape_guards(name, paths)?;
     guards::g6_hsp_env(name, &install.hsp)?;
+    let rotation = RotationGuard::acquire_with_timeout(&ProfileName::from(name), ROTATION_WAIT)?;
+    g2a_child_home(name, paths, &rotation)?;
+    drop(rotation);
     let dynamic = guards::plugin_env_vars(&guards::plugin_roots(&install.hsp, &paths.home));
     let command = child_command(&install.python, paths, &dynamic, &active_claude_env_keys());
     let projection =
@@ -669,6 +677,9 @@ fn pin_auxiliary(name: &str, paths: &HermesPaths, provider: Provider) -> Result<
                 "tollgate: the auxiliary providers are not pinned yet; 'tollgate start {name}' \
                  refuses until they are"
             );
+            for task in guards::HERMES_AUX_TASKS {
+                hint("hermes", task);
+            }
             return Ok(());
         }
     };
@@ -940,6 +951,24 @@ const SQLITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const ANTHROPIC_SESSION_WARNING: &str = "tollgate: WARNING — this Hermes session \
      called Anthropic (the in-session /model picker); it had no Claude credentials to use, but \
      check the session";
+
+/// Explain why the post-session Anthropic evidence check skipped a db node
+/// that must never be opened through a link or a special file.
+pub(crate) fn post_session_state_db_skip_warning(home: &Path) -> Option<String> {
+    let db = home.join("state.db");
+    let meta = db.symlink_metadata().ok()?;
+    let kind = if meta.file_type().is_symlink() {
+        "a symlink"
+    } else if !meta.is_file() {
+        "not a regular file"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "tollgate: WARNING — skipped Hermes state.db at {} because it is {kind}; Anthropic session evidence is unavailable",
+        db.display()
+    ))
+}
 
 /// §4.4 step 6.2: whether `<home>/state.db` holds a `session_model_usage`
 /// row billed to anthropic whose `last_seen` is at or after `run_start_secs`.

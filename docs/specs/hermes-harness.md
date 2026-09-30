@@ -163,12 +163,11 @@ tollgate never takes Hermes' `auth.lock` (`hermes_cli/auth.py:983-985`).
    - `--no-key`: `tollgate hermes key {n}`
 7. Pin the auxiliary providers (defence in depth for G10a). Resolve the entrypoint (§4.5), then for every task in
    `HERMES_AUX_TASKS` run `<hermes> config set auxiliary.<task>.provider <provider>` with the §4.4 step 4 env
-   (child `HOME` included), stdin null, 10 s each, no lock held. Before each entrypoint run, audit G2a, G6, G11,
-   and G12 through P; an unsafe leftover child home or `.env` refuses without starting Hermes. `HERMES_AUX_TASKS` is the pinned list of the 15
+   (child `HOME` included), stdin null, 10 s each, no lock held. Before each entrypoint run, audit G2a before P starts its Python child, then recheck G2a and run G11 and G12 after P; G6 runs before P. An unsafe leftover child home or `.env` refuses without starting a child. `HERMES_AUX_TASKS` is the pinned list of the 15
    task keys of 0.19.0's default config (`hermes_cli/config.py:1621-1800`: `vision`, `web_extract`,
    `compression`, `skills_hub`, `approval`, `mcp`, `title_generation`, `memory_query_rewrite`, `tts_audio_tags`,
    `triage_specifier`, `kanban_decomposer`, `profile_describer`, `goal_judge`, `curator`, `monitor`). A failure
-   prints the exact command to finish by hand with `HOME=` and `HERMES_HOME=` prefixes; the next `start` refuses (M-AUX) until it is done.
+   prints a command to finish by hand with `HOME=` and `HERMES_HOME=` prefixes (using `hermes` on PATH when the entrypoint cannot be resolved); the next `start` refuses (M-AUX) until it is done.
 8. H2h (herdr). Outside guest mode, and when `herdr` is on PATH, run `HERMES_HOME=<home> herdr integration install hermes` once; a failure is a warning. In guest mode, print the command instead (§9 D-H11).
 
 ### 4.2 The `.env` writer (`key`, `new`, and the normalisation at launch)
@@ -284,7 +283,7 @@ Guards run in this order and stop at the first refusal:
    - `--isolated` refuses with `--isolated is not available on a Hermes profile: the home is the account`;
    - `--with-fallback` refuses with `… Hermes fails over inside its own pool; there is no tollgate chain`;
    - `--auto` never picks a hermes profile.
-   `--explain` prints the pick line and stops. It runs after G1–G6 and a read-only G2a check, before the projector.
+   `--explain` prints the pick line and stops. It runs after G1–G6 and a read-only G2a check, before the projector. A missing child home is named as missing, not as a foreign entry.
 2. **Before any lock**: G1–G6 and G15 (entrypoint resolution and the version read, §4.5), then P. Record the
    `(ino, len, mtime_ns)` of `<home>/config.yaml`, `<home>/.env`, `<home>/.op.env` and `<home>/auth.json`
    (absent is a value) as they were when P read them. Then `RotationGuard(name)` [100]: re-stat the four files,
@@ -312,8 +311,8 @@ Guards run in this order and stop at the first refusal:
 5. Record `run_start`. Spawn under `SignalWatcher` / `wait_for_child` (`start.rs:488`).
 6. Teardown, in order:
    1. Refresh the usage cache (§4.6), best effort.
-   2. The post-session anthropic evidence check reads `state.db` only when `symlink_metadata` shows a regular file. When a `session_model_usage` row with `billing_provider` normalising to anthropic has `last_seen ≥ run_start`, print `tollgate: WARNING — this Hermes session called Anthropic (the in-session /model picker); it had no Claude credentials to use, but check the session` and a `logline!`. The check is evidence, not proof: auxiliary calls need not land in `session_model_usage` (G10a).
-   3. Audit `<child-home>` as G2a does, and warn naming any new entry (a `.claude/` Hermes created, say). Also compare the `symlink_metadata` of the operator's `~/.claude/.credentials.json` from before and after the session. A regular file that appears from absence or replaces a symlink warns.
+   2. The post-session anthropic evidence check reads `state.db` only when `symlink_metadata` shows a regular file; a symlink or other non-regular node is skipped with a warning that Anthropic session evidence is unavailable. When a `session_model_usage` row with `billing_provider` normalising to anthropic has `last_seen ≥ run_start`, print `tollgate: WARNING — this Hermes session called Anthropic (the in-session /model picker); it had no Claude credentials to use, but check the session` and a `logline!`. The check is evidence, not proof: auxiliary calls need not land in `session_model_usage` (G10a).
+   3. Audit `<child-home>` as G2a does, and warn naming any new entry (a `.claude/` Hermes created, say). Also compare the `symlink_metadata` of the operator's `~/.claude/.credentials.json` from before and after the session. A non-symlink path that appears from absence or replaces a symlink warns.
    4. Drop the marker and unregister the row.
    5. Exit with the child's code.
 

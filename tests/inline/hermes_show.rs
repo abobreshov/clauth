@@ -301,7 +301,15 @@ fn strategy_refuses_unsafe_homes_and_install_env_before_hermes_runs() {
             _ => unreachable!(),
         }
         let err = pool_strategy("pool-a", "round_robin").unwrap_err();
-        assert!(!err.to_string().is_empty(), "{hazard}");
+        let why = err.to_string();
+        match hazard {
+            "anthropic_key" | "claude_token" => {
+                assert!(why.contains(".env routes to anthropic"), "{hazard}: {why}");
+            }
+            "child_claude" => assert!(why.contains("holds '.claude'"), "{why}"),
+            "hsp_env" => assert!(why.contains("/.env exists; Hermes loads it"), "{why}"),
+            _ => unreachable!(),
+        }
         assert!(fx.hermes_calls().is_empty(), "{hazard}: Hermes ran");
     }
 }
