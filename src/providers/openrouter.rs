@@ -557,13 +557,20 @@ impl WalletHolds {
     }
 
     /// The persisted deadline for `fingerprint`, when one is in force at
-    /// `now_ms`. An expired file is removed (see [`Self::remove_if_expired`]);
-    /// an unreadable one reads as none. When that removal is refused because
-    /// another process renewed the hold after the unlocked read, the renewed
-    /// deadline is read back and honoured rather than reported as no hold.
+    /// `now_ms`. A skewed deadline is rewritten under its flock; an expired
+    /// file is removed (see [`Self::remove_if_expired`]). When a concurrent
+    /// write changes either deadline after the unlocked read, the current
+    /// value is checked under the lock before changing the file.
     fn persisted_until(fingerprint: &[u8; 32], now_ms: u64) -> Option<u64> {
         let path = Self::hold_path(fingerprint)?;
         let until = Self::read_until(&path)?;
+        let cap_ms = u64::try_from(Self::cap().as_millis()).unwrap_or(u64::MAX);
+        let cap_until = now_ms.saturating_add(cap_ms);
+        let until = if until > cap_until {
+            Self::clamp_skewed(&path, until, cap_until)
+        } else {
+            until
+        };
         if until > now_ms {
             return Some(until);
         }
@@ -571,6 +578,33 @@ impl WalletHolds {
             return None;
         }
         Self::read_until(&path).filter(|&t| t > now_ms)
+    }
+
+    fn clamp_skewed(path: &std::path::Path, seen_until: u64, cap_until: u64) -> u64 {
+        let Some(_lock) = Self::lock_hold(path) else {
+            return seen_until;
+        };
+        let Some(current) = Self::read_until(path) else {
+            return seen_until;
+        };
+        if current <= cap_until {
+            return current;
+        }
+        let hold = PersistedWalletHold {
+            version: WALLET_HOLD_VERSION,
+            until_ms: cap_until,
+        };
+        let written = serde_json::to_vec(&hold)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::profile::atomic_write_600(path, bytes));
+        if let Err(error) = written {
+            crate::logline::logline!(
+                "tollgate openrouter: failed to clamp wallet hold {}: {error}",
+                path.display()
+            );
+            return current;
+        }
+        cap_until
     }
 
     /// Remove `fingerprint`'s hold file, under its flock, only when it still

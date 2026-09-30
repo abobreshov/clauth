@@ -539,7 +539,10 @@ pub(crate) fn build_profile_entries(
                     Some((crate::claude::SidecarKind::Rolling, _))
                 ),
                 provider: provider_label(p),
-                base_url: p.base_url.clone(),
+                base_url: p
+                    .base_url
+                    .as_deref()
+                    .map(crate::local_api::routes::redact_endpoint),
                 tier: tier_label(p),
                 harness: "claude".to_string(),
                 has_live_session: crate::runtime::has_live_session(name),

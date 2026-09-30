@@ -1601,7 +1601,7 @@ impl Drop for SupervisorThread {
 /// must keep surviving it rather than have the watcher turn it into a death.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn inherited_ignored(signal: libc::c_int) -> bool {
+pub(crate) fn inherited_ignored(signal: libc::c_int) -> bool {
     // SAFETY: `signal` is one of `SIGTERM`/`SIGINT`/`SIGHUP`; a null `act`
     // asks the kernel to fill `old` with the current disposition and install
     // nothing. `old` is an owned, zeroed `sigaction`.
@@ -1618,8 +1618,14 @@ fn inherited_ignored(signal: libc::c_int) -> bool {
 /// Returns the supervisor back when no watcher could take it; the caller
 /// keeps it alive for the process's life either way.
 #[cfg(unix)]
-pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorThread> {
+pub(crate) fn stop_on_signal(
+    supervisor: Option<SupervisorThread>,
+    local_api: Option<Arc<crate::local_api::Server>>,
+) -> Option<SupervisorThread> {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    if supervisor.is_none() && local_api.is_none() {
+        return None;
+    }
     // Watch only the signals this daemon did not inherit as ignored (nohup, a
     // non-interactive shell's `&`): signal-hook installs its handler over an
     // inherited SIG_IGN without chaining it, so watching an ignored signal
@@ -1629,7 +1635,7 @@ pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorT
         .filter(|signal| !inherited_ignored(*signal))
         .collect();
     if watched.is_empty() {
-        return Some(supervisor);
+        return supervisor;
     }
     let mut signals = match signal_hook::iterator::Signals::new(watched) {
         Ok(signals) => signals,
@@ -1637,7 +1643,7 @@ pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorT
             logline!(
                 "tollgate daemon: cannot catch the stop signals ({e}); the shunt gateway outlives this daemon, and the next start stops it"
             );
-            return Some(supervisor);
+            return supervisor;
         }
     };
     let spawned = std::thread::Builder::new()
@@ -1646,7 +1652,12 @@ pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorT
             let Some(signal) = signals.forever().next() else {
                 return;
             };
-            supervisor.shutdown(DAEMON_STOP_BUDGET);
+            if let Some(supervisor) = supervisor {
+                supervisor.shutdown(DAEMON_STOP_BUDGET);
+            }
+            if let Some(local_api) = local_api {
+                local_api.cleanup_socket();
+            }
             if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
                 logline!("tollgate daemon: cannot re-raise signal {signal}: {e}");
             }
@@ -1665,8 +1676,11 @@ pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorT
 /// orphan and stops it there ([`Supervisor::reclaim`]), or the TUI's
 /// `stop daemon` does once no daemon is left ([`stop_left_behind_gateway`]).
 #[cfg(not(unix))]
-pub(crate) fn stop_on_signal(supervisor: SupervisorThread) -> Option<SupervisorThread> {
-    Some(supervisor)
+pub(crate) fn stop_on_signal(
+    supervisor: Option<SupervisorThread>,
+    _local_api: Option<Arc<crate::local_api::Server>>,
+) -> Option<SupervisorThread> {
+    supervisor
 }
 
 /// A test-only stand-in for a wedged `/health` answerer: when armed, the next

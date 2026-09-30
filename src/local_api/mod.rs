@@ -273,11 +273,51 @@ pub(crate) struct StartOpts {
     pub(crate) status_path: PathBuf,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    path: (u64, u64),
+    listener: (u64, u64),
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn listener_identity(listener: &std::os::unix::net::UnixListener) -> std::io::Result<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(listener.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
+#[cfg(unix)]
+fn socket_path_matches(path: &Path, identity: (u64, u64)) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    path.symlink_metadata().is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
+    })
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn stop_unix_accept(listener: &std::os::unix::net::UnixListener) {
+    use std::os::fd::AsRawFd;
+
+    let _ = unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RD) };
+}
+
 /// A running API. Dropping it stops accepting (connections in flight finish
 /// on their own timeouts) and removes the socket file it created.
 pub(crate) struct Server {
     tcp: Option<SocketAddr>,
     socket: Option<PathBuf>,
+    #[cfg(unix)]
+    socket_identity: Option<SocketIdentity>,
+    #[cfg(unix)]
+    socket_listener: Option<Arc<std::os::unix::net::UnixListener>>,
     socket_error: Option<String>,
     stop: Arc<AtomicBool>,
 }
@@ -297,6 +337,24 @@ impl Server {
     pub(crate) fn socket_error(&self) -> Option<&str> {
         self.socket_error.as_deref()
     }
+
+    #[cfg(unix)]
+    pub(crate) fn cleanup_socket(&self) {
+        self.stop.store(true, Ordering::Release);
+        let (Some(path), Some(identity), Some(listener)) =
+            (&self.socket, self.socket_identity, &self.socket_listener)
+        else {
+            return;
+        };
+        let listener_matches = match listener_identity(listener) {
+            Ok(actual) => actual == identity.listener,
+            Err(_) => true,
+        };
+        if listener_matches && socket_path_matches(path, identity.path) {
+            let _ = std::fs::remove_file(path);
+        }
+        stop_unix_accept(listener);
+    }
 }
 
 impl Drop for Server {
@@ -307,10 +365,7 @@ impl Drop for Server {
             let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
         }
         #[cfg(unix)]
-        if let Some(path) = &self.socket {
-            let _ = std::os::unix::net::UnixStream::connect(path);
-            let _ = std::fs::remove_file(path);
-        }
+        self.cleanup_socket();
     }
 }
 
@@ -350,7 +405,7 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
     let unix_listener = if opts.unix_socket {
         let path = socket_path()?;
         match bind_unix(&path) {
-            Ok(listener) => Some((listener, path)),
+            Ok((listener, identity)) => Some((listener, path, identity)),
             Err(e) if tcp_listener.is_some() => {
                 socket_error = Some(format!("{e:#}"));
                 None
@@ -365,6 +420,10 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
     let mut server = Server {
         tcp: None,
         socket: None,
+        #[cfg(unix)]
+        socket_identity: None,
+        #[cfg(unix)]
+        socket_listener: None,
         socket_error,
         stop: Arc::clone(&stop),
     };
@@ -377,9 +436,12 @@ pub(crate) fn start(opts: StartOpts) -> Result<Server> {
             .context("failed to spawn the local API accept thread")?;
     }
     #[cfg(unix)]
-    if let Some((listener, path)) = unix_listener {
+    if let Some((listener, path, identity)) = unix_listener {
         // Recorded before the spawn so a failed spawn's drop removes the node.
         server.socket = Some(path);
+        server.socket_identity = Some(identity);
+        let listener = Arc::new(listener);
+        server.socket_listener = Some(Arc::clone(&listener));
         let (ctx, stop) = (Arc::clone(&ctx), Arc::clone(&stop));
         std::thread::Builder::new()
             .name("tollgate-local-api-unix".into())
@@ -443,8 +505,8 @@ pub(crate) fn secure_socket_dir(dir: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn bind_unix(path: &Path) -> Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
+fn bind_unix(path: &Path) -> Result<(std::os::unix::net::UnixListener, SocketIdentity)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     let dir = path.parent().context("the socket path has no parent")?;
@@ -463,11 +525,45 @@ fn bind_unix(path: &Path) -> Result<std::os::unix::net::UnixListener> {
     }
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind the local API socket {}", path.display()))?;
-    // The data dir is verified 0700 and ours above; this keeps the node itself
-    // owner-only too.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to restrict {}", path.display()))?;
-    Ok(listener)
+    let mut path_identity = None;
+    let prepared = (|| {
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("failed to inspect bound socket {}", path.display()))?;
+        let identity = (metadata.dev(), metadata.ino());
+        path_identity = Some(identity);
+        if !metadata.file_type().is_socket() {
+            bail!("{} is no longer the bound socket", path.display());
+        }
+        if !socket_path_matches(path, identity) {
+            bail!("{} changed while binding the socket", path.display());
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict {}", path.display()))?;
+        let listener_identity = listener_identity(&listener)
+            .with_context(|| format!("failed to inspect bound listener for {}", path.display()))?;
+        if !socket_path_matches(path, identity) {
+            bail!("{} changed while binding the socket", path.display());
+        }
+        Ok(SocketIdentity {
+            path: identity,
+            listener: listener_identity,
+        })
+    })();
+    match prepared {
+        Ok(identity) => Ok((listener, identity)),
+        Err(error) => {
+            // Failed lstat gives no identity: NotFound leaves nothing to remove;
+            // any other error leaves the node for the next bind's stale-socket
+            // check rather than risking removal of an unidentified replacement.
+            if let Some(identity) = path_identity
+                && socket_path_matches(path, identity)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(error)
+        }
+    }
 }
 
 fn accept_tcp(listener: &TcpListener, ctx: &Arc<routes::Ctx>, stop: &AtomicBool) {
@@ -651,8 +747,25 @@ fn status_path() -> Result<PathBuf> {
     Ok(crate::profile::tollgate_dir()?.join(crate::daemon::STATUS_FILE))
 }
 
-/// `tollgate api serve [--listen ADDR]`: serve in the foreground until killed.
+/// `tollgate api serve [--listen ADDR]`: serve until a stop signal.
 pub(crate) fn cmd_serve(listen: Option<String>) -> Result<()> {
+    #[cfg(unix)]
+    let watched: Vec<_> = [
+        signal_hook::consts::signal::SIGINT,
+        signal_hook::consts::signal::SIGTERM,
+    ]
+    .into_iter()
+    .filter(|signal| !crate::daemon::gateway::inherited_ignored(*signal))
+    .collect();
+    #[cfg(unix)]
+    let mut signals = if watched.is_empty() {
+        None
+    } else {
+        Some(
+            signal_hook::iterator::Signals::new(watched)
+                .context("failed to install local API stop signals")?,
+        )
+    };
     let raw = listen.unwrap_or_else(|| saved_settings().listen);
     let addr = parse_listen(&raw)?;
     let server = start(StartOpts {
@@ -665,6 +778,12 @@ pub(crate) fn cmd_serve(listen: Option<String>) -> Result<()> {
         errln!("tollgate: unix socket not served: {e}");
     }
     outln!("token: {}", token_path()?.display());
+    #[cfg(unix)]
+    if let Some(signals) = signals.as_mut() {
+        let _ = signals.forever().next();
+        drop(server);
+        return Ok(());
+    }
     loop {
         std::thread::park();
     }

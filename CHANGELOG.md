@@ -49,6 +49,12 @@
 - The MCP `switch_profile` tool refuses a Hermes name with the relaunch hint.
 - CI runs the `needs sqlite3` tests in a job that installs it, and a `hermes_projector_real` job runs the real projector against the PyYAML and python-dotenv versions Hermes 0.19.0 pins. The fixtures include anchors, `<<:` merge keys hiding a route, and every dotenv form.
 
+### Fixed
+
+- `list` and `status --json` redact credentials in profile `base_url` values, matching the local agent API.
+- The local API removes its socket on SIGINT/SIGTERM and leaves a socket another server rebound untouched.
+- Reading a skewed persisted OpenRouter wallet hold rewrites its deadline to the retry cap, so `/credits` resumes after the cap.
+
 ### Guest mode
 
 - The Plugin tab's Claude Code plugin install and `mcpServers` wiring, `tollgate herdr install` / `uninstall` and the Plugin tab's herdr config fix now run in guest mode instead of refusing. They add, change or remove only tollgate's own entries: `tollgate@tollgate` in the plugin registry and `enabledPlugins`, the `tollgate` marketplace declaration in `settings.json`'s `extraKnownMarketplaces`, `mcpServers.tollgate` in `~/.claude.json`, the herdr plugin `tollgate` and the herdr config blocks under tollgate's marker (the keybinding conflict check still applies).
@@ -141,7 +147,5 @@ The pre-release review and how each finding was settled: [docs/tollgate-code-rev
 - **Old credential links survive guest mode.** A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before `~/.clauth` appeared is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - **Guest sessions still link the operator's read-mostly `~/.claude` content.** `CLAUDE.md`, `commands/`, `agents/`, `skills/`, `hooks/`, `output-styles/` and `keybindings.json` stay linked under real links, so an edit the session is asked to make there (a `#` memory note, `/agents`) lands in `~/.claude`. A passthrough `--continue` is not seeded into the guest store.
 - **macOS guest Keychain guard not built on macOS yet.** The default-item refusal is tested on Linux through its predicate; `keychain.rs` itself has not been compiled for macOS since the change. Nor have the macOS- and Windows-only helper spawns that now scrub monitoring keys; their command builders are compiled and tested on Linux.
-- **`list` and `status --json` show `base_url` unredacted.** `usage --json` and the agent API redact it.
-- **`tollgate api serve` leaves `api.sock` behind on SIGTERM.** The next start replaces the stale socket.
 - **herdr `--display-agent` scope unverified.** Whether the `border label` knob's label is scoped to one pane is not verified against herdr 0.9.
 - **Self-update is disabled.** There is no fork-signed release or updater yet; upgrade by reinstalling from source. `tollgate herdr install` has no release to fetch until one is published.
