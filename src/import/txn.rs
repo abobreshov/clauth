@@ -839,6 +839,8 @@ pub(crate) fn plan(s: &Survey) -> Result<Plan> {
             let store = p.upstream_profile(profile).join("credentials.json");
             let dst = dst_dir.join("credentials.json");
             let store_ino = fsops::lmeta(&store).map(|m| m.ino);
+            let quarantine =
+                (*adopt && store_ino.is_some()).then(|| quarantine_path(&dst, ADOPT_QUARANTINE));
             pl.push(
                 Op::Capture,
                 Some(slot.clone()),
@@ -853,8 +855,10 @@ pub(crate) fn plan(s: &Survey) -> Result<Plan> {
                 },
                 Facts {
                     temp: Some(slots::temp_for(&slot)),
-                    quarantine: (*adopt && store_ino.is_some())
-                        .then(|| quarantine_path(&dst, ADOPT_QUARANTINE)),
+                    quarantine_dir_created: quarantine
+                        .as_deref()
+                        .map(|q| quarantine_dir_created(s, q)),
+                    quarantine,
                     ..Facts::default()
                 },
             );
@@ -1042,6 +1046,10 @@ fn plan_carrier(pl: &mut Planner<'_>, profile: &str, item: &super::inventory::It
             // The live copy carries what the long-lived token does not (its
             // `mcpOAuth`, any refresh token): kept, never unlinked.
             after.quarantine = Some(quarantine_path(&dst, LIVE_QUARANTINE));
+            after.quarantine_dir_created = after
+                .quarantine
+                .as_deref()
+                .map(|q| quarantine_dir_created(s, q));
             after.temp = Some(slots::temp_for(&slot));
             prior.link = Some(slot);
         }
@@ -1518,6 +1526,13 @@ pub(crate) fn quarantine_path(store: &Path, name: &str) -> PathBuf {
     fsops::parent(store).join("quarantine").join(name)
 }
 
+fn quarantine_dir_created(s: &Survey, q: &Path) -> bool {
+    !s.inv
+        .items
+        .iter()
+        .any(|item| item.action == Action::Move && item.dst.as_deref() == Some(fsops::parent(q)))
+}
+
 /// Rename `from` into the quarantine path `to` (its dir made 0700), refusing
 /// to overwrite anything already there.
 pub(crate) fn park(from: &Path, to: &Path) -> Result<()> {
@@ -1734,7 +1749,7 @@ pub(crate) fn revert(e: &Entry, paths: &Paths, warnings: &mut Vec<Finding>) -> R
                 // The discarded live copy (at the temp path after a crash, or
                 // in the profile's quarantine): put it back byte-identical.
                 fsops::rename(from, link)?;
-                if Some(from) == quarantined {
+                if Some(from) == quarantined && e.after.quarantine_dir_created == Some(true) {
                     let _ = std::fs::remove_dir(fsops::parent(from));
                 }
             } else {
@@ -1760,23 +1775,29 @@ pub(crate) fn revert(e: &Entry, paths: &Paths, warnings: &mut Vec<Finding>) -> R
                     && fsops::lmeta(dst_of(e)?).is_none()
                 {
                     fsops::rename(q, dst_of(e)?)?;
-                    let _ = std::fs::remove_dir(fsops::parent(q));
+                    if e.after.quarantine_dir_created == Some(true) {
+                        let _ = std::fs::remove_dir(fsops::parent(q));
+                    }
                 }
                 return Ok(());
             }
             if let Some(q) = parked {
-                // `--adopt-live`: the captured login (or tollgate's rotation
-                // of it) goes back to being the regular slot, and the
-                // superseded store returns to `dst` for its move back — the
-                // prior shape, byte for byte when nothing rotated.
+                // An immediate undo can put the captured inode back on the
+                // slot. After a refresh or a rollback slot adoption, `dst`
+                // holds the current chain and must be moved home as-is.
                 let dst = dst_of(e)?;
-                let slot_is_link = fsops::lmeta(link).is_none_or(|m| m.is_symlink);
-                if slot_is_link && fsops::lmeta(dst).is_some_and(|m| m.is_file) {
+                let slot_is_link_or_missing = fsops::lmeta(link).is_none_or(|m| m.is_symlink);
+                if slot_is_link_or_missing && regular_ino(dst, live) {
                     fsops::remove_if_present(temp)?;
                     fsops::rename(dst, link)?;
                     fsops::rename(q, dst)?;
-                    let _ = std::fs::remove_dir(fsops::parent(q));
+                    if e.after.quarantine_dir_created == Some(true) {
+                        let _ = std::fs::remove_dir(fsops::parent(q));
+                    }
                     return fsops::sync_dirs(&[fsops::parent(link), fsops::parent(dst)]);
+                }
+                if fsops::lmeta(link).is_some_and(|m| m.is_symlink) {
+                    fsops::repoint_link(link, orig, temp)?;
                 }
                 warnings.push(
                     Finding::new(

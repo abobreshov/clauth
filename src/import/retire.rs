@@ -225,7 +225,7 @@ fn r1(j: &mut Journal, paths: &Paths, out: &mut Retired) -> Result<()> {
             );
             continue;
         }
-        let (prior, after) = edits::rewrite_facts(&doc, &ptr, None, Step::R1.as_str());
+        let (prior, after) = edits::rewrite_facts(&doc, &ptr, None, Step::R1.as_str())?;
         let e = entry(j, Op::RewriteJson, Some(file), prior, after, Step::R1);
         journaled(j, paths, e, |e| edits::apply_json(e))?;
         removed += 1;

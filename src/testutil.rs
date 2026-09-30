@@ -2540,6 +2540,7 @@ case "$1 $2" in
   "plugin config-dir") printf '%s/%s\n' '{cfg}' "$3" ;;
   "plugin uninstall") rm -f "$state/$3" ;;
   "plugin install")
+    env | cut -d= -f1 | sort > '{install_env}'
     if [ -f "$state/offline" ]; then echo "network unreachable" >&2; exit 1; fi
     cp "$state/clauth.orig" "$state/clauth" ;;
 esac
@@ -2547,6 +2548,7 @@ exit 0"#,
             state = state.display(),
             log = log.display(),
             cfg = cfg_dir.display(),
+            install_env = dir.join("install-env").display(),
         );
         let bin = write_shim(&dir, "herdr", &body);
         FakeHerdr { bin, log, state }

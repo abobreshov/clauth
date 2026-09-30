@@ -439,6 +439,7 @@ fn an_adopted_slot_keeps_the_superseded_store_and_rolls_back_byte_identical() {
         .find(|e| e.op == Op::Capture)
         .expect("capture");
     assert_eq!(capture.after.quarantine.as_deref(), Some(q.as_path()));
+    assert_eq!(capture.after.quarantine_dir_created, Some(true));
     rollback(&Options::default()).expect("rolls back");
     let meta = std::fs::symlink_metadata(slot(&env)).expect("slot");
     assert!(meta.file_type().is_file(), "the slot is regular again");
@@ -447,6 +448,163 @@ fn an_adopted_slot_keeps_the_superseded_store_and_rolls_back_byte_identical() {
     assert_eq!(ino(&store), store_ino);
     assert_eq!(std::fs::read(&store).expect("store"), store_bytes);
     assert!(!env.p(".tollgate/profiles/a").exists());
+}
+
+#[test]
+fn adopted_slot_rotation_returns_the_new_chain_and_keeps_the_superseded_one() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a"], Some("a"))
+        .oauth("a")
+        .live_regular_diverged("a");
+    run(&Options {
+        adopt_live: true,
+        ..Options::default()
+    })
+    .expect("import");
+    let dst = tstore(&env, "a", "credentials.json");
+    let q = tstore(&env, "a", "quarantine/credentials.json.superseded");
+    let superseded = std::fs::read(&q).expect("superseded");
+    let staged = tstore(&env, "a", "credentials.json.refresh");
+    let current = fixture_oauth_body("a", 9);
+    std::fs::write(&staged, &current).expect("new chain");
+    std::fs::rename(&staged, &dst).expect("atomic refresh");
+    let current_ino = ino(&dst);
+
+    let result = rollback(&Options::default()).expect("rollback");
+    let upstream = env.p(".clauth/profiles/a/credentials.json");
+    assert_eq!(ino(&upstream), current_ino, "current chain returns home");
+    assert_eq!(
+        std::fs::read(&upstream).expect("current"),
+        current.as_bytes()
+    );
+    assert_eq!(std::fs::read(&q).expect("superseded"), superseded);
+    assert_eq!(std::fs::read_link(slot(&env)).expect("slot link"), upstream);
+    assert!(result.warnings.iter().any(|w| w.code == "quarantine_kept"));
+}
+
+#[test]
+fn rollback_adopts_a_diverged_regular_slot_with_an_existing_capture_quarantine() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a"], Some("a"))
+        .oauth("a")
+        .live_regular_diverged("a");
+    run(&Options {
+        adopt_live: true,
+        ..Options::default()
+    })
+    .expect("import");
+    let q = tstore(&env, "a", "quarantine/credentials.json.superseded");
+    let original_superseded = std::fs::read(&q).expect("quarantine");
+    let next = fixture_oauth_body("a", 9);
+    regular_slot(&env, &serde_json::from_str(&next).expect("credentials"));
+    let next_ino = ino(&slot(&env));
+
+    rollback(&Options {
+        adopt_live: true,
+        ..Options::default()
+    })
+    .expect("rollback");
+    let upstream = env.p(".clauth/profiles/a/credentials.json");
+    assert_eq!(
+        ino(&upstream),
+        next_ino,
+        "adopted chain returns to the store"
+    );
+    assert_eq!(std::fs::read(&upstream).expect("store"), next.as_bytes());
+    assert_eq!(std::fs::read(&q).expect("quarantine"), original_superseded);
+}
+
+#[test]
+fn rollback_slot_adoption_does_not_put_the_current_chain_under_rollback_superseded() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a"], Some("a"))
+        .oauth("a")
+        .live_regular_diverged("a");
+    run(&Options {
+        adopt_live: true,
+        ..Options::default()
+    })
+    .expect("import");
+    let former_store = tstore(&env, "a", "credentials.json");
+    let former_ino = ino(&former_store);
+    let next = fixture_oauth_body("a", 9);
+    regular_slot(&env, &serde_json::from_str(&next).expect("credentials"));
+    let next_ino = ino(&slot(&env));
+
+    rollback(&Options {
+        adopt_live: true,
+        ..Options::default()
+    })
+    .expect("rollback");
+    assert_eq!(ino(&env.p(".clauth/profiles/a/credentials.json")), next_ino);
+    assert_eq!(
+        ino(&tstore(
+            &env,
+            "a",
+            "quarantine/credentials.json.rollback-superseded"
+        )),
+        former_ino,
+        "only the prior store is parked"
+    );
+}
+
+#[test]
+fn rollback_keeps_an_upstream_empty_quarantine_carrier() {
+    let env = Env::new();
+    env.tree
+        .roster(&["a"], Some("a"))
+        .oauth("a")
+        .live_regular_diverged("a");
+    let upstream_q = env.p(".clauth/profiles/a/quarantine");
+    std::fs::create_dir(&upstream_q).expect("upstream quarantine");
+    let upstream_ino = ino(&upstream_q);
+    run(&Options {
+        adopt_live: true,
+        ..Options::default()
+    })
+    .expect("import");
+    let capture = env
+        .journal()
+        .main
+        .into_iter()
+        .find(|e| e.op == Op::Capture)
+        .expect("capture");
+    assert_eq!(capture.after.quarantine_dir_created, Some(false));
+    rollback(&Options::default()).expect("rollback");
+    assert_eq!(
+        ino(&upstream_q),
+        upstream_ino,
+        "carrier directory returns home"
+    );
+}
+
+#[test]
+fn session_token_relink_preserves_an_upstream_empty_quarantine_carrier() {
+    let env = Env::new();
+    env.tree.roster(&["s"], Some("s")).static_token("s");
+    let live = serde_json::json!({"claudeAiOauth": {
+        "accessToken": fixture_access("s", 9),
+        "refreshToken": "FIXTURE-RT-live-copy",
+    }});
+    regular_slot(&env, &live);
+    let upstream_q = env.p(".clauth/profiles/s/quarantine");
+    std::fs::create_dir(&upstream_q).expect("upstream quarantine");
+    let upstream_ino = ino(&upstream_q);
+    let slot_ino = ino(&slot(&env));
+    run_ok();
+    let relink = env
+        .journal()
+        .main
+        .into_iter()
+        .find(|e| e.op == Op::MoveRelink)
+        .expect("relink");
+    assert_eq!(relink.after.quarantine_dir_created, Some(false));
+    rollback(&Options::default()).expect("rollback");
+    assert_eq!(ino(&upstream_q), upstream_ino);
+    assert_eq!(ino(&slot(&env)), slot_ino);
 }
 
 /// Review lens credentials #4. On a session-token profile the Same regular

@@ -146,6 +146,7 @@ Entry: `{"seq":N,"op":<op>,"src":…,"dst":…,"secret":bool,"prior":{…},"afte
 Ops: `mkdir`, `move` (prior `{ino,dev,mode,nlink:1}`), `move_relink` (store move + live symlink repoint, prior
 adds `{link,link_target}` or `{live_regular:{ino,sha256}}`; `after` holds `{temp}`, the exact
 `~/.claude/.credentials.json.tollgate-import.<pid>` path, so replay removes a leftover temp after a crash), `capture` (live regular file renamed onto a store; prior `{live_ino,store_ino}`),
+`move_relink` and `capture` also record `after.quarantine_dir_created` when they park a login, so undo removes only a directory created by that op;
 `copy` / `copy_secret` (after `{size}`; `copy` also `sha256`), `copy_tree` (after `{created:[names]}`),
 `merge_roster`, `merge_json` (after `{added_keys}`), `rewrite_json` (`{file, pointer, prior_value, new_value}`;
 never for secret-bearing keys), `rewrite_toml` (`{file, key, prior_value, backup}`), `retire_bin`
@@ -307,8 +308,11 @@ Claude `~/.claude/.credentials.json`, classified at M-1 and again at M4:
   the entry's temp path first and into the quarantine last, and a revert renames it back to the slot. A revert
   that finds the slot still the live inode (the store moved, the slot not yet) leaves the slot alone. **Diverged** → blocker `claude_live_diverged` unless `--adopt-live`, which runs
   `capture` on a `credentials.json` source, parking the superseded store in
-  `quarantine/credentials.json.superseded` (`after.quarantine`) instead of unlinking it, so a revert restores the
-  regular slot and the store byte for byte; a slot holding another stored profile's chain refuses
+  `quarantine/credentials.json.superseded` (`after.quarantine`) instead of unlinking it. A revert swaps it back
+  only while the captured inode is still at the destination; after a refresh, the current inode returns to the
+  upstream store and the superseded inode stays quarantined. The journal records whether the capture created
+  `quarantine/`, so undo leaves an upstream carrier directory in place. A slot holding another stored profile's
+  chain refuses
   `live_is_other_profile`, and one older than the store refuses `live_older_than_store`, `--adopt-live` or not; on a `session-token.json` source it refuses
   `live_diverged_on_static_token` (tollgate cannot tell which one the owner wants).
   Unparseable → `live_unclassifiable`. Needs `st_dev(~/.claude) == st_dev(~/.tollgate)` else `cross_device`.
@@ -502,7 +506,7 @@ Part 1 (`import_inventory.rs`, `import_fence.rs`, `import_txn.rs`, `import_slots
 25. `quarantine_and_mcp_logins_move_and_nothing_carrier_shaped_is_copied` · 26. `a_codex_store_lkg_and_quarantine_move_and_each_chain_has_one_inode`
 27. `config_toml_copies_are_0600_and_the_journal_records_only_their_size` · 28. `upstream_originals_of_copied_entries_stay_byte_identical`
 29. `a_symlinked_live_slot_is_repointed_in_the_move_step` · 30. `a_same_regular_live_slot_becomes_the_store_then_a_link`
-30a. `a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured` (install source unchanged; the live copy is gone; M8's assert passes)
+30a. `a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured` (install source unchanged; the live copy is quarantined; M8's assert passes)
 31. `a_diverged_regular_live_slot_refuses_without_adopt_live_and_is_captured_with_it` · 32. `a_detached_duplicate_with_no_active_profile_is_relinked_to_its_store`
 33. `an_independent_or_missing_live_slot_is_untouched` · 34. `a_live_link_to_a_non_carrier_is_refused`
 35. `a_codex_symlink_slot_moves_and_repoints_under_its_rotation_lock`
@@ -534,7 +538,7 @@ Part 2 (`import_edits.rs`, `import_retire.rs`, `tests/import_cli.rs`, existing s
     slot shapes; `~/.claude`, `~/.claude.json`, `~/.codex`, herdr `config.toml`, `installed_plugins.json`,
     `.bashrc`). Byte identity of the slot itself holds for the **symlink** slot only: a Same regular slot is
     captured (I4) and comes back as a link to its restored store, which then sits on the slot's old inode. An
-    `--adopt-live` capture restores the regular slot byte for byte (tests in `import_slots.rs`). herdr's `plugins.json`, `.plugins.lock` and `plugins/` are **excluded**: herdr rewrites them on
+    `--adopt-live` capture restores the regular slot byte for byte on immediate undo; after rotation the current store goes home and the superseded chain remains quarantined (tests in `import_slots.rs`). herdr's `plugins.json`, `.plugins.lock` and `plugins/` are **excluded**: herdr rewrites them on
     reinstall (install timestamps, a fresh checkout). The test asserts only that the reinstall argv names the
     recorded commit. This is the documented herdr residual.
 
@@ -562,7 +566,7 @@ to Shipped.
 |---|---|---|
 | I1 | Linux only; macOS/Windows → `unsupported_platform` | the macOS default Keychain item is a second live slot this spec does not move |
 | I2 | Binary retire F1 is the **first** `main` step (plan: M8) | a crash anywhere after the first move then leaves no runnable upstream to re-adopt |
-| I3 | Diverged regular claude slot needs `--adopt-live` (plan/D18: capture) | without a network identity probe a CC `/login` to another account is indistinguishable, and capture discards the store's chain |
+| I3 | Diverged regular claude slot needs `--adopt-live` (plan/D18: capture) | without a network identity probe a CC `/login` to another account is indistinguishable; the superseded store chain is parked in quarantine |
 | I4 | Same regular slot: the live inode is renamed onto the store | moved, not copied; newest `mcpOAuth` kept; one inode per chain |
 | I5 | No upstream active + slot chain equals a store → relink to it | it is a detached duplicate carrier |
 | I6 | G2 runs upstream's own `clauth herdr uninstall --yes` (as the plan says), before any lock, config backed up and the plugin record journaled; its undo restores the config inside the fence and reinstalls the recorded commit **after** the fence, best effort | upstream's block matcher is not tollgate's; upstream's command takes its state lock itself; a reinstall is a GitHub fetch (`mommy:src/herdr.rs:35,439,780`) and must not run in the hold or pull a newer upstream commit |

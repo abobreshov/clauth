@@ -17,6 +17,15 @@ fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(std::iter::once("tollgate").chain(args.iter().copied()))
 }
 
+#[test]
+fn import_adopt_live_help_says_the_superseded_chain_is_parked() {
+    let help = parse(&["import", "clauth", "--help"])
+        .expect_err("clap help")
+        .to_string();
+    assert!(help.contains("quarantine"), "{help}");
+    assert!(!help.contains("discarded"), "{help}");
+}
+
 /// Parse and unwrap to the subcommand, for the arms that must parse.
 fn command(args: &[&str]) -> Command {
     parse(args)

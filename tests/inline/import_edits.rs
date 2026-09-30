@@ -252,6 +252,54 @@ fn g2_undo_reinstalls_at_the_recorded_commit_after_the_fence_and_prints_the_comm
     assert_eq!(std::fs::read(&config).expect("config"), config_before);
 }
 
+#[test]
+fn herdr_reinstall_receives_only_the_g2_environment_allowlist() {
+    let env = Env::new();
+    env.tree.reference();
+    let (_herdr, _config, _pin) = g2_setup(&env);
+    refuse_at_m4(&env);
+    let err = run(&Options::default()).expect_err("M4 refuses");
+    assert_eq!(blocked_codes(&err), ["unknown_entry"]);
+    let names = std::fs::read_to_string(env.p("fakeherdr/install-env")).expect("install env");
+    assert!(
+        !names.lines().any(|name| name == "OWNER_API_KEY"),
+        "{names}"
+    );
+    assert!(names.lines().any(|name| name == "HOME"), "{names}");
+}
+
+#[test]
+fn rewrite_facts_refuses_secret_bearing_values_at_the_journal_boundary() {
+    let env = Env::new();
+    let file = env.p(".claude/settings.json");
+    env.tree
+        .write_json(&file, &json!({"apiKeyHelper": "sk-ant-FIXTURE-secret"}));
+    let doc = super::edits::read_doc(&file).expect("doc");
+    let err = super::edits::rewrite_facts(&doc, "/apiKeyHelper", None, "G3")
+        .expect_err("secret prior value");
+    assert!(!err.to_string().contains("FIXTURE-secret"));
+    let err =
+        super::edits::rewrite_facts(&doc, "/new", Some(&json!("sk-ant-FIXTURE-secret")), "G3")
+            .expect_err("secret new value");
+    assert!(!err.to_string().contains("FIXTURE-secret"));
+}
+
+#[test]
+fn dry_run_g2_change_has_no_accidental_whitespace_run() {
+    let env = Env::new();
+    env.tree.reference();
+    let (_herdr, config, _pin) = g2_setup(&env);
+    std::fs::write(config, "theme = \"dark\"\n").expect("unmarked");
+    let report = txn::report(&survey(&Options::default()), "dry_run");
+    let change = &report
+        .global_edits
+        .iter()
+        .find(|g| g.id == "G2")
+        .expect("G2")
+        .change;
+    assert!(!change.contains("  "), "{change}");
+}
+
 /// Test 54. G3 rebuilds upstream's `apiKeyHelper` as tollgate's for the
 /// same (renamed) profile and renames each allowed upstream MCP tool; the
 /// foreign rule and `env` stay put, and a rollback reverses both edits byte

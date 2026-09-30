@@ -277,9 +277,12 @@ pub(crate) fn rewrite_facts(
     ptr: &str,
     new: Option<&Value>,
     step: &str,
-) -> (Facts, Facts) {
+) -> Result<(Facts, Facts)> {
     let cur = lookup(&doc.map, ptr);
-    (
+    if cur.is_some_and(looks_secret) || new.is_some_and(looks_secret) {
+        bail!("{step} {ptr} contains a secret-bearing value; refusing to journal it");
+    }
+    Ok((
         Facts {
             pointer: Some(ptr.to_string()),
             prior_value: text_of(cur),
@@ -292,7 +295,7 @@ pub(crate) fn rewrite_facts(
             step: Some(step.to_string()),
             ..Facts::default()
         },
-    )
+    ))
 }
 
 // ── G1 / G3: settings.json ─────────────────────────────────────────────────
@@ -339,7 +342,7 @@ pub(crate) fn plan_settings(
     // G1.
     let g1 = pointer(&["enabledPlugins", UPSTREAM_PLUGIN]);
     if lookup(&doc.map, &g1) == Some(&Value::Bool(true)) {
-        let (prior, after) = rewrite_facts(&doc, &g1, Some(&Value::Bool(false)), "G1");
+        let (prior, after) = rewrite_facts(&doc, &g1, Some(&Value::Bool(false)), "G1")?;
         out.push(Planned {
             op: Op::RewriteJson,
             dst: file.clone(),
@@ -370,7 +373,8 @@ pub(crate) fn plan_settings(
                 &crate::profile::ProfileName::from(opts.dst_name(&p)),
             );
             let ptr = pointer(&["apiKeyHelper"]);
-            let (prior, after) = rewrite_facts(&doc, &ptr, Some(&Value::String(new.clone())), "G3");
+            let (prior, after) =
+                rewrite_facts(&doc, &ptr, Some(&Value::String(new.clone())), "G3")?;
             out.push(Planned {
                 op: Op::RewriteJson,
                 dst: file.clone(),
@@ -404,7 +408,7 @@ pub(crate) fn plan_settings(
             };
             let new = Value::String(format!("{ours}{rest}"));
             let ptr = pointer(&["permissions", "allow", &i.to_string()]);
-            let (prior, after) = rewrite_facts(&doc, &ptr, Some(&new), "G3");
+            let (prior, after) = rewrite_facts(&doc, &ptr, Some(&new), "G3")?;
             out.push(Planned {
                 op: Op::RewriteJson,
                 dst: file.clone(),
@@ -780,7 +784,7 @@ pub(crate) fn plan_g2(
             id: "G2".to_string(),
             file: paths.tilde(&config),
             change: format!(
-                "planned at run time: herdr's plugin list is read then (the dry run spawns nothing);                  if herdr lists {}, clauth herdr uninstall --yes runs with the config backed up",
+                "planned at run time: herdr's plugin list is read then (the dry run spawns nothing); if herdr lists {}, clauth herdr uninstall --yes runs with the config backed up",
                 crate::identity::UPSTREAM_HERDR_PLUGIN_ID
             ),
         };
@@ -890,10 +894,7 @@ pub(crate) fn g2_entry(paths: &Paths, plan: &G2Plan) -> Result<(Entry, Option<Ve
 /// The env G2's child runs with: the pass-through allowlist (names only,
 /// values from this process), upstream's opt-outs, and the herdr to drive.
 fn g2_env(plan: &G2Plan) -> Vec<(String, std::ffi::OsString)> {
-    let mut env: Vec<(String, std::ffi::OsString)> = G2_PASS_ENV
-        .iter()
-        .filter_map(|k| std::env::var_os(k).map(|v| ((*k).to_string(), v)))
-        .collect();
+    let mut env = pass_env();
     for k in ["CLAUTH_NO_UPDATE", "CLAUTH_NO_COMPLETIONS", "CLAUTH_NO_API"] {
         env.push((k.to_string(), "1".into()));
     }
@@ -902,6 +903,13 @@ fn g2_env(plan: &G2Plan) -> Vec<(String, std::ffi::OsString)> {
         plan.herdr.clone().into_os_string(),
     ));
     env
+}
+
+fn pass_env() -> Vec<(String, std::ffi::OsString)> {
+    G2_PASS_ENV
+        .iter()
+        .filter_map(|k| std::env::var_os(k).map(|v| ((*k).to_string(), v)))
+        .collect()
 }
 
 /// Run G2's subprocess for `e` (spec §4.8): upstream's own `herdr uninstall
@@ -1087,6 +1095,8 @@ pub(crate) fn reinstall_after_fence(j: &Journal) -> Vec<String> {
         seams::log(|| format!("herdr reinstall {}", argv.join(" ")));
         let mut cmd = std::process::Command::new(&herdr);
         cmd.args(&argv)
+            .env_clear()
+            .envs(pass_env())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

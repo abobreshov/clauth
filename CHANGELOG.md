@@ -4,6 +4,7 @@
 
 ### Import
 
+- Rollback of an adopted Claude login now returns the current refresh chain to the upstream store after a tollgate rotation or rollback slot adoption, while keeping the superseded chain quarantined. Undo preserves an upstream `quarantine/` carrier. Herdr reinstall after the fence uses G2's environment allowlist, and `--adopt-live` help describes the parked chain.
 - `tollgate import clauth` moves an upstream clauth 0.16.0 install into `~/.tollgate` and ends guest mode. `--dry-run` shows everything it would do and changes nothing, not even a lock file; the real run asks once (`--yes` skips it; a non-interactive stdin without `--yes` exits 2) and then runs one journaled transaction. [Importing clauth](wiki/Import.md).
 - Refresh chains move by rename, never by copy, so each keeps one inode; a move across filesystems is refused. Live slots are repointed or captured in the same step.
 - The global edits are journaled with their prior values: upstream's plugin off in `settings.json` (G1), upstream's own `clauth herdr uninstall --yes` with herdr's config backed up (G2), upstream's `apiKeyHelper` and `permissions.allow` MCP tool names rewritten to tollgate's (G3), and `installed_plugins.json` paths under `~/.clauth/profiles/` repointed (G4). No value from `settings.json`'s `env`, a credential or a `config.toml` reaches the journal, a backup or the report.

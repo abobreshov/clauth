@@ -159,6 +159,10 @@ pub(crate) struct Facts {
     /// instead of being unlinked, so a revert puts it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) quarantine: Option<PathBuf>,
+    /// Whether this op created the quarantine directory (rather than using
+    /// an upstream carrier directory moved by an earlier entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quarantine_dir_created: Option<bool>,
 }
 
 /// Upstream's herdr plugin as `herdr plugin list --json` listed it (G2):

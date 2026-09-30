@@ -848,8 +848,8 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_name = "OLD=NEW")]
         rename: Vec<String>,
         /// Import a regular-file ~/.claude/.credentials.json that differs from
-        /// its profile's stored login as that profile (the stored chain is
-        /// discarded).
+        /// its profile's stored login as that profile (the superseded chain
+        /// is parked in the profile's quarantine/).
         #[arg(long)]
         adopt_live: bool,
         /// Skip the confirmation prompt.
