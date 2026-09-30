@@ -1323,6 +1323,7 @@ mod hot_swap_switch {
                     code: "no_key".to_string(),
                     at_ms: crate::usage::now_ms(),
                 }),
+                launch_class: None,
             },
         );
         assert_eq!(
@@ -1338,6 +1339,7 @@ mod hot_swap_switch {
                 member: Some("wt-b".to_string()),
                 served_at_ms: Some(crate::usage::now_ms()),
                 last_failure: None,
+                launch_class: None,
             },
         );
         assert_eq!(wait_until_served("4242-0", 1), WaitOutcome::Served(1));
@@ -1400,6 +1402,7 @@ mod hot_swap_switch {
                 member: Some("wr-b".to_string()),
                 served_at_ms: Some(crate::usage::now_ms()),
                 last_failure: None,
+                launch_class: None,
             },
         );
         run_switch("4242-0", "wr-b", &wait).expect("served");

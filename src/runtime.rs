@@ -3185,7 +3185,7 @@ impl SessionSwap {
             b_between_checks: std::sync::Mutex::new(None),
             #[cfg(test)]
             b_fail_commit: std::sync::atomic::AtomicBool::new(false),
-            stall_logged: AtomicU64::new(0),
+            stall_logged: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             tick_reconciles: std::sync::atomic::AtomicU64::new(0),
         }
@@ -3271,10 +3271,11 @@ impl SessionSwap {
     /// switch <sid> <profile>` writes one for any live claude row, so a plain
     /// `start` session no writer has targeted polls and finds nothing to do.
     fn poll(&self) {
-        if self.executor == crate::hot_swap::Executor::ApiKey
-            && let Some(class) = &self.launch_class
-        {
-            return self.poll_api_key(class);
+        if self.executor == crate::hot_swap::Executor::ApiKey {
+            if let Some(class) = &self.launch_class {
+                self.poll_api_key(class);
+            }
+            return;
         }
         #[cfg(test)]
         self.a_legs

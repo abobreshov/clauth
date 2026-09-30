@@ -1297,6 +1297,7 @@ fn a_hot_swap_runtime_is_attributed_to_its_served_member() {
             member: Some("or-alt".into()),
             served_at_ms: Some(1),
             last_failure: None,
+            launch_class: None,
         },
     );
     assert_eq!(

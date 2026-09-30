@@ -613,6 +613,7 @@ fn seed_live_sessions() {
             member: Some("or-main".into()),
             served_at_ms: Some(1_759_139_990_000),
             last_failure: None,
+            launch_class: None,
         },
     );
     let mut a = crate::testutil::live_row("4242-1", "solo");
@@ -663,6 +664,37 @@ fn accounts_list_live_sessions_committed_and_served() {
          it is idle, and only a swapping view carries the flag"
     );
     assert_eq!(body(&resp)["schema_version"], 1, "additive: no schema bump");
+}
+
+#[test]
+fn accounts_list_reports_generation_zero_helper_failure_as_stalled() {
+    let _home = HomeSandbox::new();
+    seed_live_sessions();
+    let mut row = crate::live_sessions::get("4242-0").expect("row");
+    row.current_member = Some("or-main".into());
+    row.key_generation = Some(0);
+    row.committed_at = None;
+    crate::live_sessions::register(&row).expect("row");
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 0,
+            member: None,
+            served_at_ms: None,
+            last_failure: Some(crate::hot_swap::HelperFailure {
+                generation: 0,
+                code: "no_key".into(),
+                at_ms: 1,
+            }),
+            launch_class: row.launch_class.clone(),
+        },
+    );
+    let resp = handle(&ctx(), &req("GET", "/v1/accounts", "", None), Door::Unix);
+    let sessions = &body(&resp)["live_sessions"];
+    assert_eq!(sessions[0]["state"], "stalled");
+    assert_eq!(sessions[0]["served"], serde_json::Value::Null);
+    assert!(sessions[0].get("idle").is_none());
 }
 
 // 62

@@ -760,6 +760,7 @@ fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
         "helper",
         "helper.lock",
         "relaunch",
+        "relaunch.lock",
         "relaunch.taken",
         "relaunch.result",
     ]
@@ -771,10 +772,27 @@ fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
     }
     remove_sidecars("4242-0", KeepSidecars::RelaunchTaken);
     let left: Vec<bool> = paths.iter().map(|p| p.exists()).collect();
-    assert_eq!(left, vec![false, false, false, true, true]);
+    assert_eq!(left, vec![false, false, false, false, true, true]);
     remove_sidecars("4242-0", KeepSidecars::Nothing);
     assert!(paths.iter().all(|p| !p.exists()));
     assert!(get("4242-0").is_some(), "the row itself is `unregister`'s");
+}
+
+#[test]
+fn relaunch_staging_names_are_visible_to_sidecar_gc() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::tollgate_dir()
+        .expect("home")
+        .join("live_sessions");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let stage = dir.join(".4242-0.relaunch.99.request-id");
+    std::fs::write(&stage, b"staged").expect("stage");
+    let found = list_sidecars();
+    assert!(
+        found
+            .iter()
+            .any(|s| s.path == stage && s.session_id == "4242-0")
+    );
 }
 
 /// The tally counts a committed-not-served B session on the SERVED member and
@@ -803,9 +821,38 @@ fn the_tally_counts_a_swapping_session_on_its_served_member() {
             member: Some("b".to_string()),
             served_at_ms: Some(1_100),
             last_failure: None,
+            launch_class: None,
         },
     );
     let tally = LiveTally::of([committed]);
     let b = tally.member(&crate::profile::ProfileName::from("b"));
     assert_eq!((b.sessions, b.swapping), (1, 0));
+}
+
+#[test]
+fn a_generation_zero_helper_failure_counts_as_swapping() {
+    let _home = HomeSandbox::new();
+    let row = row("4242-0", "a").with_executor(crate::hot_swap::Executor::ApiKey, None);
+    crate::hot_swap::write_ack_for_test(
+        "4242-0",
+        &crate::hot_swap::HelperAck {
+            version: 1,
+            generation: 0,
+            member: None,
+            served_at_ms: None,
+            last_failure: Some(crate::hot_swap::HelperFailure {
+                generation: 0,
+                code: "no_key".into(),
+                at_ms: 1,
+            }),
+            launch_class: None,
+        },
+    );
+    let tally = LiveTally::of([row]);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("a"))
+            .swapping,
+        1
+    );
 }

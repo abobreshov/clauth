@@ -4207,7 +4207,9 @@ mod session_helper {
 
     /// A B row started on `start`, committed to `member` at `generation`.
     fn b_row(sid: &str, start: &str, member: &str, generation: u64) {
-        let mut row = live_row(sid, start).with_executor(crate::hot_swap::Executor::ApiKey, None);
+        let launch = api_key_profile(start, OR, &format!("sk-{start}"));
+        let class = crate::hot_swap::LaunchClass::of(&launch, true);
+        let mut row = live_row(sid, start).with_executor(crate::hot_swap::Executor::ApiKey, class);
         row.current_member = Some(member.to_string());
         row.key_generation = Some(generation);
         crate::live_sessions::register(&row).expect("register");
@@ -4270,6 +4272,10 @@ mod session_helper {
                 member: Some("o-c".to_string()),
                 served_at_ms: Some(10),
                 last_failure: None,
+                launch_class: crate::hot_swap::LaunchClass::of(
+                    &api_key_profile("o-a", OR, "sk-o-a"),
+                    true,
+                ),
             },
         );
         // An N-1 helper finishing after N: the row it read said generation 2.
@@ -4321,7 +4327,7 @@ mod session_helper {
             ack_of("4242-0")
                 .and_then(|a| a.last_failure)
                 .map(|f| f.code),
-            Some("no_key".to_string())
+            Some("class_differs:no_api_key".to_string())
         );
         write_api_key_profile(&api_key_profile("f-b", OR, "sk-f-b"));
         run_session_helper("4242-0", &mut Vec::new()).expect("serves");
@@ -4362,13 +4368,17 @@ mod session_helper {
                 member: Some("r-b".to_string()),
                 served_at_ms: Some(1),
                 last_failure: None,
+                launch_class: crate::hot_swap::LaunchClass::of(
+                    &api_key_profile("r-a", OR, "sk-r-a"),
+                    true,
+                ),
             },
         );
         let mut out = Vec::new();
         run_session_helper("4242-0", &mut out).expect("serves the acked member");
         assert_eq!(out, b"sk-r-b");
 
-        // No row, no ack: the start profile encoded in CLAUDE_CONFIG_DIR.
+        // No row or ack: config-dir fallback has no launch class and refuses.
         let runtime = crate::profile::tollgate_dir()
             .expect("dir")
             .join("profiles")
@@ -4376,8 +4386,8 @@ mod session_helper {
             .join("runtime-5-0");
         let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
         let mut out = Vec::new();
-        run_session_helper("5-0", &mut out).expect("serves the start profile");
-        assert_eq!(out, b"sk-r-a");
+        assert!(run_session_helper("5-0", &mut out).is_err());
+        assert!(out.is_empty());
         // A mismatched sid there fails `no_row`.
         let mut out = Vec::new();
         assert!(run_session_helper("6-0", &mut out).is_err());

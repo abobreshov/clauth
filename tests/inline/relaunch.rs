@@ -249,9 +249,17 @@ fn the_supervisor_claims_once_stops_gracefully_and_execs_the_resume_form() {
 // 53
 #[test]
 fn a_failed_relaunch_restarts_the_original_profile() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     // The new process: a start that failed before its child spawned restarts
-    // on the original profile once, without the hand-off variables.
+    // on the original profile once, keeping the verified lineage and nonce.
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (RELAUNCHED_FROM_ENV, Some(std::ffi::OsStr::new("4242-0"))),
+            (NONCE_ENV, Some(std::ffi::OsStr::new("known-nonce"))),
+            (FALLBACK_ENV, Some(std::ffi::OsStr::new("orig"))),
+        ],
+    );
     let args = vec!["--resume".to_string(), "conv-3".to_string()];
     let mut seen = Vec::new();
     let last = exec_fallback_with("orig", &args, &mut |c| {
@@ -265,12 +273,43 @@ fn a_failed_relaunch_restarts_the_original_profile() {
     });
     assert_eq!(seen.len(), 1, "one fallback attempt");
     assert_eq!(seen[0].0, ["start", "orig", "--", "--resume", "conv-3"]);
-    for key in RELAUNCH_ENV_KEYS {
-        assert_eq!(seen[0].1.get(*key), Some(&None), "{key} is removed");
-    }
+    assert_eq!(
+        seen[0].1.get(RELAUNCHED_FROM_ENV),
+        Some(&Some("4242-0".to_string()))
+    );
+    assert_eq!(
+        seen[0].1.get(NONCE_ENV),
+        Some(&Some("known-nonce".to_string()))
+    );
+    assert_eq!(seen[0].1.get(FALLBACK_ENV), Some(&None));
     assert_eq!(
         last,
         "tollgate: relaunch failed; resume with: tollgate start orig -- --resume conv-3"
+    );
+}
+
+#[test]
+fn terminal_fallback_failure_consumes_only_its_verified_taken_request() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (RELAUNCHED_FROM_ENV, Some(std::ffi::OsStr::new("4242-0"))),
+            (NONCE_ENV, Some(std::ffi::OsStr::new("known-nonce"))),
+            (FALLBACK_ENV, Some(std::ffi::OsStr::new("orig"))),
+        ],
+    );
+    let taken = crate::live_sessions::relaunch_path("4242-0", "taken").expect("path");
+    std::fs::create_dir_all(taken.parent().expect("dir")).expect("dir");
+    let mut request = request_for("target", "conv-3", home.home());
+    request.nonce = Some("known-nonce".to_string());
+    std::fs::write(&taken, serde_json::to_vec(&request).expect("ser")).expect("taken");
+    let args = vec!["--resume".to_string(), "conv-3".to_string()];
+    let last = exec_fallback_with("orig", &args, &mut |_| std::io::Error::other("posed"));
+    assert!(last.contains("relaunch failed"));
+    assert!(
+        !taken.exists(),
+        "both failed execs must release the old claim"
     );
 }
 
@@ -343,6 +382,14 @@ fn relaunch_env_is_scrubbed_from_the_child_and_ignored_without_a_matching_nonce(
     );
     assert_eq!(verified.from.as_deref(), Some("4242-0"));
     assert_eq!(verified.fallback.as_deref(), Some("orig"));
+    let fallback = Handoff::verify(
+        Some("4242-0".to_string()),
+        None,
+        Some("the-real-one".to_string()),
+    );
+    assert_eq!(fallback.from.as_deref(), Some("4242-0"));
+    assert_eq!(fallback.fallback, None);
+    verified.consume();
     assert!(!taken.exists());
 }
 
@@ -547,6 +594,145 @@ fn concurrent_relaunch_requests_are_arbitrated_and_each_cli_reads_only_its_own_a
     assert!(accepted.request.request_id.is_some());
     let _ =
         std::fs::remove_file(crate::live_sessions::relaunch_path("4242-0", "taken").expect("path"));
+}
+
+#[test]
+fn relaunch_publishes_without_hard_links_and_refuses_an_existing_request() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("claude");
+    profiles(&["nl-a", "nl-b"]);
+    let cwd = home.home().join("w");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    transcript_fixture(&store(), &cwd, &["c-nl"]);
+    let _marker = live_session("4242-0", "nl-a", &cwd);
+    let prepared = prepare("4242-0", "nl-b", None).expect("prepared");
+    set_deadlines(Some(Deadlines {
+        claim: Duration::from_millis(50),
+        register: Duration::from_millis(50),
+        poll: Duration::from_millis(5),
+    }));
+    let no_links =
+        &mut |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    let why = reason(submit_with_link(&prepared, no_links).expect_err("unclaimed"));
+    set_deadlines(None);
+    assert_eq!(why, "the session did not answer; it is unchanged");
+    let request = crate::live_sessions::relaunch_path("4242-0", "").expect("path");
+    assert!(!request.exists(), "timeout withdrew the published request");
+    std::fs::write(&request, b"existing").expect("existing request");
+    let why = reason(submit_with_link(&prepared, no_links).expect_err("busy"));
+    assert!(why.contains("already in progress"), "{why}");
+    assert_eq!(std::fs::read(&request).expect("request"), b"existing");
+}
+
+#[test]
+fn fallback_publish_never_exposes_partial_request_to_supervisor() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("claude");
+    profiles(&["atomic-a", "atomic-b"]);
+    let cwd = home.home().join("w");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    transcript_fixture(&store(), &cwd, &["c-atomic"]);
+    let _marker = live_session("4242-0", "atomic-a", &cwd);
+    let prepared = prepare("4242-0", "atomic-b", None).expect("prepared");
+    let request = crate::live_sessions::relaunch_path("4242-0", "").expect("path");
+    let result = crate::live_sessions::relaunch_path("4242-0", "result").expect("path");
+    let lock = crate::live_sessions::relaunch_path("4242-0", "lock").expect("path");
+    set_deadlines(Some(Deadlines {
+        claim: Duration::from_millis(50),
+        register: Duration::from_millis(50),
+        poll: Duration::from_millis(5),
+    }));
+    let exposed = std::cell::Cell::new(false);
+    let response = submit_with_publish(
+        &prepared,
+        &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        &mut |_, _| {
+            assert!(lock.exists(), "the exclusive publish lock spans the rename");
+            exposed.set(request.exists());
+            assert!(poll_claim("4242-0").is_none(), "no final name to claim yet");
+        },
+    );
+    set_deadlines(None);
+    assert!(
+        !exposed.get(),
+        "the supervisor could see incomplete request bytes"
+    );
+    assert!(
+        !result.exists(),
+        "polling before publish must not refuse a partial request"
+    );
+    assert!(!lock.exists(), "the publisher releases the lock");
+    assert_eq!(
+        reason(response.expect_err("unclaimed")),
+        "the session did not answer; it is unchanged"
+    );
+
+    std::fs::write(&lock, b"other publisher").expect("lock");
+    let why = reason(
+        submit_with_publish(
+            &prepared,
+            &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            &mut |_, _| {},
+        )
+        .expect_err("busy lock"),
+    );
+    assert!(why.contains("already in progress"), "{why}");
+    assert!(!request.exists());
+}
+
+#[test]
+fn relaunch_withdraws_a_publish_when_another_claim_appears_during_it() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("claude");
+    profiles(&["race-a", "race-b"]);
+    let cwd = home.home().join("w");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    transcript_fixture(&store(), &cwd, &["c-race"]);
+    let _marker = live_session("4242-0", "race-a", &cwd);
+    let prepared = prepare("4242-0", "race-b", None).expect("prepared");
+    let taken = crate::live_sessions::relaunch_path("4242-0", "taken").expect("path");
+    let why = reason(
+        submit_with_link(&prepared, &mut |staging, request| {
+            std::fs::write(&taken, b"other claimed request")?;
+            std::fs::hard_link(staging, request)
+        })
+        .expect_err("claim in flight"),
+    );
+    assert!(why.contains("already in progress"), "{why}");
+    assert!(
+        !crate::live_sessions::relaunch_path("4242-0", "")
+            .expect("path")
+            .exists()
+    );
+}
+
+#[test]
+fn nonce_or_stamp_refusal_unlinks_the_claimed_request() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("claude");
+    profiles(&["ref-a", "ref-b"]);
+    let cwd = home.home().join("w");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    transcript_fixture(&store(), &cwd, &["c-ref"]);
+    let request = request_for("ref-b", "c-ref", &cwd);
+    let taken = crate::live_sessions::relaunch_path("4242-0", "taken").expect("path");
+    for fail_nonce in [true, false] {
+        write_request("4242-0", &serde_json::to_value(&request).expect("ser"));
+        let mut make_nonce = || {
+            if fail_nonce {
+                anyhow::bail!("posed nonce failure")
+            }
+            Ok("known-nonce".to_string())
+        };
+        let mut stamp = |_: &Path, _: Vec<u8>| Err(std::io::Error::other("posed stamp failure"));
+        assert!(poll_claim_with("4242-0", &mut make_nonce, &mut stamp).is_none());
+        assert!(
+            !taken.exists(),
+            "failed claim must not block the next relaunch"
+        );
+    }
 }
 
 /// Review lens concurrency #4. The cwd scan never takes a sibling session's

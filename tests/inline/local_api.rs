@@ -810,6 +810,7 @@ fn every_get_leaves_the_home_byte_identical_with_hot_swap_sidecars() {
             member: Some("solo".into()),
             served_at_ms: Some(1),
             last_failure: None,
+            launch_class: None,
         },
     );
     let dir = crate::profile::tollgate_dir()
