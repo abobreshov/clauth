@@ -288,6 +288,31 @@ fn a_failed_relaunch_restarts_the_original_profile() {
     );
 }
 
+#[test]
+fn terminal_fallback_failure_consumes_only_its_verified_taken_request() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (RELAUNCHED_FROM_ENV, Some(std::ffi::OsStr::new("4242-0"))),
+            (NONCE_ENV, Some(std::ffi::OsStr::new("known-nonce"))),
+            (FALLBACK_ENV, Some(std::ffi::OsStr::new("orig"))),
+        ],
+    );
+    let taken = crate::live_sessions::relaunch_path("4242-0", "taken").expect("path");
+    std::fs::create_dir_all(taken.parent().expect("dir")).expect("dir");
+    let mut request = request_for("target", "conv-3", home.home());
+    request.nonce = Some("known-nonce".to_string());
+    std::fs::write(&taken, serde_json::to_vec(&request).expect("ser")).expect("taken");
+    let args = vec!["--resume".to_string(), "conv-3".to_string()];
+    let last = exec_fallback_with("orig", &args, &mut |_| std::io::Error::other("posed"));
+    assert!(last.contains("relaunch failed"));
+    assert!(
+        !taken.exists(),
+        "both failed execs must release the old claim"
+    );
+}
+
 // 54
 #[test]
 fn an_unclaimed_request_is_cancelled_after_30_s() {
@@ -597,6 +622,64 @@ fn relaunch_publishes_without_hard_links_and_refuses_an_existing_request() {
     let why = reason(submit_with_link(&prepared, no_links).expect_err("busy"));
     assert!(why.contains("already in progress"), "{why}");
     assert_eq!(std::fs::read(&request).expect("request"), b"existing");
+}
+
+#[test]
+fn fallback_publish_never_exposes_partial_request_to_supervisor() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("claude");
+    profiles(&["atomic-a", "atomic-b"]);
+    let cwd = home.home().join("w");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    transcript_fixture(&store(), &cwd, &["c-atomic"]);
+    let _marker = live_session("4242-0", "atomic-a", &cwd);
+    let prepared = prepare("4242-0", "atomic-b", None).expect("prepared");
+    let request = crate::live_sessions::relaunch_path("4242-0", "").expect("path");
+    let result = crate::live_sessions::relaunch_path("4242-0", "result").expect("path");
+    let lock = crate::live_sessions::relaunch_path("4242-0", "lock").expect("path");
+    set_deadlines(Some(Deadlines {
+        claim: Duration::from_millis(50),
+        register: Duration::from_millis(50),
+        poll: Duration::from_millis(5),
+    }));
+    let exposed = std::cell::Cell::new(false);
+    let response = submit_with_publish(
+        &prepared,
+        &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        &mut |_, _| {
+            assert!(lock.exists(), "the exclusive publish lock spans the rename");
+            exposed.set(request.exists());
+            assert!(poll_claim("4242-0").is_none(), "no final name to claim yet");
+        },
+    );
+    set_deadlines(None);
+    assert!(
+        !exposed.get(),
+        "the supervisor could see incomplete request bytes"
+    );
+    assert!(
+        !result.exists(),
+        "polling before publish must not refuse a partial request"
+    );
+    assert!(!lock.exists(), "the publisher releases the lock");
+    assert_eq!(
+        reason(response.expect_err("unclaimed")),
+        "the session did not answer; it is unchanged"
+    );
+
+    std::fs::write(&lock, b"other publisher").expect("lock");
+    let why = reason(
+        submit_with_publish(
+            &prepared,
+            &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            &mut |_, _| Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            &mut |_, _| {},
+        )
+        .expect_err("busy lock"),
+    );
+    assert!(why.contains("already in progress"), "{why}");
+    assert!(!request.exists());
 }
 
 #[test]

@@ -390,9 +390,11 @@ fail to parse as a row; it now filters explicitly to `*.json` entries whose stem
    mode, else `~/.claude/projects`). Exactly one → conv; 0 → `no conversation found for the session`;
    > 1 → `<n> conversations match; pass --conversation <id>`.
 4. `cwd` = `row.cwd` must be a dir. The CLI never sees or sends the claude args.
-5. Confirm (§2.1). Write a durable staging file and publish `<sid>.relaunch` exclusively
-   (hard link or no-replace rename; exclusive-create copy if neither is available). A competing
-   `.taken` appearing during publish withdraws this request.
+5. Confirm (§2.1). Write a durable staging file. Claim `<sid>.relaunch.lock` by exclusive create,
+   re-check that neither `.relaunch` nor `.relaunch.taken` exists, and publish the completed file
+   (hard link or no-replace rename; plain rename under the lock when neither is supported). Sync
+   the directory after the plain rename and remove the lock. A competing `.taken` appearing during
+   publish withdraws this request; an existing lock or request refuses as already in progress.
 6. Wait ≤ 30 s for `.relaunch.result`: `refused` → reason, exit 1; unclaimed → rename to `.relaunch.cancel`
    (success = nobody claimed), `the session did not answer; it is unchanged`, exit 1.
 7. `relaunching` → wait ≤ 60 s for a live row with `relaunched_from == sid` → success line; else exit 1,
@@ -422,7 +424,7 @@ that CC's Bash tool sees none. Before spawning claude, `start::run` saves the te
    (logged).
 6. `exec` error → `exec` the same with `<orig>`. The new process, on any error before the child
    spawns, with a nonce-verified `TOLLGATE_RELAUNCH_FALLBACK`: print the error and `exec` the
-   original form once, retaining `RELAUNCHED_FROM` and `NONCE` but omitting `FALLBACK`. Both failing: stderr `tollgate: relaunch failed; resume with: tollgate start <orig> -- --resume <conv>`, exit 1.
+   original form once, retaining `RELAUNCHED_FROM` and `NONCE` but omitting `FALLBACK`. Both failing: consume the verified `.taken`, then stderr `tollgate: relaunch failed; resume with: tollgate start <orig> -- --resume <conv>`, exit 1.
 Guest mode: the new start is a guest start; the passthrough `--resume` seeds the guest store
 (`start.rs:255`).
 

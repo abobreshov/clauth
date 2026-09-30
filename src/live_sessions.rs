@@ -557,6 +557,7 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     "relaunch.taken",
     "relaunch.cancel",
     "relaunch.result",
+    "relaunch.lock",
 ];
 
 /// Whether `session_id` is already taken in the registry: its row or any of

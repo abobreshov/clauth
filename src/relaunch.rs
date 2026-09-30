@@ -397,12 +397,22 @@ fn submit_with_link(
     prepared: &Prepared,
     link: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<()> {
+    submit_with_publish(prepared, link, &mut rename_no_replace, &mut |_, _| {})
+}
+
+fn submit_with_publish(
+    prepared: &Prepared,
+    link: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    before_fallback_publish: &mut dyn FnMut(&Path, &Path),
+) -> Result<()> {
     let sid = prepared.sid.as_str();
     let request = crate::live_sessions::relaunch_path(sid, "")?;
     let result = crate::live_sessions::relaunch_path(sid, "result")?;
     let taken = crate::live_sessions::relaunch_path(sid, "taken")?;
+    let lock = crate::live_sessions::relaunch_path(sid, "lock")?;
     let busy = "another relaunch of this session is already in progress; it is unchanged";
-    if taken.exists() {
+    if path_present(&taken) {
         return Err(refuse(sid, busy));
     }
     let id = prepared.request.request_id.clone();
@@ -414,13 +424,29 @@ fn submit_with_link(
     ));
     crate::profile::write_durable_600(&staging, bytes)
         .with_context(|| format!("failed to write {}", staging.display()))?;
-    let published = match link(&staging, &request) {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
-            publish_no_replace(&staging, &request)
+    let published = (|| {
+        let _guard = PublishLock::acquire(&lock)?;
+        if path_present(&request) || path_present(&taken) {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
         }
-        other => other,
-    };
+        let published = match link(&staging, &request) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                publish_no_replace(&staging, &request, rename, before_fallback_publish)
+            }
+            other => other,
+        };
+        if published.is_ok() && path_present(&taken) && request_id_of(&taken) != id {
+            if request_id_of(&request) == id {
+                let _ = std::fs::remove_file(&request);
+            }
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        }
+        published
+    })();
     let _ = std::fs::remove_file(&staging);
+    if published.is_err() && request_id_of(&request) == id {
+        let _ = std::fs::remove_file(&request);
+    }
     match published {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -429,14 +455,6 @@ fn submit_with_link(
         Err(e) => {
             return Err(e).with_context(|| format!("failed to write {}", request.display()));
         }
-    }
-    // A supervisor may have claimed an earlier request after our first
-    // `.taken` check. Withdraw only our own newly published request.
-    if taken.exists() && request_id_of(&taken) != id {
-        if request_id_of(&request) == id {
-            let _ = std::fs::remove_file(&request);
-        }
-        return Err(refuse(sid, busy));
     }
     let ours = |path: &Path| read_result(path).filter(|r| r.request_id == id);
     let limits = deadlines();
@@ -500,9 +518,61 @@ fn submit_with_link(
     }
 }
 
-/// Atomic no-replace rename where Linux supports it. The exclusive-create
-/// fallback covers filesystems that reject renameat2 as well as hard links.
-fn publish_no_replace(staging: &Path, request: &Path) -> std::io::Result<()> {
+fn path_present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// An exclusive name claimed by every CLI publisher. It spans the request
+/// and `.taken` checks through the final rename and post-publish check.
+struct PublishLock {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl PublishLock {
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: opts.open(path)?,
+        })
+    }
+}
+
+impl Drop for PublishLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let same_inode = self
+                .file
+                .metadata()
+                .ok()
+                .zip(std::fs::symlink_metadata(&self.path).ok())
+                .is_some_and(|(held, at_path)| {
+                    held.dev() == at_path.dev() && held.ino() == at_path.ino()
+                });
+            if !same_inode {
+                return;
+            }
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Atomic no-replace rename where Linux supports it. The caller's exclusive
+/// publish lock permits plain rename when this and hard links are unsupported.
+fn rename_no_replace(staging: &Path, request: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt as _;
@@ -524,30 +594,29 @@ fn publish_no_replace(staging: &Path, request: &Path) -> std::io::Result<()> {
         if result == 0 {
             return Ok(());
         }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(error);
-        }
+        Err(std::io::Error::last_os_error())
     }
-    use std::io::Write as _;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+    #[cfg(not(target_os = "linux"))]
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+fn publish_no_replace(
+    staging: &Path,
+    request: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    before_fallback_publish: &mut dyn FnMut(&Path, &Path),
+) -> std::io::Result<()> {
+    match rename(staging, request) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {}
     }
-    let mut final_file = opts.open(request)?;
-    let copied = (|| {
-        let mut source = std::fs::File::open(staging)?;
-        std::io::copy(&mut source, &mut final_file)?;
-        final_file.flush()?;
-        final_file.sync_all()
-    })();
-    if copied.is_err() {
-        let _ = std::fs::remove_file(request);
+    before_fallback_publish(staging, request);
+    if path_present(request) {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
     }
-    copied
+    std::fs::rename(staging, request)?;
+    crate::profile::sync_dir(request.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 fn read_result(path: &Path) -> Option<RelaunchResult> {
@@ -940,6 +1009,14 @@ pub(crate) fn exec_fallback_with(
         let e = exec(&mut command);
         errln!("tollgate: restarting on '{orig}' failed: {e}");
     }
+    // Neither the target nor its one fallback spawned. Release only the
+    // matching hand-off, so another relaunch is not blocked until GC.
+    let handoff = Handoff::verify(
+        std::env::var(RELAUNCHED_FROM_ENV).ok(),
+        None,
+        std::env::var(NONCE_ENV).ok(),
+    );
+    handoff.consume();
     format!("tollgate: relaunch failed; resume with: tollgate start {orig} -- --resume {conv}")
 }
 

@@ -12499,11 +12499,14 @@ fn gc_removes_orphan_sidecars_only() {
         "helper",
         "helper.lock",
         "relaunch",
+        "relaunch.lock",
         "relaunch.result",
         "relaunch.taken",
     ] {
         fs::write(side("9-0", s), b"{}").expect("sidecar");
     }
+    let dotted_stage = side("9-0", "relaunch").with_file_name(".9-0.relaunch.99.request-id");
+    fs::write(&dotted_stage, b"staged").expect("dotted stage");
     // Both relaunch answers age out together (`.relaunch.result` is kept
     // past teardown for a slow CLI, review lens concurrency #10).
     for s in ["relaunch.taken", "relaunch.result"] {
@@ -12540,11 +12543,13 @@ fn gc_removes_orphan_sidecars_only() {
         "helper",
         "helper.lock",
         "relaunch",
+        "relaunch.lock",
         "relaunch.result",
         "relaunch.taken",
     ] {
         assert!(!side("9-0", s).exists(), "9-0.{s}");
     }
+    assert!(!dotted_stage.exists(), "GC removes the actual dotted path");
     assert!(side("9-1", "helper").exists());
     assert!(side("9-1", "helper.lock").exists());
     assert!(!side("9-1", "relaunch").exists());
@@ -12815,9 +12820,17 @@ fn a_generation_zero_failure_emits_one_watchdog_line() {
     );
     let logs = crate::logline::LogLines::new();
     let capture = logs.capture_here();
+    assert_eq!(
+        swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
+        u64::MAX
+    );
     swap.poll();
     swap.poll();
     drop(capture);
+    assert_eq!(
+        swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     let lines = logs.snapshot();
     assert_eq!(
         lines

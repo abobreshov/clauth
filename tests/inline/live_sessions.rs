@@ -760,6 +760,7 @@ fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
         "helper",
         "helper.lock",
         "relaunch",
+        "relaunch.lock",
         "relaunch.taken",
         "relaunch.result",
     ]
@@ -771,7 +772,7 @@ fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
     }
     remove_sidecars("4242-0", KeepSidecars::RelaunchTaken);
     let left: Vec<bool> = paths.iter().map(|p| p.exists()).collect();
-    assert_eq!(left, vec![false, false, false, true, true]);
+    assert_eq!(left, vec![false, false, false, false, true, true]);
     remove_sidecars("4242-0", KeepSidecars::Nothing);
     assert!(paths.iter().all(|p| !p.exists()));
     assert!(get("4242-0").is_some(), "the row itself is `unregister`'s");
