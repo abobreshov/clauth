@@ -1769,7 +1769,7 @@ fn gc_orphan_sidecars() {
             if helper_side && runtime_tree_exists_for(&sidecar.session_id) {
                 continue;
             }
-            if sidecar.suffix == "relaunch.taken"
+            if (sidecar.suffix == "relaunch.taken" || sidecar.suffix == "relaunch.result")
                 && file_mtime(&sidecar.path)
                     .and_then(|m| m.elapsed().ok())
                     .is_none_or(|age| age < RELAUNCH_TAKEN_GC_AGE)
@@ -4080,15 +4080,28 @@ impl SessionSwap {
     /// `swap_refusal`, which `tollgate switch` reads back.
     fn refuse_api_key(&self, intended: &str, code: &'static str) {
         let why = SwapRefused::HotSwap(code);
-        if !self.should_announce(intended, &why) {
+        let text = crate::hot_swap::reason_text(code, None);
+        // The memo gates the log line only: the row is written whenever its
+        // stored refusal names another member or code, or predates the
+        // operator's latest request for this member, so a repeated request
+        // is answered `refused` rather than left reading as no answer.
+        if self.should_announce(intended, &why) {
+            logline!(
+                "tollgate: session {} stays on {}: {intended} is not hot-swappable ({text})",
+                self.session.as_str(),
+                self.member()
+            );
+        }
+        let recorded = crate::live_sessions::get(self.session.as_str()).is_some_and(|row| {
+            row.swap_refusal.as_ref().is_some_and(|prev| {
+                prev.member == intended
+                    && prev.code == code
+                    && row.intended_at.is_none_or(|asked| prev.at_ms >= asked)
+            })
+        });
+        if recorded {
             return;
         }
-        let text = crate::hot_swap::reason_text(code, None);
-        logline!(
-            "tollgate: session {} stays on {}: {intended} is not hot-swappable ({text})",
-            self.session.as_str(),
-            self.member()
-        );
         let refusal = crate::live_sessions::SwapRefusal {
             member: intended.to_string(),
             code: code.to_string(),
@@ -4496,7 +4509,9 @@ impl ProfileRuntime {
                 let mut session = SessionId::mint();
                 let mut paths = SessionPaths::resolve(name, isolation, &session, mode)?;
                 for _ in 0..SID_COLLISION_REMINTS {
-                    if !is_session_alive(&paths.pid_file) {
+                    if !is_session_alive(&paths.pid_file)
+                        && !crate::live_sessions::sid_in_use(session.as_str())
+                    {
                         break;
                     }
                     session = SessionId::mint();
@@ -7960,7 +7975,9 @@ impl CodexRuntime {
                 codex_paired_dir_names(isolation, session.as_str(), mode);
             for _ in 0..SID_COLLISION_REMINTS {
                 let pid_file = profile_subpath(&owned, &sessions_name)?.join(session.as_str());
-                if !is_session_alive(&pid_file) {
+                if !is_session_alive(&pid_file)
+                    && !crate::live_sessions::sid_in_use(session.as_str())
+                {
                     break;
                 }
                 session = SessionId::mint();
@@ -8187,7 +8204,9 @@ impl HermesMarker {
                 profile_subpath(&owned, &format!("{SESSIONS_STEM}-{}", sid.as_str()))
             };
             for _ in 0..SID_COLLISION_REMINTS {
-                if !is_session_alive(&sessions_for(&session)?.join(session.as_str())) {
+                if !is_session_alive(&sessions_for(&session)?.join(session.as_str()))
+                    && !crate::live_sessions::sid_in_use(session.as_str())
+                {
                     break;
                 }
                 session = SessionId::mint();

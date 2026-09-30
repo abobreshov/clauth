@@ -389,12 +389,24 @@ pub(crate) fn request_session_switch(
         })
     };
     if current == canonical.as_str() {
+        // Switching back to the current member withdraws any other intent
+        // still standing (a refused one would otherwise commit later, once
+        // its refusal clears, against this latest request).
+        if row
+            .intended_member
+            .as_deref()
+            .is_some_and(|intended| intended != current)
+        {
+            crate::live_sessions::update_as_daemon(sid, |fields| {
+                fields.request_member(current.as_str());
+            })?;
+        }
         return done(RequestOutcome::AlreadyOn);
     }
     match row.executor() {
         crate::hot_swap::Executor::Oauth => {
             crate::live_sessions::update_as_daemon(sid, |fields| {
-                fields.set_intended_member(canonical.as_str());
+                fields.request_member(canonical.as_str());
             })?;
             done(RequestOutcome::IntentRecorded)
         }
@@ -414,7 +426,7 @@ pub(crate) fn request_session_switch(
             let g0 = row.key_generation.unwrap_or(0);
             let t0 = crate::usage::now_ms();
             crate::live_sessions::update_as_daemon(sid, |fields| {
-                fields.set_intended_member(canonical.as_str());
+                fields.request_member(canonical.as_str());
             })?;
             crate::logline::logline!(
                 "tollgate: session {sid} asked to move onto {} (api-key hot swap, from {})",

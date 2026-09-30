@@ -1400,6 +1400,7 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         swap_refusal: None,
         relaunch_capable: false,
         relaunched_from: None,
+        intended_at: None,
     }
 }
 

@@ -128,6 +128,12 @@ pub(crate) struct LiveSession {
     /// from, nonce-verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) relaunched_from: Option<String>,
+    /// Daemon-written with an operator's request (`switch <sid>`): when the
+    /// standing intent was last asked for. A refusal older than this is
+    /// re-recorded even when it is the same member and code, so asking again
+    /// never reads an older refusal as no answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) intended_at: Option<u64>,
 }
 
 /// Executor B's last refusal of an intended member.
@@ -171,6 +177,7 @@ impl LiveSession {
             swap_refusal: None,
             relaunch_capable: false,
             relaunched_from: None,
+            intended_at: None,
         }
     }
 
@@ -227,6 +234,13 @@ pub(crate) struct DaemonFields<'a>(&'a mut LiveSession);
 impl DaemonFields<'_> {
     pub(crate) fn set_intended_member(&mut self, member: impl Into<String>) {
         self.0.intended_member = Some(member.into());
+    }
+
+    /// An operator's request: the intent plus when it was asked for
+    /// ([`LiveSession::intended_at`]).
+    pub(crate) fn request_member(&mut self, member: impl Into<String>) {
+        self.0.intended_member = Some(member.into());
+        self.0.intended_at = Some(crate::usage::now_ms());
     }
 
     pub(crate) fn set_chain_cursor(&mut self, cursor: usize) {
@@ -545,10 +559,28 @@ const SIDECAR_SUFFIXES: &[&str] = &[
     "relaunch.result",
 ];
 
+/// Whether `session_id` is already taken in the registry: its row or any of
+/// its sidecars exists. The sid re-mint loops check this beside the marker,
+/// so a sid live under another profile or harness (a `~/.tollgate` shared
+/// across pid namespaces) — or a dead namesake's leftovers, whose stale
+/// helper ack would poison a new session's view — is never reused.
+pub(crate) fn sid_in_use(session_id: &str) -> bool {
+    let exists = |p: Result<PathBuf>| p.is_ok_and(|p| std::fs::symlink_metadata(p).is_ok());
+    exists(row_path(session_id))
+        || SIDECAR_SUFFIXES
+            .iter()
+            .any(|suffix| exists(sidecar_path(session_id, suffix)))
+}
+
 /// Remove a session's sidecars, NotFound ignored.
 pub(crate) fn remove_sidecars(session_id: &str, keep: KeepSidecars) {
     for suffix in SIDECAR_SUFFIXES {
-        if keep == KeepSidecars::RelaunchTaken && *suffix == "relaunch.taken" {
+        // The relaunch exit path keeps `.relaunch.taken` (the new process
+        // verifies its nonce) and `.relaunch.result` (the CLI's answer, which
+        // a slow poller has not read yet); GC ages both out.
+        if keep == KeepSidecars::RelaunchTaken
+            && (*suffix == "relaunch.taken" || *suffix == "relaunch.result")
+        {
             continue;
         }
         let Ok(path) = sidecar_path(session_id, suffix) else {

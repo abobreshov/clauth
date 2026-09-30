@@ -515,3 +515,22 @@ fn a_process_whose_exe_is_the_upstream_binary_is_clauth() {
     let bun = FakeProc::new(10, &["bun", "/x/node_modules/@openai/codex/bin/codex.js"]);
     assert_eq!(classify(&bun, &scope).map(|(r, _)| r), Some(Role::Codex));
 }
+
+/// Review lens concurrency #9. A presence probe that takes a fence item's
+/// flock for an instant (as `daemon_health` does at 1 Hz) does not refuse
+/// the import: the try-locked items are retried before `lock_held`.
+#[test]
+fn a_momentary_probe_on_a_fence_item_does_not_refuse_the_import() {
+    let env = Env::new();
+    env.tree.reference();
+    let paths = env.paths();
+    let item = fence::item_paths(&paths, &names())[0].clone();
+    let holder = LockHolder::hold(&item);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        drop(holder);
+    });
+    let fence = Fence::acquire(&paths, &names());
+    release.join().expect("release");
+    assert!(fence.is_ok(), "a probe held for 120 ms must not refuse");
+}

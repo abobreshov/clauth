@@ -4159,13 +4159,10 @@ fn handle_move_session_key(app: &mut App, key: KeyEvent) {
             let Some(picked) = picked else {
                 return;
             };
-            if picked.now_on == target {
-                app.toast(
-                    ToastKind::Info,
-                    format!("session {} is already on {target}", picked.sid),
-                );
-                return;
-            }
+            // No "already on" shortcut here: `now_on` is the SERVED member,
+            // and a session committed elsewhere but not yet served must still
+            // be movable back. The request core decides (and withdraws a
+            // standing intent on a switch back).
             let tx = app.session_move_tx.clone();
             let sid = picked.sid;
             spawn_worker(move || {

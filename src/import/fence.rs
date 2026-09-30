@@ -101,6 +101,24 @@ fn lock_held(shown: &str) -> Finding {
     .with_path(shown.to_string())
 }
 
+/// Tries per try-locked item, [`TRY_RETRY`] apart: a presence probe
+/// (`daemon_health`, a concurrent dry run's `procs::held`) takes these flocks
+/// for an instant, and one busy read must not refuse the import.
+const TRY_ATTEMPTS: u32 = 3;
+const TRY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn try_lock_retrying(file: &File) -> bool {
+    for attempt in 0..TRY_ATTEMPTS {
+        if file.try_lock().is_ok() {
+            return true;
+        }
+        if attempt + 1 < TRY_ATTEMPTS {
+            std::thread::sleep(TRY_RETRY);
+        }
+    }
+    false
+}
+
 /// The held fence. Dropping it releases in reverse order (9 → 1), then pops
 /// the `ImportFence` rank.
 pub(crate) struct Fence {
@@ -134,7 +152,7 @@ impl Fence {
             let taken = if i == last {
                 crate::lock::lock_file_with_timeout(&file, ITEM_WAIT).is_ok()
             } else {
-                file.try_lock().is_ok()
+                try_lock_retrying(&file)
             };
             if !taken {
                 return Err(lock_held(&shown));

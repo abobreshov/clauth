@@ -15272,3 +15272,87 @@ fn tui_filter_cycles_four_states_and_hermes_rows_toast_relaunch() {
         "outside the Hermes view Enter is the claude switch again"
     );
 }
+
+/// Review lens guest-ux #3 / concurrency #6. The `m` modal never decides
+/// "already on" from the SERVED member: a B session committed to `tm-b` but
+/// still served by `tm-a` can be moved back onto `tm-a`, and the pick goes
+/// through the request core (which writes the intent) instead of a toast
+/// that does nothing while the session still moves to `tm-b`.
+#[test]
+fn m_moves_a_committed_but_unserved_session_back_to_the_served_member() {
+    use super::{Modal, drain_session_moves, handle_key, join_test_workers};
+    use crate::testutil::{api_key_profile, key, write_api_key_profile};
+    use ratatui::crossterm::event::KeyCode;
+    use std::time::Duration;
+    const OR: &str = "https://openrouter.ai/api";
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let launch = api_key_profile("tb-a", OR, "sk-a");
+    write_api_key_profile(&launch);
+    write_api_key_profile(&api_key_profile("tb-b", OR, "sk-b"));
+    let config = crate::profile::load_config().expect("load config");
+    let target_idx = config
+        .profiles
+        .iter()
+        .position(|p| p.name.as_str() == "tb-a")
+        .expect("tb-a is on the roster");
+    let mut app = super::App::new(config);
+    app.profile_cursor = target_idx;
+    let mut row = crate::testutil::live_row("4242-0", "tb-a").with_executor(
+        crate::hot_swap::Executor::ApiKey,
+        crate::hot_swap::LaunchClass::of(&launch, true),
+    );
+    row.current_member = Some("tb-b".to_string());
+    row.key_generation = Some(1);
+    crate::live_sessions::register(&row).expect("register");
+    let _markers: Vec<std::fs::File> = ["tb-a", "tb-b"]
+        .iter()
+        .map(|p| {
+            crate::runtime::hold_session_row_marker(
+                &crate::profile::ProfileName::from(*p),
+                false,
+                "4242-0",
+            )
+            .expect("marker")
+        })
+        .collect();
+    handle_key(&mut app, key(KeyCode::Char('m')));
+    let Some(Modal::MoveSession(form)) = app.modals.last() else {
+        panic!("the move modal is open");
+    };
+    assert_eq!(
+        form.sessions[0].now_on, "tb-a",
+        "served by the launch member"
+    );
+    let session = std::thread::spawn(|| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(intended) =
+                crate::live_sessions::get("4242-0").and_then(|r| r.intended_member)
+            {
+                crate::live_sessions::update_as_session("4242-0", |f| {
+                    f.set_current_member(intended);
+                    f.bump_key_generation();
+                    f.set_committed_at(crate::usage::now_ms());
+                })
+                .expect("commit");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    handle_key(&mut app, key(KeyCode::Enter));
+    join_test_workers();
+    session.join().expect("session thread");
+    drain_session_moves(&mut app);
+    let moved = crate::live_sessions::get("4242-0").expect("row");
+    assert_eq!(moved.intended_member.as_deref(), Some("tb-a"));
+    assert_eq!(moved.current_member.as_deref(), Some("tb-a"));
+    assert_eq!(moved.key_generation, Some(2));
+    let toast = app
+        .toasts
+        .back()
+        .map(|t| t.body.clone())
+        .unwrap_or_default();
+    assert_eq!(toast, "session 4242-0: swapping… onto tb-a");
+}

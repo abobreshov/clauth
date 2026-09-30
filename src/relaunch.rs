@@ -79,6 +79,10 @@ pub(crate) struct RelaunchRequest {
     /// Added by the supervisor when it rewrites `.relaunch.taken`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) nonce: Option<String>,
+    /// The requester's random id, echoed into the result so a CLI accepts
+    /// only its own answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) request_id: Option<String>,
 }
 
 /// `<sid>.relaunch.result`.
@@ -87,6 +91,9 @@ pub(crate) struct RelaunchResult {
     pub(crate) version: u32,
     pub(crate) outcome: String,
     pub(crate) reason: Option<String>,
+    /// The answered request's `request_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) request_id: Option<String>,
 }
 
 /// How long the CLI waits for each step.
@@ -215,6 +222,20 @@ pub(crate) fn resolve_conversation(
     if found.is_empty()
         && let Some(cwd) = &row.cwd
     {
+        // The scan cannot tell this session's transcript from a sibling's in
+        // the same project dir: resuming a sibling's conversation would put
+        // two Claude Code processes on one transcript.
+        let sibling = crate::live_sessions::list().into_iter().any(|other| {
+            other.session_id != row.session_id
+                && other.cwd.as_deref() == Some(cwd.as_path())
+                && crate::runtime::namespaced_keychain_ledger::pid_alive(other.pid)
+        });
+        if sibling {
+            return Err(
+                "another live session shares its working directory; pass --conversation <id>"
+                    .to_string(),
+            );
+        }
         let dir = store.join(encode_cwd(cwd));
         let since = std::time::UNIX_EPOCH + Duration::from_millis(row.started_at);
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -226,6 +247,7 @@ pub(crate) fn resolve_conversation(
                 if fresh
                     && path.extension().is_some_and(|e| e == "jsonl")
                     && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && !ran_elsewhere(stem, &row.session_id)
                 {
                     found.push(stem.to_string());
                 }
@@ -239,6 +261,15 @@ pub(crate) fn resolve_conversation(
         1 => Ok(found.remove(0)),
         n => Err(format!("{n} conversations match; pass --conversation <id>")),
     }
+}
+
+/// Whether `conversation`'s hook record names another tollgate session.
+fn ran_elsewhere(conversation: &str, sid: &str) -> bool {
+    crate::hook_note::record_path(conversation, None)
+        .ok()
+        .and_then(|p| crate::hook_note::load_record(&p))
+        .and_then(|r| r.runtime_sid)
+        .is_some_and(|other| other != sid)
 }
 
 // ── CLI side ─────────────────────────────────────────────────────────────────
@@ -298,6 +329,7 @@ pub(crate) fn prepare(sid: &str, profile: &str, conversation: Option<&str>) -> R
             requested_at_ms: crate::usage::now_ms(),
             requester_pid: std::process::id(),
             nonce: None,
+            request_id: Some(nonce()?),
         },
         target,
         conversation,
@@ -350,16 +382,43 @@ fn confirm(prepared: &Prepared) -> Result<bool> {
 }
 
 /// Steps 5-7: write the request, wait for the answer, wait for the new row.
+///
+/// Two concurrent requests for one session are arbitrated: the request is
+/// published exclusively (a hard link that fails on `EEXIST`), refused while
+/// another is pending or claimed, and each CLI accepts — and removes — only
+/// the result carrying its own `request_id`.
 pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
     let sid = prepared.sid.as_str();
     let request = crate::live_sessions::relaunch_path(sid, "")?;
     let result = crate::live_sessions::relaunch_path(sid, "result")?;
-    let _ = std::fs::remove_file(&result);
+    let taken = crate::live_sessions::relaunch_path(sid, "taken")?;
+    let busy = "another relaunch of this session is already in progress; it is unchanged";
+    if taken.exists() {
+        return Err(refuse(sid, busy));
+    }
+    let id = prepared.request.request_id.clone();
     let bytes = serde_json::to_vec(&prepared.request)?;
-    crate::profile::atomic_write_600(&request, bytes)
-        .with_context(|| format!("failed to write {}", request.display()))?;
+    let staging = request.with_file_name(format!(
+        ".{sid}.relaunch.{}.{}",
+        std::process::id(),
+        id.as_deref().unwrap_or("0")
+    ));
+    crate::profile::atomic_write_600(&staging, bytes)
+        .with_context(|| format!("failed to write {}", staging.display()))?;
+    let published = std::fs::hard_link(&staging, &request);
+    let _ = std::fs::remove_file(&staging);
+    match published {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(refuse(sid, busy));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to write {}", request.display()));
+        }
+    }
+    let ours = |path: &Path| read_result(path).filter(|r| r.request_id == id);
     let limits = deadlines();
-    let answer = match wait_for(limits.claim, limits.poll, || read_result(&result)) {
+    let answer = match wait_for(limits.claim, limits.poll, || ours(&result)) {
         Some(answer) => answer,
         None => {
             let cancel = crate::live_sessions::relaunch_path(sid, "cancel")?;
@@ -369,7 +428,7 @@ pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
                     return Err(refuse(sid, "the session did not answer; it is unchanged"));
                 }
                 // Claimed while we gave up: wait once more for its answer.
-                Err(_) => match wait_for(limits.claim, limits.poll, || read_result(&result)) {
+                Err(_) => match wait_for(limits.claim, limits.poll, || ours(&result)) {
                     Some(answer) => answer,
                     None => {
                         return Err(refuse(
@@ -394,11 +453,20 @@ pub(crate) fn submit(prepared: &Prepared) -> Result<()> {
             .find(|row| row.relaunched_from.as_deref() == Some(sid))
     });
     match new_row {
+        // What registered is what is printed: a start that fell back to the
+        // original profile is not reported as the target.
+        Some(row) if row.start_profile != prepared.target.as_str() => Err(refuse(
+            sid,
+            format!(
+                "the session relaunched as '{}' on '{}', not '{}'; check 'tollgate sessions'",
+                row.session_id, row.start_profile, prepared.target
+            ),
+        )),
         Some(row) => {
             outln!(
                 "tollgate: relaunched session '{sid}' as '{}' on '{}' (conversation {})",
                 row.session_id,
-                prepared.target,
+                row.start_profile,
                 prepared.conversation
             );
             Ok(())
@@ -493,7 +561,12 @@ fn nonce() -> Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn write_result(sid: &str, outcome: &str, reason: Option<String>) {
+pub(crate) fn write_result(
+    sid: &str,
+    request_id: Option<String>,
+    outcome: &str,
+    reason: Option<String>,
+) {
     let Ok(path) = crate::live_sessions::relaunch_path(sid, "result") else {
         return;
     };
@@ -501,6 +574,7 @@ fn write_result(sid: &str, outcome: &str, reason: Option<String>) {
         version: 1,
         outcome: outcome.to_string(),
         reason,
+        request_id,
     };
     if let Ok(bytes) = serde_json::to_vec(&result)
         && let Err(e) = crate::profile::atomic_write_600(&path, bytes)
@@ -516,17 +590,18 @@ pub(crate) fn poll_claim(sid: &str) -> Option<Accepted> {
     let request = crate::live_sessions::relaunch_path(sid, "").ok()?;
     let taken = crate::live_sessions::relaunch_path(sid, "taken").ok()?;
     std::fs::rename(&request, &taken).ok()?;
+    let id = request_id_of(&taken);
     match validate(&taken) {
         Err(reason) => {
             let _ = std::fs::remove_file(&taken);
-            write_result(sid, "refused", Some(reason));
+            write_result(sid, id, "refused", Some(reason));
             None
         }
         Ok((mut req, transcript)) => {
             let nonce = match nonce() {
                 Ok(n) => n,
                 Err(e) => {
-                    write_result(sid, "refused", Some(format!("{e:#}")));
+                    write_result(sid, id, "refused", Some(format!("{e:#}")));
                     return None;
                 }
             };
@@ -535,10 +610,10 @@ pub(crate) fn poll_claim(sid: &str) -> Option<Accepted> {
                 .map_err(anyhow::Error::from)
                 .and_then(|b| crate::profile::atomic_write_600(&taken, b).map_err(Into::into));
             if let Err(e) = stamped {
-                write_result(sid, "refused", Some(format!("{e:#}")));
+                write_result(sid, id, "refused", Some(format!("{e:#}")));
                 return None;
             }
-            write_result(sid, "relaunching", None);
+            write_result(sid, id, "relaunching", None);
             Some(Accepted {
                 request: req,
                 nonce,
@@ -546,6 +621,19 @@ pub(crate) fn poll_claim(sid: &str) -> Option<Accepted> {
             })
         }
     }
+}
+
+/// The `request_id` of a request file, best-effort (even one that fails
+/// validation is answered under its own id).
+pub(crate) fn request_id_of(path: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct IdOnly {
+        #[serde(default)]
+        request_id: Option<String>,
+    }
+    serde_json::from_slice::<IdOnly>(&std::fs::read(path).ok()?)
+        .ok()?
+        .request_id
 }
 
 fn validate(taken: &Path) -> Result<(RelaunchRequest, PathBuf), String> {

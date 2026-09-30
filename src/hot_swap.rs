@@ -1084,21 +1084,26 @@ const ACK_LOCK_SLEEP: std::time::Duration = std::time::Duration::from_millis(20)
 /// the only writer that commits an api-key member. Any other row serves its
 /// launch profile at generation 0, so a `current_member` another executor
 /// wrote (an OAuth swap's member) never reaches this helper's stdout.
-fn helper_target(sid: &str) -> Result<(String, u64), &'static str> {
+///
+/// An executor-B row also hands back its launch class: the helper re-checks
+/// the member against it before printing, since the class was checked only
+/// when the switch committed and the member's endpoint can change since.
+fn helper_target(sid: &str) -> Result<(String, u64, Option<LaunchClass>), &'static str> {
     if let Some(row) = crate::live_sessions::get(sid) {
         if row.executor() != Executor::ApiKey {
-            return Ok((row.start_profile, 0));
+            return Ok((row.start_profile, 0, None));
         }
+        let class = row.launch_class.clone();
         let member = row.current_member.unwrap_or(row.start_profile);
-        return Ok((member, row.key_generation.unwrap_or(0)));
+        return Ok((member, row.key_generation.unwrap_or(0), class));
     }
     if let Some(ack) = crate::live_sessions::read_helper_ack(sid)
         && let Some(member) = ack.member
     {
-        return Ok((member, ack.generation));
+        return Ok((member, ack.generation, None));
     }
     start_profile_of_config_dir(sid)
-        .map(|start| (start, 0))
+        .map(|start| (start, 0, None))
         .ok_or("no_row")
 }
 
@@ -1119,10 +1124,18 @@ fn start_profile_of_config_dir(sid: &str) -> Option<String> {
     Some(start.to_string())
 }
 
+/// The slice of a member's `config.toml` the helper reads: the key, and
+/// what [`class_matches`] compares.
 #[derive(Deserialize)]
-struct KeyOnly {
+struct HelperConfig {
+    #[serde(default)]
+    base_url: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    models: crate::profile::ModelSettings,
 }
 
 #[cfg(test)]
@@ -1133,14 +1146,28 @@ thread_local! {
 }
 
 /// The member's key from its `config.toml`, one read, no `load_profile`.
-fn helper_key(member: &str) -> Result<String, &'static str> {
+/// With the session's launch `class`, the same bytes must still match it
+/// ([`class_matches`]): a member whose endpoint, models or env changed since
+/// the commit would hand its key to the wrong provider, so the run fails
+/// with that code and the session shows as stalled instead.
+fn helper_key(member: &str, class: Option<&LaunchClass>) -> Result<String, &'static str> {
     #[cfg(test)]
     HELPER_CONFIG_READS.with(|c| c.set(c.get() + 1));
     let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(member))
         .map_err(|_| "config_unreadable")?
         .join("config.toml");
     let raw = std::fs::read_to_string(&path).map_err(|_| "config_unreadable")?;
-    let parsed: KeyOnly = toml::from_str(&raw).map_err(|_| "config_unreadable")?;
+    let parsed: HelperConfig = toml::from_str(&raw).map_err(|_| "config_unreadable")?;
+    if let Some(class) = class {
+        let mut profile = Profile::new(
+            member.to_string(),
+            parsed.base_url.clone(),
+            parsed.api_key.clone(),
+        );
+        profile.env = parsed.env.clone();
+        profile.models = parsed.models.clone();
+        class_matches(class, &profile)?;
+    }
     let key = parsed.api_key.unwrap_or_default();
     let key = key.trim();
     if key.is_empty() {
@@ -1168,7 +1195,7 @@ pub(crate) fn run_session_helper(sid: &str, out: &mut dyn std::io::Write) -> Res
             generation: 0,
             code,
         },
-        Ok((member, generation)) => match helper_key(&member) {
+        Ok((member, generation, class)) => match helper_key(&member, class.as_ref()) {
             Err(code) => RunOutcome::Failed { generation, code },
             Ok(key) => {
                 let printed = out.write_all(key.as_bytes()).and_then(|()| out.flush());

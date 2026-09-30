@@ -47,6 +47,7 @@ fn request_for(target: &str, conv: &str, cwd: &Path) -> RelaunchRequest {
         requested_at_ms: 1,
         requester_pid: 1,
         nonce: None,
+        request_id: None,
     }
 }
 
@@ -485,4 +486,107 @@ fn strip_resume_args_drops_every_resume_and_continue_spelling() {
     .map(|s| (*s).to_string())
     .collect();
     assert_eq!(strip_resume_args(&args), ["--model", "m", "keep"]);
+}
+
+/// Review lens concurrency #3. Two concurrent `--relaunch` requests for one
+/// session: the second is refused while the first is pending (the request is
+/// published exclusively), a result carrying another request's id is never
+/// taken as this CLI's answer, and the CLI reports the profile that actually
+/// registered — a relaunch that landed elsewhere is not reported as its
+/// target.
+#[test]
+fn concurrent_relaunch_requests_are_arbitrated_and_each_cli_reads_only_its_own_answer() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect(".claude");
+    profiles(&["ar-a", "ar-b", "ar-c"]);
+    let cwd = home.home().join("w");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    transcript_fixture(&store(), &cwd, &["c-ar"]);
+    let _marker = live_session("4242-0", "ar-a", &cwd);
+    let first = prepare("4242-0", "ar-b", None).expect("prepared b");
+    let second = prepare("4242-0", "ar-c", None).expect("prepared c");
+    assert_ne!(first.request.request_id, second.request.request_id);
+    let limits = Deadlines {
+        claim: Duration::from_secs(5),
+        register: Duration::from_millis(300),
+        poll: Duration::from_millis(10),
+    };
+    let request = crate::live_sessions::relaunch_path("4242-0", "").expect("path");
+    let result = crate::live_sessions::relaunch_path("4242-0", "result").expect("path");
+    let cli_b = std::thread::spawn(move || {
+        set_deadlines(Some(limits));
+        submit(&first).map_err(reason)
+    });
+    while !request.exists() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The second requester is refused while the first is pending.
+    set_deadlines(Some(limits));
+    let why = reason(submit(&second).expect_err("second refused"));
+    assert!(why.contains("already in progress"), "{why}");
+    // A result for another request is not this CLI's answer.
+    let foreign = RelaunchResult {
+        version: 1,
+        outcome: "refused".to_string(),
+        reason: Some("FOREIGN".to_string()),
+        request_id: Some("someone-else".to_string()),
+    };
+    std::fs::write(&result, serde_json::to_vec(&foreign).expect("ser")).expect("foreign");
+    std::thread::sleep(Duration::from_millis(50));
+    // The supervisor claims the first request and answers it under its id;
+    // the relaunch then registers on another profile than asked.
+    let accepted = poll_claim("4242-0").expect("claimed");
+    let mut row = live_row("4243-0", "ar-a").with_relaunch(true, Some("4242-0".to_string()));
+    row.cwd = Some(cwd.clone());
+    crate::live_sessions::register(&row).expect("register");
+    let out = cli_b.join().expect("cli b");
+    set_deadlines(None);
+    let why = out.expect_err("landed elsewhere");
+    assert!(!why.contains("FOREIGN"), "{why}");
+    assert!(why.contains("'ar-a', not 'ar-b'"), "{why}");
+    assert!(accepted.request.request_id.is_some());
+    let _ =
+        std::fs::remove_file(crate::live_sessions::relaunch_path("4242-0", "taken").expect("path"));
+}
+
+/// Review lens concurrency #4. The cwd scan never takes a sibling session's
+/// transcript: with another live session in the same working directory it
+/// refuses and asks for `--conversation`, and a transcript whose hook record
+/// names another runtime is not this session's.
+#[test]
+fn the_cwd_scan_never_resolves_a_sibling_sessions_transcript() {
+    let home = HomeSandbox::new();
+    let store = store();
+    let cwd = home.home().join("work");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let mut row = live_row("4242-0", "p");
+    row.cwd = Some(cwd.clone());
+    row.started_at = 0;
+    crate::live_sessions::register(&row).expect("register");
+    transcript_fixture(&store, &cwd, &["sibling-conv"]);
+    // A hook record naming another runtime: not ours.
+    let record = crate::hook_note::record_path("sibling-conv", None).expect("path");
+    std::fs::create_dir_all(record.parent().expect("dir")).expect("records dir");
+    std::fs::write(&record, br#"{"runtime_sid":"4243-0"}"#).expect("record");
+    assert_eq!(
+        resolve_conversation(&row, None, &store),
+        Err("no conversation found for the session".to_string())
+    );
+    std::fs::remove_file(&record).expect("rm record");
+    // A live sibling in the same cwd (this test process is alive).
+    let mut sibling = live_row("4243-0", "q");
+    sibling.cwd = Some(cwd.clone());
+    sibling.pid = std::process::id();
+    crate::live_sessions::register(&sibling).expect("register sibling");
+    assert_eq!(
+        resolve_conversation(&row, None, &store),
+        Err(
+            "another live session shares its working directory; pass --conversation <id>"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        resolve_conversation(&row, Some("sibling-conv"), &store),
+        Ok("sibling-conv".to_string())
+    );
 }

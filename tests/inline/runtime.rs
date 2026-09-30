@@ -12491,10 +12491,14 @@ fn gc_removes_orphan_sidecars_only() {
     ] {
         fs::write(side("9-0", s), b"{}").expect("sidecar");
     }
-    set_mtime(
-        &side("9-0", "relaunch.taken"),
-        SystemTime::now() - Duration::from_secs(600),
-    );
+    // Both relaunch answers age out together (`.relaunch.result` is kept
+    // past teardown for a slow CLI, review lens concurrency #10).
+    for s in ["relaunch.taken", "relaunch.result"] {
+        set_mtime(
+            &side("9-0", s),
+            SystemTime::now() - Duration::from_secs(600),
+        );
+    }
     // No row, but a runtime tree: the orphaned Claude Code may still run the
     // helper, so its ack and lock stay; the relaunch request goes.
     for s in ["helper", "helper.lock", "relaunch"] {
@@ -12504,8 +12508,10 @@ fn gc_removes_orphan_sidecars_only() {
         .expect("profile dir")
         .join("runtime-9-1");
     fs::create_dir_all(&tree).expect("runtime tree");
-    // A fresh `.relaunch.taken` waits for its new process.
+    // A fresh `.relaunch.taken` waits for its new process, and a fresh
+    // `.relaunch.result` for its CLI.
     fs::write(side("9-2", "relaunch.taken"), b"{}").expect("sidecar");
+    fs::write(side("9-2", "relaunch.result"), b"{}").expect("sidecar");
     // A live row keeps everything.
     crate::live_sessions::register(&crate::testutil::live_row("9-3", "g-a")).expect("row");
     let _live = hold_session_row_marker(&crate::profile::ProfileName::from("g-a"), false, "9-3")
@@ -12530,6 +12536,7 @@ fn gc_removes_orphan_sidecars_only() {
     assert!(side("9-1", "helper.lock").exists());
     assert!(!side("9-1", "relaunch").exists());
     assert!(side("9-2", "relaunch.taken").exists());
+    assert!(side("9-2", "relaunch.result").exists());
     for s in ["helper", "helper.lock", "relaunch"] {
         assert!(side("9-3", s).exists(), "9-3.{s}");
     }
@@ -12770,4 +12777,140 @@ fn a_stalled_commit_is_warned_once_per_generation_and_an_idle_one_never() {
         swap.stall_logged.load(std::sync::atomic::Ordering::Relaxed),
         1
     );
+}
+
+/// Review lens concurrency #1. The helper re-checks the member it serves
+/// against the session's launch class: a committed member whose endpoint
+/// was edited since (to another provider) prints nothing and fails with
+/// `class_differs:endpoint`, never handing its key to the launch endpoint.
+/// The same holds for the launch member at generation 0.
+#[test]
+fn the_helper_never_serves_a_key_whose_endpoint_left_the_launch_class() {
+    let _home = HomeSandbox::new();
+    let a = b_member("hc-a");
+    b_member("hc-b");
+    let (swap, _launch) = lone_b_session(&a);
+    let mut out = Vec::new();
+    crate::hot_swap::run_session_helper(swap.session.as_str(), &mut out).expect("gen 0");
+    assert_eq!(out, b"sk-or-hc-a");
+    intend(&swap, "hc-b");
+    swap.poll();
+    assert_eq!(row_of(&swap).current_member.as_deref(), Some("hc-b"));
+    let moved = crate::testutil::api_key_profile(
+        "hc-b",
+        "https://api.deepseek.com/anthropic",
+        "sk-deepseek-secret",
+    );
+    crate::testutil::write_api_key_profile(&moved);
+    let mut out = Vec::new();
+    let e =
+        crate::hot_swap::run_session_helper(swap.session.as_str(), &mut out).expect_err("refused");
+    assert!(out.is_empty(), "nothing printed");
+    assert!(format!("{e:#}").contains("class_differs:endpoint"), "{e:#}");
+
+    // Generation 0: the launch member itself edited away.
+    let (swap, _launch) = {
+        let c = b_member("hc-c");
+        lone_b_session(&c)
+    };
+    let moved = crate::testutil::api_key_profile(
+        "hc-c",
+        "https://api.deepseek.com/anthropic",
+        "sk-deepseek-c",
+    );
+    crate::testutil::write_api_key_profile(&moved);
+    let mut out = Vec::new();
+    assert!(crate::hot_swap::run_session_helper(swap.session.as_str(), &mut out).is_err());
+    assert!(out.is_empty());
+}
+
+/// Review lens concurrency #2 and #7. The sid re-mint loop skips a sid the
+/// registry already holds — a row live under another profile (two pid
+/// namespaces sharing one `~/.tollgate`) or a dead namesake's stale helper
+/// ack — so `register` never overwrites a foreign row and a stale ack never
+/// poisons the new session's view.
+#[test]
+fn acquire_never_reuses_a_sid_the_registry_already_holds() {
+    let home = HomeSandbox::new();
+    fake_claude_home(home.home());
+    let a = b_member("sid-a");
+    let probe = SessionId::mint();
+    let (pid, seq) = probe.as_str().split_once('-').expect("<pid>-<seq>");
+    let seq: u64 = seq.parse().expect("seq");
+    let foreign_row = format!("{pid}-{}", seq + 1);
+    let stale_ack = format!("{pid}-{}", seq + 2);
+    let row_file = crate::live_sessions::sidecar_path_for_test(&foreign_row, "helper")
+        .with_file_name(format!("{foreign_row}.json"));
+    fs::write(&row_file, b"{\"foreign\":true}").expect("foreign row");
+    let ack_file = crate::live_sessions::sidecar_path_for_test(&stale_ack, "helper");
+    fs::write(&ack_file, b"{\"generation\":7,\"member\":\"ghost\"}").expect("stale ack");
+    assert!(crate::live_sessions::sid_in_use(&foreign_row));
+    assert!(crate::live_sessions::sid_in_use(&stale_ack));
+    let rt = acquire_b(&a);
+    let sid = rt.session_id().to_string();
+    assert_ne!(sid, foreign_row, "a foreign row's sid is never reused");
+    assert_ne!(sid, stale_ack, "a stale ack's sid is never reused");
+    assert_eq!(fs::read(&row_file).expect("row"), b"{\"foreign\":true}");
+    drop(rt);
+    assert!(
+        row_file.exists(),
+        "our teardown never removes the foreign row"
+    );
+}
+
+/// Review lens concurrency #5 and #6. A repeated request for a member the
+/// session already refused (a refusal the CLI pre-check cannot see: runtime
+/// settings drift) is answered `Refused` again, never `Requested`; and a
+/// switch back to the current member withdraws the refused intent, so it
+/// never commits later once its refusal clears.
+#[test]
+fn a_repeated_refused_switch_is_refused_and_switching_back_withdraws_the_intent() {
+    use crate::sessions_cli::{RequestOutcome, Surface, SwitchWaits};
+    let _home = HomeSandbox::new();
+    let a = b_member("rr-a");
+    b_member("rr-b");
+    let (swap, _launch) = lone_b_session(&a);
+    let sid = swap.session.as_str().to_string();
+    let settings = swap.runtime.join("settings.json");
+    let original = fs::read(&settings).expect("settings");
+    let mut value: serde_json::Value = serde_json::from_slice(&original).expect("parse");
+    value["env"]["ANTHROPIC_BASE_URL"] = serde_json::json!("https://drifted.example");
+    fs::write(&settings, serde_json::to_vec(&value).expect("ser")).expect("drift");
+    crate::sessions_cli::set_switch_waits(Some(SwitchWaits {
+        commit: Duration::from_secs(3),
+        served: Duration::from_millis(200),
+        commit_poll: Duration::from_millis(10),
+        served_poll: Duration::from_millis(10),
+    }));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let (swap, stop) = (swap.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                swap.poll();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    let ask = |p: &str| {
+        crate::sessions_cli::request_session_switch(&sid, p, Surface::Cli)
+            .expect("request")
+            .outcome
+    };
+    let refused = RequestOutcome::Refused("class_differs:endpoint".to_string());
+    assert_eq!(ask("rr-b"), refused, "first request");
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(ask("rr-b"), refused, "the same request again");
+    // Back to the current member: the refused intent is withdrawn.
+    assert_eq!(ask("rr-a"), RequestOutcome::AlreadyOn);
+    assert_eq!(row_of(&swap).intended_member.as_deref(), Some("rr-a"));
+    // The drift clears: nothing commits against the latest request.
+    fs::write(&settings, &original).expect("undrift");
+    std::thread::sleep(Duration::from_millis(100));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    poller.join().expect("poller");
+    crate::sessions_cli::set_switch_waits(None);
+    let row = row_of(&swap);
+    assert_eq!(row.current_member.as_deref().unwrap_or("rr-a"), "rr-a");
+    assert_eq!(row.key_generation, Some(0));
 }

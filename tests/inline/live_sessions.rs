@@ -27,6 +27,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         swap_refusal: None,
         relaunch_capable: false,
         relaunched_from: None,
+        intended_at: None,
     }
 }
 
@@ -748,7 +749,9 @@ fn list_reads_only_session_id_json_stems() {
     assert_eq!(rows[0].session_id, "4242-0");
 }
 
-/// Teardown's sidecar sweep keeps `.relaunch.taken` on the relaunch path only.
+/// Teardown's sidecar sweep keeps `.relaunch.taken` and — review lens
+/// concurrency #10 — `.relaunch.result` (the CLI's answer) on the relaunch
+/// path only.
 #[test]
 fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
     let _home = HomeSandbox::new();
@@ -768,7 +771,7 @@ fn remove_sidecars_keeps_relaunch_taken_only_when_asked() {
     }
     remove_sidecars("4242-0", KeepSidecars::RelaunchTaken);
     let left: Vec<bool> = paths.iter().map(|p| p.exists()).collect();
-    assert_eq!(left, vec![false, false, false, true, false]);
+    assert_eq!(left, vec![false, false, false, true, true]);
     remove_sidecars("4242-0", KeepSidecars::Nothing);
     assert!(paths.iter().all(|p| !p.exists()));
     assert!(get("4242-0").is_some(), "the row itself is `unregister`'s");
