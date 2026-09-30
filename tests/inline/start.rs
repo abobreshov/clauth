@@ -24,6 +24,16 @@ fn status_code_preserves_plain_exit_code() {
     assert_eq!(status_code(status, None), 7);
 }
 
+#[test]
+fn hermes_credentials_warning_catches_a_file_created_from_absence() {
+    assert!(hermes_credentials_changed(None, Some(false)));
+    assert!(hermes_credentials_changed(Some(true), Some(false)));
+    assert!(!hermes_credentials_changed(None, None));
+    assert!(!hermes_credentials_changed(Some(false), Some(false)));
+    assert!(HERMES_CREDENTIALS_WARNING.contains("non-symlink path"));
+    assert!(!HERMES_CREDENTIALS_WARNING.contains("regular file"));
+}
+
 #[cfg(unix)]
 #[test]
 fn status_code_preserves_child_signal_code() {

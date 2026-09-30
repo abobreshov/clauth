@@ -171,6 +171,9 @@ fn argv_scan_refuses_profile_flags_anywhere_including_after_dashdash() {
         &["--profile", "x"],
         &["chat", "-p", "x"],
         &["--", "-p", "x"],
+        &["--prof", "x"],
+        &["--profi=x"],
+        &["-pfoo"],
     ] {
         let text = refusal_text(g5_argv("or-main", "openrouter", &argv(v)));
         assert!(text.contains("selects a Hermes profile"), "{v:?}: {text}");
@@ -412,10 +415,11 @@ fn auto_auxiliary_provider_refuses() {
         );
         assert!(
             text.contains(&format!(
-                "'/venv/bin/hermes config set auxiliary.{task}.provider openrouter'"
+                "HOME='/child-home' HERMES_HOME='/h' '/venv/bin/hermes' config set auxiliary.{task}.provider openrouter"
             )),
             "{text}"
         );
+        assert!(!text.contains("with 'HOME="), "{text}");
     }
     let missing = projection(|v| {
         v["config"]["auxiliary"]

@@ -160,6 +160,146 @@ fn new_adopts_a_crashed_leftover_and_refuses_a_foreign_dir() {
     assert!(!HermesState::load().unwrap().holds("other"));
 }
 
+#[test]
+fn new_refuses_unsafe_homes_and_install_env_before_hermes_runs() {
+    use crate::hermes::testkit::passing_projection;
+    for hazard in ["anthropic_key", "claude_token", "child_claude", "hsp_env"] {
+        let sb = HomeSandbox::new();
+        let _scope = NoManagedScope::new(&sb);
+        let fx = fixture(&sb);
+        let paths = HermesPaths::for_name("or-main").unwrap();
+        std::fs::create_dir_all(&paths.home).unwrap();
+        match hazard {
+            "anthropic_key" | "claude_token" => {
+                let key = if hazard == "anthropic_key" {
+                    "ANTHROPIC_API_KEY"
+                } else {
+                    "CLAUDE_CODE_OAUTH_TOKEN"
+                };
+                std::fs::write(paths.env_file(), format!("{key}=sentinel\n")).unwrap();
+                let mut projection = passing_projection("openrouter");
+                projection["env_keys"]["home"] =
+                    serde_json::json!([{"key": key, "nonblank": true}]);
+                fx.set_projection(&projection);
+            }
+            "child_claude" => {
+                std::fs::create_dir_all(sb.home().join(".claude")).unwrap();
+                std::fs::create_dir_all(&paths.child_home).unwrap();
+                std::os::unix::fs::symlink(
+                    sb.home().join(".claude"),
+                    paths.child_home.join(".claude"),
+                )
+                .unwrap();
+            }
+            "hsp_env" => {
+                std::fs::write(fx.hsp.join(".env"), "ANTHROPIC_API_KEY=sentinel\n").unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let err = new_profile(&opts("or-main", Provider::Openrouter), &mut |_| {
+            Ok(TEST_KEY.into())
+        })
+        .unwrap_err();
+        let why = err.to_string();
+        match hazard {
+            "anthropic_key" | "claude_token" => {
+                assert!(why.contains(".env routes to anthropic"), "{hazard}: {why}");
+            }
+            "child_claude" => {
+                assert!(why.contains("holds '.claude'"), "{hazard}: {why}");
+                assert!(fx.calls().is_empty(), "projector ran before G2a");
+            }
+            "hsp_env" => assert!(why.contains("/.env exists; Hermes loads it"), "{why}"),
+            _ => unreachable!(),
+        }
+        assert!(fx.hermes_calls().is_empty(), "{hazard}: Hermes ran");
+    }
+}
+
+#[test]
+fn explain_checks_the_child_home() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let _fx = fixture(&sb);
+    new_openrouter("or-main");
+    let paths = HermesPaths::for_name("or-main").unwrap();
+    std::os::unix::fs::symlink(sb.home(), paths.child_home.join(".claude")).unwrap();
+    let profile = find_profile("or-main").unwrap();
+    let err = preflight_explain("or-main", &profile, &[]).unwrap_err();
+    assert!(err.to_string().contains(".claude"), "{err}");
+}
+
+#[test]
+fn explain_names_a_missing_child_home_without_a_fake_entry() {
+    let sb = HomeSandbox::new();
+    let _scope = NoManagedScope::new(&sb);
+    let _fx = fixture(&sb);
+    new_openrouter("or-main");
+    let paths = HermesPaths::for_name("or-main").unwrap();
+    std::fs::remove_dir_all(&paths.child_home).unwrap();
+    let profile = find_profile("or-main").unwrap();
+    let err = preflight_explain("or-main", &profile, &[]).unwrap_err();
+    assert!(err.to_string().contains("child home is missing"), "{err}");
+    assert!(!err.to_string().contains("holds '.'"), "{err}");
+}
+
+#[test]
+fn unresolved_install_prints_complete_auxiliary_pin_hints() {
+    const CHILD: &str = "TOLLGATE_PIN_HINT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let sb = HomeSandbox::new();
+        new_profile(&opts("or-main", Provider::Openrouter), &mut |_| {
+            Ok(TEST_KEY.into())
+        })
+        .unwrap();
+        let _ = sb;
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hermes::tests::unresolved_install_prints_complete_auxiliary_pin_hints",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("tollgate: finish by hand: HOME=").count(),
+        guards::HERMES_AUX_TASKS.len(),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" HERMES_HOME="), "{stderr}");
+    assert!(
+        stderr.contains(" 'hermes' config set auxiliary.vision.provider openrouter"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn auxiliary_pin_hint_is_a_complete_child_home_command() {
+    let sb = HomeSandbox::new();
+    let paths = HermesPaths::for_name("or-main").unwrap();
+    let hint = pin_auxiliary_hint(&paths, "/venv/bin/hermes", "vision", Provider::Openrouter);
+    assert!(hint.starts_with("HOME="), "{hint}");
+    assert!(hint.contains(" HERMES_HOME="), "{hint}");
+    assert!(
+        hint.contains(" '/venv/bin/hermes' config set auxiliary.vision.provider openrouter"),
+        "{hint}"
+    );
+    let _ = sb;
+}
+
 /// Test 8: the key prompt runs with neither tollgate lock held.
 #[test]
 fn new_reads_the_key_before_taking_any_lock() {
@@ -251,6 +391,7 @@ fn the_child_env_scrubs_xdg_claude_config_dir_and_gh_tokens() {
         "XDG_CACHE_HOME",
         "CLAUDE_CONFIG_DIR",
         "GH_TOKEN",
+        "GH_CONFIG_DIR",
         "GITHUB_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "PYTEST_CURRENT_TEST",
@@ -608,6 +749,40 @@ fn post_session_check_flags_anthropic_billing_rows() {
         !post_session_anthropic_rows(&home, 120, None),
         "no sqlite3, no verdict"
     );
+}
+
+#[test]
+fn post_session_check_refuses_symlinked_state_db() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let sb = HomeSandbox::new();
+    let home = sb.home().join("h");
+    let bin = sb.home().join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(home.join("real.db"), "sentinel").unwrap();
+    symlink(home.join("real.db"), home.join("state.db")).unwrap();
+    let sqlite = bin.join("sqlite3");
+    let invocation = home.join("sqlite-was-run");
+    std::fs::write(
+        &sqlite,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\necho '[{{\"billing_provider\":\"anthropic\",\"last_seen\":123}}]'\n",
+            invocation.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sqlite, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let warning = post_session_state_db_skip_warning(&home).expect("symlink warning");
+    assert!(
+        warning.contains("state.db") && warning.contains("symlink"),
+        "{warning}"
+    );
+    assert!(!post_session_anthropic_rows(
+        &home,
+        100,
+        Some(bin.as_os_str())
+    ));
+    assert!(!invocation.exists(), "sqlite3 followed the symlink");
 }
 
 /// `hermes key` rewrites the one line and the roster fingerprint, and

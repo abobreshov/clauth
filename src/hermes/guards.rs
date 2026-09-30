@@ -66,6 +66,7 @@ pub(crate) const SCRUB_EXACT: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
     // The pool's `gh_cli` source (credential_sources.py:10).
     "GH_TOKEN",
+    "GH_CONFIG_DIR",
     "GITHUB_TOKEN",
     // These would point the child back into the real home past the HOME redirect.
     "XDG_CONFIG_HOME",
@@ -389,7 +390,10 @@ pub(crate) fn g5_argv(name: &str, provider: &str, args: &[String]) -> Result<()>
     let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
         let a = arg.as_str();
-        if a == "-p" || a == "--profile" || a.starts_with("--profile=") {
+        if a == "-p"
+            || (a.starts_with("-p") && !a.starts_with("--"))
+            || (long_prefix_of(a, "--profile") && !long_prefix_of(a, "--provider"))
+        {
             return Err(refuse(format!(
                 "{}'{a}' selects a Hermes profile and would leave this home; drop it (the \
                  tollgate profile is the account)",
@@ -746,11 +750,17 @@ pub(crate) fn audit_projection(
             Some(v) if v.eq_ignore_ascii_case("auto") => "auto",
             Some(_) => continue,
         };
+        let child_home = home
+            .parent()
+            .unwrap_or(home)
+            .join(super::home::CHILD_HOME_DIR);
         return Err(refuse(format!(
             "{p}auxiliary.{task}.provider is {shown}; Hermes' auto chain can fall through to \
-             Anthropic — set it with '{} config set auxiliary.{task}.provider {}' or recreate \
+             Anthropic — run HOME={} HERMES_HOME={} {} config set auxiliary.{task}.provider {} or recreate \
              the profile",
-            entry.display(),
+            super::shell_quote(&child_home.display().to_string()),
+            super::shell_quote(&home.display().to_string()),
+            super::shell_quote(&entry.display().to_string()),
             profile.provider
         )));
     }
