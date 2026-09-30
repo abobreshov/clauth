@@ -736,7 +736,8 @@ pub(crate) fn show(name: &str, json: bool, check: bool) -> Result<i32> {
 pub(crate) const STRATEGIES: &[&str] = &["fill_first", "round_robin", "random", "least_used"];
 
 /// The strategy writer (§4.7): the entrypoint resolved lock-free; then the
-/// RotationGuard with G1–G4 and G14; a marker claimed with no row; both locks
+/// full preflight and projector, then RotationGuard with the in-guard audit;
+/// a marker claimed with no row; both locks
 /// released; `<hermes> config set credential_pool_strategies.<provider> <s>`
 /// with the child env; the marker dropped. tollgate never writes
 /// `config.yaml` or `auth.json` itself. Returns the child's code.
@@ -755,20 +756,21 @@ pub(crate) fn pool_strategy(name: &str, strategy: &str) -> Result<i32> {
              strategy applies to a pool home"
         )));
     }
-    let paths = HermesPaths::for_name(name)?;
-    let install = super::resolve_install(name)?;
-    let dynamic = guards::plugin_env_vars(&guards::plugin_roots(&install.hsp, &paths.home));
+    let launch = super::preflight(name, &profile, super::Verb::Auth)?;
+    let paths = &launch.paths;
+    let install = &launch.install;
+    let dynamic = &launch.dynamic_scrub;
     let active = super::active_claude_env_keys();
 
     let rotation = RotationGuard::acquire_with_timeout(&ProfileName::from(name), ROTATION_WAIT)?;
-    super::shape_guards(name, &paths)?;
-    guards::g14_liveness(name, &paths)?;
+    super::shape_guards(name, paths)?;
+    super::audit_in_guard(&launch, &rotation)?;
     let marker = crate::runtime::HermesMarker::claim(name, false, &rotation, || {
         guards::m_busy(name, "another tollgate command holds it")
     })?;
     drop(rotation);
 
-    let mut command = super::child_command(&install.entry, &paths, &dynamic, &active);
+    let mut command = super::child_command(&install.entry, paths, dynamic, &active);
     command
         .arg("config")
         .arg("set")

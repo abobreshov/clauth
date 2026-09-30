@@ -1138,10 +1138,10 @@ pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
         .ok()
         .and_then(|p| p.symlink_metadata().ok())
         .map(|m| m.file_type().is_symlink());
-    if creds_before == Some(true) && creds_after == Some(false) {
+    if hermes_credentials_changed(creds_before, creds_after) {
         errln!(
             "tollgate: WARNING — ~/.claude/.credentials.json changed during this Hermes session \
-             (the credentials link was replaced by a regular file)"
+             (a regular file appeared or replaced the credentials link)"
         );
     }
     drop(marker);
@@ -1151,6 +1151,10 @@ pub(crate) fn run_hermes(name: &str, hermes_args: &[String]) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+fn hermes_credentials_changed(before: Option<bool>, after: Option<bool>) -> bool {
+    matches!(before, None | Some(true)) && after == Some(false)
 }
 
 #[cfg(test)]

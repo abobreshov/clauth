@@ -73,7 +73,7 @@ def env_keys(path):
 
 def route(d):
     if not isinstance(d, dict):
-        return {"provider": None, "base_url_host": None}
+        die(3, "route is not a mapping")
     return {"provider": s(d.get("provider")), "base_url_host": host(d.get("base_url"))}
 
 cfg = load_yaml(os.path.join(home, "config.yaml"))
@@ -137,7 +137,7 @@ print(json.dumps({
         "fallback_providers": provider_list(cfg.get("fallback_providers")),
         "fallback_model": provider_list(cfg.get("fallback_model")),
         "auxiliary": aux,
-        "delegation": route(cfg.get("delegation")),
+        "delegation": route(cfg.get("delegation") if cfg.get("delegation") is not None else {}),
         "credential_pool_strategies": {s(k): s(v) for k, v in strategies.items()} if isinstance(strategies, dict) else {},
         "secrets": secrets,
         "plugins_enabled": [s(p) for p in enabled] if isinstance(enabled, list) else [],

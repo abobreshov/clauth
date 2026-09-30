@@ -83,6 +83,21 @@ fn projector_failure_refuses_closed() {
     }
 }
 
+#[test]
+fn non_mapping_delegation_fails_closed() {
+    let sb = HomeSandbox::new();
+    let script = "import sys\nsrc=sys.argv[1]\npart=src[src.index('def route(d):'):src.index('cfg = load_yaml')]\ndef die(code, why): raise SystemExit(code)\ndef s(v): return v\ndef host(v): return v\nexec(part)\nroute('anthropic')\n";
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(script)
+        .arg(PROJECTOR)
+        .current_dir(sb.home())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a string delegation was accepted");
+}
+
 /// A failure message never carries stderr past the exception class: a YAML
 /// error's tail quotes the offending line, which may be an `api_key`.
 #[test]

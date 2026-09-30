@@ -26,7 +26,7 @@ tollgate hermes new or-pool --provider openrouter --pool
 
 The key is never taken on argv. It is written as one managed line of the home's `.env`, under a comment saying tollgate manages it, and every other line stays yours. The roster (`~/.tollgate/hermes-profiles.toml`) holds only Hermes' own fingerprint of the key (`sha256:` plus 16 hex digits), never the key.
 
-`new` then pins all 15 of Hermes' auxiliary tasks (vision, compression, title generation and the rest) to the profile's provider with `hermes config set`. Hermes' `auto` choice for them can fall through to Anthropic, and a launch refuses while any is unpinned. When a pin fails, `new` prints the exact command to finish by hand.
+`new` then pins all 15 of Hermes' auxiliary tasks (vision, compression, title generation and the rest) to the profile's provider with `hermes config set`. Hermes' `auto` choice for them can fall through to Anthropic, and a launch refuses while any is unpinned. Each pin first checks the child home, install `.env`, `auth.json` and projected home `.env`; a refusal starts no Hermes entrypoint. When a pin fails, `new` prints the exact command to finish by hand, prefixed with the profile's `HOME=` and `HERMES_HOME=`.
 
 Outside [guest mode](Guest-Mode), when herdr is installed, `new` also runs `HERMES_HOME=<home> herdr integration install hermes` once, so herdr recognises this home's panes. In guest mode it prints that command instead of running it, because it is not yet confirmed that it leaves herdr's shared config alone.
 
@@ -43,7 +43,7 @@ tollgate hermes auth or-pool reset openrouter
 tollgate hermes pool or-pool strategy round_robin   # fill_first, round_robin, random, least_used
 ```
 
-`auth` hands off to Hermes' own `hermes auth` with your terminal, and Hermes prompts for a key itself. tollgate never passes a key, a portal URL or a CA bundle on its argv. An account home holds one account of one provider: a second credential, or another provider, is refused. `pool … strategy` runs `hermes config set credential_pool_strategies.<provider> <s>` and applies to pool homes only. Every writing verb waits for an idle home: a live session refuses it.
+`auth` hands off to Hermes' own `hermes auth` with your terminal, and Hermes prompts for a key itself. tollgate never passes a key, a portal URL or a CA bundle on its argv. An account home holds one account of one provider: a second credential, or another provider, is refused. `pool … strategy` runs the full home audit before `hermes config set credential_pool_strategies.<provider> <s>` and applies to pool homes only. Every writing verb waits for an idle home: a live session refuses it.
 
 ## Launch
 
@@ -81,7 +81,7 @@ Before anything starts, with no lock held, tollgate checks the home's shape, `ac
 
 Then, under the profile's lock, it re-checks that none of the four audited files changed since they were read (`home changed during audit; retry` otherwise). A key edited by hand in the home `.env` is accepted and re-attributed: `note — OPENROUTER_API_KEY changed outside tollgate; re-attributed`.
 
-At teardown tollgate refreshes the usage figures, warns when `state.db` shows a call billed to Anthropic during the session (the in-session `/model` picker can reach it, though it has no credentials to use), and warns when the child home gained an entry.
+At teardown tollgate refreshes the usage figures, warns when a regular `state.db` shows a call billed to Anthropic during the session (the in-session `/model` picker can reach it, though it has no credentials to use), and warns when the child home gained an entry or a regular `~/.claude/.credentials.json` appeared or replaced a symlink.
 
 ## See what you have
 

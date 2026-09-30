@@ -264,6 +264,48 @@ fn strategy_writer_runs_hermes_config_set_idle_only_and_never_writes_auth_json()
     assert_eq!(std::fs::read(&auth).unwrap(), before);
 }
 
+#[test]
+fn strategy_refuses_unsafe_homes_and_install_env_before_hermes_runs() {
+    use crate::hermes::testkit::passing_projection;
+    for hazard in ["anthropic_key", "claude_token", "child_claude", "hsp_env"] {
+        let sb = HomeSandbox::new();
+        let _scope = NoManagedScope::new(&sb);
+        let fx = fixture(&sb);
+        new_pool("pool-a");
+        let paths = HermesPaths::for_name("pool-a").unwrap();
+        fx.clear_rec();
+        match hazard {
+            "anthropic_key" | "claude_token" => {
+                let key = if hazard == "anthropic_key" {
+                    "ANTHROPIC_API_KEY"
+                } else {
+                    "CLAUDE_CODE_OAUTH_TOKEN"
+                };
+                std::fs::write(paths.env_file(), format!("{key}=sentinel\n")).unwrap();
+                let mut projection = passing_projection("openrouter");
+                projection["env_keys"]["home"] =
+                    serde_json::json!([{"key": key, "nonblank": true}]);
+                fx.set_projection(&projection);
+            }
+            "child_claude" => {
+                std::fs::create_dir_all(sb.home().join(".claude")).unwrap();
+                std::os::unix::fs::symlink(
+                    sb.home().join(".claude"),
+                    paths.child_home.join(".claude"),
+                )
+                .unwrap();
+            }
+            "hsp_env" => {
+                std::fs::write(fx.hsp.join(".env"), "ANTHROPIC_API_KEY=sentinel\n").unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let err = pool_strategy("pool-a", "round_robin").unwrap_err();
+        assert!(!err.to_string().is_empty(), "{hazard}");
+        assert!(fx.hermes_calls().is_empty(), "{hazard}: Hermes ran");
+    }
+}
+
 /// `show --check` reports every guard in launch order and stops at the first
 /// refusal; `show` without it runs nothing but file reads.
 #[test]

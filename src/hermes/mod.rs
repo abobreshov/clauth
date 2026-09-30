@@ -294,6 +294,13 @@ pub(crate) fn preflight_explain(
 ) -> Result<()> {
     let paths = HermesPaths::for_name(name)?;
     shape_guards(name, &paths)?;
+    match home::audit_child_home(&paths.child_home)? {
+        home::ChildHomeVerdict::Ok => {}
+        home::ChildHomeVerdict::Missing => return Err(m_child_home(name, &paths, ".")),
+        home::ChildHomeVerdict::Foreign(entry) => {
+            return Err(m_child_home(name, &paths, &entry));
+        }
+    }
     guards::g5_argv(name, profile.provider.as_str(), args)?;
     guards::g5_model(name, profile.provider.as_str(), profile.model.as_deref())?;
     let install = resolve_install(name)?;
@@ -397,6 +404,28 @@ fn g2a_child_home(name: &str, paths: &HermesPaths, _rotation: &RotationGuard) ->
         home::ChildHomeVerdict::Missing => home::build_child_home(&paths.child_home),
         home::ChildHomeVerdict::Foreign(entry) => Err(m_child_home(name, paths, &entry)),
     }
+}
+
+/// The guards needed before a `config set` while auxiliary pins may still be
+/// absent. The projector runs with no tollgate lock held.
+fn audit_config_set_boundary(name: &str, paths: &HermesPaths, install: &Install) -> Result<()> {
+    shape_guards(name, paths)?;
+    guards::g6_hsp_env(name, &install.hsp)?;
+    let dynamic = guards::plugin_env_vars(&guards::plugin_roots(&install.hsp, &paths.home));
+    let command = child_command(&install.python, paths, &dynamic, &active_claude_env_keys());
+    let projection =
+        projector::run_projector(command, &paths.home, guards::managed_dir().as_deref()).map_err(
+            |e| {
+                refuse(format!(
+                    "tollgate: hermes '{name}': cannot audit {}/config.yaml ({e:#})",
+                    paths.home.display()
+                ))
+            },
+        )?;
+    let rotation = RotationGuard::acquire_with_timeout(&ProfileName::from(name), ROTATION_WAIT)?;
+    g2a_child_home(name, paths, &rotation)?;
+    guards::g11_read_and_check(name, &paths.home)?;
+    guards::g12_env(name, &projection)
 }
 
 pub(crate) fn m_child_home(name: &str, paths: &HermesPaths, entry: &str) -> anyhow::Error {
@@ -558,7 +587,7 @@ pub(crate) fn new_profile(
     }
 
     // Step 7: pin the auxiliary providers, no lock held.
-    pin_auxiliary(&name, &paths, opts.provider);
+    pin_auxiliary(&name, &paths, opts.provider)?;
     // Step 8 (H2h): herdr's Hermes integration for this home.
     herdr_integration(&paths);
     Ok(())
@@ -625,13 +654,11 @@ fn herdr_integration(paths: &HermesPaths) {
 /// for every pinned task, with the child env, stdin null, 10 s each. A
 /// failure prints the command to finish by hand; the next `start` refuses
 /// (M-AUX) until it is done.
-fn pin_auxiliary(name: &str, paths: &HermesPaths, provider: Provider) {
+fn pin_auxiliary(name: &str, paths: &HermesPaths, provider: Provider) -> Result<()> {
     let hint = |entry: &str, task: &str| {
         errln!(
-            "tollgate: finish by hand: {entry} config set auxiliary.{task}.provider {provider} \
-             (with HERMES_HOME={} HOME={})",
-            paths.home.display(),
-            paths.child_home.display()
+            "tollgate: finish by hand: {}",
+            pin_auxiliary_hint(paths, entry, task, provider)
         );
     };
     let install = match resolve_install(name) {
@@ -642,15 +669,13 @@ fn pin_auxiliary(name: &str, paths: &HermesPaths, provider: Provider) {
                 "tollgate: the auxiliary providers are not pinned yet; 'tollgate start {name}' \
                  refuses until they are"
             );
-            for task in guards::HERMES_AUX_TASKS {
-                hint("<hermes>", task);
-            }
-            return;
+            return Ok(());
         }
     };
     let dynamic = guards::plugin_env_vars(&guards::plugin_roots(&install.hsp, &paths.home));
     let active = active_claude_env_keys();
     for task in guards::HERMES_AUX_TASKS {
+        audit_config_set_boundary(name, paths, &install)?;
         let mut command = child_command(&install.entry, paths, &dynamic, &active);
         command
             .arg("config")
@@ -663,6 +688,20 @@ fn pin_auxiliary(name: &str, paths: &HermesPaths, provider: Provider) {
             hint(&install.entry.display().to_string(), task);
         }
     }
+    Ok(())
+}
+
+fn pin_auxiliary_hint(paths: &HermesPaths, entry: &str, task: &str, provider: Provider) -> String {
+    format!(
+        "HOME={} HERMES_HOME={} {} config set auxiliary.{task}.provider {provider}",
+        shell_quote(&paths.child_home.display().to_string()),
+        shell_quote(&paths.home.display().to_string()),
+        shell_quote(entry)
+    )
+}
+
+pub(crate) fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Read a key from the terminal (input hidden) or from one stdin line.
@@ -916,7 +955,7 @@ pub(crate) fn post_session_anthropic_rows(
     let Some(sqlite) = resolve::which_on(path, "sqlite3") else {
         return false;
     };
-    if !db.is_file() {
+    if !db.symlink_metadata().is_ok_and(|m| m.is_file()) {
         return false;
     }
     // A helper, like herdr or notify-send: no monitoring or billing key rides
