@@ -103,12 +103,13 @@ const CLAUDE_CARRIERS: [&str; 4] = [
     "mcp-logins.json",
 ];
 const CODEX_CARRIERS: [&str; 3] = ["auth.json", "auth.lkg.json", "auth.quarantine.json"];
-const PROFILE_COPIES: [&str; 8] = [
+const PROFILE_COPIES: [&str; 9] = [
     "account_id.json",
     "profile_fetched.json",
     "usage_cache.json",
     "third_party_cache.json",
     "third_party_auth.json",
+    "throughput_cache.json",
     "touch-receipt.json",
     "usage_history.jsonl",
     "wallet_history.jsonl",

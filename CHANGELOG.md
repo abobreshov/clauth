@@ -4,6 +4,7 @@
 
 ### Import
 
+- A profile's `throughput_cache.json` (upstream 0.16.0 keeps its per-model throughput samples in each profile) is copied as a profile cache instead of blocking the import as an unknown entry.
 - Rollback of an adopted Claude login now returns the current refresh chain to the upstream store after a tollgate rotation or rollback slot adoption, while keeping the superseded chain quarantined. Undo preserves an upstream `quarantine/` carrier. Herdr reinstall after the fence uses G2's environment allowlist, and `--adopt-live` help describes the parked chain.
 - `tollgate import clauth` moves an upstream clauth 0.16.0 install into `~/.tollgate` and ends guest mode. `--dry-run` shows everything it would do and changes nothing, not even a lock file; the real run asks once (`--yes` skips it; a non-interactive stdin without `--yes` exits 2) and then runs one journaled transaction. [Importing clauth](wiki/Import.md).
 - Refresh chains move by rename, never by copy, so each keeps one inode; a move across filesystems is refused. Live slots are repointed or captured in the same step.

@@ -172,7 +172,7 @@ helper token. Rollback applies the inverse map.
 | `profiles/<p>/auth.json`, `auth.lkg.json`, `auth.quarantine.json` | **move** | codex carriers; single-inode rule §4.5 |
 | `profiles/<p>/*.pending`, `profiles/<p>/.*.tmp.*`, `~/.clauth/.*.tmp.*` | refuse | `pending_rotation` / `stray_temp` (either may hold the newest chain) |
 | `profiles/<p>/config.toml` | copy-0600 | secret (api key); journaled `copy_secret` |
-| `profiles/<p>/{account_id,profile_fetched,usage_cache,third_party_cache,third_party_auth,touch-receipt}.json`, `usage_history.jsonl`, `wallet_history.jsonl` | copy | 0600 at dst |
+| `profiles/<p>/{account_id,profile_fetched,usage_cache,third_party_cache,third_party_auth,throughput_cache,touch-receipt}.json`, `usage_history.jsonl`, `wallet_history.jsonl` | copy | 0600 at dst |
 | `profiles/<p>/{adopt_refusal,kick_block}.json`, `auth.attempt` | skip | standing state re-derived by the scheduler |
 | `profiles/<p>/codex-home/` | copy_tree | refuse `codex_home_carrier` if an `auth.json` exists at any depth |
 | `profiles/<p>/runtime*`, `sessions*`, `codex-home-*` | skip | held marker → `session_marker_held`; a regular-file `.credentials.json`/`auth.json` inside → `stale_runtime_carrier` |

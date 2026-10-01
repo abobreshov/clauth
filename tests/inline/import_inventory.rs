@@ -132,6 +132,25 @@ fn an_unknown_top_level_or_profile_entry_is_refused() {
     ));
 }
 
+/// Upstream 0.16.0 keeps the per-model throughput samples inside each
+/// profile (`throughput.rs` writes them with `write_profile_cache`): a
+/// profile cache, copied, not an unknown entry.
+#[test]
+fn a_profile_throughput_cache_is_copied_not_refused() {
+    let env = Env::new();
+    env.tree.roster(&["a"], Some("a")).oauth("a");
+    env.tree.unknown_entry("profiles/a/throughput_cache.json");
+    let s = survey(&Options::default());
+    assert!(
+        !s.blockers.iter().any(|b| b.code == "unknown_entry"),
+        "{:?}",
+        s.blockers
+    );
+    assert!(
+        entry_lines(&report_of(&s)).contains(&"copy profiles/a/throughput_cache.json".to_string())
+    );
+}
+
 /// Test 4. A crashed rotation's staged chain and a crashed write's staging
 /// file each refuse with the remedy that lets upstream adopt it.
 #[test]
