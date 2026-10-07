@@ -2981,3 +2981,65 @@ pub(crate) fn seq_of(line: &str) -> u64 {
     }
     panic!("no --seq in report line: {line}");
 }
+
+/// Persist duplicate OAuth profiles with personal-data canaries. Caller owns a
+/// HomeSandbox; all feeds must retain only the twin's profile name.
+pub(crate) fn identity_canary_config() -> crate::profile::AppConfig {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    register_names(&["canary-one", "canary-two"]);
+    let profiles: Vec<_> = ["canary-one", "canary-two"]
+        .into_iter()
+        .map(|name| {
+            let mut p = Profile::new(name.to_string(), None, None);
+            p.credentials = Some(ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: format!("access-{name}"),
+                    refresh_token: Some(format!("refresh-{name}")),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            });
+            crate::profile::save_profile(&p).expect("save canary profile");
+            let mut identity =
+                crate::profile_cache::AccountIdentity::uuid_only("canary-account-uuid".into(), 1);
+            identity.email = Some("canary@example.invalid".to_string());
+            identity.organization_name = Some("Canary Org".to_string());
+            identity.organization_uuid = Some("canary-org-uuid".to_string());
+            crate::usage::seed_login_identity(&p.name, Some(&identity));
+            assert!(matches!(
+                crate::profile_cache::login_identity(&p.name),
+                crate::profile_cache::LoginIdentity::Anchored {
+                    details: Some(_),
+                    ..
+                }
+            ));
+            p
+        })
+        .collect();
+    let config = AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..Default::default()
+        },
+        profiles,
+    };
+    crate::profile::save_app_state(&config.state).expect("save canary roster");
+    assert_eq!(
+        crate::profile_cache::same_account_as(&config, &"canary-two".into()).as_deref(),
+        Some("canary-one")
+    );
+    config
+}
+
+pub(crate) fn assert_no_identity_canary(text: &str) {
+    for personal in [
+        "canary@example.invalid",
+        "Canary Org",
+        "canary-org-uuid",
+        "canary-account-uuid",
+    ] {
+        assert!(!text.contains(personal), "identity leaked: {personal}");
+    }
+}

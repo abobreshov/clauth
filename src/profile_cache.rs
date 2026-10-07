@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::profile::ProfileName;
+use crate::profile::{AccountId, ProfileName};
 
 /// Filename of the OAuth usage cache, relative to the per-profile dir.
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
@@ -24,6 +24,65 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// adoption — the identity anchor that lets an unattended adopt refuse a live
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
+
+/// Local-only details observed by the login's existing `/profile` read.
+pub(crate) const ACCOUNT_IDENTITY_FILE: &str = "account_identity.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AccountIdentity {
+    pub(crate) account_uuid: AccountId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) organization_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) organization_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) organization_type: Option<String>,
+    pub(crate) verified_at_ms: u64,
+}
+
+impl AccountIdentity {
+    #[cfg(test)]
+    pub(crate) fn uuid_only(account_uuid: AccountId, verified_at_ms: u64) -> Self {
+        Self {
+            account_uuid,
+            email: None,
+            organization_uuid: None,
+            organization_name: None,
+            organization_type: None,
+            verified_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoginIdentity {
+    Pending,
+    Unanchored,
+    Anchored {
+        account: AccountId,
+        details: Option<AccountIdentity>,
+    },
+}
+
+/// Bind details to the current anchor so a torn two-file write cannot display
+/// another login's email. In-memory test profiles never resolve the real home.
+pub(crate) fn login_identity(name: &ProfileName) -> LoginIdentity {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return LoginIdentity::Unanchored;
+    }
+    if identity_pending(name) {
+        return LoginIdentity::Pending;
+    }
+    let Some(account) = account_anchor(name) else {
+        return LoginIdentity::Unanchored;
+    };
+    let details = load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
+        .filter(|identity| identity.account_uuid == account);
+    LoginIdentity::Anchored { account, details }
+}
 
 /// A login was installed without a resolved identity. Persisted before the
 /// credential write so cross-process walks never use the displaced anchor.
@@ -318,6 +377,7 @@ pub(crate) fn profile_cache_path(name: &ProfileName, file: &str) -> Option<PathB
 /// home. The table keeps the guard beside the constants it protects.
 fn expected_cache_file<T: 'static>() -> Option<&'static str> {
     match TypeId::of::<T>() {
+        t if t == TypeId::of::<AccountIdentity>() => Some(ACCOUNT_IDENTITY_FILE),
         t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
         t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
         _ => None,

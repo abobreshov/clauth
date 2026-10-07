@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Authentication and account identity
+
+- Setup shows the stored OAuth login's email, account, organization and verification age, including pending identity, setup-token scope and duplicate-account explanations. Login identity stays local.
+- Setup's `a → verify login` reads the stored access token's account once, without refreshing tokens. Login commits cache the same probe's identity, and regular profile reads refresh it without extra requests per tick.
+- Logout clears the account anchor, pending marker and identity snapshot so an old login no longer flags or blocks its twin. Setup also explains stale anchors left by older logouts.
+
 ## 0.2.0 — 2026-10-07
 
 ### TUI and usage reporting

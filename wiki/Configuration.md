@@ -33,6 +33,10 @@ Claude Code's logout-cleared usage, artifact, organization and feature caches ar
 
 On macOS, `tollgate which` checks the relevant Keychain item after file matching misses. Only a refresh-token SHA-256 digest or negative result is cached per service for 30 seconds under `~/.tollgate/keychain-which-cache/`; entries older than a day are swept on cache reads and writes.
 
+Setup shows a read-only login block for the selected account, even while editing a draft. A verified OAuth login shows its email, short account UUID, organization, plan and verification age. An anchored account whose details have not been read yet says `anchored · details on next read`; unknown and pending identities explain how to verify. API and console profiles say `not an OAuth login`; a setup token alone cannot read its account. With a static setup token, `usage login` identifies the login used for usage reads, while sessions run on the setup token whose account cannot be read.
+
+Use `a → verify login` (hotkey `v` in the menu) on an OAuth account with stored credentials to read its identity once. It never rotates a token; an expired or refused token should be refreshed on Usage with `r` first. Duplicate warnings explain whether known organizations differ or whether the twin is logged out. Logout now clears the identity anchor, pending marker and snapshot. Accounts logged out by an older version may show `stale anchor`, with instructions to log in again or delete the profile to clear the old duplicate guard.
+
 ### Third-party usage data
 
 Six providers get typed usage panels (the full per-provider reference, including what is read and the limitations, is [Providers](Providers)):
@@ -400,7 +404,9 @@ The daemon must be started from an environment that holds the named variables; `
       wallet_history.jsonl # 2 days of balance readings, feeding the wallet-burn rate
       third_party_cache.json
       third_party_auth.json# set while the usage login is expired; a hash, never the credential
-      account_id.json      # which account this is, so a re-login can be told apart
+      account_id.json      # bare account UUID anchor
+      account_identity.json# local login email, organization and verification time
+      identity_pending.json# installed login awaiting an account confirmation
       profile_fetched.json # when the plan tier was last read
       kick_block.json      # messages-limiter block state
       throughput_cache.json# observed delegate tokens/sec per model

@@ -824,3 +824,14 @@ fn openapi_links_accounts_to_optional_health_note_and_attribution() {
     );
     assert_eq!(schemas["Amount"]["type"], "string");
 }
+
+#[test]
+fn identity_canary_stays_out_of_status_route() {
+    let _home = HomeSandbox::new();
+    let _config = crate::testutil::identity_canary_config();
+    let resp = handle(&ctx(), &req("GET", "/v1/status", "", None), Door::Unix);
+    assert_eq!(resp.status, 200);
+    let text = String::from_utf8(resp.body).unwrap();
+    assert!(text.contains("canary-one") && text.contains("canary-two"));
+    crate::testutil::assert_no_identity_canary(&text);
+}

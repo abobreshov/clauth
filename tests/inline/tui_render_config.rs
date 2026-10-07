@@ -1147,3 +1147,467 @@ fn login_labels_read_the_same_for_every_flow() {
     snap.logged_in = true;
     assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }
+
+fn identity_fixture(account: &str, email: Option<&str>) -> crate::profile_cache::AccountIdentity {
+    crate::profile_cache::AccountIdentity {
+        account_uuid: account.into(),
+        email: email.map(str::to_string),
+        organization_uuid: Some("organization-one".into()),
+        organization_name: Some("Example Org".into()),
+        organization_type: None,
+        verified_at_ms: 1_000,
+    }
+}
+
+fn login_fixture() -> LoginView {
+    LoginView {
+        login_is_oauth: true,
+        has_credentials: true,
+        setup_token: false,
+        split: false,
+        identity: crate::profile_cache::LoginIdentity::Anchored {
+            account: "account-one".into(),
+            details: Some(identity_fixture(
+                "account-one",
+                Some("reader@example.invalid"),
+            )),
+        },
+        same_as: None,
+        other_has_credentials: true,
+        other_identity: None,
+        plan: Some("max".into()),
+    }
+}
+
+fn assert_login_text(lines: &[Line<'static>], needle: &str, style: Style) {
+    let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    assert!(text.contains(needle), "{needle:?} absent from {text}");
+    assert!(
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.content.contains(needle) && s.style.fg == style.fg),
+        "{needle:?} must carry expected foreground in {text}"
+    );
+}
+
+#[test]
+fn login_block_non_oauth_is_faint() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.login_is_oauth = false;
+    view.same_as = Some("leadtone".into());
+    assert_login_text(
+        &login_lines(&view, 61_000, WIDE),
+        "not an OAuth login",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_stale_anchor_warns_before_setup_token() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.has_credentials = false;
+    view.setup_token = true;
+    view.same_as = Some("leadtone".into());
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "stale anchor", theme::warning());
+    assert_login_text(
+        &lines,
+        "left by an old login · still flags 'leadtone' · log in again or delete this profile",
+        theme::faint(),
+    );
+    assert!(
+        !lines
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("reader@example.invalid")
+    );
+}
+
+#[test]
+fn login_block_setup_token_only_names_scope_limit() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.has_credentials = false;
+    view.setup_token = true;
+    assert_login_text(
+        &login_lines(&view, 61_000, WIDE),
+        "setup token only · its scope cannot read the account",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_no_credentials_is_faint() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.has_credentials = false;
+    assert_login_text(
+        &login_lines(&view, 61_000, WIDE),
+        "none stored",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_pending_names_the_guard_and_verify_action() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.identity = crate::profile_cache::LoginIdentity::Pending;
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "pending", theme::warning());
+    assert_login_text(
+        &lines,
+        "account not confirmed yet · auto-switch skips it · a → verify login",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_unanchored_offers_one_verify_read() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.identity = crate::profile_cache::LoginIdentity::Unanchored;
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "unknown", theme::faint());
+    assert_login_text(&lines, "a → verify login reads it once", theme::faint());
+}
+
+#[test]
+fn login_block_anchored_details_show_email_org_plan_and_age() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let lines = login_lines(&login_fixture(), 61_000, WIDE);
+    assert_login_text(&lines, "reader@example.invalid", theme::accent());
+    assert_login_text(&lines, "account- · Example Org · max", theme::accent());
+    assert_login_text(&lines, "verified 1m ago", theme::accent());
+    assert_eq!(lines[0].spans[0].content.chars().count(), 16);
+    assert_eq!(lines[0].spans[0].style.fg, theme::label().fg);
+}
+
+#[test]
+fn login_block_anchored_without_details_names_next_read() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.identity = crate::profile_cache::LoginIdentity::Anchored {
+        account: "account-one".into(),
+        details: None,
+    };
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "account- · max", theme::accent());
+    assert_login_text(&lines, "anchored · details on next read", theme::dim());
+}
+
+#[test]
+fn login_block_cla_split_uses_usage_login_and_caveat() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.split = true;
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "usage login", theme::label());
+    assert_login_text(&lines, "reader@example.invalid", theme::accent());
+    assert_login_text(
+        &lines,
+        "sessions run on the setup token · its account cannot be read",
+        theme::faint(),
+    );
+    view.split = false;
+    assert!(
+        !login_lines(&view, 61_000, WIDE)
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("setup token")
+    );
+}
+
+#[test]
+fn login_block_duplicate_logged_out_twin_takes_precedence() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.same_as = Some("leadtone".into());
+    view.other_has_credentials = false;
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "same account as leadtone", theme::warning());
+    assert_login_text(
+        &lines,
+        "'leadtone' is logged out but kept its old anchor · log it in or delete it",
+        theme::faint(),
+    );
+    assert_eq!(
+        lines.iter().filter(|l| line_text(l).contains('└')).count(),
+        1
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| line_text(l).starts_with("                [ same account as leadtone ]"))
+    );
+}
+
+#[test]
+fn login_block_duplicate_different_org_warns_about_quotas() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.same_as = Some("leadtone".into());
+    let mut other = identity_fixture("account-one", None);
+    other.organization_uuid = Some("another-org".into());
+    view.other_identity = Some(crate::profile_cache::LoginIdentity::Anchored {
+        account: "account-one".into(),
+        details: Some(other),
+    });
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "same account as leadtone", theme::warning());
+    assert_login_text(
+        &lines,
+        "different organization · quotas may differ; auto-switch still skips one",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_duplicate_unknown_org_explains_likely_quota() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.same_as = Some("leadtone".into());
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "same account as leadtone", theme::warning());
+    assert_login_text(
+        &lines,
+        "same Anthropic account · likely one quota · re-login one with the intended account",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_duplicate_same_org_explains_shared_quota() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    view.same_as = Some("leadtone".into());
+    view.other_identity = Some(crate::profile_cache::LoginIdentity::Anchored {
+        account: "account-one".into(),
+        details: Some(identity_fixture("account-one", None)),
+    });
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "same account as leadtone", theme::warning());
+    assert_login_text(
+        &lines,
+        "both draw on one quota · re-login one with the intended account",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn login_block_email_wraps_at_value_column() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let email = "abcdefghijklmnopqrstu@example.invalid";
+    assert_eq!(email.chars().count(), 37);
+    let mut view = login_fixture();
+    view.identity = crate::profile_cache::LoginIdentity::Anchored {
+        account: "account-one".into(),
+        details: Some(identity_fixture("account-one", Some(email))),
+    };
+    let lines = login_lines(&view, 61_000, 34);
+    let email_lines = &lines[..3];
+    assert!(
+        email_lines[1..]
+            .iter()
+            .all(|l| line_text(l).starts_with("                "))
+    );
+    assert!(email_lines.iter().all(|l| l.width() <= 34));
+    let joined = email_lines
+        .iter()
+        .map(|l| line_text(l).chars().skip(16).collect::<String>())
+        .collect::<String>();
+    assert_eq!(joined, email);
+}
+
+#[test]
+fn login_block_handles_missing_email_org_and_unicode_ids() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = login_fixture();
+    let mut identity = identity_fixture("éééééééé-nine", None);
+    identity.organization_name = None;
+    identity.organization_uuid = Some("組組組組組組組組-extra".into());
+    view.identity = crate::profile_cache::LoginIdentity::Anchored {
+        account: identity.account_uuid.clone(),
+        details: Some(identity),
+    };
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_eq!(lines.len(), 2, "absent email omits its row");
+    assert_login_text(
+        &lines,
+        "éééééééé · org 組組組組組組組組 · max",
+        theme::accent(),
+    );
+    if let crate::profile_cache::LoginIdentity::Anchored {
+        details: Some(d), ..
+    } = &mut view.identity
+    {
+        d.organization_uuid = None;
+    }
+    assert_login_text(
+        &login_lines(&view, 61_000, WIDE),
+        "éééééééé · max",
+        theme::accent(),
+    );
+}
+
+#[test]
+fn setup_login_block_sits_between_token_and_name_and_blank_has_none() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    let render = |snap: &Snap| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_settings_rows(f, f.area(), &app, &[ConfigRow::Name], 0, snap, false))
+            .unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let mut snap = Snap::blank("selected");
+    snap.name = "selected".into();
+    let blank = render(&snap);
+    assert!(snap.login.is_none());
+    assert!(
+        !blank
+            .iter()
+            .any(|l| l.contains("identity") || l.contains("account-"))
+    );
+    snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
+    snap.login = Some(login_fixture());
+    let lines = render(&snap);
+    let position = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
+    assert!(position("type") < position("token"));
+    assert!(position("token") < position("reader@example.invalid"));
+    assert!(position("verified") < position("name"));
+}
+
+fn setup_identity_config() -> crate::profile::AppConfig {
+    let profiles = ["leadtone", "scifoo"]
+        .into_iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(&name.into());
+            p.credentials = Some(setup_credentials("stored-access"));
+            p
+        })
+        .collect();
+    crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["leadtone".into(), "scifoo".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles,
+    }
+}
+
+fn setup_credentials(access: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.into(),
+            refresh_token: Some("fixture-refresh".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+#[test]
+fn setup_snap_reads_duplicate_each_frame_even_with_draft_text() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    for name in ["leadtone", "scifoo"] {
+        crate::usage::seed_login_identity(
+            &name.into(),
+            Some(&identity_fixture(
+                "same-account",
+                Some("first@example.invalid"),
+            )),
+        );
+    }
+    let mut app = App::new(setup_identity_config());
+    app.profile_cursor = 1;
+    for with_text in [true, false] {
+        assert_eq!(
+            build_snap(&app, with_text)
+                .login
+                .unwrap()
+                .same_as
+                .as_ref()
+                .map(|n| n.as_str()),
+            Some("leadtone")
+        );
+    }
+    crate::usage::seed_login_identity(
+        &"scifoo".into(),
+        Some(&identity_fixture(
+            "new-account",
+            Some("second@example.invalid"),
+        )),
+    );
+    let snap = build_snap(&app, false);
+    let login = snap.login.unwrap();
+    assert!(login.same_as.is_none());
+    assert!(
+        login_lines(&login, 61_000, WIDE)
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("second@example.invalid")
+    );
+}
+
+#[test]
+fn setup_snap_relogin_never_shows_previous_email() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    for proven in [false, true] {
+        let mut config = setup_identity_config();
+        for profile in &config.profiles {
+            crate::profile::save_profile(profile).unwrap();
+        }
+        crate::usage::seed_login_identity(
+            &"scifoo".into(),
+            Some(&identity_fixture("account-a", Some("a@example.invalid"))),
+        );
+        crate::actions::overwrite_captured_profile(
+            &mut config,
+            &"scifoo".into(),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(setup_credentials("replacement-access")),
+                base_url: None,
+                api_key: None,
+                anchor: if proven {
+                    crate::actions::AnchorAction::Proven(identity_fixture(
+                        "account-b",
+                        Some("b@example.invalid"),
+                    ))
+                } else {
+                    crate::actions::AnchorAction::Unproven
+                },
+            },
+        )
+        .unwrap();
+        let mut app = App::new(config);
+        app.profile_cursor = 1;
+        let view = build_snap(&app, false).login.unwrap();
+        let lines = login_lines(&view, 61_000, WIDE);
+        let text = lines.iter().map(line_text).collect::<String>();
+        assert!(
+            !text.contains("a@example.invalid"),
+            "old email must disappear: {text}"
+        );
+        if proven {
+            assert_login_text(&lines, "b@example.invalid", theme::accent());
+        } else {
+            assert_login_text(&lines, "pending", theme::warning());
+        }
+    }
+}

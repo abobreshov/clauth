@@ -2864,3 +2864,14 @@ fn status_json_lists_hermes_profiles() {
     assert_eq!(redacted["hermes_profiles"][0]["name"], "herm");
     assert_eq!(redacted["hermes_profiles"][0]["provider"], "openrouter");
 }
+
+#[test]
+fn identity_canary_stays_out_of_profile_entries_and_status() {
+    let _home = HomeSandbox::new();
+    let config = crate::testutil::identity_canary_config();
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    crate::testutil::assert_no_identity_canary(&serde_json::to_string(&entries).unwrap());
+    crate::testutil::assert_no_identity_canary(
+        &status_value(&config, 300_000, None, false).to_string(),
+    );
+}

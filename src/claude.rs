@@ -3564,6 +3564,10 @@ fn snapshot_active_credentials_unchecked(
                 active,
                 crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             );
+            crate::profile_cache::remove_profile_cache(
+                active,
+                crate::profile_cache::ACCOUNT_IDENTITY_FILE,
+            );
         }
         profile.set_credentials(Some(credentials), held);
         save_profile(profile)?;

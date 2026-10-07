@@ -2068,7 +2068,7 @@ pub(crate) fn find_matching_oauth_profile(
 pub(crate) enum AnchorAction {
     /// The snapshot's OAuth login provably belongs to this account uuid — an
     /// interactive login's own `/profile` probe. Write it on commit.
-    Proven(AccountId),
+    Proven(crate::profile_cache::AccountIdentity),
     /// The snapshot proves no identity (an off-disk read, a failed probe):
     /// remove the anchor on commit, so the old account's cannot vouch for the
     /// login the snapshot just installed.
@@ -2204,10 +2204,10 @@ pub(crate) fn capture_into_profile(
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
         save_app_state(&config.state)?;
-        crate::usage::seed_login_anchor(
+        crate::usage::seed_login_identity(
             &seed_name,
             match &anchor {
-                AnchorAction::Proven(uuid) => Some(uuid),
+                AnchorAction::Proven(identity) => Some(identity),
                 _ => None,
             },
         );
@@ -2231,7 +2231,7 @@ pub(crate) fn create_profile_from_login(
     name: String,
     model: Option<String>,
     credentials: ClaudeCredentials,
-    account_uuid: Option<AccountId>,
+    identity: Option<crate::profile_cache::AccountIdentity>,
 ) -> Result<()> {
     let name = ProfileName::from(name);
     let seed_name = name.clone();
@@ -2267,7 +2267,7 @@ pub(crate) fn create_profile_from_login(
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
         save_app_state(&config.state)?;
-        crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
+        crate::usage::seed_login_identity(&seed_name, identity.as_ref());
         Ok(())
     })?;
     // The draft parked the login's uuid until `create account` fixed the name;
@@ -2412,8 +2412,10 @@ pub(crate) fn overwrite_captured_profile(
         profile.third_party_usage = None;
         save_profile(profile)?;
         match &anchor {
-            AnchorAction::Proven(uuid) => crate::usage::seed_login_anchor(name, Some(uuid)),
-            AnchorAction::Unproven => crate::usage::seed_login_anchor(name, None),
+            AnchorAction::Proven(identity) => {
+                crate::usage::seed_login_identity(name, Some(identity))
+            }
+            AnchorAction::Unproven => crate::usage::seed_login_identity(name, None),
             AnchorAction::Unchanged => {}
         }
 
@@ -2533,6 +2535,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         crate::profile::clear_staged_credentials(name);
 
         for file in [
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            crate::profile_cache::IDENTITY_PENDING_FILE,
+            crate::profile_cache::ACCOUNT_IDENTITY_FILE,
             crate::profile_cache::USAGE_CACHE_FILE,
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
             // Inert once the credential changes, but this profile may now be a

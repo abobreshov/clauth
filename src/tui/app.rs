@@ -1084,7 +1084,7 @@ pub(crate) enum ActionMenuAction {
     StartDaemon,
     /// `--replace`'s termination with no successor, offered while one runs.
     StopDaemon,
-    // Setup tab — all three act on the focused account and none has a key.
+    // Setup tab — whole-account actions, including an explicit login probe.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
     Duplicate,
@@ -1094,6 +1094,8 @@ pub(crate) enum ActionMenuAction {
     /// Stamp a preset's base url + model settings onto the focused account.
     /// Opens the picker.
     ApplyPreset,
+    /// Read the stored OAuth login identity once, without refreshing its token.
+    VerifyLogin,
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
@@ -1218,6 +1220,7 @@ impl ActionMenuAction {
     fn preferred_hotkey(&self) -> Option<char> {
         match self {
             Self::RotateTokens => Some('t'),
+            Self::VerifyLogin => Some('v'),
             Self::ToggleEstimates => Some('e'),
             Self::TogglePace => Some('p'),
             // `r` belongs to the focused account's own refresh, and `e`/`p` to
@@ -1255,6 +1258,7 @@ impl ActionMenuAction {
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
+            Self::VerifyLogin => "verify login",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
@@ -2297,6 +2301,11 @@ pub(crate) struct App {
     pub(crate) daemon_control_rx: std::sync::mpsc::Receiver<DaemonControlResult>,
     /// Sender side; cloned into each worker.
     pub(crate) daemon_control_tx: std::sync::mpsc::Sender<DaemonControlResult>,
+    /// The selected profile's explicit identity probe, if one is running.
+    pub(crate) verify_login_inflight: Option<ProfileName>,
+    pub(crate) verify_login_rx:
+        std::sync::mpsc::Receiver<(ProfileName, crate::usage::VerifyOutcome)>,
+    pub(crate) verify_login_tx: std::sync::mpsc::Sender<(ProfileName, crate::usage::VerifyOutcome)>,
     /// The `m` modal's session-move outcomes; drained in `on_tick`.
     pub(crate) session_move_rx: std::sync::mpsc::Receiver<SessionMoveResult>,
     /// Sender side; cloned into each move worker.
@@ -2707,6 +2716,7 @@ impl App {
         }
 
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
+        let (verify_login_tx, verify_login_rx) = std::sync::mpsc::channel();
         let (session_move_tx, session_move_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
@@ -2810,6 +2820,9 @@ impl App {
             daemon_control_busy: false,
             daemon_control_rx,
             daemon_control_tx,
+            verify_login_inflight: None,
+            verify_login_rx,
+            verify_login_tx,
             session_move_rx,
             session_move_tx,
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -8189,10 +8202,10 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ReloadTokenStats);
         }
         // Both halves of the Setup tab configure the SAME focused account, so
-        // they carry the same three items. Every per-row action already has a
-        // key (the detail pane is a list of actions and ⏎ runs the row); what
-        // is left is the whole-account work no row states: copy it, save its
-        // endpoint + models as a template, stamp one back onto it. On `+ new`
+        // they carry the same whole-account items. Every per-row action has a
+        // key (the detail pane is a list of actions and ⏎ runs the row). The
+        // menu can copy the account, save or apply its endpoint + model preset,
+        // and explicitly verify its stored login. On `+ new`
         // there is no source account to duplicate or save, but a preset can
         // still stamp the draft's endpoint + model fields.
         Tab::Setup => {
@@ -8201,6 +8214,14 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 scoped.push(Duplicate);
                 scoped.push(SaveAsPreset);
                 scoped.push(ApplyPreset);
+                if app.verify_login_inflight.is_none()
+                    && app
+                        .config()
+                        .find(&name)
+                        .is_some_and(|p| p.login_is_oauth() && p.credentials.is_some())
+                {
+                    scoped.push(VerifyLogin);
+                }
                 // The api-key row is on this tab, so the page that key comes
                 // from belongs next to it.
                 if focused_provider_console(app).is_some() {
@@ -8435,6 +8456,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
+        ActionMenuAction::VerifyLogin => start_verify_login(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
@@ -8453,6 +8475,122 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
 
 /// Where the daemon's start and stop toasts send the user when either fails.
 const DAEMON_LOG_HINT: &str = "see ~/.tollgate/daemon.log";
+
+/// Read the focused account identity once without holding the config lock.
+fn start_verify_login(app: &mut App) {
+    if app.verify_login_inflight.is_some() {
+        return;
+    }
+    let Some((name, true, _)) = focused_account(app) else {
+        return;
+    };
+    let tx = app.verify_login_tx.clone();
+    app.verify_login_inflight = Some(name.clone());
+    app.toast(ToastKind::Info, format!("verifying '{name}'"));
+    spawn_worker(move || {
+        // spawn_worker's outer catch cannot send an outcome; this catch always
+        // re-arms the action even if the probe itself panics.
+        let outcome = catch_unwind(AssertUnwindSafe(|| crate::usage::verify_login(&name)))
+            .unwrap_or(crate::usage::VerifyOutcome::Network);
+        let _ = tx.send((name, outcome));
+    });
+}
+
+/// Identity details stay on the UI thread and only in this explicit toast.
+fn drain_verify_login(app: &mut App) {
+    use crate::usage::{ReconcileOutcome, VerifyOutcome};
+    while let Ok((name, outcome)) = app.verify_login_rx.try_recv() {
+        app.verify_login_inflight = None;
+        let (kind, body) = match outcome {
+            VerifyOutcome::Verified {
+                identity,
+                reconcile,
+            } => {
+                let account: String = identity.account_uuid.chars().take(8).collect();
+                let details = identity.email.as_ref().map_or_else(
+                    || format!("acct {account}"),
+                    |email| format!("{email} · acct {account}"),
+                );
+                let previous = match &reconcile {
+                    ReconcileOutcome::Replaced {
+                        previous: Some(previous),
+                    } if previous != &identity.account_uuid => Some(previous),
+                    _ => None,
+                };
+                let was = previous.map_or_else(String::new, |old| {
+                    format!(" (was {})", old.chars().take(8).collect::<String>())
+                });
+                let duplicate = {
+                    let cfg = app.config();
+                    crate::profile_cache::same_account_as(&cfg, &name).map(|other| {
+                        let other_has_login = cfg.find(&other)
+                            .is_some_and(|p| p.credentials.is_some());
+                        let other_org = match crate::profile_cache::login_identity(&other) {
+                            crate::profile_cache::LoginIdentity::Anchored {
+                                details: Some(details), ..
+                            } => details.organization_uuid,
+                            _ => None,
+                        };
+                        let reason = if !other_has_login {
+                            format!("'{other}' is logged out but kept its old anchor · log it in or delete it")
+                        } else {
+                            match (&identity.organization_uuid, other_org.as_ref()) {
+                                (Some(org), Some(other_org)) if org != other_org =>
+                                    "different organization · quotas may differ; auto-switch still skips one".to_string(),
+                                (None, _) | (_, None) =>
+                                    "same Anthropic account · likely one quota · re-login one with the intended account".to_string(),
+                                _ => "both draw on one quota · re-login one with the intended account".to_string(),
+                            }
+                        };
+                        format!("'{name}' is the same Anthropic account as '{other}'\n{reason}{was}")
+                    })
+                };
+                match reconcile {
+                    ReconcileOutcome::WriteFailed => (
+                        ToastKind::Warning,
+                        format!(
+                            "could not save the identity of '{name}'\n{details} · see tollgate.log"
+                        ),
+                    ),
+                    ReconcileOutcome::NoUuid => (
+                        ToastKind::Warning,
+                        format!("could not verify '{name}'\nprofile identity unreadable"),
+                    ),
+                    _ if duplicate.is_some() => (ToastKind::Warning, duplicate.unwrap_or_default()),
+                    _ if previous.is_some() => (
+                        ToastKind::Warning,
+                        format!("'{name}' is now a different account\n{details}{was}"),
+                    ),
+                    _ => (ToastKind::Success, format!("verified '{name}'\n{details}")),
+                }
+            }
+            VerifyOutcome::StoreMoved => (
+                ToastKind::Info,
+                format!("'{name}' changed login during verify · nothing saved"),
+            ),
+            failure => {
+                let reason = match failure {
+                    VerifyOutcome::NoStoredLogin => "no stored login".to_string(),
+                    VerifyOutcome::Expired => "access token expired · refresh it on Usage (r), then verify".to_string(),
+                    VerifyOutcome::Refused => "stored access token refused (401) · refresh it on Usage (r); re-login if that fails".to_string(),
+                    VerifyOutcome::NoProfileScope => "stored access token has no profile scope (403)".to_string(),
+                    VerifyOutcome::RateLimited(retry_after) => retry_after.map_or_else(
+                        || "rate limited (429) · try again later".to_string(),
+                        |delay| format!("rate limited (429) · try again in ~{}s", delay.as_secs()),
+                    ),
+                    VerifyOutcome::Network => "profile request failed · try again".to_string(),
+                    VerifyOutcome::Unreadable => "profile identity unreadable".to_string(),
+                    VerifyOutcome::Verified { .. } | VerifyOutcome::StoreMoved => unreachable!(),
+                };
+                (
+                    ToastKind::Warning,
+                    format!("could not verify '{name}'\n{reason}"),
+                )
+            }
+        };
+        app.toast(kind, body);
+    }
+}
 
 /// The action menu's `start daemon`: spawn `<this binary> daemon` detached,
 /// then report, off the UI thread, whether a daemon came up. The worker stays
@@ -10382,7 +10520,7 @@ fn commit_new_account(app: &mut App) {
                 name.clone(),
                 model,
                 login.credentials,
-                login.account_uuid,
+                login.identity,
             ),
             // Every model row the form holds rides the create, so a preset's
             // per-tier pins (OpenRouter's, Alibaba's) are not dropped.
@@ -11819,11 +11957,12 @@ fn drain_login_events(app: &mut App) {
 /// divergence, gates the overwrite on `AppState.default_divergence`: only an
 /// `Overwrite` default applies silently; anything else asks first.
 fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login::LoginOutcome) {
-    let duplicate_warning = outcome.account_uuid.as_ref().and_then(|account| {
+    let email = outcome.identity.as_ref().and_then(|id| id.email.clone());
+    let duplicate_warning = outcome.identity.as_ref().and_then(|identity| {
         crate::profile_cache::duplicate_login_warning_for_account(
             &app.config(),
             &ProfileName::from(session.name.clone()),
-            account,
+            &identity.account_uuid,
         )
     });
     if session.is_new {
@@ -11833,7 +11972,13 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // so the profile this login belongs to has no final name yet.
         let stashed = stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome)));
         if stashed {
-            app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+            app.toast(
+                ToastKind::Success,
+                email.map_or_else(
+                    || "logged in\ncreate account saves it".to_string(),
+                    |email| format!("logged in as {email}\ncreate account saves it"),
+                ),
+            );
             if let Some(warning) = duplicate_warning {
                 app.toast(ToastKind::Warning, warning);
             }
@@ -11868,7 +12013,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         base_url: None,
         api_key: None,
         anchor: outcome
-            .account_uuid
+            .identity
             .map(crate::actions::AnchorAction::Proven)
             .unwrap_or(crate::actions::AnchorAction::Unproven),
     };
@@ -11916,7 +12061,11 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             clear_profile_status_chrome(app, &ProfileName::from(session.name.clone()));
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
-            app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
+            let mut body = format!("logged in '{}'", session.name);
+            if let Some(email) = email {
+                body.push_str(&format!("\nas {email}"));
+            }
+            app.toast(ToastKind::Success, body);
             toast_duplicate_login(app, &ProfileName::from(session.name.clone()));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
@@ -12082,6 +12231,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_codex_rows(app);
     poll_plugin_refresh(app);
     drain_daemon_control(app);
+    drain_verify_login(app);
     drain_session_moves(app);
     poll_daemon_health(app);
 

@@ -1111,12 +1111,19 @@ fn adopt_first_login_removes_a_stale_identity_anchor() {
     config.state.active_profile = Some(name.into());
     config.state.profiles = vec![name.into()];
     crate::profile::save_app_state(&config.state).expect("persist state");
-    // A logged-out profile can still carry its old anchor: `clear_profile_credentials`
-    // does not remove it, so a first-login adopt onto that shell must not let the
-    // stale uuid vouch for the new login.
+    // Profiles logged out before identity cleanup may still carry an old anchor.
+    // Logout now removes identity, but a first-login adopt onto an older shell
+    // must not let the stale uuid vouch for the new login.
     crate::usage::seed_login_anchor(
         &crate::profile::ProfileName::from(name),
         Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    crate::usage::seed_login_identity(
+        &name.into(),
+        Some(&crate::profile_cache::AccountIdentity::uuid_only(
+            "uuid-a".into(),
+            1,
+        )),
     );
     let live = claude_credentials_path().expect("creds path");
     std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
@@ -1135,6 +1142,11 @@ fn adopt_first_login_removes_a_stale_identity_anchor() {
         ),
         None,
         "a first-login adoption proves no uuid, so the stale anchor must go"
+    );
+    assert!(
+        !crate::profile::profile_subpath(&name.into(), crate::profile_cache::ACCOUNT_IDENTITY_FILE)
+            .unwrap()
+            .exists()
     );
 }
 

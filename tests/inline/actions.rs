@@ -3104,7 +3104,7 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
         base_url: None,
         api_key: None,
         anchor: account_uuid
-            .map(crate::profile::AccountId::from)
+            .map(|uuid| crate::profile_cache::AccountIdentity::uuid_only(uuid.into(), 1))
             .map(AnchorAction::Proven)
             .unwrap_or(AnchorAction::Unproven),
     }
@@ -6915,7 +6915,10 @@ fn round1_proven_overwrite_seeds_identity_before_later_settings_failure() {
             credentials: Some(tok("at-b")),
             base_url: None,
             api_key: None,
-            anchor: AnchorAction::Proven("uuid-b".into()),
+            anchor: AnchorAction::Proven(crate::profile_cache::AccountIdentity::uuid_only(
+                "uuid-b".into(),
+                1,
+            )),
         },
     );
     assert!(
@@ -6934,4 +6937,100 @@ fn round1_proven_overwrite_seeds_identity_before_later_settings_failure() {
         "the proven anchor must commit with the login even if later settings fail"
     );
     assert!(!crate::profile_cache::identity_pending(&name));
+}
+
+#[test]
+fn proven_login_commits_identity_snapshot_with_anchor() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["identity-target"]);
+    let profile = Profile::new("identity-target".to_string(), None, None);
+    save_profile(&profile).unwrap();
+    let mut config = inactive_config(profile);
+    let mut identity =
+        crate::profile_cache::AccountIdentity::uuid_only("identity-account".into(), 42);
+    identity.email = Some("commit@example.invalid".to_string());
+    let mut snapshot = login_snapshot("new-refresh", None);
+    snapshot.anchor = AnchorAction::Proven(identity.clone());
+    overwrite_captured_profile(&mut config, &"identity-target".into(), snapshot).unwrap();
+    assert_eq!(
+        anchor_of("identity-target").as_deref(),
+        Some("identity-account")
+    );
+    assert_eq!(
+        crate::profile_cache::login_identity(&"identity-target".into()),
+        crate::profile_cache::LoginIdentity::Anchored {
+            account: identity.account_uuid.clone(),
+            details: Some(identity)
+        }
+    );
+}
+
+#[test]
+fn new_login_mint_commits_identity_snapshot_with_anchor() {
+    let _home = HomeSandbox::new();
+    let mut config = inactive_config(Profile::new("existing".to_string(), None, None));
+    let identity = crate::profile_cache::AccountIdentity::uuid_only("mint-account".into(), 52);
+    let credentials = login_snapshot("mint-refresh", None).credentials.unwrap();
+    create_profile_from_login(
+        &mut config,
+        "mint-identity".to_string(),
+        None,
+        credentials,
+        Some(identity.clone()),
+    )
+    .unwrap();
+    assert_eq!(anchor_of("mint-identity").as_deref(), Some("mint-account"));
+    assert_eq!(
+        crate::profile_cache::login_identity(&"mint-identity".into()),
+        crate::profile_cache::LoginIdentity::Anchored {
+            account: identity.account_uuid.clone(),
+            details: Some(identity)
+        }
+    );
+}
+
+#[test]
+fn logout_removes_anchor_pending_and_identity_snapshot() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::testutil::identity_canary_config();
+    let name = crate::profile::ProfileName::from("canary-two");
+    crate::profile_cache::begin_login_install(&name).unwrap();
+    clear_profile_credentials(&mut config, &name).unwrap();
+    for file in [
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        crate::profile_cache::IDENTITY_PENDING_FILE,
+        crate::profile_cache::ACCOUNT_IDENTITY_FILE,
+    ] {
+        assert!(
+            !crate::profile::profile_subpath(&name, file)
+                .unwrap()
+                .exists(),
+            "{file}"
+        );
+    }
+    assert_eq!(
+        crate::profile_cache::same_account_as(&config, &"canary-one".into()),
+        None
+    );
+}
+
+#[test]
+fn captured_proven_login_commits_identity_snapshot_with_anchor() {
+    let _home = HomeSandbox::new();
+    let mut config = inactive_config(Profile::new("existing".to_string(), None, None));
+    let identity = crate::profile_cache::AccountIdentity::uuid_only("capture-account".into(), 63);
+    let mut snapshot = login_snapshot("captured-refresh", None);
+    snapshot.anchor = AnchorAction::Proven(identity.clone());
+    capture_into_profile(&mut config, "capture-identity".to_string(), None, snapshot).unwrap();
+    assert_eq!(
+        anchor_of("capture-identity").as_deref(),
+        Some("capture-account")
+    );
+    assert_eq!(
+        crate::profile_cache::login_identity(&"capture-identity".into()),
+        crate::profile_cache::LoginIdentity::Anchored {
+            account: identity.account_uuid.clone(),
+            details: Some(identity)
+        }
+    );
 }

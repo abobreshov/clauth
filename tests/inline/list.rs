@@ -1220,3 +1220,13 @@ fn list_prints_hermes_section() {
         "a blank line separates the sections: {out}"
     );
 }
+
+#[test]
+fn identity_canary_stays_out_of_list_table() {
+    let _home = HomeSandbox::new();
+    let config = crate::testutil::identity_canary_config();
+    let entries = build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
+    assert!(table.contains("canary-one") && table.contains("canary-two"));
+    crate::testutil::assert_no_identity_canary(&table);
+}

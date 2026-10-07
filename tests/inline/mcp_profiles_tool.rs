@@ -891,3 +891,12 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
          manage — they are Claude Code only. Switch it with `tollgate <name>`"
     );
 }
+
+#[test]
+fn identity_canary_stays_out_of_mcp_profile_rows() {
+    let _home = HomeSandbox::new();
+    let _config = crate::testutil::identity_canary_config();
+    let text = first_text(&call_profiles(None, None));
+    assert!(text.contains("canary-one") && text.contains("canary-two"));
+    crate::testutil::assert_no_identity_canary(&text);
+}
