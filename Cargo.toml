@@ -1,6 +1,6 @@
 [package]
 name = "tollgate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Monitor and manage AI subscriptions and spending across providers (Claude, Codex, Ollama Cloud, Nous/Hermes, OpenRouter, …); switch accounts; herdr and agent APIs. CLI + TUI."
 license = "MIT"
