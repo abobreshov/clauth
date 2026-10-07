@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -1832,20 +1832,16 @@ fn run_check_inner(
     let deadline = Instant::now() + bound;
     let status = loop {
         if cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_check_child(child, true)?;
             anyhow::bail!("gateway check cancelled");
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(CHECK_POLL_INTERVAL),
             outcome => {
-                // Only a child that already exited refuses the kill; the wait
-                // reaps it either way, so none is ever left running.
-                let _ = child.kill();
-                child
-                    .wait()
-                    .with_context(|| format!("failed to reap {}", binary.display()))?;
+                // The supervisor must reach its shutdown deadline even when
+                // a killed check remains stuck in uninterruptible I/O.
+                stop_check_child(child, cancel.is_some())?;
                 return match outcome {
                     Err(e) => {
                         Err(e).with_context(|| format!("failed to wait on {}", binary.display()))
@@ -1874,6 +1870,27 @@ fn run_check_inner(
         stderr: CheckStderr(String::from_utf8_lossy(&stderr).trim().to_string()),
     }
     .into())
+}
+
+fn stop_check_child(mut child: Child, detached: bool) -> Result<()> {
+    let _ = child.kill();
+    if detached {
+        reap_check_async(move || {
+            let _ = child.wait();
+        })
+    } else {
+        child.wait().context("failed to reap gateway check")?;
+        Ok(())
+    }
+}
+
+/// A check's reap may outlive the stop budget; its supervisor never waits on it.
+fn reap_check_async(wait: impl FnOnce() + Send + 'static) -> Result<()> {
+    std::thread::Builder::new()
+        .name("tollgate-check-reaper".into())
+        .spawn(wait)
+        .map(|_| ())
+        .context("cannot spawn gateway check reaper")
 }
 
 /// How much of a failed check's stderr the refusal keeps. shunt 0.47.0's

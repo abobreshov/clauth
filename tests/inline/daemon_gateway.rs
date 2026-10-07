@@ -2076,6 +2076,7 @@ fn expect_restart(
     name: &str,
     changed: &str,
 ) {
+    let checks_before = rig.check_runs();
     fs::write(&rig.config, changed).expect("config");
     supervisor.step(t0.after(secs(2)));
     assert_eq!(
@@ -2108,7 +2109,11 @@ fn expect_restart(
         [first_pid],
         "the receiver side: exactly one SIGTERM, not two"
     );
-    assert_eq!(rig.check_runs(), 1, "the restart is gated on one check");
+    assert_eq!(
+        rig.check_runs(),
+        checks_before + 1,
+        "the restart is gated on one new check"
+    );
 }
 
 /// The base `[server]` table every restart-only edit starts from.
@@ -3028,61 +3033,21 @@ fn a_two_setting_edit_names_both_key_paths_in_order() {
     );
 }
 
-/// A child whose spawn-time read failed (a fact path crossed a non-table)
-/// adopts the first readable round's facts as its baseline, logged once, and
-/// then restarts on a later change like any other child.
+/// A missing spawn baseline cannot prove that the child loaded the edited
+/// config: require a successful check and one respawn before accepting facts.
 #[cfg(unix)]
 #[test]
-fn a_child_whose_spawn_read_failed_adopts_the_first_readable_round_then_restarts_on_a_change() {
+fn a_child_whose_spawn_read_failed_checks_and_restarts_on_the_first_readable_round() {
     let rig = Rig::new("0.49.1");
     rig.arm_check_stub();
-    fs::write(
-        &rig.config,
-        format!(
-            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\nlimits = \"not-a-table\"\n",
-            rig.port
-        ),
-    )
-    .expect("config");
     let mut supervisor = rig.supervisor();
     let t0 = t0();
     supervisor.step(t0);
     rig.server.wait_serving(true);
     supervisor.step(t0.after(secs(1)));
-    assert_eq!(rig.slot().state, GatewayState::Healthy);
     let pid = rig.only_call().pid;
-
-    // The first readable round adopts its facts as the baseline, logged once.
-    fs::write(&rig.config, base_config(rig.port)).expect("config");
-    supervisor.step(t0.after(secs(2)));
-    assert_eq!(
-        rig.slot().state,
-        GatewayState::Healthy,
-        "adopting the baseline never restarts"
-    );
-    assert!(stub::alive(pid), "no stop while adopting the baseline");
-    assert_eq!(
-        rig.calls().len(),
-        1,
-        "no respawn while adopting the baseline"
-    );
-    assert_eq!(
-        rig.check_runs(),
-        0,
-        "no check runs while adopting the baseline"
-    );
-    let adopt_line = "tollgate daemon: the shunt gateway's config could not be read at spawn; adopting the current config as its restart baseline";
-    assert_eq!(
-        rig.lines
-            .snapshot()
-            .iter()
-            .filter(|line| **line == adopt_line)
-            .count(),
-        1,
-        "the adoption is logged once"
-    );
-
-    // A later change restarts like any other child.
+    // Simulate the parent's independent post-spawn read losing an editor race.
+    supervisor.child.as_mut().unwrap().spawn_mark = None;
     let changed = format!(
         "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
         rig.port
@@ -3090,11 +3055,16 @@ fn a_child_whose_spawn_read_failed_adopts_the_first_readable_round_then_restarts
     expect_restart(
         &rig,
         &mut supervisor,
-        t0.after(secs(2)),
+        t0,
         pid,
-        "server.bind",
+        "unknown spawn-time restart settings",
         &changed,
     );
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(5)));
+    assert_eq!(rig.calls().len(), 2, "the new child establishes a baseline");
+    assert_eq!(rig.check_runs(), 1);
+    assert!(supervisor.child.as_ref().unwrap().spawn_mark.is_some());
 }
 
 /// A config whose `[sentry]` subtree holds `nan` compares equal to itself
@@ -3180,9 +3150,9 @@ fn restart_facts_cover_every_transition_and_ignore_hot_edits() {
     let hot = read("# reordered and edited hot fields\n[server]\nsse_keepalive_seconds = 60\nshutdown_timeout_seconds = 2\nbind = '127.0.0.1:3067'\n[sentry]\nrate = nan\n[[models]]\nid = 'fable'\n".into());
     assert_eq!(hot, base);
     fs::write(&config, "[server]\nlimits = 'broken'").unwrap();
-    assert!(RestartFacts::read(&config).is_none());
+    assert!(RestartFacts::read(&config).is_err());
     fs::write(&config, "not = [toml").unwrap();
-    assert!(RestartFacts::read(&config).is_none());
+    assert!(RestartFacts::read(&config).is_err());
 }
 
 #[cfg(unix)]
@@ -3274,4 +3244,89 @@ fn restart_check_is_cancelled_before_spawn_and_during_a_wedged_check() {
     assert!(crate::gateway::check_adopted_config(&record, &cancel).is_err());
     stopper.join().unwrap();
     assert!(started.elapsed() < secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_table_edit_after_spawn_logs_once_and_the_repaired_bind_restarts() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    let pid = rig.only_call().pid;
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = '0.0.0.0:{}'\nlimits = 'SECRET-NOT-A-TABLE'\n",
+            rig.port
+        ),
+    )
+    .unwrap();
+    for seconds in 2..=4 {
+        supervisor.step(t0.after(secs(seconds)));
+    }
+    assert!(stub::alive(pid));
+    assert_eq!(rig.calls().len(), 1);
+    assert_eq!(rig.check_runs(), 0);
+    let refusal = |line: &&String| {
+        line.contains("cannot read the shunt gateway's restart settings at server.limits.max_request_header_bytes")
+    };
+    assert_eq!(rig.lines.snapshot().iter().filter(refusal).count(), 1);
+    assert!(
+        !rig.lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("SECRET-NOT-A-TABLE"))
+    );
+    let changed = format!(
+        "[server]\nbind = '0.0.0.0:{}'\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(5)),
+        pid,
+        "server.bind",
+        &changed,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_baseline_never_stops_the_child_until_the_check_passes() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    let pid = rig.only_call().pid;
+    supervisor.child.as_mut().unwrap().spawn_mark = None;
+    fs::write(rig.dir.join("check-fail"), "").unwrap();
+    supervisor.step(t0.after(secs(1)));
+    supervisor.step(t0.after(secs(2)));
+    assert!(stub::alive(pid));
+    assert!(supervisor.child.as_ref().unwrap().spawn_mark.is_none());
+    assert_eq!(
+        rig.check_runs(),
+        1,
+        "refusal memo applies to unknown baselines too"
+    );
+    fs::remove_file(rig.dir.join("check-fail")).unwrap();
+    let changed = format!(
+        "[server]\nbind = '0.0.0.0:{}'\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(61)),
+        pid,
+        "unknown spawn-time restart settings",
+        &changed,
+    );
 }

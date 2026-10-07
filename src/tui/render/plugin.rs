@@ -820,7 +820,11 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
         JobPhase::Running | JobPhase::Blocking => {
             let live = jobs::running_liveness(record, now);
             let elapsed = format!("elapsed {}", humanize_duration(live.elapsed_secs as i64));
-            (vec![elapsed], Some(live))
+            let output = match live.last_output_secs_ago {
+                Some(secs) => format!("last output {}", age_phrase(secs)),
+                None => "no output yet".into(),
+            };
+            (vec![elapsed, output], Some(live))
         }
     };
     if let Some(account) = &record.spawned_by {

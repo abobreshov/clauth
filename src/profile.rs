@@ -1145,7 +1145,7 @@ impl AppState {
         self.walk_min_gain_mins
             .unwrap_or(60)
             .saturating_mul(60)
-            .max(1)
+            .max(WALK_RESET_TOLERANCE_SECS)
     }
 
     pub(crate) fn walk_cooldown_secs(&self) -> u64 {
@@ -1260,6 +1260,9 @@ fn default_refresh_interval() -> u64 {
 /// days, so the hop must fire while there is still room to land it — the
 /// full rationale lives on the gate in `fallback.rs`.
 pub(crate) const DEFAULT_WEEKLY_SWITCH_PCT: f64 = 98.0;
+
+/// Reset jitter never counts as a proactive gain, even with a zero gain knob.
+pub(crate) const WALK_RESET_TOLERANCE_SECS: u64 = 60;
 
 /// Lowest configurable weekly line. Below this the chain thrashes: most
 /// members spend half their week above the line, so every hop immediately

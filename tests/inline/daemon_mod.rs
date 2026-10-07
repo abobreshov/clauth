@@ -2341,3 +2341,83 @@ fn an_intervening_switch_cancels_a_queued_proactive_move() {
         "beta"
     );
 }
+
+#[test]
+fn a_scan_after_a_dropped_proactive_move_executes_same_target_exhaustion() {
+    let _home = HomeSandbox::new();
+    let mut config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    config.state.fallback_chain = vec!["alpha".into(), "beta".into()];
+    config.state.last_switch_at = Some(crate::usage::now_epoch_secs().max(0) as u64);
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .pending_switch
+        .lock()
+        .unwrap()
+        .insert(PendingSwitchTarget {
+            target: "beta".into(),
+            key_rejected_cause: None,
+            reason: Some("home walk: weekly reset 2h0m sooner".into()),
+            proactive: true,
+        });
+    daemon.drain_pending_switch();
+    assert!(daemon.pending_switch.lock().unwrap().is_empty());
+    assert_eq!(
+        daemon.config.lock().unwrap().state.active_profile,
+        Some("alpha".into())
+    );
+    for (name, utilization) in [("alpha", 96.0), ("beta", 10.0)] {
+        daemon.usage_store.lock().unwrap().insert(
+            name.into(),
+            crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(
+                        crate::usage::now_epoch_secs() + 3600,
+                    )),
+                }),
+                ..Default::default()
+            },
+        );
+        daemon
+            .usage_status
+            .lock()
+            .unwrap()
+            .insert(name.into(), crate::usage::FetchStatus::Fresh);
+    }
+    crate::usage::scan_auto_switch(
+        &daemon.config,
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.third_party_status,
+        &daemon.third_party_streaks,
+        &daemon.third_party_broken,
+        &daemon.poll_streaks,
+        &daemon.kick_blocks,
+        &daemon.activity,
+        &daemon.pending_switch,
+        &daemon.pending_switch_off,
+    );
+    {
+        let pending = daemon.pending_switch.lock().unwrap();
+        let decision = pending.iter().next().expect("fresh exhaustion decision");
+        assert_eq!(decision.target, "beta");
+        assert!(!decision.proactive);
+        assert_eq!(
+            decision.reason.as_deref(),
+            Some("5h at 96% ≥ threshold 95%")
+        );
+    }
+    daemon.drain_pending_switch();
+    assert_eq!(
+        daemon.config.lock().unwrap().state.active_profile,
+        Some("beta".into())
+    );
+}

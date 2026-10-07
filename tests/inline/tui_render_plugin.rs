@@ -257,12 +257,12 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
     };
     assert_eq!(
         facts("uwuclxdy"),
-        "elapsed 2m 14s · spawned by cld · idle-kill in 4m 48s",
+        "elapsed 2m 14s · last output 12s ago · spawned by cld · idle-kill in 4m 48s",
         "a running row counts from its own stamps and names its spawner",
     );
     assert_eq!(
         facts("kerry"),
-        "elapsed 40s · idle-kill in 4m 30s",
+        "elapsed 40s · last output 30s ago · idle-kill in 4m 30s",
         "a record with no origin names no spawner",
     );
     assert_eq!(
@@ -288,12 +288,12 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
     };
     assert_eq!(
         row("uwuclxdy"),
-        "● running   uwuclxdy  elapsed 2m 14s · spawned by cld · idle-kill in 4m 48s  /home/u/repos/app",
-        "the run's directory closes the row, never its last words",
+        "● running   uwuclxdy  elapsed 2m 14s · last output 12s ago · spawned by cld · idle-kill in 4m 48s",
+        "liveness facts leave too little room for a readable directory at width 100",
     );
     assert_eq!(
         row("kerry"),
-        "● blocking  kerry     elapsed 40s · idle-kill in 4m 30s",
+        "● blocking  kerry     elapsed 40s · last output 30s ago · idle-kill in 4m 30s",
         "a record with no origin ends on its facts",
     );
     assert_eq!(
@@ -395,15 +395,20 @@ fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
     // The liveness fields reach the screen. Their VALUES move with the real
     // clock this path reads, and are pinned exactly by the test above.
     let running = row_for("uwuclxdy");
-    for needle in ["elapsed ", "spawned by cld", "idle-kill in "] {
+    for needle in [
+        "elapsed ",
+        "last output ",
+        "spawned by cld",
+        "idle-kill in ",
+    ] {
         assert!(
             running.contains(needle),
             "`{needle}` missing from the running row:\n{running}"
         );
     }
     assert!(
-        running.contains("/home/u/repos/app"),
-        "the run directory closes the row: {running}"
+        !running.contains("/home/u/repos/app"),
+        "a narrow row drops the directory after preserving liveness facts: {running}"
     );
     assert!(
         row_for("DS8").contains("finished "),
@@ -463,6 +468,13 @@ fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
             crate::usage::humanize_duration(secs("elapsed_secs") as i64)
         )),
         "elapsed disagrees with monitor's {payload}: {facts}"
+    );
+    assert!(
+        facts.contains(&format!(
+            "last output {}",
+            super::age_phrase(secs("last_output_secs_ago"))
+        )),
+        "last output disagrees with monitor's {payload}: {facts}"
     );
     // The idle guard lands first on this fixture, so that is the countdown the
     // row spends its one cell on — and it is monitor's own figure.
@@ -1072,4 +1084,33 @@ fn delegate_lines_pin_the_overflow_count_and_the_directory_exactly() {
         "● running   acct  elapsed 5s",
         "a row with no room for a readable directory drops it",
     );
+}
+
+#[test]
+fn delegates_without_deadlines_show_silence_alongside_their_origin() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut job = seed_every_state(NOW)
+        .into_iter()
+        .find(|job| job.record.profile == "uwuclxdy")
+        .unwrap();
+    job.record.timeout_secs = 0;
+    job.record.idle_secs = None;
+    for (last_output, expected) in [
+        (0, "no output yet"),
+        (NOW - 1_200_000, "last output 20m ago"),
+    ] {
+        job.record.last_output_at = last_output;
+        let row = super::delegate_row(&job, NOW);
+        let text = super::delegate_line(&row, 8, 160)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains(expected), "{text}");
+        assert!(
+            text.contains("spawned by cld") && text.contains("/home/u/repos/app"),
+            "{text}"
+        );
+        assert!(!text.contains("kill"));
+    }
 }

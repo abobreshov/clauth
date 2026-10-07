@@ -4578,9 +4578,10 @@ fn session_host_pid() -> Option<u32> {
 }
 
 /// The pid of the Claude Code session record in `dir` (`<pid>.json`, one per
-/// process) whose `sessionId` is `session_id`, when exactly one names it: a
-/// dead record left behind, or two processes resumed on one id, makes the
-/// answer ambiguous, and a wrong pid would hide this process's delegates.
+/// process) whose `sessionId` is `session_id`, when exactly one live record names
+/// it. Dead records are excluded. Two live records make the answer ambiguous,
+/// and a wrong pid would hide this process's delegates. Off unix the existing
+/// liveness probe cannot prove existence, so the caller uses session identity.
 #[cfg(any(not(unix), test))]
 fn session_record_pid(dir: &std::path::Path, session_id: &str) -> Option<u32> {
     #[derive(serde::Deserialize)]
@@ -4595,7 +4596,12 @@ fn session_record_pid(dir: &std::path::Path, session_id: &str) -> Option<u32> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| std::fs::read(e.path()).ok())
         .filter_map(|bytes| serde_json::from_slice::<SessionRecord>(&bytes).ok())
-        .filter(|r| r.session_id == session_id);
+        .filter(|r| r.session_id == session_id)
+        .filter(|r| {
+            r.pid != 0
+                && r.pid <= i32::MAX as u32
+                && crate::runtime::namespaced_keychain_ledger::pid_alive(r.pid)
+        });
     let pid = matching.next()?.pid;
     matching.next().is_none().then_some(pid)
 }

@@ -263,7 +263,9 @@ impl PendingSwitchTarget {
     pub(crate) fn cooldown_blocked(&self, state: &crate::profile::AppState) -> bool {
         self.proactive
             && state.last_switch_at.is_some_and(|last| {
-                (now_epoch_secs().max(0) as u64).saturating_sub(last) < state.walk_cooldown_secs()
+                (now_epoch_secs().max(0) as u64)
+                    .checked_sub(last)
+                    .is_some_and(|elapsed| elapsed < state.walk_cooldown_secs())
             })
     }
 }

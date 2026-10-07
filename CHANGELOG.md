@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Auto-switch decisions preserve the trigger from the deciding branch with a frozen clock and cached burn rate; zero gain settings retain the reset-jitter tolerance, and future switch timestamps do not extend cooldown.
+- Unreadable gateway restart settings are reported once per config digest; a missing spawn baseline requires a checked respawn. Killed daemon check children are reaped separately to preserve the stop budget.
+- Delegate rows again show last-output age or “no output yet” alongside origin. Session records supply host pids only when liveness can be proven; otherwise delegate accounting uses the host session.
+
 - Context notes count this process's delegates across `/clear`, excluding peer sessions when attribution is known. Delegate job records preserve host pid/session, run directory and spawning account through completion; the Plugin tab displays the origin.
 - Delegate rewake hooks match both the plugin and bare tollgate MCP tool names.
 - The shunt supervisor clamps its stop wait to the deadline and restarts on all restart-only config edits after a cancellable `shunt check`, with digest-only restart facts and bounded refusal rechecks.

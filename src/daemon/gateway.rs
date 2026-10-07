@@ -533,14 +533,13 @@ static FACT_SPECS: &[FactSpec] = &[
 ];
 
 impl RestartFacts {
-    /// The restart-only facts of `config`, or `None` when the file cannot be
-    /// read, does not parse as TOML, or a fact's path crosses a non-table.
-    fn read(config: &Path) -> Option<RestartFacts> {
-        let text = std::fs::read_to_string(config).ok()?;
-        let doc: toml::Value = toml::from_str(&text).ok()?;
+    /// Read the facts, naming an unreadable document or a malformed fact path.
+    fn read(config: &Path) -> Result<RestartFacts, &'static str> {
+        let text = std::fs::read_to_string(config).map_err(|_| "config file")?;
+        let doc: toml::Value = toml::from_str(&text).map_err(|_| "TOML document")?;
         let mut values = Vec::with_capacity(FACT_SPECS.len());
         for spec in FACT_SPECS {
-            let value = match (walk(&doc, spec.keys).ok()?, spec.kind) {
+            let value = match (walk(&doc, spec.keys).map_err(|()| spec.path)?, spec.kind) {
                 (Some(value), FactKind::Value) => FactValue::Value(Some(digest_of(value))),
                 (Some(_), FactKind::Present) => FactValue::Present(true),
                 (Some(value), FactKind::NonEmpty) => FactValue::NonEmpty(non_empty(value)),
@@ -550,7 +549,7 @@ impl RestartFacts {
             };
             values.push(value);
         }
-        Some(RestartFacts { values })
+        Ok(RestartFacts { values })
     }
 
     /// The log key paths of every fact that differs from `spawned`, in
@@ -594,7 +593,7 @@ impl RestartChange {
 
 /// The value at `keys` in `doc`: `Ok(None)` for an absent key, `Ok(Some(v))`
 /// for the terminal value, `Err(())` when an intermediate key exists but is
-/// not a table (no evidence about any fact).
+/// not a table (an unreadable fact path, reported by the supervisor).
 fn walk<'a>(doc: &'a toml::Value, keys: &[&str]) -> Result<Option<&'a toml::Value>, ()> {
     let mut current = doc;
     for (index, key) in keys.iter().enumerate() {
@@ -947,28 +946,37 @@ impl Supervisor {
                 return None;
             }
             Intent::Run(record) => {
-                if let Some(current) = RestartFacts::read(record.config()) {
-                    if let Some(spawned) = &running.spawn_mark {
-                        let settings = current.changed_since(spawned);
-                        if !settings.is_empty() {
-                            let change = RestartChange { settings };
-                            if restart_cleared(
-                                record,
-                                &change,
-                                &mut running.refused_check,
-                                tick.at,
-                                &self.cancel,
-                            ) {
-                                self.begin_stop(AfterStop::Respawn { why: change.why() }, tick);
-                                return None;
-                            }
-                        }
-                    } else {
-                        running.spawn_mark = Some(current);
-                        logline!(
-                            "tollgate daemon: the shunt gateway's config could not be read at spawn; adopting the current config as its restart baseline"
+                let change = match RestartFacts::read(record.config()) {
+                    Ok(current) => RestartChange {
+                        settings: running.spawn_mark.as_ref().map_or_else(
+                            || vec!["unknown spawn-time restart settings"],
+                            |spawned| current.changed_since(spawned),
+                        ),
+                    },
+                    Err(path) => {
+                        note_restart_read_failure(
+                            record,
+                            path,
+                            &mut running.refused_check,
+                            tick.at,
                         );
+                        return (tick.at >= running.next_probe).then_some(StepWants::Child {
+                            tick,
+                            addr: running.probe,
+                        });
                     }
+                };
+                if !change.settings.is_empty()
+                    && restart_cleared(
+                        record,
+                        &change,
+                        &mut running.refused_check,
+                        tick.at,
+                        &self.cancel,
+                    )
+                {
+                    self.begin_stop(AfterStop::Respawn { why: change.why() }, tick);
+                    return None;
                 }
             }
         }
@@ -1243,7 +1251,7 @@ impl Supervisor {
             stop_bound,
             identity,
             stop: None,
-            spawn_mark: RestartFacts::read(record.config()),
+            spawn_mark: RestartFacts::read(record.config()).ok(),
             refused_check: RefusedCheck::default(),
         };
         if let Err(e) = write_marker(&running.marker(None)) {
@@ -1674,6 +1682,28 @@ fn refusal_line(name: &str, change: &RestartChange, e: &anyhow::Error) -> String
             "{changed}, but its check could not run: {e:#}; keeping the running gateway until the check passes"
         ),
     }
+}
+
+/// A bad fact path is an unapplied edit, never evidence of no change.
+/// Keep the child and log once per byte digest, without quoting file contents.
+fn note_restart_read_failure(
+    record: &GatewayRecord,
+    path: &str,
+    memo: &mut RefusedCheck,
+    now: Instant,
+) {
+    let digest = std::fs::read(record.config())
+        .ok()
+        .map(|bytes| <[u8; 32]>::from(Sha256::digest(&bytes)));
+    let line = format!(
+        "tollgate daemon: cannot read the shunt gateway's restart settings at {path}; keeping the running gateway until the config is readable"
+    );
+    if memo.digest != digest || memo.line.as_deref() != Some(line.as_str()) {
+        logline!("{line}");
+    }
+    memo.digest = digest;
+    memo.at = Some(now);
+    memo.line = Some(line);
 }
 
 /// Check a changed config once per byte digest or bounded retry interval.

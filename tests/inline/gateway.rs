@@ -3687,3 +3687,26 @@ fn restart_check_stderr_wait_is_cancelled_even_when_a_descendant_holds_the_pipe(
     });
     drop(sender);
 }
+
+#[test]
+fn a_stalled_check_reap_never_holds_the_supervisor_stop_budget() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (finished, done) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    super::reap_check_async(move || {
+        entered.send(()).unwrap();
+        wait.recv().unwrap();
+        finished.send(()).unwrap();
+    })
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        done.try_recv().is_err(),
+        "the reap is still stuck while the supervisor is free"
+    );
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(1)).unwrap();
+}

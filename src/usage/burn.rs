@@ -124,6 +124,25 @@ pub(crate) fn compute_burn_rates_from_history(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    compute_burn_rates_from_history_at(
+        history,
+        windows,
+        lookback_ms,
+        min_samples,
+        gap_cut_ms,
+        now_ms,
+    )
+}
+
+/// The same derivation at the clock captured with a decision's usage reading.
+pub(crate) fn compute_burn_rates_from_history_at(
+    history: &[(u64, UsageInfo)],
+    windows: &[(&str, &UsageWindow)],
+    lookback_ms: u64,
+    min_samples: usize,
+    gap_cut_ms: u64,
+    now_ms: u64,
+) -> HashMap<String, Option<f64>> {
     let half_life_ms = (lookback_ms as f64 / 4.0).max(1.0);
 
     let mut rates = HashMap::new();

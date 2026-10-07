@@ -9139,10 +9139,13 @@ fn the_delegate_origin_stamps_the_host_session_off_the_server_env() {
 /// another session, a non-record file and an absent dir name no host.
 #[test]
 fn the_session_record_naming_the_session_gives_the_host_pid() {
+    let _home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
+    let pid = std::process::id();
+    let expected = cfg!(unix).then_some(pid);
     std::fs::write(
         dir.path().join("4242.json"),
-        r#"{"pid":4242,"sessionId":"sess-host","name":"repo-q"}"#,
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-q"}).to_string(),
     )
     .expect("write host record");
     std::fs::write(
@@ -9151,17 +9154,17 @@ fn the_session_record_naming_the_session_gives_the_host_pid() {
     )
     .expect("write peer record");
     std::fs::write(dir.path().join("4242.abc.key"), "not json").expect("write key");
-    assert_eq!(session_record_pid(dir.path(), "sess-host"), Some(4242));
+    assert_eq!(session_record_pid(dir.path(), "sess-host"), expected);
     assert_eq!(session_record_pid(dir.path(), "sess-none"), None);
     assert_eq!(
         session_record_pid(&dir.path().join("absent"), "sess-host"),
         None
     );
-    // A dead record left behind, or a second process resumed on the same id:
+    // Two live matching records:
     // ambiguous, so no host rather than a wrong one.
     std::fs::write(
         dir.path().join("6060.json"),
-        r#"{"pid":6060,"sessionId":"sess-host","name":"repo-q"}"#,
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-q"}).to_string(),
     )
     .expect("write duplicate record");
     assert_eq!(session_record_pid(dir.path(), "sess-host"), None);
@@ -9172,11 +9175,13 @@ fn the_session_record_naming_the_session_gives_the_host_pid() {
 #[test]
 fn the_session_host_pid_reads_the_server_env_and_config_dir() {
     let home = HomeSandbox::new();
+    let pid = std::process::id();
+    let expected = cfg!(unix).then_some(pid);
     let config = home.home().join("runtime-x");
     std::fs::create_dir_all(config.join("sessions")).expect("sessions dir");
     std::fs::write(
         config.join("sessions").join("4242.json"),
-        r#"{"pid":4242,"sessionId":"sess-host","name":"repo-q"}"#,
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-q"}).to_string(),
     )
     .expect("write record");
     assert_eq!(session_host_pid(), None, "no session id, no host");
@@ -9184,7 +9189,7 @@ fn the_session_host_pid_reads_the_server_env_and_config_dir() {
     std::fs::create_dir_all(&global).expect("global sessions dir");
     std::fs::write(
         global.join("5151.json"),
-        r#"{"pid":5151,"sessionId":"sess-host","name":"repo-g"}"#,
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-g"}).to_string(),
     )
     .expect("write global record");
     let _sid = crate::testutil::EnvPin::new(
@@ -9199,10 +9204,15 @@ fn the_session_host_pid_reads_the_server_env_and_config_dir() {
     );
     assert_eq!(
         session_host_pid(),
-        Some(5151),
+        expected,
         "an empty CLAUDE_CONFIG_DIR falls back to ~/.claude"
     );
     drop(_sid);
+    std::fs::write(
+        global.join("5151.json"),
+        serde_json::json!({"pid":pid,"sessionId":"other-session"}).to_string(),
+    )
+    .expect("replace global record");
     let _dir = crate::testutil::ConfigDirSandbox::new(&home, &config);
     let _sid = crate::testutil::EnvPin::new(
         &home,
@@ -9211,5 +9221,25 @@ fn the_session_host_pid_reads_the_server_env_and_config_dir() {
             Some(std::ffi::OsStr::new("sess-host")),
         )],
     );
-    assert_eq!(session_host_pid(), Some(4242));
+    assert_eq!(session_host_pid(), expected);
+}
+
+#[test]
+fn a_sole_matching_dead_session_record_never_stamps_a_host_pid() {
+    let home = HomeSandbox::new();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    let sessions = home.home().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        serde_json::json!({"pid":pid,"sessionId":"same-id"}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(session_record_pid(&sessions, "same-id"), None);
 }

@@ -4506,6 +4506,14 @@ fn home_walk_settings_are_additive_and_round_trip() {
         ..AppState::default()
     };
     let restored: AppState = toml::from_str(&toml::to_string(&state).unwrap()).unwrap();
+    assert_eq!(
+        AppState {
+            walk_min_gain_mins: Some(0),
+            ..AppState::default()
+        }
+        .walk_min_gain_secs(),
+        60
+    );
     assert_eq!(restored.walk_min_gain_secs(), 7200);
     assert_eq!(restored.walk_cooldown_secs(), 0);
     assert_eq!(restored.last_switch_at, state.last_switch_at);

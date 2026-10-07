@@ -13369,3 +13369,21 @@ fn session_home_walk_uses_its_own_swap_cooldown_and_exhaustion_bypasses_it() {
     scan_sessions(&config, &store, &status);
     assert_eq!(decision_of("4242-1"), (Some("b".into()), Some(1)));
 }
+
+#[test]
+fn dispatch_cooldown_ignores_a_future_switch_timestamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let decision = super::PendingSwitchTarget {
+        target: "beta".into(),
+        key_rejected_cause: None,
+        reason: Some("home walk".into()),
+        proactive: true,
+    };
+    let mut state = crate::profile::AppState {
+        last_switch_at: Some(now_epoch_secs().max(0) as u64 + 365 * 86400),
+        ..Default::default()
+    };
+    assert!(!decision.cooldown_blocked(&state));
+    state.last_switch_at = Some(now_epoch_secs().max(0) as u64);
+    assert!(decision.cooldown_blocked(&state));
+}

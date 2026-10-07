@@ -1284,8 +1284,12 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         ],
     );
     let active_window = window(92.0, Some(live_reset()));
-    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("gamma"), &active_window)
-        .expect("rate computed from history");
+    let rate = burn_rate_for_profile(
+        &crate::profile::ProfileName::from("gamma"),
+        &active_window,
+        crate::usage::now_ms(),
+    )
+    .expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Gamma 5h-exhausted: the target follows ONLY the walk-order mode. The
@@ -1374,9 +1378,12 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
             ),
         ],
     );
-    let slow_rate =
-        burn_rate_for_profile(&crate::profile::ProfileName::from("gamma"), &active_window)
-            .expect("rate computed from history");
+    let slow_rate = burn_rate_for_profile(
+        &crate::profile::ProfileName::from("gamma"),
+        &active_window,
+        crate::usage::now_ms(),
+    )
+    .expect("rate computed from history");
     assert!(
         (slow_rate - 200.0).abs() < 1.0,
         "expected ~200 %/h, got {slow_rate}"
@@ -4361,8 +4368,12 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     // standing in for the caller's in-memory `history_cache` lookup
     // (`App::active_burn_rate`) that feeds the real UI-thread call site.
     let active_window = window(96.0, Some(live_reset()));
-    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("a"), &active_window)
-        .expect("rate computed from history");
+    let rate = burn_rate_for_profile(
+        &crate::profile::ProfileName::from("a"),
+        &active_window,
+        crate::usage::now_ms(),
+    )
+    .expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Burn-aware: 96% is over the 95% threshold, so the static check inside the
@@ -8040,4 +8051,204 @@ fn switch_reason_reports_exhaustion_when_an_ambient_key_rejection_was_not_needed
     assert!(!decision.key_rejection_necessary);
     assert!(!decision.proactive);
     assert_eq!(decision.reason, "5h at 96% ≥ threshold 95%");
+}
+
+#[test]
+fn zero_gain_and_cooldown_do_not_reopen_reset_jitter_ping_pong() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = walk_order_config();
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    config.state.walk_min_gain_mins = Some(0);
+    config.state.walk_cooldown_mins = Some(0);
+    let mut snapshot = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snapshot.fresh = snapshot.chain.iter().map(|m| m.name.clone()).collect();
+    let samples = [
+        "2026-10-14T04:59:59.567Z",
+        "2026-10-14T04:59:59.970Z",
+        "2026-10-14T05:00:00.306Z",
+        "2026-10-14T05:00:00.366Z",
+    ];
+    for active in ["alpha", "beta"] {
+        snapshot.active = active.into();
+        for a in samples {
+            for b in samples {
+                let reading = |reset: &str| {
+                    usage_both(
+                        Some(window(10.0, Some(live_reset()))),
+                        Some(window(10.0, Some(reset.into()))),
+                    )
+                };
+                let usage = HashMap::from([
+                    ("alpha".into(), reading(a)),
+                    ("beta".into(), reading(b)),
+                    ("gamma".into(), reading("2026-10-15T05:00:00Z")),
+                ]);
+                assert_eq!(
+                    next_auto_switch_target_for_test(&snapshot, &usage),
+                    None,
+                    "{active}: {a} / {b}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_future_switch_timestamp_does_not_extend_the_home_cooldown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = walk_order_config();
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    let mut snapshot = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snapshot.active = "alpha".into();
+    snapshot.fresh = snapshot.chain.iter().map(|m| m.name.clone()).collect();
+    snapshot.last_switch_at = Some(now_epoch_secs().max(0) as u64 + 365 * 86400);
+    let clear = |hours: i64| {
+        usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(10.0, Some(reset_in(hours * 3600)))),
+        )
+    };
+    let usage = HashMap::from([
+        ("alpha".into(), clear(6)),
+        ("beta".into(), clear(2)),
+        ("gamma".into(), clear(4)),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_for_test(&snapshot, &usage),
+        Some(SwitchAction::To("beta".into()))
+    );
+}
+
+#[test]
+fn anchored_reset_bands_stay_stable_for_three_members_fifty_seconds_apart() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = now_epoch_secs() + 86400;
+    // Chain order C, B, A: A anchors {A, B}; C starts the next group.
+    for a in -1..=1 {
+        for b in -1..=1 {
+            for c in -1..=1 {
+                let readings: Vec<_> = [base + 100 + c, base + 50 + b, base + a]
+                    .into_iter()
+                    .map(|reset| {
+                        usage_both(
+                            None,
+                            Some(window(10.0, Some(crate::usage::epoch_secs_to_iso(reset)))),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    ordered_walk(WalkOrder::SoonestWeeklyReset, 2, 3, &|i| Some(&readings[i])),
+                    vec![1, 2, 0]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_exhaustion_decision_keeps_its_trigger_at_the_frozen_reset_boundary() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = walk_order_config();
+    let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snap.active = "alpha".into();
+    snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
+    let now = 1_700_000_000u64;
+    snap.last_switch_at = Some(now);
+    let usage = HashMap::from([
+        (
+            "alpha".into(),
+            usage_both(
+                Some(window(
+                    97.0,
+                    Some(crate::usage::epoch_secs_to_iso(now as i64 + 1)),
+                )),
+                None,
+            ),
+        ),
+        (
+            "beta".into(),
+            usage_both(
+                Some(window(
+                    10.0,
+                    Some(crate::usage::epoch_secs_to_iso(now as i64 + 3600)),
+                )),
+                None,
+            ),
+        ),
+        (
+            "gamma".into(),
+            usage_both(
+                Some(window(
+                    10.0,
+                    Some(crate::usage::epoch_secs_to_iso(now as i64 + 3600)),
+                )),
+                None,
+            ),
+        ),
+    ]);
+    let reading = UsageReading::new(usage.clone(), now * 1000);
+    let decision = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    assert_eq!(decision.action, SwitchAction::To("beta".into()));
+    assert_eq!(decision.reason, "5h at 97% ≥ threshold 95%");
+    assert!(!decision.proactive);
+    // A new reading at the boundary has reset; the old decision remains a
+    // non-proactive exhaustion decision even though today's wall clock is later.
+    assert!(
+        next_auto_switch_decision_with_reading(
+            &snap,
+            &snap,
+            &UsageReading::new(usage, (now + 1) * 1000)
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn burn_decisions_reuse_the_frozen_rate_after_history_changes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = walk_order_config();
+    let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snap.active = "alpha".into();
+    snap.burn_aware = true;
+    snap.burn_floor_pct = 90.0;
+    snap.interval_ms = 60_000;
+    snap.burn_horizon_cap_ms = 60_000;
+    let now = 1_700_000_000_000u64;
+    let sample = |pct| {
+        usage_both(
+            Some(window(
+                pct,
+                Some(crate::usage::epoch_secs_to_iso((now / 1000) as i64 + 3600)),
+            )),
+            None,
+        )
+    };
+    write_history(
+        "alpha",
+        &[(now - 120_000, sample(70.0)), (now - 60_000, sample(80.0))],
+    );
+    let usage = HashMap::from([
+        ("alpha".into(), sample(90.0)),
+        ("beta".into(), sample(10.0)),
+        ("gamma".into(), sample(10.0)),
+    ]);
+    let reading = UsageReading::new(usage.clone(), now);
+    let before = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    assert_eq!(before.action, SwitchAction::To("beta".into()));
+    assert!(!before.proactive);
+    assert!(
+        before.reason.contains("600.0%/h projects 100.0%"),
+        "{}",
+        before.reason
+    );
+    write_history("alpha", &[]);
+    let after = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    assert_eq!(
+        before, after,
+        "counterfactual and reason must reuse the captured rate"
+    );
+    assert!(
+        next_auto_switch_decision_with_reading(&snap, &snap, &UsageReading::new(usage, now))
+            .is_none()
+    );
 }
