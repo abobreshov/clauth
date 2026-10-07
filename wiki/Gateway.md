@@ -1,0 +1,2 @@
+
+The daemon restarts a supervised shunt when restart-only settings change in either direction, after `shunt check` passes with the gateway's cwd and environment. This includes server bind, concurrency, shutdown, access control, header/URL limits, rate limits, boot-only subsystem presence, spend/pool state paths and poll cadence, status polling, sentry and otel. Hot-reloadable edits and formatting changes keep the child. Invalid edits keep the running child and log a refusal once; unchanged refusals are rechecked after 60 seconds. Shutdown cancels an in-flight check.

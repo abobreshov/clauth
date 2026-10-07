@@ -21,11 +21,13 @@
 //! daemon's own stderr: shunt logs every request at `info`, which would flood
 //! `daemon.log`'s size cap.
 
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -365,6 +367,251 @@ impl Identity {
     }
 }
 
+// ── restart-only facts ─────────────────────────────────────────────────────
+
+/// The restart-only settings shunt cannot hot-apply, read from the adopted
+/// config's TOML as written. The list mirrors shunt's
+/// `warn_on_restart_only_changes` — every `previous.X != next.X` there — plus
+/// the boot-fixed settings the warner omits, read at shunt's own spawn sites:
+/// `[server.pool]`'s `usage_refresh_seconds` and `state_path`, and
+/// `[server.status]` (its presence, whether `sources` is non-empty, and its
+/// `refresh_seconds`).
+///
+/// Each value fact is the SHA-256 of the canonical serialization of the raw
+/// TOML value at its key path (a sorted-key serialization, so whitespace,
+/// comments and key order never count, and a `${…}` reference compares as its
+/// text); a presence fact stays a boolean, and `[server.status].sources` is
+/// the boolean "non-empty". The mark keeps the digest, never the raw value, so
+/// a `[sentry]` dsn or an `[otel]` header never lives in the daemon heap and
+/// NaN compares equal to itself instead of restarting every round. An absent
+/// key vs an explicit shunt-default value is a change, because tollgate does not
+/// re-derive shunt's defaults. The compare is conservative: a respelling shunt
+/// reads as the same value (an int-vs-float respelling, `-0.0`, a value its
+/// spawn site clamps or treats as off), or an unknown key inside a member
+/// table, restarts once where shunt's typed compare would see no change — a
+/// needless restart is safer than an edit that silently stays unapplied.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RestartFacts {
+    values: Vec<FactValue>,
+}
+
+/// One restart-only fact's value: the digest of the value at a key path
+/// (`None` = absent), a table's presence, or an array's non-emptiness.
+#[derive(Debug, Clone, PartialEq)]
+enum FactValue {
+    Value(Option<[u8; 32]>),
+    Present(bool),
+    NonEmpty(bool),
+}
+
+/// How a [`FactSpec`] reads its fact.
+#[derive(Clone, Copy)]
+enum FactKind {
+    /// The value at the key path, compared by digest.
+    Value,
+    /// The key's presence, whatever its type.
+    Present,
+    /// Whether the key holds a non-empty array.
+    NonEmpty,
+}
+
+/// A restart-only setting: its document walk and its log key path.
+struct FactSpec {
+    keys: &'static [&'static str],
+    path: &'static str,
+    kind: FactKind,
+}
+
+/// The restart-only settings in the warner's order, then the boot-fixed trio.
+static FACT_SPECS: &[FactSpec] = &[
+    FactSpec {
+        keys: &["server", "bind"],
+        path: "server.bind",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "max_concurrent_requests"],
+        path: "server.max_concurrent_requests",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "shutdown_timeout_seconds"],
+        path: "server.shutdown_timeout_seconds",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "access_control"],
+        path: "[server.access_control]",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "limits", "max_request_header_bytes"],
+        path: "server.limits.max_request_header_bytes",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "limits", "max_url_length"],
+        path: "server.limits.max_url_length",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "rate_limits"],
+        path: "[server.rate_limits]",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "admin"],
+        path: "[server.admin]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "gateway"],
+        path: "[server.gateway]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "spend"],
+        path: "[server.spend]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "spend", "state_path"],
+        path: "server.spend.state_path",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "codex_endpoint"],
+        path: "[server.codex_endpoint]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "usage"],
+        path: "[server.usage]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "oauth_usage"],
+        path: "[server.oauth_usage]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["sentry"],
+        path: "[sentry]",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["otel"],
+        path: "[otel]",
+        kind: FactKind::Value,
+    },
+    // The boot-fixed trio, which the warner omits.
+    FactSpec {
+        keys: &["server", "pool", "usage_refresh_seconds"],
+        path: "server.pool.usage_refresh_seconds",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "pool", "state_path"],
+        path: "server.pool.state_path",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "status"],
+        path: "[server.status]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "status", "sources"],
+        path: "[server.status].sources",
+        kind: FactKind::NonEmpty,
+    },
+    FactSpec {
+        keys: &["server", "status", "refresh_seconds"],
+        path: "server.status.refresh_seconds",
+        kind: FactKind::Value,
+    },
+];
+
+impl RestartFacts {
+    /// The restart-only facts of `config`, or `None` when the file cannot be
+    /// read, does not parse as TOML, or a fact's path crosses a non-table.
+    fn read(config: &Path) -> Option<RestartFacts> {
+        let text = std::fs::read_to_string(config).ok()?;
+        let doc: toml::Value = toml::from_str(&text).ok()?;
+        let mut values = Vec::with_capacity(FACT_SPECS.len());
+        for spec in FACT_SPECS {
+            let value = match (walk(&doc, spec.keys).ok()?, spec.kind) {
+                (Some(value), FactKind::Value) => FactValue::Value(Some(digest_of(value))),
+                (Some(_), FactKind::Present) => FactValue::Present(true),
+                (Some(value), FactKind::NonEmpty) => FactValue::NonEmpty(non_empty(value)),
+                (None, FactKind::Value) => FactValue::Value(None),
+                (None, FactKind::Present) => FactValue::Present(false),
+                (None, FactKind::NonEmpty) => FactValue::NonEmpty(false),
+            };
+            values.push(value);
+        }
+        Some(RestartFacts { values })
+    }
+
+    /// The log key paths of every fact that differs from `spawned`, in
+    /// fact-set order.
+    fn changed_since(&self, spawned: &RestartFacts) -> Vec<&'static str> {
+        self.values
+            .iter()
+            .zip(&spawned.values)
+            .zip(FACT_SPECS)
+            .filter(|((current, spawned), _)| current != spawned)
+            .map(|(_, spec)| spec.path)
+            .collect()
+    }
+}
+
+/// The SHA-256 of a value's canonical serialization: the [`toml::Value`]
+/// `Display`, which emits sorted table keys and a sign-discarded `nan`, so two
+/// equal values (NaN included) digest alike and no value text is kept.
+fn digest_of(value: &toml::Value) -> [u8; 32] {
+    <[u8; 32]>::from(Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// Whether `value` is a non-empty array (the `[server.status].sources` fact).
+fn non_empty(value: &toml::Value) -> bool {
+    matches!(value, toml::Value::Array(items) if !items.is_empty())
+}
+
+/// The restart-only settings that changed since a child spawned, as log-ready
+/// key paths in fact-set order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RestartChange {
+    settings: Vec<&'static str>,
+}
+
+impl RestartChange {
+    /// The stop line's cause, e.g. `its config changed server.bind`.
+    fn why(&self) -> String {
+        format!("its config changed {}", self.settings.join(", "))
+    }
+}
+
+/// The value at `keys` in `doc`: `Ok(None)` for an absent key, `Ok(Some(v))`
+/// for the terminal value, `Err(())` when an intermediate key exists but is
+/// not a table (no evidence about any fact).
+fn walk<'a>(doc: &'a toml::Value, keys: &[&str]) -> Result<Option<&'a toml::Value>, ()> {
+    let mut current = doc;
+    for (index, key) in keys.iter().enumerate() {
+        let Some(next) = current.get(*key) else {
+            return Ok(None);
+        };
+        if index + 1 == keys.len() {
+            return Ok(Some(next));
+        }
+        if !next.is_table() {
+            return Err(());
+        }
+        current = next;
+    }
+    Ok(None)
+}
+
 // ── the supervisor ──────────────────────────────────────────────────────────
 
 /// One instant as the supervisor reads it: the monotonic clock for its own
@@ -394,6 +641,19 @@ impl Tick {
     }
 }
 
+/// The state a restart gate carries about a child's last
+/// refused `shunt check`, so the memo survives the round and the re-check
+/// bound and log dedup are enforced per child.
+#[derive(Default)]
+pub(crate) struct RefusedCheck {
+    /// The digest of the config bytes whose check last refused.
+    digest: Option<[u8; 32]>,
+    /// When the check last refused.
+    at: Option<Instant>,
+    /// The refusal line last logged for this child.
+    line: Option<String>,
+}
+
 /// The gateway tollgate spawned.
 struct Running {
     child: Child,
@@ -409,6 +669,8 @@ struct Running {
     stop_bound: Duration,
     identity: Identity,
     stop: Option<Stop>,
+    spawn_mark: Option<RestartFacts>,
+    refused_check: RefusedCheck,
 }
 
 impl Running {
@@ -445,7 +707,7 @@ enum AfterStop {
     /// changes.
     BelowFloor(String),
     /// The record's spawn inputs changed; spawn it afresh on them at once.
-    Respawn,
+    Respawn { why: String },
     /// The daemon is exiting.
     Shutdown,
 }
@@ -483,6 +745,7 @@ pub(crate) struct Supervisor {
     /// repeated skip of the same file's lines does not log again; a spawn
     /// that skips nothing clears it.
     last_skipped: Option<(PathBuf, Vec<usize>)>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// The probe a [`Supervisor::tend`] round still wants before it is complete.
@@ -534,6 +797,7 @@ impl Supervisor {
             retry_at: None,
             held: None,
             last_skipped: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         supervisor.publish();
         supervisor
@@ -628,7 +892,7 @@ impl Supervisor {
                 );
                 return;
             }
-            std::thread::sleep(STOP_POLL);
+            std::thread::sleep(STOP_POLL.min(deadline - now));
         }
     }
 
@@ -674,10 +938,39 @@ impl Supervisor {
             Intent::Run(record)
                 if spawn_inputs(record) != spawn_inputs(&running.identity.record) =>
             {
-                self.begin_stop(AfterStop::Respawn, tick);
+                self.begin_stop(
+                    AfterStop::Respawn {
+                        why: "its config, binary or env file changed".into(),
+                    },
+                    tick,
+                );
                 return None;
             }
-            Intent::Run(_) => {}
+            Intent::Run(record) => {
+                if let Some(current) = RestartFacts::read(record.config()) {
+                    if let Some(spawned) = &running.spawn_mark {
+                        let settings = current.changed_since(spawned);
+                        if !settings.is_empty() {
+                            let change = RestartChange { settings };
+                            if restart_cleared(
+                                record,
+                                &change,
+                                &mut running.refused_check,
+                                tick.at,
+                                &self.cancel,
+                            ) {
+                                self.begin_stop(AfterStop::Respawn { why: change.why() }, tick);
+                                return None;
+                            }
+                        }
+                    } else {
+                        running.spawn_mark = Some(current);
+                        logline!(
+                            "tollgate daemon: the shunt gateway's config could not be read at spawn; adopting the current config as its restart baseline"
+                        );
+                    }
+                }
+            }
         }
         if tick.at >= running.next_probe {
             Some(StepWants::Child {
@@ -733,7 +1026,7 @@ impl Supervisor {
         let why = match &then {
             AfterStop::Idle(slot) => format!("the gateway is now {:?}", slot.state),
             AfterStop::BelowFloor(read) => format!("it reported shunt {read}"),
-            AfterStop::Respawn => "its config, binary or env file changed".to_string(),
+            AfterStop::Respawn { why } => why.clone(),
             AfterStop::Shutdown => "the daemon is exiting".to_string(),
         };
         logline!(
@@ -779,7 +1072,7 @@ impl Supervisor {
                 self.held = Some(running.identity);
                 self.set(slot, tick);
             }
-            Some(AfterStop::Respawn) => {
+            Some(AfterStop::Respawn { .. }) => {
                 logline!(
                     "tollgate daemon: the shunt gateway (pid {}) stopped ({report}); starting it on the changed record",
                     running.pid
@@ -950,6 +1243,8 @@ impl Supervisor {
             stop_bound,
             identity,
             stop: None,
+            spawn_mark: RestartFacts::read(record.config()),
+            refused_check: RefusedCheck::default(),
         };
         if let Err(e) = write_marker(&running.marker(None)) {
             logline!("tollgate daemon: failed to record the gateway's pid: {e:#}");
@@ -1342,12 +1637,89 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
         .then(|| ticks.to_string())
 }
 
+/// Explain a refused restart without exposing the check's stderr.
+fn refusal_line(name: &str, change: &RestartChange, e: &anyhow::Error) -> String {
+    let changed = format!("{name}'s config changed {}", change.settings.join(", "));
+    match e.downcast_ref::<crate::gateway::ConfigEditRefusal>() {
+        Some(crate::gateway::ConfigEditRefusal::ShuntMissing { binary }) => format!(
+            "{changed}, but {binary} is not there to check it; keeping the running gateway until the check passes",
+            binary = binary.display()
+        ),
+        Some(crate::gateway::ConfigEditRefusal::CheckTimedOut {
+            binary,
+            config,
+            after,
+        }) => format!(
+            "{changed}, but `{binary} check --config {config}` ran past {after:?} and was stopped; keeping the running gateway until the check passes; run that command to see why it does not finish",
+            binary = binary.display(),
+            config = config.display()
+        ),
+        Some(crate::gateway::ConfigEditRefusal::CheckFailed {
+            binary,
+            config,
+            code,
+            ..
+        }) => {
+            let status = match code {
+                Some(code) => format!("exit {code}"),
+                None => "killed by a signal".to_string(),
+            };
+            format!(
+                "{changed}, but `{binary} check --config {config}` refused it ({status}); keeping the running gateway until the check passes; run that command to see why",
+                binary = binary.display(),
+                config = config.display()
+            )
+        }
+        _ => format!(
+            "{changed}, but its check could not run: {e:#}; keeping the running gateway until the check passes"
+        ),
+    }
+}
+
+/// Check a changed config once per byte digest or bounded retry interval.
+fn restart_cleared(
+    record: &GatewayRecord,
+    change: &RestartChange,
+    memo: &mut RefusedCheck,
+    now: Instant,
+    cancel: &AtomicBool,
+) -> bool {
+    let digest = std::fs::read(record.config())
+        .ok()
+        .map(|bytes| <[u8; 32]>::from(Sha256::digest(&bytes)));
+    if digest.is_some()
+        && memo.digest == digest
+        && memo
+            .at
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(60))
+    {
+        return false;
+    }
+    match crate::gateway::check_adopted_config(record, cancel) {
+        Ok(()) => !cancel.load(Ordering::Acquire),
+        Err(e) => {
+            if cancel.load(Ordering::Acquire) {
+                return false;
+            }
+            memo.digest = digest;
+            memo.at = Some(now);
+            let reason = refusal_line("the shunt gateway", change, &e);
+            if memo.line.as_deref() != Some(reason.as_str()) {
+                logline!("tollgate daemon: {reason}");
+                memo.line = Some(reason);
+            }
+            false
+        }
+    }
+}
+
 // ── the thread ──────────────────────────────────────────────────────────────
 
 /// The `tollgate-gateway` thread and the way to end it.
 pub(crate) struct SupervisorThread {
     commands: Option<Sender<RunMessage>>,
     thread: Option<JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// What the supervisor thread's inbox carries: a probe's answer, or a
@@ -1380,6 +1752,7 @@ fn run_probe(addr: SocketAddr) -> Result<Health> {
 /// thread.
 pub(crate) fn start(handle: GatewayHandle, _singleton: &DaemonLock) -> Result<SupervisorThread> {
     let supervisor = Supervisor::new(handle);
+    let cancel = Arc::clone(&supervisor.cancel);
     let (commands, inbox) = mpsc::channel::<RunMessage>();
     let probe_sender = commands.clone();
     let thread = std::thread::Builder::new()
@@ -1389,6 +1762,7 @@ pub(crate) fn start(handle: GatewayHandle, _singleton: &DaemonLock) -> Result<Su
     Ok(SupervisorThread {
         commands: Some(commands),
         thread: Some(thread),
+        cancel,
     })
 }
 
@@ -1572,6 +1946,7 @@ impl SupervisorThread {
             return StopOutcome::Stopped;
         };
         let deadline = Instant::now() + budget;
+        self.cancel.store(true, Ordering::Release);
         let (done, answered) = mpsc::channel();
         if commands
             .send(RunMessage::Shutdown(ShutdownReq { deadline, done }))

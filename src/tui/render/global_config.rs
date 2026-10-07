@@ -309,6 +309,9 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             WalkOrder::SoonestWeeklyReset => {
                 "spend the accepted member whose 7d window resets soonest, so less quota expires unspent"
             }
+            WalkOrder::MostWeeklyHeadroom => {
+                "spend the accepted member whose 7d window is least used, so the week spreads across the chain"
+            }
         }),
         GlobalConfigRow::BurnFloor => format!(
             "never switch away before {}% used, however fast the burn",
@@ -472,6 +475,10 @@ fn detail_row(
                 (
                     "soonest weekly reset",
                     rows.walk_order == WalkOrder::SoonestWeeklyReset,
+                ),
+                (
+                    "most weekly headroom",
+                    rows.walk_order == WalkOrder::MostWeeklyHeadroom,
                 ),
             ],
             selected,

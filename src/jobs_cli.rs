@@ -247,7 +247,7 @@ fn tail_cell(tail: &str) -> String {
 /// Legitimate right-to-left text needs none of them: the implicit bidi algorithm
 /// renders a plain Arabic or Hebrew tail correctly on its own, measured on
 /// both.
-fn reorders_display(c: char) -> bool {
+pub(crate) fn reorders_display(c: char) -> bool {
     matches!(
         c,
         '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'

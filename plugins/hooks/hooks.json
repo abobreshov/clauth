@@ -33,7 +33,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_tollgate_tollgate__delegate$",
+        "matcher": "^mcp__(plugin_tollgate_)?tollgate__delegate$",
         "hooks": [
           {
             "type": "command",

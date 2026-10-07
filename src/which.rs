@@ -279,6 +279,12 @@ pub(crate) fn session_config_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The config dir the running Claude Code session reads: [`session_config_dir`],
+/// else the global `~/.claude`.
+pub(crate) fn session_config_dir_or_global() -> Option<PathBuf> {
+    session_config_dir().or_else(|| crate::profile::claude_dir().ok())
+}
+
 /// The credentials file [`resolve_active`] reads for this process's session.
 ///
 /// Exposed so a caller can stat the resolution's input instead of redoing the

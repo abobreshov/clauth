@@ -3667,3 +3667,23 @@ fn a_store_under_upstreams_data_dir_is_kept() {
         Some(KeptReason::UpstreamOwned)
     );
 }
+
+#[test]
+fn restart_check_stderr_wait_is_cancelled_even_when_a_descendant_holds_the_pipe() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (sender, chunks) = std::sync::mpsc::channel();
+    sender.send(b"check refused".to_vec()).unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let stderr =
+            super::collect_stderr(&chunks, started + Duration::from_secs(10), Some(&cancel));
+        assert_eq!(stderr, b"check refused");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    });
+    drop(sender);
+}

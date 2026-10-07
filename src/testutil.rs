@@ -25,6 +25,10 @@ pub(crate) struct HomeSandbox {
     _guard: crate::lockorder::RankedGuard<'static, ()>,
     home: PathBuf,
     prev_config_dir: Option<std::ffi::OsString>,
+    prev_herdr_pane: Option<std::ffi::OsString>,
+    prev_herdr_bin: Option<std::ffi::OsString>,
+    prev_session_id: Option<std::ffi::OsString>,
+    prev_claude_pid: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
@@ -40,7 +44,7 @@ impl HomeSandbox {
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
-        // `home_override` does not reach `CLAUDE_CONFIG_DIR`, and the operator's
+        // `home_override` does not reach `CLAUDE_CONFIG_DIR`, and the user's
         // own value names a runtime OUTSIDE this tempdir: `which::session_auth`
         // and `which::resolve_active` honor it, so a test run from inside a
         // `tollgate start` session resolves the real `~/.claude/.credentials.json`
@@ -51,7 +55,25 @@ impl HomeSandbox {
         let prev_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
         // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let prev_herdr_pane = std::env::var_os("HERDR_PANE_ID");
+        let prev_herdr_bin = std::env::var_os("HERDR_BIN_PATH");
+        // SAFETY: serialized by HOME_TEST_LOCK and restored on drop.
+        unsafe {
+            std::env::remove_var("HERDR_PANE_ID");
+            std::env::remove_var("HERDR_BIN_PATH");
+        };
+        let prev_session_id = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+        let prev_claude_pid = std::env::var_os("CLAUDE_PID");
+        // SAFETY: serialized by HOME_TEST_LOCK, restored after workers join.
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("CLAUDE_PID");
+        }
         Self {
+            prev_session_id,
+            prev_claude_pid,
+            prev_herdr_pane,
+            prev_herdr_bin,
             _tmp: tmp,
             _guard: guard,
             home,
@@ -73,7 +95,7 @@ impl Drop for HomeSandbox {
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
         // detached worker still running when `HOME_OVERRIDE` clears resolves
-        // the operator's REAL `$HOME` and takes real locks under `~/.tollgate`
+        // the user's REAL `$HOME` and takes real locks under `~/.tollgate`
         // (`RotationGuard::acquire` alone does `mkdir_700` + a blocking
         // flock). Doing it here rather than asking each test to call the join
         // fns covers the tests that never thought about it — which is every
@@ -84,13 +106,30 @@ impl Drop for HomeSandbox {
         crate::tui::join_test_workers();
         join_background_tasks();
         crate::profile::clear_home_override();
-        // Restore the operator's own value, after the joins above for the same
+        // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
         // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, still held.
+        // SAFETY: serialized by HOME_TEST_LOCK, after joining all test workers.
+        match self.prev_herdr_pane.take() {
+            Some(prev) => unsafe { std::env::set_var("HERDR_PANE_ID", prev) },
+            None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
+        }
+        match self.prev_herdr_bin.take() {
+            Some(prev) => unsafe { std::env::set_var("HERDR_BIN_PATH", prev) },
+            None => unsafe { std::env::remove_var("HERDR_BIN_PATH") },
+        }
         match self.prev_config_dir.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", prev) },
             None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        match self.prev_session_id.take() {
+            Some(prev) => unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", prev) },
+            None => unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") },
+        }
+        match self.prev_claude_pid.take() {
+            Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
+            None => unsafe { std::env::remove_var("CLAUDE_PID") },
         }
     }
 }
@@ -2780,4 +2819,97 @@ impl LockHolder {
         file.try_lock().expect("hold the lock");
         Self { _file: file }
     }
+}
+
+/// Pin the pane env a herdr report test drives: `HERDR_PANE_ID` selects the
+/// pane, `HERDR_BIN_PATH` (usually an echo shim) names the binary the report
+/// spawns. Borrows the sandbox: the env is a process-global serialized by
+/// `HOME_TEST_LOCK`, which the sandbox holds.
+#[cfg(unix)]
+pub(crate) fn herdr_pane_env<'a>(
+    home: &'a HomeSandbox,
+    pane: Option<&str>,
+    bin: Option<&Path>,
+) -> EnvPin<'a> {
+    EnvPin::new(
+        home,
+        &[
+            ("HERDR_PANE_ID", pane.map(std::ffi::OsStr::new)),
+            ("HERDR_BIN_PATH", bin.map(Path::as_os_str)),
+        ],
+    )
+}
+
+/// Shim that appends its full argv to `report.log` beside itself and exits 0.
+/// `$0` resolves to the shim itself, so the log needs no embedded path; a
+/// report test spawns the shim as `HERDR_BIN_PATH` (or on `PATH`) and reads
+/// the spawned argv back from the log.
+#[cfg(unix)]
+pub(crate) fn echo_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(dir, name, r#"echo "$@" >> "$(dirname "$0")/report.log""#)
+}
+
+/// Same log line, then exit 1: the caller must swallow the failing status.
+#[cfg(unix)]
+pub(crate) fn exit1_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\nexit 1",
+    )
+}
+
+/// Logs its argv, then sleeps past a bounded caller's kill deadline. `exec` so
+/// the kill takes the whole process.
+#[cfg(unix)]
+pub(crate) fn hang_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"; exec sleep 30",
+    )
+}
+
+/// Every line the shims in `dir` recorded so far (empty when none).
+#[cfg(unix)]
+pub(crate) fn report_lines(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Poll `report_lines` until at least `want` lines exist or `timeout` elapses.
+#[cfg(unix)]
+pub(crate) fn wait_for_lines(dir: &Path, want: usize, timeout: std::time::Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let lines = report_lines(dir);
+        if lines.len() >= want {
+            return lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shim log stalled at {} lines (want {want})",
+            lines.len()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The `--seq` value of one recorded report line (the token after the flag).
+#[cfg(unix)]
+pub(crate) fn seq_of(line: &str) -> u64 {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--seq" {
+            return tokens
+                .next()
+                .expect("seq value")
+                .parse()
+                .expect("seq is numeric");
+        }
+    }
+    panic!("no --seq in report line: {line}");
 }

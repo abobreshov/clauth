@@ -204,7 +204,10 @@ How the Omarchy keys map onto tollgate's colour roles:
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
-| `walk_order` | string | `chain` | reorder each accept pass by the soonest-resetting 7d window: `chain` or `soonest-weekly-reset` |
+| `walk_order` | string | `chain` | reorder each accept pass by the soonest-resetting 7d window: `chain`, `soonest-weekly-reset` or `most-weekly-headroom`; headroom ties below 5 percentage points keep chain position after the 5h tie breaker |
+| `walk_min_gain_mins` | integer | `60` | minimum earlier weekly reset for a proactive home walk (minimum effective gain is 1 second) |
+| `walk_cooldown_mins` | integer | `30` | dwell after a successful global switch (or the session’s own swap) before another proactive move; `0` disables the cooldown |
+| `last_switch_at` | integer | absent | saved Unix time of the last successful global switch; maintained by tollgate |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
@@ -419,3 +422,5 @@ Five static lock files sit alongside and are never deleted on purpose: `.lock`, 
 Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 
 The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) tollgate builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)).
+
+Delegate job records add `host_pid` and `host_session` for the spawning Claude Code process, `cwd` for the run directory, and `spawned_by` for the caller's account. These fields survive heartbeat and completion writes. The Plugin tab shows each delegate's directory and spawning account; older records omit unknown origins.

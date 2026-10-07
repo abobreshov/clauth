@@ -33,6 +33,8 @@ fn stage_switch(d: &Daemon, target: &str) {
         .lock()
         .expect("pending_switch")
         .insert(PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: target.into(),
             key_rejected_cause: None,
         });
@@ -45,6 +47,8 @@ fn stage_key_rejected_switch(d: &Daemon, target: &str, active: &str, recorded_fp
         .lock()
         .expect("pending_switch")
         .insert(PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: target.into(),
             key_rejected_cause: Some((active.to_string(), recorded_fp)),
         });
@@ -636,6 +640,8 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
     assert_eq!(
         queued,
         vec![PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "oauth".to_string(),
             key_rejected_cause: None,
         }],
@@ -743,6 +749,8 @@ fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
     assert_eq!(
         queued,
         vec![PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: Some(("a".to_string(), a_fp)),
         }],
@@ -2209,4 +2217,127 @@ fn start_gives_up_at_the_wait() {
     let _ = child.wait();
     assert_eq!(outcome, super::StartOutcome::NotYet);
     assert!(started.elapsed() >= wait);
+}
+
+#[test]
+fn a_successful_switch_persists_its_time_and_logs_the_deciding_figures() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .pending_switch
+        .lock()
+        .unwrap()
+        .insert(PendingSwitchTarget {
+            target: "beta".into(),
+            key_rejected_cause: None,
+            reason: Some("5h at 96% ≥ threshold 95%".into()),
+            proactive: false,
+        });
+    let before = crate::usage::now_epoch_secs().max(0) as u64;
+    daemon.drain_pending_switch();
+    let state = crate::profile::load_app_state().unwrap();
+    let stamp = state.last_switch_at.unwrap();
+    assert!(stamp >= before && stamp <= crate::usage::now_epoch_secs().max(0) as u64);
+    assert_eq!(
+        daemon.config.lock().unwrap().state.last_switch_at,
+        Some(stamp)
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "tollgate daemon: switched to 'beta' (5h at 96% ≥ threshold 95%)")
+    );
+    // A no-op does not reset the cooldown or emit another switch line.
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+    assert_eq!(
+        crate::profile::load_app_state().unwrap().last_switch_at,
+        Some(stamp)
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|l| l.contains("switched to 'beta'"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_intervening_switch_cancels_a_queued_proactive_move() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.config.lock().unwrap().state.last_switch_at =
+        Some(crate::usage::now_epoch_secs().max(0) as u64);
+    let decision = PendingSwitchTarget {
+        target: "beta".into(),
+        key_rejected_cause: None,
+        reason: Some("home walk: weekly reset 2h0m sooner".into()),
+        proactive: true,
+    };
+    daemon
+        .pending_switch
+        .lock()
+        .unwrap()
+        .insert(decision.clone());
+    daemon.drain_pending_switch();
+    assert_eq!(
+        daemon
+            .config
+            .lock()
+            .unwrap()
+            .state
+            .active_profile
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "alpha"
+    );
+    assert!(daemon.pending_switch.lock().unwrap().is_empty());
+
+    // The same destination reached through exhaustion is never held back.
+    daemon
+        .pending_switch
+        .lock()
+        .unwrap()
+        .insert(PendingSwitchTarget {
+            proactive: false,
+            reason: Some("5h at 96% ≥ threshold 95%".into()),
+            ..decision
+        });
+    daemon.drain_pending_switch();
+    assert_eq!(
+        daemon
+            .config
+            .lock()
+            .unwrap()
+            .state
+            .active_profile
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "beta"
+    );
 }

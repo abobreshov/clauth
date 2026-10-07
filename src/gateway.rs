@@ -1778,6 +1778,34 @@ fn run_check(
     cwd: &Path,
     env: &GatewayEnv,
 ) -> Result<()> {
+    run_check_inner(binary, candidate, config, cwd, env, None)
+}
+
+/// Check the adopted config with the same cwd and scrubbed env as a spawn.
+pub(crate) fn check_adopted_config(
+    record: &GatewayRecord,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    run_check_inner(
+        record.shunt_binary(),
+        record.config(),
+        record.config(),
+        gateway_cwd(record)?,
+        &gateway_env(record)?,
+        Some(cancel),
+    )
+}
+
+fn run_check_inner(
+    binary: &Path,
+    candidate: &Path,
+    config: &Path,
+    cwd: &Path,
+    env: &GatewayEnv,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire));
+    anyhow::ensure!(!cancelled(), "gateway check cancelled");
     let mut command = Command::new(binary);
     command
         .arg("check")
@@ -1803,6 +1831,11 @@ fn run_check(
     let bound = check_timeout();
     let deadline = Instant::now() + bound;
     let status = loop {
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("gateway check cancelled");
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(CHECK_POLL_INTERVAL),
@@ -1831,8 +1864,9 @@ fn run_check(
         return Ok(());
     }
     let stderr = stderr
-        .map(|chunks| collect_stderr(&chunks, deadline))
+        .map(|chunks| collect_stderr(&chunks, deadline, cancel))
         .unwrap_or_default();
+    anyhow::ensure!(!cancelled(), "gateway check cancelled");
     Err(ConfigEditRefusal::CheckFailed {
         binary: binary.to_path_buf(),
         config: config.to_path_buf(),
@@ -1875,10 +1909,26 @@ fn drain_stderr(mut pipe: ChildStderr) -> Receiver<Vec<u8>> {
 
 /// The stderr that arrives before `deadline`, the check's own bound: a
 /// process the check started can hold the pipe open past the check's exit.
-fn collect_stderr(chunks: &Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+fn collect_stderr(
+    chunks: &Receiver<Vec<u8>>,
+    deadline: Instant,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
-    while let Ok(chunk) = chunks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        bytes.extend(chunk);
+    while Instant::now() < deadline
+        && !cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = if cancel.is_some() {
+            remaining.min(CHECK_POLL_INTERVAL)
+        } else {
+            remaining
+        };
+        match chunks.recv_timeout(wait) {
+            Ok(chunk) => bytes.extend(chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
     bytes
 }

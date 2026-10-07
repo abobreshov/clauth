@@ -410,7 +410,8 @@ pub(crate) enum GlobalConfigRow {
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
-    /// today's chain-position walk) / `soonest weekly reset`. Space cycles.
+    /// today's chain-position walk) / `soonest weekly reset` / `most weekly
+    /// headroom`. Space cycles.
     /// Decides WHERE each accept pass lands; `switch mode` decides WHEN the
     /// active is left, so the two stay orthogonal.
     WalkOrder,
@@ -6102,7 +6103,8 @@ fn toggle_burn_aware_switching(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
-/// Cycle the walk-order mode (issue #86): `chain` ↔ `soonest weekly reset`.
+/// Cycle the walk-order mode (issue #86): `chain` → `soonest weekly reset` →
+/// `most weekly headroom` → `chain`.
 /// `cycle_reset_display`'s persistence shape exactly: mutate the shared
 /// `AppConfig`, `save_app_state`, bump `last_reload_fp` — no separate
 /// propagation to the scheduler, since every walk reads the mode off the same
@@ -6111,7 +6113,8 @@ fn toggle_burn_aware_switching(app: &mut App) {
 fn cycle_walk_order(app: &mut App) {
     let next = match app.config().state.walk_order() {
         WalkOrder::Chain => WalkOrder::SoonestWeeklyReset,
-        WalkOrder::SoonestWeeklyReset => WalkOrder::Chain,
+        WalkOrder::SoonestWeeklyReset => WalkOrder::MostWeeklyHeadroom,
+        WalkOrder::MostWeeklyHeadroom => WalkOrder::Chain,
     };
     {
         let mut cfg = app.config();
@@ -11364,6 +11367,9 @@ pub(crate) fn on_tick(app: &mut App) {
         // executes even beside an ambient stale mark.
         {
             let cfg = app.config();
+            if decision.cooldown_blocked(&cfg.state) {
+                continue;
+            }
             if crate::usage::queued_switch_away_is_stale(
                 decision.key_rejected_cause.as_ref(),
                 &cfg.profiles,

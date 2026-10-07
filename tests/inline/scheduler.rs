@@ -8157,6 +8157,8 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
     let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::from([
         super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "already-queued".to_string(),
             key_rejected_cause: None,
         },
@@ -8175,6 +8177,8 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
     assert_eq!(
         pending.lock().unwrap().clone(),
         HashSet::from([super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "already-queued".to_string(),
             key_rejected_cause: None,
         }]),
@@ -8328,6 +8332,8 @@ fn scan_recovery_queues_a_recovered_chain_member() {
     assert_eq!(
         pending.lock().unwrap().clone(),
         HashSet::from([super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: None,
         }]),
@@ -11774,6 +11780,8 @@ fn apply_codex_switch_moves_the_operator_link_with_the_marker() {
 #[test]
 fn apply_codex_switch_walks_at_the_codex_weekly_line() {
     let _home = crate::testutil::HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
     let state = third_party_state(crate::providers::fetch_third_party_usage);
     assert_eq!(
         state
@@ -11815,6 +11823,12 @@ fn apply_codex_switch_walks_at_the_codex_weekly_line() {
         codex_active().as_deref(),
         Some("cx2"),
         "over the codex line: hops, whatever the claude line says"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("codex auto-switched to 'cx2' (7d at 60% ≥ threshold 50%)"))
     );
 }
 
@@ -12653,6 +12667,8 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
     assert_eq!(
         queued,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: Some(("a".to_string(), entry_a.credential_fingerprint())),
         }],
@@ -12726,6 +12742,8 @@ fn scan_auto_switch_does_not_label_an_independently_exhausted_key_rejected_activ
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: None,
         }],
@@ -12758,6 +12776,8 @@ fn scan_auto_switch_does_not_label_an_independent_healthy_home_return_beside_key
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: None,
         }],
@@ -12809,6 +12829,8 @@ fn scan_auto_switch_records_the_cause_when_key_rejection_changes_the_target() {
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: Some(("a".to_string(), entry_a.credential_fingerprint())),
         }],
@@ -12847,6 +12869,8 @@ fn scan_auto_switch_records_the_cause_when_the_active_day_claim_reclaims_home() 
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: Some(("a".to_string(), entry_a.credential_fingerprint())),
         }],
@@ -12885,6 +12909,8 @@ fn scan_auto_switch_does_not_label_a_two_claimant_day_collision_beside_key_rejec
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: None,
         }],
@@ -12916,6 +12942,8 @@ fn scan_auto_switch_does_not_label_a_key_rejected_auth_broken_active() {
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: None,
         }],
@@ -12950,6 +12978,8 @@ fn scan_auto_switch_does_not_label_a_reading_dead_key_rejected_active() {
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "b".to_string(),
             key_rejected_cause: None,
         }],
@@ -13293,4 +13323,49 @@ fn the_decision_leg_never_writes_a_b_row() {
         None,
         "the decision leg wrote nothing on the B row"
     );
+}
+
+#[test]
+fn session_home_walk_uses_its_own_swap_cooldown_and_exhaustion_bypasses_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b"], Some("a"));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.walk_order = Some(crate::profile::WalkOrder::SoonestWeeklyReset);
+        // Global activity must not hold back an unrelated session's home walk.
+        cfg.state.last_switch_at = Some(now_epoch_secs().max(0) as u64);
+    }
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    {
+        let mut usage = store.lock().unwrap();
+        for (name, hours) in [("a", 6), ("b", 2)] {
+            usage.get_mut(name).unwrap().seven_day = Some(crate::usage::UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    now_epoch_secs() + hours * 3600,
+                )),
+            });
+        }
+    }
+    let mut recent = session_row("4242-1", "a");
+    recent.last_swap_at = Some(crate::usage::now_ms());
+    let _recent_marker = register_live_row(&recent);
+    let ready = session_row("4242-2", "a");
+    let _ready_marker = register_live_row(&ready);
+    let status = all_fresh(&["a", "b"]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(decision_of("4242-1"), (None, None));
+    assert_eq!(decision_of("4242-2"), (Some("b".into()), Some(1)));
+
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .unwrap()
+        .five_hour
+        .as_mut()
+        .unwrap()
+        .utilization = 96.0;
+    scan_sessions(&config, &store, &status);
+    assert_eq!(decision_of("4242-1"), (Some("b".into()), Some(1)));
 }

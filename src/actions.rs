@@ -740,6 +740,7 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHel
     // the wrong account until its next `/login`.
     crate::claude_json::strip_home_oauth_account()?;
     config.state.set_active(Some(name.clone()), held);
+    config.state.last_switch_at = Some(crate::usage::now_epoch_secs().max(0) as u64);
     // Fresh state, not the whole in-memory list: a daemon drain may hold a
     // config older than a concurrent CLI delete/rename/login, and re-serializing
     // it would resurrect a deleted row or rewind an edit. Only the active marker
@@ -747,6 +748,7 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHel
     // that one field.
     let mut state = load_app_state()?;
     state.set_active(Some(name.clone()), held);
+    state.last_switch_at = config.state.last_switch_at;
     save_app_state(&state)
 }
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Context notes count this process's delegates across `/clear`, excluding peer sessions when attribution is known. Delegate job records preserve host pid/session, run directory and spawning account through completion; the Plugin tab displays the origin.
+- Delegate rewake hooks match both the plugin and bare tollgate MCP tool names.
+- The shunt supervisor clamps its stop wait to the deadline and restarts on all restart-only config edits after a cancellable `shunt check`, with digest-only restart facts and bounded refusal rechecks.
+- Claude Code hooks report `tollgate resume <sid> --profile <account>` to herdr on session start or attribution change, preserving the account after a herdr restart.
+- Added `most-weekly-headroom` walk order to the Config tab and chain walks, with a 5-percentage-point tie band. It ranks OAuth hop targets only and leaves healthy accounts parked.
+- Prevented auto-switch home walks from ping-ponging on weekly reset jitter: a 60-minute minimum gain, stable reset tolerance bands and a persisted 30-minute proactive cooldown. Exhaustion still switches immediately; daemon switch logs name the trigger and deciding figures.
+
 ### Import
 
 - A profile's `throughput_cache.json` (upstream 0.16.0 keeps its per-model throughput samples in each profile) is copied as a profile cache instead of blocking the import as an unknown entry.

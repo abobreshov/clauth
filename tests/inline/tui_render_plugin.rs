@@ -159,6 +159,10 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64, kind: RecordKind) 
         endpoint: None,
         provider: None,
         isolated: false,
+        cwd: None,
+        spawned_by: None,
+        host_session: None,
+        host_pid: 0,
         idle_secs: Some(300),
         kind,
         owner_pid: 0,
@@ -171,8 +175,14 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64, kind: RecordKind) 
 /// literal that agrees with whatever the fields are today.
 fn seed_every_state(now: u64) -> Vec<jobs::StoredJob> {
     // Freshest first once listed: each anchor is further back than the last.
+    // Only some records carry an origin: the others are the shape an older
+    // server wrote.
     jobs::write_heartbeat(
-        &running_spec("d-bg-0", "uwuclxdy", now - 134_000, RecordKind::Collectable),
+        &RunningSpec {
+            cwd: Some("/home/u/repos/app".to_string()),
+            spawned_by: Some("cld".to_string()),
+            ..running_spec("d-bg-0", "uwuclxdy", now - 134_000, RecordKind::Collectable)
+        },
         now - 12_000,
         "reading the plan doc",
     )
@@ -197,16 +207,25 @@ fn seed_every_state(now: u64) -> Vec<jobs::StoredJob> {
             "started_at": now - 1_800_000,
             "done_at": now - 900_000,
             "envelope": { "result": "finished a while back" },
+            "cwd": "/home/u/repos/api",
+            "spawned_by": "uwuclxdy",
         }))
         .unwrap(),
     )
     .unwrap();
-    // Output landing on this very millisecond: the one input that reaches
+    // Finished on this very millisecond: the one input that reaches
     // `age_phrase`'s zero branch, without which the row reads `now ago`.
-    jobs::write_heartbeat(
-        &running_spec("d-fresh-0", "glm2", now - 5_000, RecordKind::Collectable),
-        now,
-        "just spoke",
+    std::fs::write(
+        dir.join("d-fresh-0.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-fresh-0",
+            "profile": "glm2",
+            "state": "done",
+            "started_at": now - 5_000,
+            "done_at": now,
+            "envelope": { "result": "just finished" },
+        }))
+        .unwrap(),
     )
     .unwrap();
     // Silent far past the corpse window: its server is gone.
@@ -220,10 +239,12 @@ fn seed_every_state(now: u64) -> Vec<jobs::StoredJob> {
     jobs::list_banded(now)
 }
 
-/// The exact figures, at a `now` the test owns: elapsed, last-output age and the
-/// deadline that lands first, each from the fields the heartbeat already writes.
+/// The exact rows, at a `now` the test owns: elapsed, the spawning account and
+/// the deadline that lands first, then the run's directory, each from the
+/// fields the record carries; a record without an origin shows neither.
 #[test]
 fn a_delegate_row_carries_the_figures_its_own_record_holds() {
+    use ratatui::text::Line;
     let _home = crate::testutil::HomeSandbox::new();
     let cells = super::delegate_cells(&seed_every_state(NOW), NOW);
     let facts = |account: &str| -> String {
@@ -236,23 +257,48 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
     };
     assert_eq!(
         facts("uwuclxdy"),
-        "elapsed 2m 14s · last output 12s ago · idle-kill in 4m 48s",
-        "a running row counts from its own stamps",
+        "elapsed 2m 14s · spawned by cld · idle-kill in 4m 48s",
+        "a running row counts from its own stamps and names its spawner",
     );
     assert_eq!(
         facts("kerry"),
-        "elapsed 40s · last output 30s ago · idle-kill in 4m 30s",
-        "and a blocking one reads identically — only its spelling differs",
+        "elapsed 40s · idle-kill in 4m 30s",
+        "a record with no origin names no spawner",
     );
     assert_eq!(
         facts("glm2"),
-        "elapsed 5s · last output just now · idle-kill in 5m",
-        "a run that spoke this millisecond reads `just now`, never `now ago`",
+        "finished just now",
+        "a job that finished this millisecond reads `just now`, never `now ago`",
     );
     assert_eq!(
         facts("DS8"),
-        "finished 15m ago",
-        "a finished job is dated by its finish, and says nothing it no longer has",
+        "finished 15m ago · spawned by uwuclxdy",
+        "a finished job is dated by its finish and keeps its spawner",
+    );
+
+    let line_text = |line: &Line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    let row = |account: &str| {
+        let cell = cells.iter().find(|c| c.profile == account).unwrap();
+        line_text(&super::delegate_line(cell, 8, 100))
+    };
+    assert_eq!(
+        row("uwuclxdy"),
+        "● running   uwuclxdy  elapsed 2m 14s · spawned by cld · idle-kill in 4m 48s  /home/u/repos/app",
+        "the run's directory closes the row, never its last words",
+    );
+    assert_eq!(
+        row("kerry"),
+        "● blocking  kerry     elapsed 40s · idle-kill in 4m 30s",
+        "a record with no origin ends on its facts",
+    );
+    assert_eq!(
+        row("DS8"),
+        "● done      DS8       finished 15m ago · spawned by uwuclxdy  /home/u/repos/api",
     );
     assert_eq!(
         facts("glm1"),
@@ -349,21 +395,15 @@ fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
     // The liveness fields reach the screen. Their VALUES move with the real
     // clock this path reads, and are pinned exactly by the test above.
     let running = row_for("uwuclxdy");
-    for needle in ["elapsed ", "last output ", "idle-kill in "] {
+    for needle in ["elapsed ", "spawned by cld", "idle-kill in "] {
         assert!(
             running.contains(needle),
             "`{needle}` missing from the running row:\n{running}"
         );
     }
     assert!(
-        running.contains("\"reading the"),
-        "the delegate's own words ride last, quoted so they cannot read as \
-         tollgate's:\n{running}"
-    );
-    assert!(
-        running.contains('…'),
-        "and the tail is what gives way when the row runs out of width, rather \
-         than pushing a figure off it:\n{running}"
+        running.contains("/home/u/repos/app"),
+        "the run directory closes the row: {running}"
     );
     assert!(
         row_for("DS8").contains("finished "),
@@ -423,13 +463,6 @@ fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
             crate::usage::humanize_duration(secs("elapsed_secs") as i64)
         )),
         "elapsed disagrees with monitor's {payload}: {facts}"
-    );
-    assert!(
-        facts.contains(&format!(
-            "last output {} ago",
-            crate::usage::humanize_duration(secs("last_output_secs_ago") as i64)
-        )),
-        "last-output age disagrees with monitor's {payload}: {facts}"
     );
     // The idle guard lands first on this fixture, so that is the countdown the
     // row spends its one cell on — and it is monitor's own figure.
@@ -941,5 +974,102 @@ fn herdr_tag_refresh_editor_renders_the_edit_state() {
     assert!(
         screen.contains("min is 1 s"),
         "the range sub-line renders while typing:\n{screen}"
+    );
+}
+
+/// A delegate's `cwd` is the calling model's own argument, so a terminal
+/// escape or a bidi override in it reaches the row only as its visible escape,
+/// the way the shunt row shows an untrusted slot string.
+#[test]
+fn a_delegate_cwd_renders_control_and_bidi_characters_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    jobs::write_heartbeat(
+        &RunningSpec {
+            cwd: Some("/w/\u{1b}[2J/\u{202e}x".to_string()),
+            ..running_spec("d-esc-0", "acct", now - 5_000, RecordKind::Collectable)
+        },
+        now - 1_000,
+        "",
+    )
+    .unwrap();
+    let cells = super::delegate_cells(&jobs::list_banded(now), now);
+    assert_eq!(
+        cells[0].cwd.as_deref(),
+        Some("/w/\\u{1b}[2J/\\u{202e}x"),
+        "the escape and the override render as text, never as bytes",
+    );
+}
+
+/// The pure `delegate_lines` contract: the overflow marker counts exactly, and
+/// the run's directory is what gives way (a middle `…`, then the whole of it)
+/// when the row runs out of width.
+#[test]
+fn delegate_lines_pin_the_overflow_count_and_the_directory_exactly() {
+    use crate::mcp::jobs::JobPhase;
+    use ratatui::text::Line;
+    let line_text = |line: &Line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    for i in 0..5 {
+        jobs::write_heartbeat(
+            &running_spec(
+                &format!("d-t-{i}"),
+                &format!("acct{i}"),
+                now - 10_000 - i as u64,
+                RecordKind::Collectable,
+            ),
+            now - 1_000 - i as u64,
+            "working",
+        )
+        .unwrap();
+    }
+    let stored = jobs::list_banded(now);
+    let cells = super::delegate_cells(&stored, now);
+
+    // 5 rows into a 3-row viewport: 2 shown, the marker names the other 3.
+    let lines = super::delegate_lines(&cells, 3, 100);
+    assert_eq!(
+        line_text(lines.last().expect("marker line")),
+        "+3 more",
+        "the marker names the exact hidden count"
+    );
+
+    // One running row with a long directory: at full width it rides whole; at
+    // a narrow width it gives way in the middle, keeping the tree and the
+    // leaf; with less room than `CWD_MIN_W` it is dropped whole.
+    let one = super::DelegateCells {
+        state: JobPhase::Running,
+        profile: "acct".to_string(),
+        facts: vec!["elapsed 5s".to_string()],
+        cwd: Some("/home/u/repos/rs/tollgate".to_string()),
+    };
+    assert_eq!(
+        line_text(&super::delegate_line(&one, 4, 100)),
+        "● running   acct  elapsed 5s  /home/u/repos/rs/tollgate",
+        "the directory rides whole when it fits",
+    );
+    // 28 cells of row and a 2-cell gap before the directory: 45 leaves it 15,
+    // 42 leaves it exactly `CWD_MIN_W`, 41 one short of it.
+    assert_eq!(
+        line_text(&super::delegate_line(&one, 4, 45)),
+        "● running   acct  elapsed 5s  /home/u…ollgate",
+        "a narrow row keeps both ends of the directory",
+    );
+    assert_eq!(
+        line_text(&super::delegate_line(&one, 4, 42)),
+        "● running   acct  elapsed 5s  /home/…lgate",
+        "the narrowest room a directory still renders in",
+    );
+    assert_eq!(
+        line_text(&super::delegate_line(&one, 4, 41)),
+        "● running   acct  elapsed 5s",
+        "a row with no room for a readable directory drops it",
     );
 }

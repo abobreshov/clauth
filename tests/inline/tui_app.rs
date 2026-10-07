@@ -195,6 +195,10 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
                 endpoint: None,
                 provider: None,
                 isolated: false,
+                cwd: None,
+                spawned_by: None,
+                host_session: None,
+                host_pid: 0,
                 idle_secs: Some(300),
                 kind: jobs::RecordKind::Collectable,
                 owner_pid: 0,
@@ -1103,6 +1107,8 @@ fn on_tick_drops_a_repaired_key_rejected_switch_away() {
         .lock()
         .expect("pending")
         .insert(crate::usage::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "oauth".to_string(),
             key_rejected_cause: Some(("tp".to_string(), old_fp)),
         });
@@ -1175,6 +1181,8 @@ fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
         .lock()
         .expect("pending")
         .insert(crate::usage::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
             target: "oauth".to_string(),
             key_rejected_cause: None,
         });
@@ -6301,6 +6309,27 @@ fn walk_order_space_cycles_and_persists() {
         reloaded.walk_order(),
         crate::profile::WalkOrder::SoonestWeeklyReset,
         "the cycled value persists to disk"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.walk_order(),
+        crate::profile::WalkOrder::MostWeeklyHeadroom,
+        "space cycles on to most weekly headroom"
+    );
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(
+            crate::profile::tollgate_dir()
+                .unwrap()
+                .join("profiles.toml"),
+        )
+        .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert_eq!(
+        reloaded.walk_order(),
+        crate::profile::WalkOrder::MostWeeklyHeadroom,
+        "the third value persists to disk too"
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));

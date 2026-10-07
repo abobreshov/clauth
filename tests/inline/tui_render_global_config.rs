@@ -1,7 +1,7 @@
 //! Config-tab row geometry. Every blurred row's value starts at the same
 //! column (the Config tab is a tight chip group); cycle options are
 //! bare labels on 2-space gaps with the active option bracketed only on focus;
-//! an on/off boolean renders as a toggle, not a 2-option cycle.
+//! an on/off boolean renders as a toggle, not a 3-option cycle.
 
 use super::*;
 use ratatui::style::Modifier;
@@ -226,7 +226,7 @@ fn edit_line_buffer_starts_at_the_value_column() {
 /// pinned whole: this row is the queue's only control, so a reworded hint is a
 /// user-facing change nothing else would catch.
 #[test]
-fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
+fn auto_start_queue_renders_as_a_toggle_with_every_hint_pinned() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let on = line_text(&detail_row(
         GlobalConfigRow::AutoStartQueue,
@@ -265,7 +265,7 @@ fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
 }
 
 /// `refresh spent` is a pure on/off boolean — a toggle (`─●` / `○─`),
-/// not a 2-option cycle row (`[on]  off`).
+/// not a 3-option cycle row (`[on]  off`).
 #[test]
 fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
@@ -756,12 +756,12 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
     }
 }
 
-// ── walk order (issue #86): a 2-option cycle beside switch mode ─────────────
+// ── walk order (issue #86): a 3-option cycle beside switch mode ─────────────
 
-/// `walk order` is a plain 2-option `cycle_row`; its hint states behavior
+/// `walk order` is a plain 3-option `cycle_row`; its hint states behavior
 /// alone for each value, never restating the row's own value.
 #[test]
-fn walk_order_renders_as_a_cycle_with_both_hints_pinned() {
+fn walk_order_renders_as_a_cycle_with_every_hint_pinned() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let chain = toggles();
     let line = line_text(&detail_row(
@@ -776,6 +776,10 @@ fn walk_order_renders_as_a_cycle_with_both_hints_pinned() {
     assert!(
         line.contains("soonest weekly reset"),
         "the inactive option stays visible: {line}"
+    );
+    assert!(
+        line.contains("most weekly headroom"),
+        "the third option stays visible: {line}"
     );
     assert_eq!(
         row_hint(GlobalConfigRow::WalkOrder, chain, tunables()).as_deref(),
@@ -800,6 +804,40 @@ fn walk_order_renders_as_a_cycle_with_both_hints_pinned() {
         row_hint(GlobalConfigRow::WalkOrder, soonest, tunables()).as_deref(),
         Some(
             "spend the accepted member whose 7d window resets soonest, so less quota expires unspent"
+        ),
+    );
+    let headroom = RowState {
+        walk_order: WalkOrder::MostWeeklyHeadroom,
+        ..toggles()
+    };
+    // Focus brackets the ACTIVE option, so the bracket pins which value the
+    // row holds (a substring alone also matches an inactive option).
+    let focused_soonest = line_text(&detail_row(
+        GlobalConfigRow::WalkOrder,
+        true,
+        soonest,
+        tunables(),
+        None,
+    ));
+    assert!(
+        focused_soonest.contains("[soonest weekly reset]"),
+        "{focused_soonest}"
+    );
+    let focused_headroom = line_text(&detail_row(
+        GlobalConfigRow::WalkOrder,
+        true,
+        headroom,
+        tunables(),
+        None,
+    ));
+    assert!(
+        focused_headroom.contains("[most weekly headroom]"),
+        "{focused_headroom}"
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::WalkOrder, headroom, tunables()).as_deref(),
+        Some(
+            "spend the accepted member whose 7d window is least used, so the week spreads across the chain"
         ),
     );
 }
