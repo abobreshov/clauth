@@ -1107,7 +1107,7 @@ fn non_login_keys_renders_the_toggle_and_exact_hints() {
     off_state.preserve_non_login_keys = false;
     {
         let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-        let on = line_text(&detail_row(
+        let on = line_text(&one_row(
             GlobalConfigRow::PreserveNonLoginKeys,
             false,
             toggles(),
@@ -1119,7 +1119,7 @@ fn non_login_keys_renders_the_toggle_and_exact_hints() {
             on.contains("─●"),
             "full-tier on renders the slide switch: {on}"
         );
-        let off = line_text(&detail_row(
+        let off = line_text(&one_row(
             GlobalConfigRow::PreserveNonLoginKeys,
             false,
             off_state,
@@ -1133,7 +1133,7 @@ fn non_login_keys_renders_the_toggle_and_exact_hints() {
     }
     {
         let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
-        let off = line_text(&detail_row(
+        let off = line_text(&one_row(
             GlobalConfigRow::PreserveNonLoginKeys,
             false,
             off_state,
