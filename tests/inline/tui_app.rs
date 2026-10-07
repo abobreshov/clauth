@@ -16592,7 +16592,7 @@ fn invalid_utf8_notes_cannot_be_saved_as_replacement_characters() {
 }
 
 #[test]
-fn note_editor_ignores_shortcut_chords_but_accepts_text_and_quit() {
+fn note_editor_accepts_alt_text_and_ignores_control_chords() {
     use super::{KeyEvent, KeyModifiers};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = notes_app(vec![mini_profile("alice", None)]);
@@ -16600,25 +16600,37 @@ fn note_editor_ignores_shortcut_chords_but_accepts_text_and_quit() {
     super::open_note_editor(&mut app);
     for modifiers in [
         KeyModifiers::CONTROL,
-        KeyModifiers::ALT,
         KeyModifiers::CONTROL | KeyModifiers::ALT,
     ] {
         for ch in ['a', 'e', 'u', 'x'] {
             super::handle_key(&mut app, KeyEvent::new(KeyCode::Char(ch), modifiers));
         }
     }
-    assert_eq!(draft(&app), "");
+    for ch in ['j', 'w'] {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT),
+        );
+    }
+    assert_eq!(draft(&app), "", "Control chords are not text");
+    for ch in ['a', 'é', '@', 'j', 'w'] {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT),
+        );
+    }
+    assert_eq!(draft(&app), "aé@jw", "Alt/Option characters are text");
     super::handle_key(
         &mut app,
         KeyEvent::new(KeyCode::Char('É'), KeyModifiers::SHIFT),
     );
-    assert_eq!(draft(&app), "É", "shifted Unicode text is still data");
+    assert_eq!(draft(&app), "aé@jwÉ", "shifted Unicode text is still data");
     super::handle_key(
         &mut app,
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
     );
     assert!(app.quit, "Ctrl-C still owns quit before the editor");
-    assert_eq!(draft(&app), "É");
+    assert_eq!(draft(&app), "aé@jwÉ");
 }
 
 #[test]

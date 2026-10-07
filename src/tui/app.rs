@@ -4819,13 +4819,7 @@ fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
         {
             NoteKey::Word
         }
-        KeyCode::Char(ch)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            NoteKey::Char(ch)
-        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Char(ch),
         KeyCode::Backspace => NoteKey::Backspace,
         KeyCode::Delete => NoteKey::Delete,
         KeyCode::Left => NoteKey::Left,
