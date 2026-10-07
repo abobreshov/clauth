@@ -1098,6 +1098,7 @@ fn walk_order_soonest_never_reorders_across_the_accept_pass_ladder() {
 #[test]
 fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
     let member = |name: &str, preferred: bool| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1147,6 +1148,7 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
 #[test]
 fn walk_order_scheduler_twin_matches_the_ui_twin_in_both_directions() {
     let member = |name: &str| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1157,6 +1159,9 @@ fn walk_order_scheduler_twin_matches_the_ui_twin_in_both_directions() {
         check_scoped: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "gamma".into(),
         chain: vec![member("alpha"), member("beta"), member("gamma")],
         switch_off_when_spent: false,
@@ -1206,6 +1211,7 @@ fn walk_order_scheduler_twin_matches_the_ui_twin_in_both_directions() {
 fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
     let _home = crate::testutil::HomeSandbox::new();
     let member = |name: &str| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1216,6 +1222,9 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         check_scoped: true,
     };
     let snap = |order: WalkOrder, burn_aware: bool| ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "gamma".into(),
         chain: vec![member("alpha"), member("beta"), member("gamma")],
         switch_off_when_spent: false,
@@ -1275,8 +1284,12 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         ],
     );
     let active_window = window(92.0, Some(live_reset()));
-    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("gamma"), &active_window)
-        .expect("rate computed from history");
+    let rate = burn_rate_for_profile(
+        &crate::profile::ProfileName::from("gamma"),
+        &active_window,
+        crate::usage::now_ms(),
+    )
+    .expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Gamma 5h-exhausted: the target follows ONLY the walk-order mode. The
@@ -1365,9 +1378,12 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
             ),
         ],
     );
-    let slow_rate =
-        burn_rate_for_profile(&crate::profile::ProfileName::from("gamma"), &active_window)
-            .expect("rate computed from history");
+    let slow_rate = burn_rate_for_profile(
+        &crate::profile::ProfileName::from("gamma"),
+        &active_window,
+        crate::usage::now_ms(),
+    )
+    .expect("rate computed from history");
     assert!(
         (slow_rate - 200.0).abs() < 1.0,
         "expected ~200 %/h, got {slow_rate}"
@@ -1392,6 +1408,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
 #[test]
 fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put() {
     let member = |name: &str| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1402,6 +1419,9 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         check_scoped: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "gamma".into(),
         chain: vec![member("alpha"), member("beta"), member("gamma")],
         switch_off_when_spent: false,
@@ -1446,6 +1466,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
 #[test]
 fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
     let member = |name: &str, preferred: bool| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1456,6 +1477,9 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         check_scoped: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "gamma".into(),
         // beta is preferred (+3d) while alpha resets sooner (+2h): preferred
         // wins the return-to-preferred pass before the home pass is ever
@@ -1506,6 +1530,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
 #[test]
 fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
     let member = |name: &str| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1516,6 +1541,9 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         check_scoped: true,
     };
     let snap = |order: WalkOrder, fresh: Vec<ProfileName>| ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "gamma".into(),
         chain: vec![member("alpha"), member("beta"), member("gamma")],
         switch_off_when_spent: false,
@@ -1585,6 +1613,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
 #[test]
 fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() {
     let member = |name: &str| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -1595,6 +1624,9 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         check_scoped: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "beta".into(),
         chain: vec![member("beta"), member("alpha")],
         switch_off_when_spent: false,
@@ -1697,6 +1729,410 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
     );
 }
 
+// ── walk order: most-weekly-headroom ─────────────────────────────────────────
+//
+// `most-weekly-headroom` lands each accept pass on the accepted member whose
+// live 7d window is least used, the live 5h window breaking a weekly tie and
+// chain position settling the rest. A lapsed window, a weekly window with no
+// reset yet and an absent 5h window read as unused; a member with no weekly
+// window to read (a 5h-only reading, or none at all) ranks after every member
+// that has one. It orders hop targets only: there is no walk-home pass, so a
+// healthy active never moves for it.
+
+fn weekly_read(five: f64, seven: f64) -> UsageInfo {
+    usage_both(
+        Some(window(five, Some(live_reset()))),
+        Some(window(seven, Some(reset_in(3 * 86_400)))),
+    )
+}
+
+/// Chain [alpha, beta, gamma], active gamma 5h-spent; alpha and beta carry the
+/// given readings.
+fn headroom_config(alpha: UsageInfo, beta: UsageInfo) -> AppConfig {
+    config_with_chain(
+        vec![
+            profile_with_usage("alpha", Some(95.0), Some(alpha)),
+            profile_with_usage("beta", Some(95.0), Some(beta)),
+            profile_with_util("gamma", Some(95.0), Some(100.0)),
+        ],
+        "gamma",
+    )
+}
+
+fn headroom_member(name: &str, preferred: bool) -> ChainMember {
+    ChainMember {
+        oauth: true,
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    }
+}
+
+fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainSnapshot {
+    ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
+        active: "gamma".into(),
+        chain: chain.iter().map(|n| headroom_member(n, false)).collect(),
+        switch_off_when_spent: false,
+        broken: vec![],
+        burn_aware: false,
+        walk_order: order,
+        interval_ms: 60_000,
+        burn_floor_pct: 98.0,
+        burn_horizon_cap_ms: 60_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        reading_dead: vec![],
+        fresh: fresh.iter().map(|n| ProfileName::from(*n)).collect(),
+    }
+}
+
+#[test]
+fn walk_order_most_headroom_picks_the_least_used_week_not_the_next_slot() {
+    let mut config = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 5.0));
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("alpha".to_string())),
+        "chain mode takes the next slot"
+    );
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "the least-used week wins over the next slot"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_breaks_a_weekly_tie_on_five_hour() {
+    let mut config = headroom_config(weekly_read(60.0, 20.0), weekly_read(5.0, 20.0));
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "the same week, so the emptier 5h window decides"
+    );
+    // beta's 5h reading says 90%, but that window reset a minute ago.
+    let lapsed_five = usage_both(
+        Some(window(90.0, Some(reset_in(-60)))),
+        Some(window(20.0, Some(reset_in(3 * 86_400)))),
+    );
+    let mut config = headroom_config(weekly_read(5.0, 20.0), lapsed_five);
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "a 5h window that already reset reads as unused"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_ties_keep_chain_position() {
+    let mut config = headroom_config(weekly_read(10.0, 20.0), weekly_read(10.0, 20.0));
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("alpha".to_string())),
+        "an all-equal pass keeps chain position"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_never_ranks_an_excluded_member_in() {
+    let mut config = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 1.0));
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    config.state.auth_broken = vec![ProfileName::from("beta")];
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("alpha".to_string())),
+        "an auth-broken member stays out however empty its week reads"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_reads_a_lapsed_weekly_window_as_unused() {
+    // beta's last 7d reading says 90%, but that window reset an hour ago.
+    let lapsed = usage_both(
+        Some(window(10.0, Some(live_reset()))),
+        Some(window(90.0, Some(reset_in(-3600)))),
+    );
+    let mut config = headroom_config(weekly_read(10.0, 30.0), lapsed);
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "a week that already rolled over is an unused week"
+    );
+}
+
+// Alibaba's `/usage` publishes the 7d pair only, so its 5h window is absent.
+#[test]
+fn walk_order_most_headroom_reads_an_absent_five_hour_window_as_unused() {
+    let seven_only = usage_both(None, Some(window(20.0, Some(reset_in(3 * 86_400)))));
+    let mut config = headroom_config(weekly_read(60.0, 20.0), seven_only);
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "the same week, and a missing 5h window reads as unused, so beta wins the tie"
+    );
+    // Exactly unused: against a live 0% 5h at the same week it ties, and chain
+    // position keeps the 7d-only alpha first.
+    let seven_only = usage_both(None, Some(window(20.0, Some(reset_in(3 * 86_400)))));
+    let mut config = headroom_config(seven_only, weekly_read(0.0, 20.0));
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("alpha".to_string())),
+        "a missing 5h window reads as exactly 0%, so the tie keeps chain position"
+    );
+}
+
+// A weekly window at exactly 0% omits its reset (Alibaba, GLM): it is still a
+// read week, and the emptiest one.
+#[test]
+fn walk_order_most_headroom_ranks_a_week_with_no_reset_yet_among_read_weeks() {
+    let fresh_week = usage_both(
+        Some(window(10.0, Some(live_reset()))),
+        Some(window(0.0, None)),
+    );
+    let mut config = headroom_config(weekly_read(10.0, 30.0), fresh_week);
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "a 0% week with no reset yet outranks a 30% week"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_ranks_a_member_with_no_weekly_window_last() {
+    // alpha reads a 5h window only: its week is unknown, never proven empty.
+    // beta's week sits at 97%, just under the 98% weekly line, so no finite
+    // stand-in for the unknown week below 97% can pass.
+    let five_only = usage_info(Some(window(10.0, Some(live_reset()))));
+    let mut config = headroom_config(five_only, weekly_read(10.0, 97.0));
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "a member with a read week outranks one with no weekly window"
+    );
+}
+
+// The ordering applies WITHIN each accept pass: alpha owns the emptiest week
+// but is spend-armed only (5h spent, billing room), beta is clear on a busier
+// week — the clear member still wins the headroom pass.
+#[test]
+fn walk_order_most_headroom_never_reorders_across_the_accept_pass_ladder() {
+    let mut alpha = profile_with_usage(
+        "alpha",
+        Some(95.0),
+        Some(UsageInfo {
+            five_hour: Some(window(100.0, Some(live_reset()))),
+            seven_day: Some(window(1.0, Some(reset_in(3 * 86_400)))),
+            spend: Some(spend_block(true, 0.0, Some(50.0))),
+            ..UsageInfo::default()
+        }),
+    );
+    alpha.max_auto_spend = Some(100.0);
+    let mut config = config_with_chain(
+        vec![
+            alpha,
+            profile_with_usage("beta", Some(95.0), Some(weekly_read(10.0, 70.0))),
+            profile_with_util("gamma", Some(95.0), Some(100.0)),
+        ],
+        "gamma",
+    );
+    config.state.spend_budget_switching = true;
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".to_string())),
+        "a clear member wins over an emptier-week spend-armed-only one"
+    );
+}
+
+// The scheduler twin: the same ranking off a frozen snapshot, an unread member
+// (no usage entry) ranked last yet still reachable.
+#[test]
+fn walk_order_most_headroom_scheduler_twin_ranks_hops_and_reaches_an_unread_member() {
+    let chain = ["alpha", "beta", "delta", "gamma"];
+    let spent = || usage_info(Some(window(100.0, Some(live_reset()))));
+    let usage = HashMap::from([
+        ("alpha".to_string(), weekly_read(10.0, 80.0)),
+        ("beta".to_string(), weekly_read(10.0, 60.0)),
+        ("gamma".to_string(), spent()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_for_test(&headroom_snapshot(WalkOrder::Chain, &chain, &[]), &usage),
+        Some(SwitchAction::To("alpha".to_string())),
+        "chain mode keeps today's scheduler-side pick"
+    );
+    assert_eq!(
+        next_auto_switch_target_for_test(
+            &headroom_snapshot(WalkOrder::MostWeeklyHeadroom, &chain, &[]),
+            &usage
+        ),
+        Some(SwitchAction::To("beta".to_string())),
+        "beta's 60% week beats alpha's 80%, and the unread delta ranks after both"
+    );
+    let only_active = HashMap::from([("gamma".to_string(), spent())]);
+    assert_eq!(
+        next_auto_switch_target_for_test(
+            &headroom_snapshot(WalkOrder::MostWeeklyHeadroom, &chain, &[]),
+            &only_active
+        ),
+        Some(SwitchAction::To("alpha".to_string())),
+        "with nothing read, chain position picks among the unread members"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_scheduler_twin_ranks_an_unread_member_after_a_97_percent_week() {
+    let chain = ["alpha", "beta", "gamma"];
+    let usage = HashMap::from([
+        ("beta".to_string(), weekly_read(10.0, 97.0)),
+        (
+            "gamma".to_string(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_for_test(
+            &headroom_snapshot(WalkOrder::MostWeeklyHeadroom, &chain, &[]),
+            &usage
+        ),
+        Some(SwitchAction::To("beta".to_string())),
+        "the unread alpha ranks after beta's 97% week"
+    );
+}
+
+// No walk-home pass: the fixture on which soonest-weekly-reset walks a healthy
+// active home leaves it put under most-weekly-headroom, as under chain.
+#[test]
+fn walk_order_most_headroom_never_walks_a_healthy_active() {
+    let chain = ["alpha", "beta", "gamma"];
+    let fresh = ["gamma", "alpha", "beta"];
+    let clear = |seven: f64, seven_reset: String| {
+        usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(seven, Some(seven_reset))),
+        )
+    };
+    let usage = HashMap::from([
+        ("alpha".to_string(), clear(5.0, reset_in(3 * 86_400))),
+        ("beta".to_string(), clear(5.0, reset_in(2 * 3600))),
+        (
+            "gamma".to_string(),
+            usage_both(
+                Some(window(50.0, Some(live_reset()))),
+                Some(window(90.0, Some(reset_in(4 * 86_400)))),
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_for_test(
+            &headroom_snapshot(WalkOrder::SoonestWeeklyReset, &chain, &fresh),
+            &usage
+        ),
+        Some(SwitchAction::To("beta".to_string())),
+        "control: soonest-weekly-reset walks this healthy active home"
+    );
+    assert_eq!(
+        next_auto_switch_target_for_test(
+            &headroom_snapshot(WalkOrder::MostWeeklyHeadroom, &chain, &fresh),
+            &usage
+        ),
+        None,
+        "most-weekly-headroom leaves a healthy active put, however busy its week"
+    );
+}
+
+#[test]
+fn walk_order_most_headroom_orders_recovery_unless_preferred_wins() {
+    let recovered = |seven: f64| {
+        usage_both(
+            Some(window(50.0, Some(live_reset()))),
+            Some(window(seven, Some(reset_in(3 * 86_400)))),
+        )
+    };
+    let store = store_with_infos(vec![("b", recovered(60.0)), ("a", recovered(10.0))]);
+    let chain = vec![headroom_member("b", false), headroom_member("a", false)];
+    assert_eq!(
+        find_recovered_member(&chain, &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "chain mode keeps the first recovered member in chain order"
+    );
+    assert_eq!(
+        find_recovered_member(&chain, &store, &[], WalkOrder::MostWeeklyHeadroom),
+        Some("a".to_string()),
+        "no preferred: the least-used recovered week wins"
+    );
+    let pref_chain = vec![headroom_member("b", true), headroom_member("a", false)];
+    assert_eq!(
+        find_recovered_member(&pref_chain, &store, &[], WalkOrder::MostWeeklyHeadroom),
+        Some("b".to_string()),
+        "the preferred short-circuit outranks the headroom ordering"
+    );
+}
+
+#[test]
+fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_intact() {
+    let _sb = start_walk_sandbox(&["beta", "alpha"]);
+    let dated = |seven: f64| UsageInfo {
+        five_hour: Some(window(30.0, Some(live_reset()))),
+        seven_day: Some(window(seven, Some(reset_in(3 * 86_400)))),
+        fetched_at: Some(crate::usage::now_ms() - 240_000),
+        ..Default::default()
+    };
+    start_walk_write_usage("beta", &dated(70.0));
+    start_walk_write_usage("alpha", &dated(10.0));
+    let mut config = config_with_chain(
+        vec![start_walk_profile("beta"), start_walk_profile("alpha")],
+        "beta",
+    );
+    let (_rows, pick) = start_walk(&config, None, false);
+    assert_eq!(
+        pick,
+        Some(0),
+        "default: chain order takes beta, the first clear"
+    );
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(
+        pick,
+        Some(1),
+        "most-weekly-headroom: alpha's 10% week beats beta's 70%"
+    );
+    assert_eq!(rows[0].block, None);
+    assert_eq!(rows[1].block, None);
+    // Freshness pass intact: alpha (the emptier week) reads UNDATED, so pass
+    // one lands the dated-fresh beta before the any-freshness pass could.
+    start_walk_write_usage(
+        "alpha",
+        &UsageInfo {
+            five_hour: Some(window(30.0, Some(live_reset()))),
+            seven_day: Some(window(10.0, Some(reset_in(3 * 86_400)))),
+            ..Default::default()
+        },
+    );
+    let (_rows, pick) = start_walk(&config, None, false);
+    assert_eq!(
+        pick,
+        Some(0),
+        "the fresh pass prefers the dated-fresh beta over the undated emptier alpha"
+    );
+}
+
 // ── recovery_target ──────────────────────────────────────────────────────────
 //
 // After switch-off-all (no active profile), find a chain member whose
@@ -1706,6 +2142,7 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
 fn find_recovered_returns_first_member_below_threshold() {
     let members = vec![
         ChainMember {
+            oauth: true,
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1716,6 +2153,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             check_scoped: true,
         },
         ChainMember {
+            oauth: true,
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1748,6 +2186,7 @@ fn find_recovered_returns_first_member_below_threshold() {
 fn find_recovered_skips_exhausted_members() {
     let members = vec![
         ChainMember {
+            oauth: true,
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1758,6 +2197,7 @@ fn find_recovered_skips_exhausted_members() {
             check_scoped: true,
         },
         ChainMember {
+            oauth: true,
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1779,6 +2219,7 @@ fn find_recovered_skips_exhausted_members() {
 fn find_recovered_returns_none_when_no_member_has_data() {
     let members = vec![
         ChainMember {
+            oauth: true,
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1789,6 +2230,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             check_scoped: true,
         },
         ChainMember {
+            oauth: true,
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1810,6 +2252,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
 fn find_recovered_uses_threshold_per_member() {
     let members = vec![
         ChainMember {
+            oauth: true,
             name: "a".into(),
             threshold: 90.0,
             last_resort: false,
@@ -1820,6 +2263,7 @@ fn find_recovered_uses_threshold_per_member() {
             check_scoped: true,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
+            oauth: true,
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
@@ -1843,6 +2287,7 @@ fn find_recovered_uses_threshold_per_member() {
 #[test]
 fn find_recovered_recovers_when_window_expired() {
     let members = vec![ChainMember {
+        oauth: true,
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
@@ -1867,6 +2312,7 @@ fn find_recovered_recovers_when_window_expired() {
 #[test]
 fn find_recovered_recovers_when_windowless() {
     let members = vec![ChainMember {
+        oauth: true,
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
@@ -1888,6 +2334,7 @@ fn find_recovered_recovers_when_windowless() {
 #[test]
 fn find_recovered_treats_missing_resets_at_as_lapsed() {
     let members = vec![ChainMember {
+        oauth: true,
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
@@ -3921,8 +4368,12 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     // standing in for the caller's in-memory `history_cache` lookup
     // (`App::active_burn_rate`) that feeds the real UI-thread call site.
     let active_window = window(96.0, Some(live_reset()));
-    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("a"), &active_window)
-        .expect("rate computed from history");
+    let rate = burn_rate_for_profile(
+        &crate::profile::ProfileName::from("a"),
+        &active_window,
+        crate::usage::now_ms(),
+    )
+    .expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Burn-aware: 96% is over the 95% threshold, so the static check inside the
@@ -4157,6 +4608,7 @@ fn weekly_dead_member_never_recovers() {
     // member kept getting relinked every 5h rollover. It must stay out until
     // the WEEKLY reset passes.
     let members = vec![ChainMember {
+        oauth: true,
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
@@ -5096,9 +5548,13 @@ fn blocked_reason_weekly_hard_outranks_a_kick_block() {
 /// `last_resort`, no broken, no kick-rejected.
 fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
     ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         active: "a".into(),
         chain: vec![
             ChainMember {
+                oauth: true,
                 name: "a".into(),
                 threshold: 95.0,
                 last_resort: false,
@@ -5109,6 +5565,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
             },
             ChainMember {
+                oauth: true,
                 name: "b".into(),
                 threshold: 95.0,
                 last_resort: false,
@@ -5119,6 +5576,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
             },
             ChainMember {
+                oauth: true,
                 name: "c".into(),
                 threshold: 95.0,
                 last_resort: false,
@@ -5189,6 +5647,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
 
     let weekly_pct = 98.0;
     let member_b = ChainMember {
+        oauth: true,
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
@@ -5842,6 +6301,39 @@ fn fully_clear_target_skips_canceled_and_disabled_members() {
     );
 }
 
+// The scoped trigger's walk follows the walk-order mode like every other walk:
+// b is next in chain order, c's week resets soonest, d's week is least used.
+#[test]
+fn fully_clear_target_follows_every_walk_order() {
+    let read = |seven: f64, reset_secs: i64| {
+        usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(seven, Some(reset_in(reset_secs)))),
+        )
+    };
+    let mut config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage("b", Some(95.0), Some(read(80.0, 3 * 86_400))),
+            profile_with_usage("c", Some(95.0), Some(read(70.0, 2 * 3600))),
+            profile_with_usage("d", Some(95.0), Some(read(10.0, 4 * 86_400))),
+        ],
+        "a",
+    );
+    for (order, want) in [
+        (WalkOrder::Chain, "b"),
+        (WalkOrder::SoonestWeeklyReset, "c"),
+        (WalkOrder::MostWeeklyHeadroom, "d"),
+    ] {
+        config.state.walk_order = Some(order);
+        assert_eq!(
+            fully_clear_target(&config, 98.0, &HashSet::new()),
+            Some(want.to_string()),
+            "{order:?}"
+        );
+    }
+}
+
 #[test]
 fn scoped_gate_off_active_never_fires_the_scoped_hop() {
     // Active is model-blocked but its own `check_scoped` gate is off: no
@@ -5923,6 +6415,7 @@ fn next_target_prefers_fully_clear_member() {
 fn find_recovered_prefers_member_clear_of_scoped_windows() {
     let chain = vec![
         ChainMember {
+            oauth: true,
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
@@ -5933,6 +6426,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             check_scoped: true,
         },
         ChainMember {
+            oauth: true,
             name: "c".into(),
             threshold: 95.0,
             last_resort: false,
@@ -5969,6 +6463,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         ),
     )]);
     let chain_b = vec![ChainMember {
+        oauth: true,
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
@@ -5994,6 +6489,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
 #[test]
 fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
     let mkmember = |name: &str, preferred: bool| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -6048,6 +6544,7 @@ fn recovery_respects_each_members_gates() {
     // the first recovery pass. c rides the soft weekly band with its weekly
     // gate off — clear too; chain order picks b.
     let member = |name: &str, check_weekly: bool, check_scoped: bool| ChainMember {
+        oauth: true,
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
@@ -7138,6 +7635,7 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
     api.api_key = Some("k".to_string());
     api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
     let member = ChainMember {
+        oauth: true,
         name: "zai".into(),
         threshold: 95.0,
         last_resort: false,
@@ -7242,6 +7740,7 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
     let fp = crate::usage::profile_credential_fingerprint(&ali).unwrap();
     crate::profile_cache::write_auth_expired(&ali.name, fp);
     let member = ChainMember {
+        oauth: true,
         name: "ali".into(),
         threshold: 95.0,
         last_resort: false,
@@ -7362,6 +7861,7 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         "a console-lapsed Alibaba member stays pickable by the walk"
     );
     let member = ChainMember {
+        oauth: true,
         name: "ali".into(),
         threshold: 95.0,
         last_resort: false,
@@ -7376,5 +7876,379 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         start_block(&config, &member, profile, None, false, false, None),
         None,
         "a console-lapsed Alibaba member is not refused by the start walk"
+    );
+}
+
+/// Replay the owner's sub-second reset samples in both account directions.
+#[test]
+fn home_walk_reset_jitter_never_relinks_and_sort_keeps_chain_position() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = walk_order_config();
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
+    let samples = [
+        "2026-10-14T04:59:59.567Z",
+        "2026-10-14T04:59:59.970Z",
+        "2026-10-14T05:00:00.306Z",
+        "2026-10-14T05:00:00.366Z",
+    ];
+    for active in ["alpha", "beta"] {
+        snap.active = active.into();
+        for a in samples {
+            for b in samples {
+                let clear = |reset: &str| {
+                    usage_both(
+                        Some(window(10.0, Some(live_reset()))),
+                        Some(window(10.0, Some(reset.into()))),
+                    )
+                };
+                let usage = HashMap::from([
+                    ("alpha".into(), clear(a)),
+                    ("beta".into(), clear(b)),
+                    ("gamma".into(), clear("2026-10-15T05:00:00Z")),
+                ]);
+                assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
+                assert_eq!(
+                    ordered_walk(WalkOrder::SoonestWeeklyReset, 2, 3, &|i| usage
+                        .get(snap.chain[i].name.as_str())),
+                    vec![0, 1, 2]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn home_walk_two_hour_gain_switches_once_then_parks_and_honours_cooldown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = walk_order_config();
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
+    let clear = |hours: i64| {
+        usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(10.0, Some(reset_in(hours * 3600)))),
+        )
+    };
+    let mut usage = HashMap::from([
+        ("alpha".into(), clear(6)),
+        ("beta".into(), clear(2)),
+        ("gamma".into(), clear(4)),
+    ]);
+    let now = now_epoch_secs().max(0) as u64;
+    snap.last_switch_at = Some(now - 1799);
+    assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
+    snap.last_switch_at = Some(now - 1800);
+    let decision = next_auto_switch_decision_with_usage(&snap, &snap, &usage).unwrap();
+    assert_eq!(decision.action, SwitchAction::To("beta".into()));
+    assert_eq!(decision.reason, "home walk: weekly reset 2h0m sooner");
+    assert!(decision.proactive);
+    snap.active = "beta".into();
+    snap.last_switch_at = Some(now);
+    for _ in 0..8 {
+        assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
+    }
+    snap.last_switch_at = Some(now - 3600);
+    assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
+    snap.active = "gamma".into();
+    snap.last_switch_at = Some(now);
+    usage
+        .get_mut("gamma")
+        .unwrap()
+        .five_hour
+        .as_mut()
+        .unwrap()
+        .utilization = 96.0;
+    let decision = next_auto_switch_decision_with_usage(&snap, &snap, &usage).unwrap();
+    assert_eq!(decision.action, SwitchAction::To("beta".into()));
+    assert_eq!(decision.reason, "5h at 96% ≥ threshold 95%");
+    assert!(!decision.proactive);
+    // The gain knob is independent of exhaustion.
+    snap.walk_min_gain_secs = 3 * 3600;
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &usage),
+        Some(SwitchAction::To("beta".into()))
+    );
+    usage
+        .get_mut("gamma")
+        .unwrap()
+        .five_hour
+        .as_mut()
+        .unwrap()
+        .utilization = 10.0;
+    snap.last_switch_at = None;
+    assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
+}
+
+#[test]
+fn most_headroom_tolerates_usage_jitter_and_ignores_non_oauth_ranking() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (a, b) in [(20.0, 20.2), (20.3, 19.9), (19.8, 20.1)] {
+        let mut config = headroom_config(weekly_read(10.0, a), weekly_read(10.0, b));
+        config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+        let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+        snap.last_switch_at = Some(now_epoch_secs().max(0) as u64);
+        let usage = HashMap::from([
+            ("alpha".into(), weekly_read(10.0, a)),
+            ("beta".into(), weekly_read(10.0, b)),
+            ("gamma".into(), weekly_read(96.0, 70.0)),
+            ("monitor:external".into(), weekly_read(0.0, 0.0)),
+            ("upstream:external".into(), weekly_read(0.0, 0.0)),
+        ]);
+        assert_eq!(
+            next_auto_switch_target_for_test(&snap, &usage),
+            Some(SwitchAction::To("alpha".into()))
+        );
+        snap.active = "alpha".into();
+        snap.last_switch_at = None;
+        assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
+    }
+    let mut config = headroom_config(weekly_read(10.0, 0.0), weekly_read(10.0, 80.0));
+    config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
+    config.profiles[0].base_url = Some("https://example.invalid".into());
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("beta".into()))
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    let usage = config
+        .profiles
+        .iter()
+        .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
+        .collect();
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &usage),
+        Some(SwitchAction::To("beta".into()))
+    );
+}
+
+#[test]
+fn switch_reason_reports_exhaustion_when_an_ambient_key_rejection_was_not_needed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = walk_order_config();
+    let mut without = snapshot_chain(&config, &HashSet::new()).unwrap();
+    without.active = "alpha".into();
+    without.fresh = without.chain.iter().map(|m| m.name.clone()).collect();
+    let mut with = without.clone();
+    with.broken.push("alpha".into());
+    let usage = HashMap::from([
+        (
+            "alpha".into(),
+            usage_both(Some(window(96.0, Some(live_reset()))), None),
+        ),
+        (
+            "beta".into(),
+            usage_both(Some(window(10.0, Some(live_reset()))), None),
+        ),
+        (
+            "gamma".into(),
+            usage_both(Some(window(10.0, Some(live_reset()))), None),
+        ),
+    ]);
+    let decision = next_auto_switch_decision_with_usage(&with, &without, &usage).unwrap();
+    assert!(!decision.key_rejection_necessary);
+    assert!(!decision.proactive);
+    assert_eq!(decision.reason, "5h at 96% ≥ threshold 95%");
+}
+
+#[test]
+fn zero_gain_and_cooldown_do_not_reopen_reset_jitter_ping_pong() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = walk_order_config();
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    config.state.walk_min_gain_mins = Some(0);
+    config.state.walk_cooldown_mins = Some(0);
+    let mut snapshot = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snapshot.fresh = snapshot.chain.iter().map(|m| m.name.clone()).collect();
+    let samples = [
+        "2026-10-14T04:59:59.567Z",
+        "2026-10-14T04:59:59.970Z",
+        "2026-10-14T05:00:00.306Z",
+        "2026-10-14T05:00:00.366Z",
+    ];
+    for active in ["alpha", "beta"] {
+        snapshot.active = active.into();
+        for a in samples {
+            for b in samples {
+                let reading = |reset: &str| {
+                    usage_both(
+                        Some(window(10.0, Some(live_reset()))),
+                        Some(window(10.0, Some(reset.into()))),
+                    )
+                };
+                let usage = HashMap::from([
+                    ("alpha".into(), reading(a)),
+                    ("beta".into(), reading(b)),
+                    ("gamma".into(), reading("2026-10-15T05:00:00Z")),
+                ]);
+                assert_eq!(
+                    next_auto_switch_target_for_test(&snapshot, &usage),
+                    None,
+                    "{active}: {a} / {b}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_future_switch_timestamp_does_not_extend_the_home_cooldown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = walk_order_config();
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    let mut snapshot = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snapshot.active = "alpha".into();
+    snapshot.fresh = snapshot.chain.iter().map(|m| m.name.clone()).collect();
+    snapshot.last_switch_at = Some(now_epoch_secs().max(0) as u64 + 365 * 86400);
+    let clear = |hours: i64| {
+        usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(10.0, Some(reset_in(hours * 3600)))),
+        )
+    };
+    let usage = HashMap::from([
+        ("alpha".into(), clear(6)),
+        ("beta".into(), clear(2)),
+        ("gamma".into(), clear(4)),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_for_test(&snapshot, &usage),
+        Some(SwitchAction::To("beta".into()))
+    );
+}
+
+#[test]
+fn anchored_reset_bands_stay_stable_for_three_members_fifty_seconds_apart() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = now_epoch_secs() + 86400;
+    // Chain order C, B, A: A anchors {A, B}; C starts the next group.
+    for a in -1..=1 {
+        for b in -1..=1 {
+            for c in -1..=1 {
+                let readings: Vec<_> = [base + 100 + c, base + 50 + b, base + a]
+                    .into_iter()
+                    .map(|reset| {
+                        usage_both(
+                            None,
+                            Some(window(10.0, Some(crate::usage::epoch_secs_to_iso(reset)))),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    ordered_walk(WalkOrder::SoonestWeeklyReset, 2, 3, &|i| Some(&readings[i])),
+                    vec![1, 2, 0]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_exhaustion_decision_keeps_its_trigger_at_the_frozen_reset_boundary() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = walk_order_config();
+    let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snap.active = "alpha".into();
+    snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
+    let now = 1_700_000_000u64;
+    snap.last_switch_at = Some(now);
+    let usage = HashMap::from([
+        (
+            "alpha".into(),
+            usage_both(
+                Some(window(
+                    97.0,
+                    Some(crate::usage::epoch_secs_to_iso(now as i64 + 1)),
+                )),
+                None,
+            ),
+        ),
+        (
+            "beta".into(),
+            usage_both(
+                Some(window(
+                    10.0,
+                    Some(crate::usage::epoch_secs_to_iso(now as i64 + 3600)),
+                )),
+                None,
+            ),
+        ),
+        (
+            "gamma".into(),
+            usage_both(
+                Some(window(
+                    10.0,
+                    Some(crate::usage::epoch_secs_to_iso(now as i64 + 3600)),
+                )),
+                None,
+            ),
+        ),
+    ]);
+    let reading = UsageReading::new(usage.clone(), now * 1000);
+    let decision = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    assert_eq!(decision.action, SwitchAction::To("beta".into()));
+    assert_eq!(decision.reason, "5h at 97% ≥ threshold 95%");
+    assert!(!decision.proactive);
+    // A new reading at the boundary has reset; the old decision remains a
+    // non-proactive exhaustion decision even though today's wall clock is later.
+    assert!(
+        next_auto_switch_decision_with_reading(
+            &snap,
+            &snap,
+            &UsageReading::new(usage, (now + 1) * 1000)
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn burn_decisions_reuse_the_frozen_rate_after_history_changes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = walk_order_config();
+    let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
+    snap.active = "alpha".into();
+    snap.burn_aware = true;
+    snap.burn_floor_pct = 90.0;
+    snap.interval_ms = 60_000;
+    snap.burn_horizon_cap_ms = 60_000;
+    let now = 1_700_000_000_000u64;
+    let sample = |pct| {
+        usage_both(
+            Some(window(
+                pct,
+                Some(crate::usage::epoch_secs_to_iso((now / 1000) as i64 + 3600)),
+            )),
+            None,
+        )
+    };
+    write_history(
+        "alpha",
+        &[(now - 120_000, sample(70.0)), (now - 60_000, sample(80.0))],
+    );
+    let usage = HashMap::from([
+        ("alpha".into(), sample(90.0)),
+        ("beta".into(), sample(10.0)),
+        ("gamma".into(), sample(10.0)),
+    ]);
+    let reading = UsageReading::new(usage.clone(), now);
+    let before = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    assert_eq!(before.action, SwitchAction::To("beta".into()));
+    assert!(!before.proactive);
+    assert!(
+        before.reason.contains("600.0%/h projects 100.0%"),
+        "{}",
+        before.reason
+    );
+    write_history("alpha", &[]);
+    let after = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    assert_eq!(
+        before, after,
+        "counterfactual and reason must reuse the captured rate"
+    );
+    assert!(
+        next_auto_switch_decision_with_reading(&snap, &snap, &UsageReading::new(usage, now))
+            .is_none()
     );
 }

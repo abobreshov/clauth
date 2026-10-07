@@ -239,6 +239,9 @@ pub(crate) struct NoteRecord {
     /// record written before the field and outside a tollgate runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) runtime_sid: Option<String>,
+    /// Last persisted herdr resume report sequence, absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_seq: Option<u64>,
 }
 
 /// The session id encoded in this process's `CLAUDE_CONFIG_DIR`, when that is
@@ -466,9 +469,16 @@ pub(crate) fn run() -> Result<()> {
     // Land the exact-owner stamp AFTER the print: a contended state flock then
     // delays the durable write, never the note the user sees, and at the ceiling
     // the note has already left before the stamp wait can lose it.
-    if let Some(profile) = fire.exact_owner {
-        crate::sessions::stamp_exact_owner(&payload.session_id, &profile);
+    if let Some(profile) = fire.exact_owner.as_deref() {
+        crate::sessions::stamp_exact_owner(&payload.session_id, profile);
     }
+    // Last, so the report's own bounded spawn can never delay the note or the
+    // stamp that already left the process.
+    crate::hook_resume::report_for_fire(
+        &payload,
+        fire.current.as_deref(),
+        fire.exact_owner.is_some(),
+    );
     Ok(())
 }
 
@@ -671,6 +681,10 @@ pub(crate) fn last_fire_within_missing_transcript_grace(session_id: &str) -> boo
 struct FireOutcome {
     note: Option<String>,
     exact_owner: Option<String>,
+    /// The account this fire resolved to, after the staleness guard — carried
+    /// so the herdr resume-command leg can report it even when nothing
+    /// changed, which a `SessionStart` fire does to refresh herdr's copy.
+    current: Option<String>,
 }
 
 /// Decide what this fire says and store what it learned. Returns the note and
@@ -688,6 +702,7 @@ fn note_for_inner(
         return FireOutcome {
             note: None,
             exact_owner: None,
+            current: None,
         };
     };
 
@@ -809,6 +824,7 @@ fn note_for_inner(
             return FireOutcome {
                 note: None,
                 exact_owner: None,
+                current,
             };
         }
     } else {
@@ -821,7 +837,11 @@ fn note_for_inner(
     // flock it takes is outer to the scope lock in the lock order, so it must
     // never be acquired while the scope lock is held.
     drop(_hold);
-    FireOutcome { note, exact_owner }
+    FireOutcome {
+        note,
+        exact_owner,
+        current,
+    }
 }
 
 /// Test-visible wrapper that computes the fire and lands the exact-owner stamp
@@ -898,13 +918,24 @@ pub(crate) struct ScopeLock {
 }
 
 impl ScopeLock {
+    pub(crate) fn acquired(&self) -> bool {
+        self._held.is_some()
+    }
+
     pub(crate) fn acquire() -> Self {
-        const WAIT: Duration = Duration::from_secs(2);
+        Self::acquire_within(Duration::from_secs(2))
+    }
+
+    /// The same hold with a shorter wait, for a leg whose product is optional:
+    /// the resume-command report's mint degrades to silence under contention,
+    /// and a maxed stack of full waits must not push a hook fire past the
+    /// manifest's 10 s host timeout on the very fires the leg reports on.
+    pub(crate) fn acquire_within(wait: Duration) -> Self {
         let held = (|| {
             let dir = records_dir().ok()?;
             crate::profile::mkdir_700(&dir).ok()?;
             let file = crate::profile::open_state_file(&dir.join(".lock")).ok()?;
-            if let Err(e) = crate::lock::lock_file_with_timeout(&file, WAIT) {
+            if let Err(e) = crate::lock::lock_file_with_timeout(&file, wait) {
                 // Never swallowed: proceeding unlocked is duplicate notes
                 // coming back, and without this the only diagnostic that
                 // exists is discarded and the degradation is silent.

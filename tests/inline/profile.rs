@@ -553,13 +553,13 @@ fn app_state_reads_burn_aware_switching_true() {
     assert!(state.burn_aware_switching);
 }
 
-// `walk_order` (issue #86) defaults to `chain` and its on-disk spelling is
-// the hyphenated `soonest-weekly-reset` — the serde rename is the load
-// boundary, so a rename typo must red here, not on an operator's first save.
-// Unset is omitted from a stock file (the `reset_display` Option contract),
-// and BOTH values round-trip.
+// `walk_order` (issue #86) defaults to `chain` and its on-disk spellings are
+// the hyphenated `soonest-weekly-reset` and `most-weekly-headroom` — the serde
+// rename is the load boundary, so a rename typo must red here, not on an
+// operator's first save. Unset is omitted from a stock file (the
+// `reset_display` Option contract), and EVERY value round-trips.
 #[test]
-fn app_state_walk_order_defaults_chain_and_both_values_round_trip() {
+fn app_state_walk_order_defaults_chain_and_every_value_round_trips() {
     let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
     assert_eq!(state.walk_order(), WalkOrder::Chain);
     assert!(
@@ -590,6 +590,16 @@ fn app_state_walk_order_defaults_chain_and_both_values_round_trip() {
     );
     let reparsed_chain: AppState = toml::from_str(&rendered_chain).expect("reparse chain state");
     assert_eq!(reparsed_chain.walk_order(), WalkOrder::Chain);
+
+    let headroom: AppState =
+        toml::from_str("profiles = []\nwalk_order = \"most-weekly-headroom\"\n")
+            .expect("parse the hand-written spelling");
+    assert_eq!(headroom.walk_order(), WalkOrder::MostWeeklyHeadroom);
+    let rendered_headroom = toml::to_string_pretty(&headroom).expect("render headroom state");
+    assert!(
+        rendered_headroom.contains("walk_order = \"most-weekly-headroom\""),
+        "must render the hyphenated spelling, got:\n{rendered_headroom}"
+    );
 }
 
 // On must round-trip explicitly; off (the default) is omitted entirely from
@@ -4481,4 +4491,30 @@ fn a_default_serve_table_carries_a_stray_key() {
         after[marker..].contains("[serve]"),
         "the carried [serve] table lands after the marker:\n{after}"
     );
+}
+
+#[test]
+fn home_walk_settings_are_additive_and_round_trip() {
+    let old: AppState = toml::from_str("profiles = []").unwrap();
+    assert_eq!(old.walk_min_gain_secs(), 3600);
+    assert_eq!(old.walk_cooldown_secs(), 1800);
+    assert_eq!(old.last_switch_at, None);
+    let state = AppState {
+        walk_min_gain_mins: Some(120),
+        walk_cooldown_mins: Some(0),
+        last_switch_at: Some(1_800_000_000),
+        ..AppState::default()
+    };
+    let restored: AppState = toml::from_str(&toml::to_string(&state).unwrap()).unwrap();
+    assert_eq!(
+        AppState {
+            walk_min_gain_mins: Some(0),
+            ..AppState::default()
+        }
+        .walk_min_gain_secs(),
+        60
+    );
+    assert_eq!(restored.walk_min_gain_secs(), 7200);
+    assert_eq!(restored.walk_cooldown_secs(), 0);
+    assert_eq!(restored.last_switch_at, state.last_switch_at);
 }

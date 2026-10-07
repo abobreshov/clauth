@@ -198,6 +198,32 @@ pub(crate) struct JobRecord {
     /// parseable without a migration.
     #[serde(default)]
     pub(crate) isolated: bool,
+    /// The directory the delegate's `claude` runs in, resolved once at the
+    /// call: a resume's recorded workspace, else the caller's `cwd`, else the
+    /// server's own. `None` on a record an older server wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<String>,
+    /// The account of the session whose `tollgate mcp` server spawned the
+    /// delegate, resolved once at the call off the server's own credentials.
+    /// `None` on a record an older server wrote and where no profile owns the
+    /// session's credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spawned_by: Option<String>,
+    /// The Claude Code session id the spawning `tollgate mcp` server started
+    /// under (`CLAUDE_CODE_SESSION_ID` in its environment): the host identity
+    /// a reader matches when either side's pid is unknown, valid until the
+    /// host's first `/clear`. `None` on a record an older server wrote and on
+    /// a server launched outside Claude Code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host_session: Option<String>,
+    /// The `claude` process hosting the spawning conversation (the server's
+    /// parent). A process outlives its session id: `/clear` hands the
+    /// conversation a new id while the same process and server live on, and
+    /// closing the process orphans every delegate it spawned under either id.
+    /// `0` where unknown: a record an older server wrote, or (off unix) a host
+    /// with no single session record naming its id at server start.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) host_pid: u32,
     /// The child's own session id, off the first streamed event that carried
     /// one: the resume handle a crashed run's record must outlive its server
     /// for. The stdout reader captures it long before any crash and the
@@ -305,6 +331,14 @@ pub(crate) struct RunningSpec {
     /// same reason: a heartbeat rewrites the whole record, and a hand-off
     /// must keep the answer the mint resolved once.
     pub(crate) isolated: bool,
+    /// The run's directory and its spawning account, carried the same way and
+    /// for the same reason (see [`JobRecord::cwd`], [`JobRecord::spawned_by`]).
+    pub(crate) cwd: Option<String>,
+    pub(crate) spawned_by: Option<String>,
+    /// The spawning conversation and its host process, carried the same way
+    /// (see [`JobRecord::host_session`], [`JobRecord::host_pid`]).
+    pub(crate) host_session: Option<String>,
+    pub(crate) host_pid: u32,
     /// Which spelling every write of this record lands under. A background job
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
@@ -454,6 +488,10 @@ pub(crate) fn write_heartbeat_with_session(
             endpoint: spec.endpoint.clone(),
             provider: spec.provider.clone(),
             isolated: spec.isolated,
+            cwd: spec.cwd.clone(),
+            spawned_by: spec.spawned_by.clone(),
+            host_session: spec.host_session.clone(),
+            host_pid: spec.host_pid,
             session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
@@ -499,29 +537,27 @@ pub(crate) fn promote(spec: &RunningSpec) -> Result<()> {
 /// session id rides the record off the envelope's own `session_id` key — every
 /// completion arm stamps it (the id tollgate pinned at the spawn), so a collected
 /// completion is resumable, and the listing names the handle beside the job id.
-pub(crate) fn write_done(
-    job_id: &str,
-    profile: &str,
-    started_at: u64,
-    endpoint: Option<String>,
-    provider: Option<String>,
-    isolated: bool,
-    envelope: serde_json::Value,
-) -> Result<()> {
+/// Every call fact comes off `spec`, the one the heartbeats wrote from, so a
+/// fact the mint resolved cannot drop off the record at the finish.
+pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Result<()> {
     let session_id = envelope
         .get("session_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     write_atomic(
         &JobRecord {
-            job_id: job_id.to_string(),
-            profile: profile.to_string(),
+            job_id: spec.job_id.clone(),
+            profile: spec.profile.clone(),
             state: JobState::Done,
-            started_at,
+            started_at: spec.started_at,
             envelope: Some(envelope),
-            endpoint,
-            provider,
-            isolated,
+            endpoint: spec.endpoint.clone(),
+            provider: spec.provider.clone(),
+            isolated: spec.isolated,
+            cwd: spec.cwd.clone(),
+            spawned_by: spec.spawned_by.clone(),
+            host_session: spec.host_session.clone(),
+            host_pid: spec.host_pid,
             session_id,
             timeout_secs: 0,
             idle_secs: None,
@@ -539,6 +575,42 @@ pub(crate) fn write_done(
         // took the envelope from the join, so `Handoff::finalize` deletes that
         // record rather than writing a second delivery into it.
         RecordKind::Collectable,
+    )
+}
+
+/// [`write_done`] from loose parts, for tests that finalize a record with no
+/// running spec of their own: no cwd, spawning account or host, the shape an
+/// older server's finish wrote.
+#[cfg(test)]
+pub(crate) fn write_done_parts(
+    job_id: &str,
+    profile: &str,
+    started_at: u64,
+    endpoint: Option<String>,
+    provider: Option<String>,
+    isolated: bool,
+    envelope: serde_json::Value,
+) -> Result<()> {
+    write_done(
+        &RunningSpec {
+            job_id: job_id.to_string(),
+            profile: profile.to_string(),
+            started_at,
+            recorded_at: started_at,
+            timeout_secs: 0,
+            idle_secs: None,
+            endpoint,
+            provider,
+            isolated,
+            cwd: None,
+            spawned_by: None,
+            host_session: None,
+            host_pid: 0,
+            kind: RecordKind::Collectable,
+            owner_pid: 0,
+            owner_started_at: 0,
+        },
+        envelope,
     )
 }
 

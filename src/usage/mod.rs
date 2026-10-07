@@ -37,7 +37,8 @@ pub(crate) mod upstream;
 
 pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
-    compute_burn_rates_from_history, eta_left_secs, funded_wallet_rate, project_utilization,
+    compute_burn_rates_from_history, compute_burn_rates_from_history_at, eta_left_secs,
+    funded_wallet_rate, project_utilization,
 };
 pub(crate) use codex::fetch_codex_usage;
 // The mapping is exercised directly by the codex chain tests, which drive a real

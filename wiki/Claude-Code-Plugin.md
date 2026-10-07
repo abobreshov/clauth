@@ -147,3 +147,5 @@ On connect it sends a short brief: a one-line index of the five tools, what `swi
 The roster groups profiles that share a provider, tier and endpoint host onto one line, and leads with the account that has the most window left, counted over live windows only — a lapsed window counts no headroom, so the account ranks on its next live figure. Live usage numbers are deliberately left out of that snapshot, since they go stale immediately; only the ordering reflects them. `profiles` is the live read.
 
 Everything specific to one tool rides that tool's own description rather than the brief: what a delegate costs, that it sees only its prompt, the depth cap. It loads when the tool does, and is never stated twice.
+
+The context note counts only delegates spawned by this Claude Code process when host attribution is available, so it keeps counting after `/clear` and excludes peer sessions. Legacy unstamped jobs are conservatively counted. The delegate rewake hook matches both `mcp__plugin_tollgate_tollgate__delegate` and `mcp__tollgate__delegate`.

@@ -602,7 +602,7 @@ fn stamp(epoch_ms: u64) -> String {
 }
 
 /// Middle-ellipsis truncation (for URLs / IDs — both ends carry meaning).
-fn middle_truncate(s: &str, max: usize) -> String {
+pub(super) fn middle_truncate(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max || max < 3 {
         return truncate(s, max);

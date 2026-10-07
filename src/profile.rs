@@ -841,11 +841,13 @@ impl Default for UpdateSettings {
 /// byte for byte: first accept in chain position, starting one slot after the
 /// active and wrapping. `SoonestWeeklyReset` reorders each accept pass by the
 /// soonest-resetting weekly window, so the member whose quota expires soonest
-/// drains first and less expires unspent; the pass ladder (free quota >
-/// serving sink > spend-armed > dead sink > halt) and every exclusion are
-/// untouched — the mode decides only WHERE among the members a pass already
-/// accepts to land. Serialized as a lowercase string with an explicit
-/// hyphenated second value: `walk_order = "soonest-weekly-reset"`.
+/// drains first and less expires unspent; `MostWeeklyHeadroom` reorders it by
+/// the least-used week, so hops spread across the chain instead of always
+/// landing on the next slot. The pass ladder (free quota > serving sink >
+/// spend-armed > dead sink > halt) and every exclusion are untouched — the
+/// mode decides only WHERE among the members a pass already accepts to land.
+/// Serialized as a lowercase string with explicit hyphenated spellings:
+/// `walk_order = "soonest-weekly-reset"`, `walk_order = "most-weekly-headroom"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum WalkOrder {
@@ -855,6 +857,10 @@ pub(crate) enum WalkOrder {
     /// Order each accept pass by the soonest-resetting weekly window.
     #[serde(rename = "soonest-weekly-reset")]
     SoonestWeeklyReset,
+    /// Order each accept pass by the least-used weekly window. Hop targets
+    /// only: unlike `SoonestWeeklyReset` it never walks a healthy active.
+    #[serde(rename = "most-weekly-headroom")]
+    MostWeeklyHeadroom,
 }
 
 /// Stored at ~/.tollgate/profiles.toml — ordering and active marker only.
@@ -900,12 +906,22 @@ pub(crate) struct AppState {
     /// (issue #86): `chain` (the default) walks by chain position exactly as
     /// it always has; `soonest-weekly-reset` lands each pass on the accepted
     /// member whose weekly window resets soonest, so less quota expires
-    /// unspent. `None` = the [`WalkOrder`] default, so an untouched
+    /// unspent; `most-weekly-headroom` on the one whose week is least used.
+    /// `None` = the [`WalkOrder`] default, so an untouched
     /// profiles.toml carries neither this key nor the setting and walks
     /// byte-identically to before the key existed. Read through
     /// [`AppState::walk_order`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_order: Option<WalkOrder>,
+    /// Minimum weekly-reset improvement for a proactive home walk (minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) walk_min_gain_mins: Option<u64>,
+    /// Minimum dwell after a switch before another proactive home move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) walk_cooldown_mins: Option<u64>,
+    /// Last successful global switch, Unix seconds; absent on older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_switch_at: Option<u64>,
     /// Opt-in master switch for spending real money: when on, the auto-switch
     /// chain may pick a member whose subscription windows are spent but whose
     /// account still has pay-as-you-go budget, bounded by that member's
@@ -1125,6 +1141,17 @@ impl AppState {
         self.walk_order.unwrap_or_default()
     }
 
+    pub(crate) fn walk_min_gain_secs(&self) -> u64 {
+        self.walk_min_gain_mins
+            .unwrap_or(60)
+            .saturating_mul(60)
+            .max(WALK_RESET_TOLERANCE_SECS)
+    }
+
+    pub(crate) fn walk_cooldown_secs(&self) -> u64 {
+        self.walk_cooldown_mins.unwrap_or(30).saturating_mul(60)
+    }
+
     /// The effective wall-clock notation (unset = 24-hour).
     pub(crate) fn clock_format(&self) -> ClockFormat {
         self.clock_format.unwrap_or_default()
@@ -1234,6 +1261,9 @@ fn default_refresh_interval() -> u64 {
 /// full rationale lives on the gate in `fallback.rs`.
 pub(crate) const DEFAULT_WEEKLY_SWITCH_PCT: f64 = 98.0;
 
+/// Reset jitter never counts as a proactive gain, even with a zero gain knob.
+pub(crate) const WALK_RESET_TOLERANCE_SECS: u64 = 60;
+
 /// Lowest configurable weekly line. Below this the chain thrashes: most
 /// members spend half their week above the line, so every hop immediately
 /// re-triggers.
@@ -1278,6 +1308,9 @@ impl Default for AppState {
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             walk_order: None,
+            walk_min_gain_mins: None,
+            walk_cooldown_mins: None,
+            last_switch_at: None,
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),

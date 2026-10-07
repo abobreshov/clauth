@@ -37,6 +37,7 @@ use super::panes::{
     master_detail, section_box, value_caret,
 };
 use super::prose;
+use super::status::middle_truncate;
 use crate::format::truncate;
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
@@ -604,9 +605,9 @@ const STATE_W: usize = 8;
 /// Cap on the account column, so one long name cannot push every row's figures
 /// off the pane.
 const NAME_W_MAX: usize = 18;
-/// A tail shorter than this is all ellipsis and no signal, so it is dropped
-/// whole instead.
-const TAIL_MIN_W: usize = 8;
+/// A directory squeezed below this keeps too little of either end to name a
+/// tree, so it is dropped whole instead.
+const CWD_MIN_W: usize = 12;
 
 /// The line under the list. Owner's words, verbatim: the pane takes no keys, so
 /// this is the whole of what it offers beyond the list itself.
@@ -713,7 +714,7 @@ fn delegate_lines(rows: &[DelegateCells], viewport: usize, width: usize) -> Vec<
     lines
 }
 
-/// One delegate row: `● running  account  facts …  "tail"`.
+/// One delegate row: `● running  account  facts …  cwd`.
 fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
@@ -727,13 +728,14 @@ fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'st
         ),
         Span::styled(cells.facts.join(" · "), theme::dim()),
     ];
-    // The delegate's own words, quoted so they cannot read as tollgate's report
-    // about it, and last so the columns before them never move.
+    // Last, so the columns before it never move.
     let used: usize = spans.iter().map(Span::width).sum();
-    let room = width.saturating_sub(used + 4); // the 2-space gap and both quotes
-    if !cells.tail.is_empty() && room >= TAIL_MIN_W {
+    let room = width.saturating_sub(used + 2); // the 2-space gap
+    if let Some(cwd) = &cells.cwd
+        && room >= CWD_MIN_W
+    {
         spans.push(Span::styled(
-            format!("  \"{}\"", truncate(&cells.tail, room)),
+            format!("  {}", middle_truncate(cwd, room)),
             theme::faint(),
         ));
     }
@@ -780,10 +782,9 @@ struct DelegateCells {
     profile: String,
     /// What this record can say, in the order a reader scans it.
     facts: Vec<String>,
-    /// The delegate's own last words, already bounded by the writer. Empty when
-    /// it has said nothing, and on every finished record (a done envelope
-    /// carries the whole result, so a tail beside it says nothing new).
-    tail: String,
+    /// The directory the run works in, escaped for display. `None` on a record
+    /// an older server wrote.
+    cwd: Option<String>,
 }
 
 /// One cell set per stored record, in the order they arrive.
@@ -799,53 +800,59 @@ fn delegate_cells(stored: &[StoredJob], now: u64) -> Vec<DelegateCells> {
     stored.iter().map(|job| delegate_row(job, now)).collect()
 }
 
+/// Render untrusted path and account text as visible terminal-safe escapes.
+fn escape_control(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || crate::jobs_cli::reorders_display(c) {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
     let record = &job.record;
     let profile = record.profile.clone();
     // The store's own retention stamp, so a row is dated by the same field that
     // decides how long it survives.
     let since = job.age_secs(now);
-    // Through `phase()` rather than by re-matching `(liveness, kind)` here: a
-    // fifth situation added there must not compile clean into this pane still
-    // classifying by the old four.
+    // Through `phase()` rather than by re-matching `(liveness, kind)` here: the
+    // four situations and any later fifth live on `JobPhase`, so this pane
+    // cannot drift its own classification.
     let state = job.phase();
-    match state {
-        JobPhase::Done => DelegateCells {
-            state,
-            profile,
-            facts: vec![format!("finished {}", age_phrase(since))],
-            tail: String::new(),
-        },
-        JobPhase::Orphaned => DelegateCells {
-            state,
-            profile,
-            facts: vec![format!("last seen {}", age_phrase(since))],
-            tail: record.tail.clone(),
-        },
+    let (mut facts, live) = match state {
+        JobPhase::Done => (vec![format!("finished {}", age_phrase(since))], None),
+        JobPhase::Orphaned => (vec![format!("last seen {}", age_phrase(since))], None),
         JobPhase::Running | JobPhase::Blocking => {
             let live = jobs::running_liveness(record, now);
-            let mut facts = vec![format!(
-                "elapsed {}",
-                humanize_duration(live.elapsed_secs as i64)
-            )];
-            facts.push(match live.last_output_secs_ago {
+            let elapsed = format!("elapsed {}", humanize_duration(live.elapsed_secs as i64));
+            let output = match live.last_output_secs_ago {
                 Some(secs) => format!("last output {}", age_phrase(secs)),
-                None => "no output yet".to_string(),
-            });
-            if let Some((label, secs)) = next_deadline(&live) {
-                facts.push(if secs == 0 {
-                    format!("{label} now")
-                } else {
-                    format!("{label} in {}", humanize_duration(secs as i64))
-                });
-            }
-            DelegateCells {
-                state,
-                profile,
-                facts,
-                tail: record.tail.clone(),
-            }
+                None => "no output yet".into(),
+            };
+            (vec![elapsed, output], Some(live))
         }
+    };
+    if let Some(account) = &record.spawned_by {
+        facts.push(format!("spawned by {}", escape_control(account)));
+    }
+    if let Some((label, secs)) = live.as_ref().and_then(next_deadline) {
+        facts.push(if secs == 0 {
+            format!("{label} now")
+        } else {
+            format!("{label} in {}", humanize_duration(secs as i64))
+        });
+    }
+    DelegateCells {
+        state,
+        profile,
+        facts,
+        // The calling model's own `delegate` argument, so it reaches the
+        // terminal only as visible escapes.
+        cwd: record.cwd.as_deref().map(escape_control),
     }
 }
 

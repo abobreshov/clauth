@@ -47,6 +47,19 @@ pub(crate) struct AutoSwitchDecision {
     /// True when removing only the active from the key-rejected set, rebuilding
     /// the whole chain snapshot, yields no action or a different one.
     pub(crate) key_rejection_necessary: bool,
+    pub(crate) reason: String,
+    pub(crate) proactive: bool,
+}
+
+impl AutoSwitchDecision {
+    fn new(action: SwitchAction, reason: String, proactive: bool) -> Self {
+        Self {
+            action,
+            reason,
+            proactive,
+            key_rejection_necessary: false,
+        }
+    }
 }
 
 /// Default 5-hour utilization threshold (percent) applied when a chain member
@@ -459,11 +472,15 @@ fn scoped_weekly_blocked(profile: &Profile, chain_soft: f64) -> bool {
 /// usage snapshot, gated by the member's `check_scoped` toggle and judged at
 /// its snapshot-resolved `scoped_line`. An absent entry fails safe to "not
 /// blocked" (the member is then judged by the aggregate gates alone).
-fn scoped_blocked_from_usage(member: &ChainMember, usage: &HashMap<String, UsageInfo>) -> bool {
+fn scoped_blocked_from_usage(
+    member: &ChainMember,
+    usage: &HashMap<String, UsageInfo>,
+    now: i64,
+) -> bool {
     member.check_scoped
-        && usage.get(member.name.as_str()).is_some_and(|info| {
-            scoped_weekly_blocked_info(info, now_epoch_secs(), member.scoped_line)
-        })
+        && usage
+            .get(member.name.as_str())
+            .is_some_and(|info| scoped_weekly_blocked_info(info, now, member.scoped_line))
 }
 
 /// True when the profile's 5h utilization has crossed its own threshold. Also
@@ -508,18 +525,19 @@ pub(crate) fn is_canceled(profile: &Profile) -> bool {
 /// holding the `AppConfig` guard) plus the current live sample, run through
 /// the same recency-weighted computation and windowing `App::active_burn_rate`
 /// uses for the Overview ETA line. `None` until enough distinct samples exist.
-/// Sole caller is the scheduler-side [`is_exhausted_active_from_usage`] — the
+/// Used by the scheduler-side reading cache for [`exhaustion_reason`] — the
 /// UI-thread [`is_exhausted_active`] takes its rate as a parameter instead so
 /// the render pass never triggers this disk read under the config guard.
-fn burn_rate_for_profile(name: &ProfileName, window: &UsageWindow) -> Option<f64> {
+fn burn_rate_for_profile(name: &ProfileName, window: &UsageWindow, now_ms: u64) -> Option<f64> {
     let history = crate::profile::load_usage_history(name);
     let pair = ("5h", window);
-    crate::usage::compute_burn_rates_from_history(
+    crate::usage::compute_burn_rates_from_history_at(
         &history,
         std::slice::from_ref(&pair),
         crate::usage::BURN_LOOKBACK_MS,
         crate::usage::BURN_MIN_SAMPLES,
         crate::usage::BURN_GAP_CUT_MS,
+        now_ms,
     )
     .remove("5h")
     .flatten()
@@ -599,7 +617,7 @@ pub(crate) fn projected_exhausted(
 /// reproduces [`is_exhausted`] bit for bit — mode off must never diverge from
 /// today's static behavior. On, `active_burn_pct_per_hour` — the caller's
 /// in-memory rate; this function never reads disk itself, see
-/// [`is_exhausted_active_from_usage`] for the disk-reading scheduler twin —
+/// [`exhaustion_reason`] for the disk-reading scheduler twin —
 /// feeds [`is_exhausted_projected`]. Deliberately never applied to the target
 /// walk's candidates or `soonest_resume`; this only ever changes whether the
 /// ACTIVE profile itself is
@@ -910,6 +928,8 @@ pub(crate) fn health_blocked_reason(
 #[derive(Debug, Clone)]
 pub(crate) struct ChainMember {
     pub(crate) name: ProfileName,
+    /// Only Claude Code OAuth chain members contribute weekly ranking keys.
+    pub(crate) oauth: bool,
     pub(crate) threshold: f64,
     /// Mirrors `Profile::last_resort` — a terminal stop for the chain walk,
     /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
@@ -960,6 +980,9 @@ pub(crate) struct ChainSnapshot {
     /// weekly window. Orthogonal to `burn_aware`: burn-aware decides WHEN to
     /// leave the active, walk order WHERE to land.
     pub(crate) walk_order: WalkOrder,
+    pub(crate) walk_min_gain_secs: u64,
+    pub(crate) walk_cooldown_secs: u64,
+    pub(crate) last_switch_at: Option<u64>,
     /// Snapshot of `AppState::refresh_interval_ms` — the projection's poll
     /// interval. Read through `config.state` here (this snapshot is already
     /// built once under the config lock per tick) rather than the scheduler's
@@ -1071,6 +1094,7 @@ pub(crate) fn snapshot_codex_chain(
             .into_iter()
             .map(|name| ChainMember {
                 name,
+                oauth: true,
                 threshold: DEFAULT_THRESHOLD,
                 last_resort: false,
                 preferred: false,
@@ -1087,6 +1111,9 @@ pub(crate) fn snapshot_codex_chain(
         // the codex snapshot takes the claude-side default; a codex profile
         // record has no knob to set this).
         walk_order: WalkOrder::Chain,
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
         interval_ms,
         burn_floor_pct: 0.0,
         burn_horizon_cap_ms: 0,
@@ -1171,6 +1198,7 @@ fn chain_member(
     let profile = config.find(name);
     ChainMember {
         name: name.clone(),
+        oauth: profile.is_some_and(Profile::is_oauth),
         threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
         last_resort: profile.is_some_and(|p| p.last_resort),
         preferred: config.is_home_today(name, key_rejected),
@@ -1232,6 +1260,9 @@ fn build_chain_snapshot(
         broken: config.state.auth_broken.clone(),
         burn_aware: config.state.burn_aware_switching,
         walk_order: config.state.walk_order(),
+        walk_min_gain_secs: config.state.walk_min_gain_secs(),
+        walk_cooldown_secs: config.state.walk_cooldown_secs(),
+        last_switch_at: config.state.last_switch_at,
         interval_ms: config.state.refresh_interval_ms,
         burn_floor_pct: config.state.burn_switch_floor_pct(),
         burn_horizon_cap_ms: config.state.burn_horizon_cap_ms(),
@@ -1269,6 +1300,7 @@ fn is_exhausted_from_info(
 /// (the member's snapshot-resolved one, or the literal hard cap). The snapshot
 /// is taken once per evaluation so a fetch landing between this read and the
 /// next pass cannot flip the decision.
+#[cfg(test)]
 fn is_exhausted_from_usage(
     member: &ChainMember,
     usage: &HashMap<String, UsageInfo>,
@@ -1291,48 +1323,54 @@ fn is_canceled_from_usage(name: &ProfileName, usage: &HashMap<String, UsageInfo>
         .is_some_and(|p| p.is_canceled())
 }
 
-/// Scheduler-side [`is_exhausted_active`] over a usage snapshot: reads the 5h
-/// window from the same single-lock snapshot as [`is_exhausted_from_usage`], so
-/// the scheduler's periodic scan agrees with the UI-thread one-shot
-/// (`auto_switch_if_needed`) on the ACTIVE decision. The snapshot is owned
-/// (cloned under the one lock), so the (disk-only, unlocked) burn rate lookup
-/// below runs with no store lock held — same property the pre-snapshot shape
-/// upheld per predicate.
-fn is_exhausted_active_from_usage(
+/// The active exhaustion arm's reason, evaluated at the reading's clock.
+/// Its burn rate is cached across the with/without-key-rejection evaluations.
+fn exhaustion_reason(
     member: &ChainMember,
-    burn_aware: bool,
-    interval_ms: u64,
-    usage: &HashMap<String, UsageInfo>,
+    snapshot: &ChainSnapshot,
+    reading: &UsageReading,
     line: f64,
-    floor_pct: f64,
-    horizon_cap_ms: u64,
-) -> bool {
-    let now = now_epoch_secs();
-    let Some(info) = usage.get(member.name.as_str()) else {
-        return false;
-    };
-    // The weekly line trumps projection (mirrors `is_exhausted_active`).
-    if weekly_blocked_info(info, now, line) {
-        return true;
+) -> Option<String> {
+    let info = reading.usage.get(member.name.as_str())?;
+    if weekly_blocked_info(info, reading.now_secs(), line) {
+        return info
+            .seven_day
+            .as_ref()
+            .map(|w| format!("7d at {:.0}% ≥ threshold {:.0}%", w.utilization, line));
     }
-    let Some(window) = (five_hour_live(info, now).then_some(info.five_hour.as_ref()))
-        .flatten()
-        .cloned()
-    else {
-        return false;
-    };
-    if !burn_aware {
-        return window.utilization >= member.threshold;
+    let window = info
+        .five_hour
+        .as_ref()
+        .filter(|_| five_hour_live(info, reading.now_secs()))?;
+    if window.utilization >= member.threshold {
+        return Some(format!(
+            "5h at {:.0}% ≥ threshold {:.0}%",
+            window.utilization, member.threshold
+        ));
     }
-    let rate = burn_rate_for_profile(&member.name, &window);
-    is_exhausted_projected(
-        window.utilization,
-        member.threshold,
-        rate,
-        interval_ms,
-        floor_pct,
-        horizon_cap_ms,
-    )
+    if snapshot.burn_aware
+        && let Some(rate) = reading.burn_rate(&member.name, window)
+        && projected_exhausted(
+            window.utilization,
+            member.threshold,
+            rate,
+            snapshot.interval_ms,
+            snapshot.burn_floor_pct,
+            snapshot.burn_horizon_cap_ms,
+        )
+    {
+        let horizon_ms = snapshot.interval_ms.min(snapshot.burn_horizon_cap_ms);
+        let projected = window.utilization + rate * horizon_ms as f64 / 3_600_000.0;
+        return Some(format!(
+            "burn projection: 5h at {:.0}%, {:.1}%/h projects {:.1}% ≥ 100% in {}s, floor {:.0}%",
+            window.utilization,
+            rate,
+            projected,
+            horizon_ms / 1000,
+            snapshot.burn_floor_pct.min(member.threshold)
+        ));
+    }
+    None
 }
 
 /// The soonest-reset ranking key for one member's cached usage: the epoch min
@@ -1360,33 +1398,85 @@ fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
     best
 }
 
-/// One accept pass's candidate visit order under `mode`, the shared ordering
-/// helper every fallback walk pass threads through (issue #86). It replaces
-/// the old `walk_chain` primitive: the visit sequence is the same, the
-/// skip/accept folding moved to each call site's `find`.
-///
-/// `WalkOrder::Chain` returns the old walk's exact visit sequence — every
-/// slot starting one after `idx` and wrapping — so the default is byte for
-/// byte today's walk. `WalkOrder::SoonestWeeklyReset` stable-sorts that
-/// sequence by `reset_key` (soonest first; `None` — no parseable weekly
-/// reset — after every `Some`, since an unknown reset cannot be proven
-/// soon). The stable sort keeps the chain-position walk order as the tie
-/// rule: ties on the parsed instant fall back to chain position, the exact
-/// tie rule `soonest_resume` documents and pins. Skip predicates stay at
-/// the call sites, unchanged — the mode reorders only WITHIN one accept
-/// pass, never across the pass ladder.
-fn ordered_walk(
+/// A read week ranks ahead of an unknown week. Lapsed windows are unused.
+fn weekly_headroom_key(info: &UsageInfo, now: i64) -> Option<(f64, f64)> {
+    let seven = info.seven_day.as_ref()?;
+    let weekly = if seven_day_live(info, now) {
+        seven.utilization
+    } else {
+        0.0
+    };
+    let five = info
+        .five_hour
+        .as_ref()
+        .filter(|_| five_hour_live(info, now))
+        .map_or(0.0, |w| w.utilization);
+    (weekly.is_finite() && five.is_finite()).then_some((weekly, five))
+}
+
+/// Sort exact keys first, then restore incoming walk position within anchored bands.
+/// Anchoring keeps the ordering transitive; a fuzzy pairwise comparator does not.
+fn banded_walk(order: &mut [usize], key: &dyn Fn(usize) -> Option<f64>, margin: f64) {
+    let position = order.to_vec();
+    order.sort_by(|&a, &b| match (key(a), key(b)) {
+        (Some(a), Some(b)) => a.total_cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let mut start = 0;
+    while start < order.len() {
+        let anchor = key(order[start]);
+        let mut end = start + 1;
+        while end < order.len()
+            && match (anchor, key(order[end])) {
+                (Some(a), Some(b)) => b - a < margin,
+                (None, None) => true,
+                _ => false,
+            }
+        {
+            end += 1;
+        }
+        order[start..end].sort_by_key(|i| position.iter().position(|p| p == i));
+        start = end;
+    }
+}
+
+/// Reorder within an accept pass. Known keys form groups anchored at each
+/// group's smallest key: <60 seconds for resets, <5 percentage points for usage.
+/// Each group retains incoming walk position; unknown readings rank last.
+fn ordered_walk<'u>(
     mode: WalkOrder,
     idx: usize,
     len: usize,
-    reset_key: &dyn Fn(usize) -> Option<i64>,
+    reading: &dyn Fn(usize) -> Option<&'u UsageInfo>,
+) -> Vec<usize> {
+    ordered_walk_at(mode, idx, len, reading, now_epoch_secs())
+}
+
+fn ordered_walk_at<'u>(
+    mode: WalkOrder,
+    idx: usize,
+    len: usize,
+    reading: &dyn Fn(usize) -> Option<&'u UsageInfo>,
+    now: i64,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (1..=len).map(|offset| (idx + offset) % len).collect();
-    if mode == WalkOrder::SoonestWeeklyReset {
-        order.sort_by_key(|&i| {
-            let k = reset_key(i);
-            (k.is_none(), k)
-        });
+    match mode {
+        WalkOrder::Chain => {}
+        WalkOrder::SoonestWeeklyReset => banded_walk(
+            &mut order,
+            &|i| reading(i).and_then(weekly_reset_key).map(|t| t as f64),
+            crate::profile::WALK_RESET_TOLERANCE_SECS as f64,
+        ),
+        WalkOrder::MostWeeklyHeadroom => {
+            let keys: Vec<_> = (0..len)
+                .map(|i| reading(i).and_then(|u| weekly_headroom_key(u, now)))
+                .collect();
+            // Weekly near ties are settled by the 5h band, then chain position.
+            banded_walk(&mut order, &|i| keys[i].map(|(_, five)| five), 5.0);
+            banded_walk(&mut order, &|i| keys[i].map(|(seven, _)| seven), 5.0);
+        }
     }
     order
 }
@@ -1513,7 +1603,8 @@ pub(crate) struct StartCandidate {
 /// freshness accepted in pass two — the same preference the switch walk gives
 /// its target in [`next_auto_switch_target`]). Each pass follows the
 /// `walk_order` mode: chain position by default, the soonest-resetting weekly
-/// window under `soonest-weekly-reset`.
+/// window under `soonest-weekly-reset`, the least-used week under
+/// `most-weekly-headroom`.
 pub(crate) fn start_walk(
     config: &AppConfig,
     families: Option<&[String]>,
@@ -1529,12 +1620,13 @@ pub(crate) fn start_walk(
     // not once per candidate.
     let key_rejected = durable_key_rejected(config);
     let mut rows: Vec<StartCandidate> = Vec::with_capacity(names.len());
-    // The walk-order ranking key per row, built in the same loop as the rows
-    // (parallel vec, same indices) so the walk below can order by weekly
-    // reset without widening `StartCandidate`'s public shape. The key is
-    // consulted only by the soonest-reset sort, so under `chain` (the
-    // default) the push stays inert and the walk is byte-identical.
-    let mut reset_keys: Vec<Option<i64>> = Vec::with_capacity(names.len());
+    // The reading each row's walk-order ranking reads, built in the same loop
+    // as the rows (parallel vec, same indices) so the walk below can order
+    // them without widening `StartCandidate`'s public shape. Owned, because a
+    // third-party row's reading lives only inside its loop iteration. Only
+    // the ranking modes consult it, so under `chain` (the default) nothing is
+    // copied and the walk is byte-identical.
+    let mut readings: Vec<Option<UsageInfo>> = Vec::with_capacity(names.len());
     for name in names {
         let Some(profile) = config.find(name) else {
             continue;
@@ -1569,10 +1661,10 @@ pub(crate) fn start_walk(
             needs_oauth,
             families,
         );
-        reset_keys.push(if walk_order == WalkOrder::Chain {
+        readings.push(if walk_order == WalkOrder::Chain {
             None
         } else {
-            usage.and_then(weekly_reset_key)
+            usage.filter(|_| profile.is_oauth()).cloned()
         });
         rows.push(StartCandidate {
             name: name.clone(),
@@ -1586,7 +1678,7 @@ pub(crate) fn start_walk(
         return (rows, None);
     }
     let len = rows.len();
-    let order = ordered_walk(walk_order, len - 1, len, &|i| reset_keys[i]);
+    let order = ordered_walk(walk_order, len - 1, len, &|i| readings[i].as_ref());
     let pick = order
         .iter()
         .copied()
@@ -1727,8 +1819,9 @@ fn candidate_excluded(
 /// Picks the next chain member to switch to, starting one slot after the active
 /// profile and wrapping. Returns None when nothing is viable. Each pass visits
 /// its candidates in walk-order mode (`AppState.walk_order`): chain position by
-/// default, the soonest-resetting weekly window under `soonest-weekly-reset` —
-/// the ordering applies WITHIN each pass only, never across the ladder below.
+/// default, the soonest-resetting weekly window under `soonest-weekly-reset`,
+/// the least-used week under `most-weekly-headroom` — the ordering applies
+/// WITHIN each pass only, never across the ladder below.
 ///
 ///   1. Any member with real headroom (5h utilization below threshold, or no
 ///      usage data fetched yet) that its own gates leave in rotation: the
@@ -1761,18 +1854,18 @@ pub(crate) fn next_target(
 
     let skip =
         |i: usize| chain[i] == *active || candidate_excluded(config, &chain[i], key_rejected);
-    let reset_key = |i: usize| {
+    let reading = |i: usize| {
         config
             .find(&chain[i])
+            .filter(|p| p.is_oauth())
             .and_then(|p| p.usage.as_ref())
-            .and_then(weekly_reset_key)
     };
-    let order = ordered_walk(config.state.walk_order(), active_idx, len, &reset_key);
+    let order = ordered_walk(config.state.walk_order(), active_idx, len, &reading);
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
         order
             .iter()
             .copied()
-            .find(|&i| !skip(i) && config.find(&chain[i]).is_some_and(&accept))
+            .find(|&i| !skip(i) && config.find(&chain[i]).is_some_and(accept))
             .map(|i| chain[i].to_string())
     };
 
@@ -1932,22 +2025,51 @@ pub(crate) fn next_target(
 /// One lock window over the `UsageStore` — fail-safe to an empty map on poison,
 /// matching the per-predicate shape's `Err(_) => false` paths in aggregate
 /// (every predicate reads a missing entry the same way it reads no entry).
-fn usage_snapshot(store: &UsageStore) -> HashMap<String, UsageInfo> {
-    match store.lock() {
+struct UsageReading {
+    usage: HashMap<String, UsageInfo>,
+    now_ms: u64,
+    burn_rates: std::cell::RefCell<HashMap<ProfileName, Option<f64>>>,
+}
+
+impl UsageReading {
+    fn new(usage: HashMap<String, UsageInfo>, now_ms: u64) -> Self {
+        Self {
+            usage,
+            now_ms,
+            burn_rates: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn now_secs(&self) -> i64 {
+        (self.now_ms / 1000).min(i64::MAX as u64) as i64
+    }
+
+    fn burn_rate(&self, name: &ProfileName, window: &UsageWindow) -> Option<f64> {
+        *self
+            .burn_rates
+            .borrow_mut()
+            .entry(name.clone())
+            .or_insert_with(|| burn_rate_for_profile(name, window, self.now_ms))
+    }
+}
+
+fn usage_snapshot(store: &UsageStore) -> UsageReading {
+    let (usage, now_ms) = match store.lock() {
         Ok(s) => {
             #[cfg(test)]
             NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS.with(|c| c.set(c.get() + 1));
-            s.clone()
+            (s.clone(), crate::usage::now_ms())
         }
-        Err(_) => HashMap::new(),
-    }
+        Err(_) => (HashMap::new(), crate::usage::now_ms()),
+    };
+    UsageReading::new(usage, now_ms)
 }
 
 pub(crate) fn next_auto_switch_target(
     snapshot: &ChainSnapshot,
     store: &UsageStore,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_with_usage(snapshot, &usage_snapshot(store))
+    next_auto_switch_target_core(snapshot, &usage_snapshot(store)).map(|d| d.action)
 }
 
 /// The richer evaluator entry point: the action PLUS whether the active's key
@@ -1963,7 +2085,7 @@ pub(crate) fn next_auto_switch_decision(
     without_snapshot: &ChainSnapshot,
     store: &UsageStore,
 ) -> Option<AutoSwitchDecision> {
-    next_auto_switch_decision_with_usage(with_snapshot, without_snapshot, &usage_snapshot(store))
+    next_auto_switch_decision_with_reading(with_snapshot, without_snapshot, &usage_snapshot(store))
 }
 
 /// Snapshot-driven core of [`next_auto_switch_target`]: every predicate reads
@@ -1981,11 +2103,16 @@ pub(crate) fn next_auto_switch_target_for_test(
 /// The simple (no-cause) "with key rejection" evaluation: the active's effective
 /// broken/preferred read straight off the snapshot, where the caller already
 /// folded key rejection into `broken` and `preferred`.
+#[cfg(test)]
 fn next_auto_switch_target_with_usage(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_core(snapshot, usage)
+    next_auto_switch_target_core(
+        snapshot,
+        &UsageReading::new(usage.clone(), crate::usage::now_ms()),
+    )
+    .map(|d| d.action)
 }
 
 /// Evaluate twice and compare: once on `with_snapshot` (key rejection folded
@@ -1994,18 +2121,34 @@ fn next_auto_switch_target_with_usage(
 /// rejection was necessary for the exact action — an independently produced
 /// exhaustion/scoped/home/overlap move comes out identical and carries no
 /// cause.
+#[cfg(test)]
 fn next_auto_switch_decision_with_usage(
     with_snapshot: &ChainSnapshot,
     without_snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
 ) -> Option<AutoSwitchDecision> {
-    let with = next_auto_switch_target_core(with_snapshot, usage)?;
-    let without = next_auto_switch_target_core(without_snapshot, usage);
-    let key_rejection_necessary = Some(&with) != without.as_ref();
-    Some(AutoSwitchDecision {
-        action: with,
-        key_rejection_necessary,
-    })
+    next_auto_switch_decision_with_reading(
+        with_snapshot,
+        without_snapshot,
+        &UsageReading::new(usage.clone(), crate::usage::now_ms()),
+    )
+}
+
+fn next_auto_switch_decision_with_reading(
+    with_snapshot: &ChainSnapshot,
+    without_snapshot: &ChainSnapshot,
+    reading: &UsageReading,
+) -> Option<AutoSwitchDecision> {
+    let with = next_auto_switch_target_core(with_snapshot, reading)?;
+    let without = next_auto_switch_target_core(without_snapshot, reading);
+    let key_rejection_necessary = without.as_ref().map(|d| &d.action) != Some(&with.action);
+    let mut decision = if key_rejection_necessary {
+        with
+    } else {
+        without?
+    };
+    decision.key_rejection_necessary = key_rejection_necessary;
+    Some(decision)
 }
 
 /// The walk body, reading the ACTIVE's effective broken and preferred straight
@@ -2013,8 +2156,10 @@ fn next_auto_switch_decision_with_usage(
 /// the whole-chain counterfactual one, so no per-run facts are spliced in.
 fn next_auto_switch_target_core(
     snapshot: &ChainSnapshot,
-    usage: &HashMap<String, UsageInfo>,
-) -> Option<SwitchAction> {
+    reading_snapshot: &UsageReading,
+) -> Option<AutoSwitchDecision> {
+    let usage = &reading_snapshot.usage;
+    let now = reading_snapshot.now_secs();
     let active_idx = snapshot
         .chain
         .iter()
@@ -2056,15 +2201,17 @@ fn next_auto_switch_target_core(
     // last Fresh read is a trustworthy verdict the existing rules already
     // weigh.
     let active_reading_dead = snapshot.reading_dead.iter().any(|n| n == &active.name);
-    let active_exhausted = is_exhausted_active_from_usage(
-        active,
-        snapshot.burn_aware,
-        snapshot.interval_ms,
-        usage,
-        active.weekly_line,
-        snapshot.burn_floor_pct,
-        snapshot.burn_horizon_cap_ms,
-    );
+    let forced_reason = if active_broken {
+        Some("active authentication rejected".into())
+    } else if active_kick_rejected {
+        Some("active messages limit rejected".into())
+    } else if active_canceled {
+        Some("active subscription canceled".into())
+    } else if active_reading_dead {
+        Some("active usage channel dead".into())
+    } else {
+        exhaustion_reason(active, snapshot, reading_snapshot, active.weekly_line)
+    };
 
     let skip = |i: usize| {
         snapshot.chain[i].name == active.name
@@ -2075,12 +2222,13 @@ fn next_auto_switch_target_core(
                 .any(|k| k == &snapshot.chain[i].name)
             || is_canceled_from_usage(&snapshot.chain[i].name, usage)
     };
-    let reset_key = |i: usize| {
-        usage
-            .get(snapshot.chain[i].name.as_str())
-            .and_then(weekly_reset_key)
+    let reading = |i: usize| {
+        snapshot.chain[i]
+            .oauth
+            .then(|| usage.get(snapshot.chain[i].name.as_str()))
+            .flatten()
     };
-    let order = ordered_walk(snapshot.walk_order, active_idx, len, &reset_key);
+    let order = ordered_walk_at(snapshot.walk_order, active_idx, len, &reading, now);
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         order
             .iter()
@@ -2092,15 +2240,11 @@ fn next_auto_switch_target_core(
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
     let clear = |m: &ChainMember| {
-        !is_exhausted_from_usage(m, usage, m.weekly_line) && !scoped_blocked_from_usage(m, usage)
+        !is_exhausted_from_info(m, usage.get(m.name.as_str()), m.weekly_line, now)
+            && !scoped_blocked_from_usage(m, usage, now)
     };
 
-    if !active_broken
-        && !active_kick_rejected
-        && !active_canceled
-        && !active_reading_dead
-        && !active_exhausted
-    {
+    if forced_reason.is_none() {
         // Scoped active trigger: a per-model weekly line crossed on an
         // otherwise-healthy active (its `check_scoped` gate on) hops ONLY
         // when a clear member exists. When every sibling is equally blocked
@@ -2110,14 +2254,32 @@ fn next_auto_switch_target_core(
         // it was deliberately parked out of — oscillating on the sibling's
         // 5h period. Same precedence the serving-sink pass gives it below.
         if !active.last_resort
-            && scoped_blocked_from_usage(active, usage)
+            && active.check_scoped
+            && let Some(w) = usage
+                .get(active.name.as_str())
+                .and_then(|info| worst_scoped_window(info, now, active.scoped_line))
             && let Some(name) = walk(&clear)
         {
-            return Some(SwitchAction::To(name));
+            return Some(AutoSwitchDecision::new(
+                SwitchAction::To(name),
+                format!(
+                    "scoped {} at {:.0}% ≥ threshold {:.0}%",
+                    w.label, w.window.utilization, active.scoped_line
+                ),
+                false,
+            ));
+        }
+        // Exhaustion (including scoped caps above) bypasses this dwell gate.
+        if snapshot.last_switch_at.is_some_and(|last| {
+            (now.max(0) as u64)
+                .checked_sub(last)
+                .is_some_and(|elapsed| elapsed < snapshot.walk_cooldown_secs)
+        }) {
+            return None;
         }
         // Return-to-preferred: a healthy active that is not itself the operator's
         // preferred (home) account walks back the instant preferred reads clear
-        // AND fresh. No dwell timer, no hysteresis — it is self-limiting: had
+        // AND fresh, after the proactive cooldown. It is self-limiting: had
         // preferred stayed clear this whole time, the exhaustion walk could only
         // ever have left it when preferred was the SPENT member, so a clear
         // preferred that is not the active means work drifted off it on
@@ -2158,37 +2320,15 @@ fn next_auto_switch_target_core(
                 })
                 .map(|(_, m)| m)
         {
-            return Some(SwitchAction::To(pref.name.to_string()));
+            return Some(AutoSwitchDecision::new(
+                SwitchAction::To(pref.name.to_string()),
+                "return to preferred: clear and fresh".into(),
+                true,
+            ));
         }
-        // Re-computed home (issue #86, walk-order mode): with no `preferred`
-        // member anywhere in the chain, `soonest-weekly-reset` walks a
-        // healthy active "home" to the soonest-reset clear+fresh member —
-        // the operator's home recomputed as "where the quota expires
-        // first", so work parks where it will be spent rather than where it
-        // will expire. The walk is one-shot in the same structural sense as
-        // the return-to-preferred pass: the already-home guard below bars
-        // any re-fire once the active IS the soonest member. The same hard
-        // freshness gates as the return-to-preferred pass above (fresh
-        // ACTIVE and fresh target), and the same absence of a `last_resort`
-        // guard: a sink is a refuge, not a permanent park, and the
-        // recomputed home outranks it. The ordering rides the shared
-        // `order` (the soonest-reset sequence with the chain-position tie
-        // rule). `chain` (the default) has no home pass — a healthy active
-        // stays put, byte-identical to today, and a chain that DOES carry
-        // `preferred` keeps preferred's behavior exactly whatever the mode
-        // (the guard above).
-        // Already-home guard (the `pref != active.name` analog): the walk
-        // fires only toward a clear+fresh member whose weekly reset is
-        // STRICTLY sooner than the active's own — the active qualifies as a
-        // home itself, so once the chain lands on the soonest member no
-        // candidate is sooner and it parks. Without the guard a second
-        // clear+fresh member ping-pongs the walk every tick (the active is
-        // skipped as a candidate, so the walk always finds a "home" to walk
-        // TO — one credential relink per scheduler tick, forever). Ties with
-        // the active keep the current position: walking between tied members
-        // buys nothing and oscillates the same way. A candidate with no
-        // parseable reset never outranks a Some active, and an active with
-        // none defers to any candidate that has one.
+        // With no explicit home, move only for a material reset improvement.
+        // Freshness on both sides and the dwell gate above prevent cached or
+        // jittered reads from relinking every global session's credentials.
         let active_key = usage.get(active.name.as_str()).and_then(weekly_reset_key);
         if snapshot.walk_order == WalkOrder::SoonestWeeklyReset
             && !snapshot.chain.iter().enumerate().any(|(i, m)| {
@@ -2203,14 +2343,42 @@ fn next_auto_switch_target_core(
                 !skip(i)
                     && clear(&snapshot.chain[i])
                     && snapshot.fresh.iter().any(|n| n == &snapshot.chain[i].name)
-                    && reset_key(i)
-                        .is_some_and(|candidate_key| active_key.is_none_or(|a| candidate_key < a))
+                    && reading(i)
+                        .and_then(weekly_reset_key)
+                        .is_some_and(|candidate_key| {
+                            active_key.is_none_or(|a| {
+                                a.saturating_sub(candidate_key)
+                                    >= snapshot
+                                        .walk_min_gain_secs
+                                        .max(crate::profile::WALK_RESET_TOLERANCE_SECS)
+                                        .min(i64::MAX as u64)
+                                        as i64
+                            })
+                        })
             })
         {
-            return Some(SwitchAction::To(snapshot.chain[pi].name.to_string()));
+            let reason = match (active_key, reading(pi).and_then(weekly_reset_key)) {
+                (Some(a), Some(b)) => {
+                    let gain = (a - b) / 60;
+                    format!(
+                        "home walk: weekly reset {}h{}m sooner",
+                        gain / 60,
+                        gain % 60
+                    )
+                }
+                _ => "home walk: readable weekly reset replaces unknown reset".into(),
+            };
+            return Some(AutoSwitchDecision::new(
+                SwitchAction::To(snapshot.chain[pi].name.to_string()),
+                reason,
+                true,
+            ));
         }
         return None;
     }
+
+    let forced_reason = forced_reason?;
+    let forced = |action| AutoSwitchDecision::new(action, forced_reason.clone(), false);
 
     // Freshness stays a preference, not a gate, lockstep with [`next_target`]
     // (2026-06-28 target asymmetry): prefer a member whose usage read we
@@ -2218,10 +2386,10 @@ fn next_auto_switch_target_core(
     // gates the ACTIVE on), but the any-freshness pass always runs.
     let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == &m.name);
     if let Some(name) = walk(&|m| clear(m) && is_fresh(m)) {
-        return Some(SwitchAction::To(name));
+        return Some(forced(SwitchAction::To(name)));
     }
     if let Some(name) = walk(&clear) {
-        return Some(SwitchAction::To(name));
+        return Some(forced(SwitchAction::To(name)));
     }
 
     // Serving-sink pass, lockstep with [`next_target`]: a `last_resort` sink
@@ -2232,14 +2400,28 @@ fn next_auto_switch_target_core(
     // "don't hop between sinks" rule — a DEAD sink active keeps its
     // stay-put-or-spend behavior below).
     let active_is_last_resort = active.last_resort;
-    if active_is_last_resort && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT) {
+    if active_is_last_resort
+        && !is_exhausted_from_info(
+            active,
+            usage.get(active.name.as_str()),
+            WEEKLY_HARD_BLOCK_PCT,
+            now,
+        )
+    {
         return None;
     }
     if !active_is_last_resort
-        && let Some(name) =
-            walk(&|m| m.last_resort && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT))
+        && let Some(name) = walk(&|m| {
+            m.last_resort
+                && !is_exhausted_from_info(
+                    m,
+                    usage.get(m.name.as_str()),
+                    WEEKLY_HARD_BLOCK_PCT,
+                    now,
+                )
+        })
     {
-        return Some(SwitchAction::To(name));
+        return Some(forced(SwitchAction::To(name)));
     }
 
     // Spend-armed pass, lockstep with [`next_target`]: between a serving sink
@@ -2262,7 +2444,7 @@ fn next_auto_switch_target_core(
             m.max_spend,
         )
     }) {
-        return Some(SwitchAction::To(name));
+        return Some(forced(SwitchAction::To(name)));
     }
 
     // Dead-sink fallback (`active_is_last_resort` hoisted above the serving-sink
@@ -2271,7 +2453,7 @@ fn next_auto_switch_target_core(
         return None;
     }
     if let Some(name) = walk(&|m| m.last_resort) {
-        return Some(SwitchAction::To(name));
+        return Some(forced(SwitchAction::To(name)));
     }
 
     // No headroom, no `last_resort` member anywhere. In wrap-off mode, halt
@@ -2297,17 +2479,14 @@ fn next_auto_switch_target_core(
         snapshot.switch_off_when_spent
     };
     if halt_flag
-        && is_exhausted_active_from_usage(
-            active,
-            snapshot.burn_aware,
-            snapshot.interval_ms,
-            usage,
-            WEEKLY_HARD_BLOCK_PCT,
-            snapshot.burn_floor_pct,
-            snapshot.burn_horizon_cap_ms,
-        )
+        && let Some(reason) =
+            exhaustion_reason(active, snapshot, reading_snapshot, WEEKLY_HARD_BLOCK_PCT)
     {
-        return Some(SwitchAction::Off);
+        return Some(AutoSwitchDecision::new(
+            SwitchAction::Off,
+            format!("all chain members spent: {reason}"),
+            false,
+        ));
     }
     None
 }
@@ -2326,25 +2505,20 @@ fn fully_clear_target(
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
     let skip = |i: usize| chain[i] == active || candidate_excluded(config, &chain[i], key_rejected);
-    let reset_key = |i: usize| {
+    let reading = |i: usize| {
         config
             .find(&chain[i])
+            .filter(|p| p.is_oauth())
             .and_then(|p| p.usage.as_ref())
-            .and_then(weekly_reset_key)
     };
-    let pick = ordered_walk(
-        config.state.walk_order(),
-        active_idx,
-        chain.len(),
-        &reset_key,
-    )
-    .into_iter()
-    .find(|&i| {
-        !skip(i)
-            && config.find(&chain[i]).is_some_and(|p| {
-                !is_exhausted(p, weekly_pct) && !scoped_weekly_blocked(p, weekly_pct)
-            })
-    });
+    let pick = ordered_walk(config.state.walk_order(), active_idx, chain.len(), &reading)
+        .into_iter()
+        .find(|&i| {
+            !skip(i)
+                && config.find(&chain[i]).is_some_and(|p| {
+                    !is_exhausted(p, weekly_pct) && !scoped_weekly_blocked(p, weekly_pct)
+                })
+        });
     pick.map(|i| chain[i].to_string())
 }
 
@@ -2425,7 +2599,12 @@ pub(crate) fn find_recovered_member(
         walk_order,
         chain.len().saturating_sub(1),
         chain.len(),
-        &|i| usage.get(chain[i].name.as_str()).and_then(weekly_reset_key),
+        &|i| {
+            chain[i]
+                .oauth
+                .then(|| usage.get(chain[i].name.as_str()))
+                .flatten()
+        },
     );
     for i in order.iter().copied() {
         if recovered(&chain[i], true) == Some(true) {

@@ -496,6 +496,58 @@ impl Rig {
         .expect("save the record");
     }
 
+    /// Rewrite the `shunt` stub to also answer `check`, keeping the run path
+    /// [`stub::write_stub`] wrote and the fifo it made: a `run` behaves
+    /// exactly as before, while a `check` records one line per run in
+    /// `dir/checks` and exits by marker — `check-fail` exits 1 with one
+    /// stderr line, `check-slow` sleeps 60 s (for a timeout), else it exits 0.
+    fn arm_check_stub(&self) {
+        let script = format!(
+            "#!/bin/sh\n\
+             d='{d}'\n\
+             if [ \"$1\" = \"check\" ]; then\n\
+             \x20 echo check >> \"$d/checks\"\n\
+             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; exec sleep 60; fi\n\
+             \x20 if [ -e \"$d/check-fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
+             \x20 exit 0\n\
+             fi\n\
+             if [ -e \"$d/ignore-term\" ]; then\n\
+             \x20 trap 'echo \"term $$\" >> \"$d/signals\"' TERM\n\
+             else\n\
+             \x20 trap 'echo \"term $$\" >> \"$d/signals\"; trap - TERM; kill -s TERM $$' TERM\n\
+             fi\n\
+             {{\n\
+             \x20 echo \"pid $$\"\n\
+             \x20 echo \"bin $0\"\n\
+             \x20 for a in \"$@\"; do echo \"arg $a\"; done\n\
+             \x20 echo \"cwd $(pwd -P)\"\n\
+             \x20 env | grep -e '^SHUNT_' -e '^CODEX_AUTH_FILE=' -e '^CLAUDE_CREDENTIALS=' | LC_ALL=C sort | sed 's/^/env /'\n\
+             \x20 echo \"secret ${{GATEWAY_TEST_SECRET-}}\"\n\
+             \x20 echo end\n\
+             }} >> \"$d/calls\"\n\
+             echo \"gateway stub stdout $$\"\n\
+             echo \"gateway stub stderr $$\" >&2\n\
+             if [ ! -e \"$d/no-health\" ]; then exec 3>\"$d/fifo\"; fi\n\
+             i=0\n\
+             while [ \"$i\" -lt 120 ]; do\n\
+             \x20 sleep 1 3>&- &\n\
+             \x20 wait $!\n\
+             \x20 i=$((i + 1))\n\
+             done\n",
+            d = self.dir.display(),
+        );
+        fs::write(&self.binary, script).expect("arm the check stub");
+    }
+
+    /// The number of `check` runs the armed stub recorded.
+    fn check_runs(&self) -> usize {
+        fs::read_to_string(self.dir.join("checks"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count()
+    }
+
     fn supervisor(&self) -> Supervised {
         Supervised(Supervisor::new(Arc::clone(&self.handle)))
     }
@@ -2009,5 +2061,1272 @@ fn a_supervisor_that_panics_is_logged_as_a_panic() {
             "tollgate daemon: the shunt gateway supervisor panicked; the next daemon start finishes the stop"
         ],
         "the panic is logged as a panic, and nothing else is"
+    );
+}
+
+/// Writes `changed` over the rig's config and drives one restart: the child
+/// stops (one SIGTERM), a fresh spawn happens, no crash is counted, one check
+/// ran, and the stop line names `name` (the changed key paths) by equality.
+#[cfg(unix)]
+fn expect_restart(
+    rig: &Rig,
+    supervisor: &mut Supervised,
+    t0: Tick,
+    first_pid: u32,
+    name: &str,
+    changed: &str,
+) {
+    let checks_before = rig.check_runs();
+    fs::write(&rig.config, changed).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "the restart-only edit restarts the child"
+    );
+    let stop_line = format!(
+        "tollgate daemon: stopping the shunt gateway (pid {first_pid}): its config changed {name}"
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == stop_line)
+            .count(),
+        1,
+        "the log names the setting by its key path, never its value"
+    );
+    // The stub dies on its own SIGTERM: wait for the pipe to fall silent,
+    // then step until the reap respawns it (the default-trap restart path,
+    // never a kill at the drain bound).
+    rig.server.wait_serving(false);
+    step_until(rig, supervisor, t0.after(secs(3)), GatewayState::Starting);
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [first_pid],
+        "the receiver side: exactly one SIGTERM, not two"
+    );
+    assert_eq!(
+        rig.check_runs(),
+        checks_before + 1,
+        "the restart is gated on one new check"
+    );
+}
+
+/// The base `[server]` table every restart-only edit starts from.
+#[cfg(unix)]
+fn base_config(port: u16) -> String {
+    format!("[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n")
+}
+
+/// A restart-only case: `(spawn config, changed config)` over a port.
+#[cfg(unix)]
+type RestartCase = dyn Fn(u16) -> (String, String);
+
+/// `bind = "127.0.0.1:3067"` edited to another host keeps the port, so the
+/// same rig port keeps answering `/health` while the bind fact flips.
+#[cfg(unix)]
+#[test]
+fn a_bind_edit_restarts_once_and_names_the_setting() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(&rig, &mut supervisor, t0, pid, "server.bind", &changed);
+}
+
+/// Losing `[server.admin]` restarts too: the fact is the key's presence in
+/// either direction.
+#[cfg(unix)]
+#[test]
+fn removing_the_admin_table_restarts_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        pid,
+        "[server.admin]",
+        &base_config(rig.port),
+    );
+}
+
+/// A model's `display_name` is hot-reloadable: editing it never restarts.
+#[cfg(unix)]
+#[test]
+fn a_model_display_name_edit_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n[[models]]\nid = \"fable\"\ndisplay_name = \"Fable\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n[[models]]\nid = \"fable\"\ndisplay_name = \"Renamed\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a display_name edit keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a display_name edit");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A comment added above `bind`, or `bind` moved within `[server]`, compares
+/// as the same value: no restart.
+#[cfg(unix)]
+#[test]
+fn a_comment_or_key_move_above_bind_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let reordered = format!(
+        "# a comment above bind\n[server]\nshutdown_timeout_seconds = 2\nbind = \"127.0.0.1:{}\"\n",
+        rig.port
+    );
+    fs::write(&rig.config, reordered).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a comment and key move keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a comment or key move");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A refused restart-only edit keeps the child, logs the refusal once, and
+/// does not re-run the check while the bytes stay unchanged.
+#[cfg(unix)]
+#[test]
+fn a_refused_bind_edit_keeps_the_child_and_logs_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    fs::write(&rig.config, changed).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a refused bind edit keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a refused check");
+    assert_eq!(rig.calls().len(), 1, "no respawn on a refused check");
+    assert_eq!(rig.check_runs(), 1, "one check for the changed bind");
+
+    let keep_line = format!(
+        "tollgate daemon: the shunt gateway's config changed server.bind, but `{} check --config {}` refused it (exit 1); keeping the running gateway until the check passes; run that command to see why",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the refusal is logged once, naming the setting, never its value"
+    );
+
+    supervisor.step(t0.after(secs(3)));
+    supervisor.step(t0.after(secs(4)));
+    assert_eq!(rig.check_runs(), 1, "an unchanged config is not re-checked");
+    assert_eq!(rig.calls().len(), 1, "still no respawn");
+    assert!(
+        stub::alive(pid),
+        "the child stays alive across memoized rounds"
+    );
+}
+
+/// Every member of the restart-only fact set, in every transition its kind
+/// admits. The transitions are generated from the fact table itself: the
+/// profiles below are cross-checked against `FACT_SPECS` (length, label,
+/// walk, kind) before any transition runs, so a member added, removed,
+/// re-pathed, or re-kinded fails this test instead of drifting.
+#[cfg(unix)]
+#[test]
+fn every_restart_only_setting_restarts_once_when_it_changes() {
+    let profiles = member_profiles();
+    assert_eq!(
+        profiles.len(),
+        FACT_SPECS.len(),
+        "the test profiles drifted from the fact set's length"
+    );
+    for (profile, spec) in profiles.iter().zip(FACT_SPECS.iter()) {
+        assert_eq!(
+            profile.path, spec.path,
+            "a test profile's label drifted from the fact set: {}",
+            spec.path
+        );
+        assert_eq!(
+            profile.keys, spec.keys,
+            "a test profile's walk drifted from the fact set: {}",
+            spec.path
+        );
+        assert_eq!(
+            kind_name(profile.kind),
+            kind_name(spec.kind),
+            "a test profile's kind drifted from the fact set: {}",
+            spec.path
+        );
+    }
+    for profile in &profiles {
+        match profile.kind {
+            FactKind::Value => {
+                // absent -> present, present -> a different value, and back to
+                // absent.
+                restart_case(profile, profile.absent, profile.present_a);
+                restart_case(
+                    profile,
+                    profile.present_a,
+                    profile.present_b.expect("a Value fact carries present_b"),
+                );
+                restart_case(profile, profile.present_a, profile.absent);
+            }
+            FactKind::Present => {
+                // absent -> present and back; a content edit inside the present
+                // table is a keep, covered by the non-member test.
+                restart_case(profile, profile.absent, profile.present_a);
+                restart_case(profile, profile.present_a, profile.absent);
+            }
+            FactKind::NonEmpty => {
+                let empty = profile
+                    .empty
+                    .expect("a NonEmpty fact carries its empty config");
+                // absent -> non-empty, [] -> non-empty, and each back.
+                restart_case(profile, profile.absent, profile.present_a);
+                restart_case(profile, empty, profile.present_a);
+                restart_case(profile, profile.present_a, empty);
+                restart_case(profile, profile.present_a, profile.absent);
+            }
+        }
+    }
+}
+
+/// A restart-only fact's test profile: the fact-table entries it must match,
+/// and the config fragments that drive every transition its kind admits.
+#[cfg(unix)]
+struct MemberProfile {
+    /// The log key path, matched against `FactSpec::path`.
+    path: &'static str,
+    /// The document walk, matched against `FactSpec::keys`.
+    keys: &'static [&'static str],
+    /// The fact kind, matched against `FactSpec::kind`.
+    kind: FactKind,
+    /// The config with the member's key absent.
+    absent: fn(u16) -> String,
+    /// The config with the member present (value A).
+    present_a: fn(u16) -> String,
+    /// The config with the member present (value B, different): a `Value` fact
+    /// only — a `Present` or `NonEmpty` member's content edit is a keep, not a
+    /// restart.
+    present_b: Option<fn(u16) -> String>,
+    /// A `NonEmpty` member's config with the key present but `[]`.
+    empty: Option<fn(u16) -> String>,
+    /// Env-file line(s) pinning the probe port while the config's `bind` key
+    /// is absent, so `server.bind`'s absent <-> present transitions stay
+    /// spawnable (the daemon would otherwise probe shunt's default port).
+    env_pin: Option<fn(u16) -> String>,
+}
+
+/// The fact's kind as a name, so the cross-check compares kinds without a
+/// `PartialEq` derive on `FactKind`.
+#[cfg(unix)]
+fn kind_name(kind: FactKind) -> &'static str {
+    match kind {
+        FactKind::Value => "Value",
+        FactKind::Present => "Present",
+        FactKind::NonEmpty => "NonEmpty",
+    }
+}
+
+/// The test profiles, in the fact set's order.
+#[cfg(unix)]
+fn member_profiles() -> Vec<MemberProfile> {
+    vec![
+        MemberProfile {
+            path: "server.bind",
+            keys: &["server", "bind"],
+            kind: FactKind::Value,
+            absent: |_| "[server]\nshutdown_timeout_seconds = 2\n".to_string(),
+            present_a: base_config,
+            present_b: Some(|p| {
+                format!("[server]\nbind = \"0.0.0.0:{p}\"\nshutdown_timeout_seconds = 2\n")
+            }),
+            empty: None,
+            env_pin: Some(|p| format!("SHUNT_SERVER__BIND=127.0.0.1:{p}")),
+        },
+        MemberProfile {
+            path: "server.max_concurrent_requests",
+            keys: &["server", "max_concurrent_requests"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| format!("{}max_concurrent_requests = 2048\n", base_config(p)),
+            present_b: Some(|p| format!("{}max_concurrent_requests = 4096\n", base_config(p))),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.shutdown_timeout_seconds",
+            keys: &["server", "shutdown_timeout_seconds"],
+            kind: FactKind::Value,
+            absent: |p| format!("[server]\nbind = \"127.0.0.1:{p}\"\n"),
+            present_a: base_config,
+            present_b: Some(|p| {
+                format!("[server]\nbind = \"127.0.0.1:{p}\"\nshutdown_timeout_seconds = 3\n")
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.access_control]",
+            keys: &["server", "access_control"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.access_control]\nallow_cidrs = [\"10.0.0.0/8\"]\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.access_control]\nallow_cidrs = [\"10.0.0.0/16\"]\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.limits.max_request_header_bytes",
+            keys: &["server", "limits", "max_request_header_bytes"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.limits]\nmax_request_header_bytes = 512\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.limits]\nmax_request_header_bytes = 1024\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.limits.max_url_length",
+            keys: &["server", "limits", "max_url_length"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| format!("{}[server.limits]\nmax_url_length = 256\n", base_config(p)),
+            present_b: Some(|p| {
+                format!("{}[server.limits]\nmax_url_length = 512\n", base_config(p))
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.rate_limits]",
+            keys: &["server", "rate_limits"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.rate_limits.device_verify]\nmax = 3\nwindow_seconds = 20\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.rate_limits.device_verify]\nmax = 5\nwindow_seconds = 20\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.admin]",
+            keys: &["server", "admin"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.admin]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.gateway]",
+            keys: &["server", "gateway"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.gateway]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.spend]",
+            keys: &["server", "spend"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.spend]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.spend.state_path",
+            keys: &["server", "spend", "state_path"],
+            kind: FactKind::Value,
+            absent: |p| format!("{}[server.spend]\n", base_config(p)),
+            present_a: |p| {
+                format!(
+                    "{}[server.spend]\nstate_path = \"/tmp/spend.json\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.spend]\nstate_path = \"/tmp/spend-2.json\"\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.codex_endpoint]",
+            keys: &["server", "codex_endpoint"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.codex_endpoint]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.usage]",
+            keys: &["server", "usage"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.usage]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.oauth_usage]",
+            keys: &["server", "oauth_usage"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.oauth_usage]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[sentry]",
+            keys: &["sentry"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[sentry]\ndsn = \"\"\nenvironment = \"dev\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[sentry]\ndsn = \"\"\nenvironment = \"prod\"\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[otel]",
+            keys: &["otel"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[otel]\nendpoint = \"http://localhost:4318\"\nsample_ratio = 0.5\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[otel]\nendpoint = \"http://localhost:4318\"\nsample_ratio = 1.0\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.pool.usage_refresh_seconds",
+            keys: &["server", "pool", "usage_refresh_seconds"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.pool]\nusage_refresh_seconds = 120\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.pool]\nusage_refresh_seconds = 300\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.pool.state_path",
+            keys: &["server", "pool", "state_path"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.pool]\nstate_path = \"/tmp/pool.json\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.pool]\nstate_path = \"/tmp/pool-2.json\"\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.status]",
+            keys: &["server", "status"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.status]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.status].sources",
+            keys: &["server", "status", "sources"],
+            kind: FactKind::NonEmpty,
+            absent: |p| format!("{}[server.status]\n", base_config(p)),
+            present_a: |p| {
+                format!(
+                    "{}[server.status]\n[[server.status.sources]]\nprovider = \"claude\"\nurl = \"https://status.claude.com/api/v2/summary.json\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: None,
+            empty: Some(|p| format!("{}[server.status]\nsources = []\n", base_config(p))),
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.status.refresh_seconds",
+            keys: &["server", "status", "refresh_seconds"],
+            kind: FactKind::Value,
+            absent: |p| format!("{}[server.status]\n", base_config(p)),
+            present_a: |p| format!("{}[server.status]\nrefresh_seconds = 120\n", base_config(p)),
+            present_b: Some(|p| {
+                format!("{}[server.status]\nrefresh_seconds = 300\n", base_config(p))
+            }),
+            empty: None,
+            env_pin: None,
+        },
+    ]
+}
+
+/// One restart-only change, driven end to end in a fresh sandbox: spawn on
+/// `spawn(p)`, edit to `changed(p)`, and assert exactly one restart gated on
+/// one check, the stop line naming the profile's key path by equality.
+#[cfg(unix)]
+fn restart_case(profile: &MemberProfile, spawn: fn(u16) -> String, changed: fn(u16) -> String) {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    if let Some(pin) = profile.env_pin {
+        fs::write(
+            &rig.env_file,
+            format!("GATEWAY_TEST_SECRET=from-env-file\n{}\n", pin(rig.port)),
+        )
+        .expect("env pin");
+    }
+    let spawn_config = spawn(rig.port);
+    fs::write(&rig.config, spawn_config).expect("spawn config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "{}: spawns healthy",
+        profile.path
+    );
+    let first = rig.only_call().pid;
+    let changed_config = changed(rig.port);
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        first,
+        profile.path,
+        &changed_config,
+    );
+}
+
+/// Representative hot-reloadable non-members: editing them never restarts.
+#[cfg(unix)]
+#[test]
+fn hot_reloadable_settings_never_restart_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let base = base_config(rig.port);
+    let edits: Vec<(&str, String)> = vec![
+        (
+            "an [[upstreams]] field",
+            format!(
+                "{base}[[upstreams]]\nname = \"u\"\nkind = \"anthropic\"\nbase_url = \"https://api.anthropic.com\"\n"
+            ),
+        ),
+        (
+            "[[models]]",
+            format!("{base}[[models]]\nid = \"fable\"\ndisplay_name = \"Fable\"\n"),
+        ),
+        (
+            "[[routes]]",
+            format!("{base}[[routes]]\nmodel = \"fable\"\n"),
+        ),
+        ("[server.auth]", format!("{base}[server.auth]\n")),
+        (
+            "[server.pool].hard_threshold",
+            format!("{base}[server.pool]\nhard_threshold = 0.9\n"),
+        ),
+    ];
+    for (name, changed) in edits {
+        fs::write(&rig.config, changed).expect("config");
+        supervisor.step(t0.after(secs(2)));
+        assert_eq!(
+            rig.slot().state,
+            GatewayState::Healthy,
+            "{name} keeps the child"
+        );
+        assert!(stub::alive(pid), "{name} never stops the child");
+    }
+    assert_eq!(
+        rig.calls().len(),
+        1,
+        "no respawn for any hot-reloadable edit"
+    );
+}
+
+/// One hot-reloadable edit inside a present restart-only table, driven end to
+/// end in a fresh sandbox: spawn on `spawn_config`, edit to `changed_config`,
+/// and assert no restart and no check.
+#[cfg(unix)]
+fn keep_case(name: &str, case: &RestartCase) {
+    let rig = Rig::new("0.49.1");
+    let (spawn_config, changed_config) = case(rig.port);
+    fs::write(&rig.config, spawn_config).expect("spawn config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "{name}: spawns healthy"
+    );
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, changed_config).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "{name} keeps the child"
+    );
+    assert!(stub::alive(pid), "{name} never stops the child");
+    assert_eq!(rig.calls().len(), 1, "no respawn for {name}");
+}
+
+/// A non-member sibling inside a restart-only table hot-reloads: editing it
+/// never restarts the child, even while the member table is present.
+#[cfg(unix)]
+#[test]
+fn a_non_member_edit_inside_a_member_table_keeps_the_child() {
+    // One keep case per member table: a sibling or content edit that leaves
+    // every fact inside it unchanged. `[server.usage]` and `[server.oauth_usage]`
+    // have no fields of their own, so an arbitrary key stands in for their
+    // content (presence alone is the fact).
+    let cases: Vec<(&str, Box<RestartCase>)> = vec![
+        (
+            "[server] sse_keepalive_seconds beside the bind facts",
+            Box::new(|p| {
+                (
+                    format!("{}sse_keepalive_seconds = 60\n", base_config(p)),
+                    format!("{}sse_keepalive_seconds = 61\n", base_config(p)),
+                )
+            }),
+        ),
+        (
+            "a [[server.admin.write_keys]] edit under a present table",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.admin]\n[[server.admin.write_keys]]\nid = \"tollgate\"\nkey = \"first\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.admin]\n[[server.admin.write_keys]]\nid = \"tollgate\"\nkey = \"second\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.limits] max_request_bytes",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.limits]\nmax_request_bytes = 1000\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.limits]\nmax_request_bytes = 2000\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.spend] blocked_message",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.spend]\nblocked_message = \"nope\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.spend]\nblocked_message = \"denied\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.pool] hard_threshold beside usage_refresh_seconds",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.pool]\nusage_refresh_seconds = 120\nhard_threshold = 0.9\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.pool]\nusage_refresh_seconds = 120\nhard_threshold = 0.95\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.gateway] trust_forwarded_for",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.gateway]\ntrust_forwarded_for = true\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.gateway]\ntrust_forwarded_for = false\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.codex_endpoint] provider",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.codex_endpoint]\nprovider = \"codex\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.codex_endpoint]\nprovider = \"other\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.usage] a field",
+            Box::new(|p| {
+                (
+                    format!("{}[server.usage]\nnote = \"a\"\n", base_config(p)),
+                    format!("{}[server.usage]\nnote = \"b\"\n", base_config(p)),
+                )
+            }),
+        ),
+        (
+            "[server.oauth_usage] a field",
+            Box::new(|p| {
+                (
+                    format!("{}[server.oauth_usage]\nnote = \"a\"\n", base_config(p)),
+                    format!("{}[server.oauth_usage]\nnote = \"b\"\n", base_config(p)),
+                )
+            }),
+        ),
+        (
+            "a [[server.status.sources]] URL edit with the list non-empty",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.status]\n[[server.status.sources]]\nprovider = \"claude\"\nurl = \"https://status.claude.com/api/v2/summary.json\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.status]\n[[server.status.sources]]\nprovider = \"claude\"\nurl = \"https://status.anthropic.com/api/v2/summary.json\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.status] sources absent -> sources = [] (shunt starts no poller either way)",
+            Box::new(|p| {
+                (
+                    format!("{}[server.status]\nrefresh_seconds = 300\n", base_config(p)),
+                    format!(
+                        "{}[server.status]\nrefresh_seconds = 300\nsources = []\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.status] sources = [] -> absent",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.status]\nrefresh_seconds = 300\nsources = []\n",
+                        base_config(p)
+                    ),
+                    format!("{}[server.status]\nrefresh_seconds = 300\n", base_config(p)),
+                )
+            }),
+        ),
+    ];
+    for (name, case) in &cases {
+        keep_case(name, case.as_ref());
+    }
+}
+
+/// Changing two restart-only members at once names both key paths in fact-set
+/// order, comma-separated.
+#[cfg(unix)]
+#[test]
+fn a_two_setting_edit_names_both_key_paths_in_order() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n[server.admin]\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        pid,
+        "server.bind, [server.admin]",
+        &changed,
+    );
+}
+
+/// A missing spawn baseline cannot prove that the child loaded the edited
+/// config: require a successful check and one respawn before accepting facts.
+#[cfg(unix)]
+#[test]
+fn a_child_whose_spawn_read_failed_checks_and_restarts_on_the_first_readable_round() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    let pid = rig.only_call().pid;
+    // Simulate the parent's independent post-spawn read losing an editor race.
+    supervisor.child.as_mut().unwrap().spawn_mark = None;
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        pid,
+        "unknown spawn-time restart settings",
+        &changed,
+    );
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(5)));
+    assert_eq!(rig.calls().len(), 2, "the new child establishes a baseline");
+    assert_eq!(rig.check_runs(), 1);
+    assert!(supervisor.child.as_ref().unwrap().spawn_mark.is_some());
+}
+
+/// A config whose `[sentry]` subtree holds `nan` compares equal to itself
+/// round after round (the mark holds a digest, never the raw value): an
+/// unchanged round never restarts.
+#[cfg(unix)]
+#[test]
+fn a_config_holding_nan_in_a_value_fact_does_not_restart_on_an_unchanged_round() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(
+        &rig.config,
+        format!(
+            "{}[sentry]\ndsn = \"\"\ntraces_sample_rate = nan\n",
+            base_config(rig.port)
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    // The config is untouched: a NaN value fact must not read as changed.
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "an unchanged NaN fact never restarts"
+    );
+    assert!(
+        stub::alive(pid),
+        "the child stays alive across unchanged rounds"
+    );
+    assert_eq!(rig.calls().len(), 1, "no respawn on an unchanged NaN fact");
+    assert_eq!(
+        rig.check_runs(),
+        0,
+        "no check runs on an unchanged NaN fact"
+    );
+}
+
+#[cfg(unix)]
+fn with_admin_table(rig: &Rig) -> String {
+    format!("{}[server.admin]\n", base_config(rig.port))
+}
+
+/// Exercise every restart fact without a loopback listener, independently of
+/// the end-to-end stub cases above.
+#[cfg(unix)]
+#[test]
+fn restart_facts_cover_every_transition_and_ignore_hot_edits() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("shunt.toml");
+    let read = |text: String| {
+        fs::write(&config, text).unwrap();
+        RestartFacts::read(&config).unwrap()
+    };
+    let profiles = member_profiles();
+    assert_eq!(profiles.len(), FACT_SPECS.len());
+    for (p, spec) in profiles.iter().zip(FACT_SPECS) {
+        assert_eq!(p.path, spec.path);
+        assert_eq!(p.keys, spec.keys);
+        assert_eq!(kind_name(p.kind), kind_name(spec.kind));
+        let absent = read((p.absent)(3067));
+        let present = read((p.present_a)(3067));
+        assert_eq!(present.changed_since(&absent), [p.path]);
+        assert_eq!(absent.changed_since(&present), [p.path]);
+        if let Some(other) = p.present_b {
+            assert_eq!(read(other(3067)).changed_since(&present), [p.path]);
+        }
+        if let Some(empty) = p.empty {
+            assert_eq!(read(empty(3067)), absent);
+        }
+    }
+    let base = read(
+        "[server]\nbind = '127.0.0.1:3067'\nshutdown_timeout_seconds = 2\n[sentry]\nrate = nan\n"
+            .into(),
+    );
+    let hot = read("# reordered and edited hot fields\n[server]\nsse_keepalive_seconds = 60\nshutdown_timeout_seconds = 2\nbind = '127.0.0.1:3067'\n[sentry]\nrate = nan\n[[models]]\nid = 'fable'\n".into());
+    assert_eq!(hot, base);
+    fs::write(&config, "[server]\nlimits = 'broken'").unwrap();
+    assert!(RestartFacts::read(&config).is_err());
+    fs::write(&config, "not = [toml").unwrap();
+    assert!(RestartFacts::read(&config).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn restart_check_memoizes_refusal_rechecks_and_never_logs_stderr() {
+    let home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let config = home.home().join("shunt.toml");
+    fs::write(&config, "[server]\nbind = '127.0.0.1:3067'\n").unwrap();
+    let binary = crate::testutil::write_shim(
+        home.home(),
+        "shunt",
+        r#"
+        echo check >> "$(dirname "$0")/checks"
+        if [ ! -e "$(dirname "$0")/pass" ]; then echo 'SECRET-ONLY-IN-CHECK-STDERR' >&2; exit 1; fi
+    "#,
+    );
+    let mut record = GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(binary);
+    let change = RestartChange {
+        settings: vec!["server.bind"],
+    };
+    let mut memo = RefusedCheck::default();
+    let now = Instant::now();
+    let cancel = AtomicBool::new(false);
+    assert!(!restart_cleared(&record, &change, &mut memo, now, &cancel));
+    assert!(!restart_cleared(
+        &record,
+        &change,
+        &mut memo,
+        now + secs(59),
+        &cancel
+    ));
+    assert_eq!(
+        fs::read_to_string(home.home().join("checks"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    fs::write(home.home().join("pass"), "").unwrap();
+    assert!(restart_cleared(
+        &record,
+        &change,
+        &mut memo,
+        now + secs(60),
+        &cancel
+    ));
+    assert_eq!(
+        fs::read_to_string(home.home().join("checks"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let logs = lines.snapshot();
+    assert_eq!(logs.len(), 1, "one refusal log: {logs:?}");
+    assert!(logs[0].contains("config changed server.bind"));
+    assert!(!logs[0].contains("SECRET-ONLY-IN-CHECK-STDERR"));
+}
+
+#[cfg(unix)]
+#[test]
+fn restart_check_is_cancelled_before_spawn_and_during_a_wedged_check() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("shunt.toml");
+    fs::write(&config, "[server]\nbind = '127.0.0.1:3067'\n").unwrap();
+    let binary = crate::testutil::write_shim(
+        home.home(),
+        "shunt",
+        r#"echo entered > "$(dirname "$0")/entered"; exec sleep 30"#,
+    );
+    let mut record = GatewayRecord::new(config).unwrap();
+    record.binary = Some(binary);
+    let cancel = Arc::new(AtomicBool::new(true));
+    assert!(crate::gateway::check_adopted_config(&record, &cancel).is_err());
+    assert!(!home.home().join("entered").exists());
+    cancel.store(false, Ordering::Release);
+    let entered = home.home().join("entered");
+    let stopper = std::thread::spawn({
+        let cancel = Arc::clone(&cancel);
+        move || {
+            stub::wait_until("our check enters", secs(5), || entered.exists());
+            cancel.store(true, Ordering::Release);
+        }
+    });
+    let started = Instant::now();
+    assert!(crate::gateway::check_adopted_config(&record, &cancel).is_err());
+    stopper.join().unwrap();
+    assert!(started.elapsed() < secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_table_edit_after_spawn_logs_once_and_the_repaired_bind_restarts() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    let pid = rig.only_call().pid;
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = '0.0.0.0:{}'\nlimits = 'SECRET-NOT-A-TABLE'\n",
+            rig.port
+        ),
+    )
+    .unwrap();
+    for seconds in 2..=4 {
+        supervisor.step(t0.after(secs(seconds)));
+    }
+    assert!(stub::alive(pid));
+    assert_eq!(rig.calls().len(), 1);
+    assert_eq!(rig.check_runs(), 0);
+    let refusal = |line: &&String| {
+        line.contains("cannot read the shunt gateway's restart settings at server.limits.max_request_header_bytes")
+    };
+    assert_eq!(rig.lines.snapshot().iter().filter(refusal).count(), 1);
+    assert!(
+        !rig.lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("SECRET-NOT-A-TABLE"))
+    );
+    let changed = format!(
+        "[server]\nbind = '0.0.0.0:{}'\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(5)),
+        pid,
+        "server.bind",
+        &changed,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_baseline_never_stops_the_child_until_the_check_passes() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    let pid = rig.only_call().pid;
+    supervisor.child.as_mut().unwrap().spawn_mark = None;
+    fs::write(rig.dir.join("check-fail"), "").unwrap();
+    supervisor.step(t0.after(secs(1)));
+    supervisor.step(t0.after(secs(2)));
+    assert!(stub::alive(pid));
+    assert!(supervisor.child.as_ref().unwrap().spawn_mark.is_none());
+    assert_eq!(
+        rig.check_runs(),
+        1,
+        "refusal memo applies to unknown baselines too"
+    );
+    fs::remove_file(rig.dir.join("check-fail")).unwrap();
+    let changed = format!(
+        "[server]\nbind = '0.0.0.0:{}'\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(61)),
+        pid,
+        "unknown spawn-time restart settings",
+        &changed,
     );
 }

@@ -122,7 +122,7 @@ pub(crate) fn compute_burn_rates_from_history(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    compute_burn_rates_at(
+    compute_burn_rates_from_history_at(
         history,
         windows,
         lookback_ms,
@@ -132,8 +132,9 @@ pub(crate) fn compute_burn_rates_from_history(
     )
 }
 
-/// The history fit with an explicit clock, shared by cache-only reports.
-pub(crate) fn compute_burn_rates_at(
+/// The same derivation at an explicit clock: the one captured with a decision's
+/// usage reading, or a cache-only report's.
+pub(crate) fn compute_burn_rates_from_history_at(
     history: &[(u64, UsageInfo)],
     windows: &[(&str, &UsageWindow)],
     lookback_ms: u64,

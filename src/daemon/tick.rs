@@ -342,6 +342,10 @@ impl super::Daemon {
                 current_key_rejected_names(&broken_snapshot, &cfg.profiles)
                     .into_iter()
                     .collect();
+            if decision.cooldown_blocked(&cfg.state) {
+                self.switch_backoff = None;
+                return;
+            }
             // Revalidate under the fresh config (reloaded at the top of this
             // tick). Only a record that CARRIES a key-rejection cause can be
             // stale: a repair landing between the scan's queue and this dispatch
@@ -380,10 +384,16 @@ impl super::Daemon {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 self.switch_backoff = None;
-                if returning {
-                    logline!("tollgate daemon: returned to preferred account '{target}'");
-                } else {
-                    logline!("tollgate daemon: switched to '{target}'");
+                let reason = decision
+                    .reason
+                    .as_deref()
+                    .unwrap_or("queued switch: legacy decision");
+                if changed && returning {
+                    logline!(
+                        "tollgate daemon: returned to preferred account '{target}' ({reason})"
+                    );
+                } else if changed {
+                    logline!("tollgate daemon: switched to '{target}' ({reason})");
                 }
                 // The `cfg` guard is dropped at the block's end above, so this
                 // republish holds no config lock. A no-op switch (target already

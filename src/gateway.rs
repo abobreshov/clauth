@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -1778,6 +1778,34 @@ fn run_check(
     cwd: &Path,
     env: &GatewayEnv,
 ) -> Result<()> {
+    run_check_inner(binary, candidate, config, cwd, env, None)
+}
+
+/// Check the adopted config with the same cwd and scrubbed env as a spawn.
+pub(crate) fn check_adopted_config(
+    record: &GatewayRecord,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    run_check_inner(
+        record.shunt_binary(),
+        record.config(),
+        record.config(),
+        gateway_cwd(record)?,
+        &gateway_env(record)?,
+        Some(cancel),
+    )
+}
+
+fn run_check_inner(
+    binary: &Path,
+    candidate: &Path,
+    config: &Path,
+    cwd: &Path,
+    env: &GatewayEnv,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire));
+    anyhow::ensure!(!cancelled(), "gateway check cancelled");
     let mut command = Command::new(binary);
     command
         .arg("check")
@@ -1803,16 +1831,17 @@ fn run_check(
     let bound = check_timeout();
     let deadline = Instant::now() + bound;
     let status = loop {
+        if cancelled() {
+            stop_check_child(child, true)?;
+            anyhow::bail!("gateway check cancelled");
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(CHECK_POLL_INTERVAL),
             outcome => {
-                // Only a child that already exited refuses the kill; the wait
-                // reaps it either way, so none is ever left running.
-                let _ = child.kill();
-                child
-                    .wait()
-                    .with_context(|| format!("failed to reap {}", binary.display()))?;
+                // The supervisor must reach its shutdown deadline even when
+                // a killed check remains stuck in uninterruptible I/O.
+                stop_check_child(child, cancel.is_some())?;
                 return match outcome {
                     Err(e) => {
                         Err(e).with_context(|| format!("failed to wait on {}", binary.display()))
@@ -1831,8 +1860,9 @@ fn run_check(
         return Ok(());
     }
     let stderr = stderr
-        .map(|chunks| collect_stderr(&chunks, deadline))
+        .map(|chunks| collect_stderr(&chunks, deadline, cancel))
         .unwrap_or_default();
+    anyhow::ensure!(!cancelled(), "gateway check cancelled");
     Err(ConfigEditRefusal::CheckFailed {
         binary: binary.to_path_buf(),
         config: config.to_path_buf(),
@@ -1840,6 +1870,27 @@ fn run_check(
         stderr: CheckStderr(String::from_utf8_lossy(&stderr).trim().to_string()),
     }
     .into())
+}
+
+fn stop_check_child(mut child: Child, detached: bool) -> Result<()> {
+    let _ = child.kill();
+    if detached {
+        reap_check_async(move || {
+            let _ = child.wait();
+        })
+    } else {
+        child.wait().context("failed to reap gateway check")?;
+        Ok(())
+    }
+}
+
+/// A check's reap may outlive the stop budget; its supervisor never waits on it.
+fn reap_check_async(wait: impl FnOnce() + Send + 'static) -> Result<()> {
+    std::thread::Builder::new()
+        .name("tollgate-check-reaper".into())
+        .spawn(wait)
+        .map(|_| ())
+        .context("cannot spawn gateway check reaper")
 }
 
 /// How much of a failed check's stderr the refusal keeps. shunt 0.47.0's
@@ -1875,10 +1926,26 @@ fn drain_stderr(mut pipe: ChildStderr) -> Receiver<Vec<u8>> {
 
 /// The stderr that arrives before `deadline`, the check's own bound: a
 /// process the check started can hold the pipe open past the check's exit.
-fn collect_stderr(chunks: &Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+fn collect_stderr(
+    chunks: &Receiver<Vec<u8>>,
+    deadline: Instant,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
-    while let Ok(chunk) = chunks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        bytes.extend(chunk);
+    while Instant::now() < deadline
+        && !cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = if cancel.is_some() {
+            remaining.min(CHECK_POLL_INTERVAL)
+        } else {
+            remaining
+        };
+        match chunks.recv_timeout(wait) {
+            Ok(chunk) => bytes.extend(chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
     bytes
 }

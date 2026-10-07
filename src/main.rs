@@ -17,6 +17,7 @@ mod herdr;
 mod hermes;
 mod hook_context;
 mod hook_note;
+mod hook_resume;
 mod hot_swap;
 mod identity;
 mod import;

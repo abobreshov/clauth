@@ -1360,6 +1360,10 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
         endpoint: None,
         provider: None,
         isolated: false,
+        cwd: None,
+        spawned_by: None,
+        host_session: None,
+        host_pid: 0,
         idle_secs: Some(300),
         // A background job's record is collectable from its reserve; the
         // liveness spelling belongs to a blocking run alone.
@@ -1775,7 +1779,7 @@ fn a_minted_provider_rides_the_record_to_the_served_by_clause() {
         "the heartbeat writes the mint's provider onto the running record"
     );
 
-    jobs::write_done(
+    jobs::write_done_parts(
         &id,
         "work",
         1000,
@@ -1809,7 +1813,7 @@ fn a_minted_provider_rides_the_record_to_the_served_by_clause() {
 fn a_normal_isolated_done_record_renders_its_envelope() {
     let _home = HomeSandbox::new();
     let id = jobs::new_job_id(1000);
-    jobs::write_done(
+    jobs::write_done_parts(
         &id,
         "work",
         1000,
@@ -1970,7 +1974,7 @@ fn an_endpointless_done_record_collects_as_endpoint_unknown() {
         None,
     ))
     .expect("save oauth profile");
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-old-0",
         "work",
         1,
@@ -2287,7 +2291,7 @@ fn run_delegate_never_returns_between_spawning_the_reader_and_taking_the_capture
 fn monitor_done_returns_envelope_and_evicts() {
     let _home = HomeSandbox::new();
     let env = serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" });
-    jobs::write_done("d-done-0", "work", 1, None, None, false, env).unwrap();
+    jobs::write_done_parts("d-done-0", "work", 1, None, None, false, env).unwrap();
 
     let result = call_monitor("d-done-0");
     assert_ne!(result.is_error, Some(true));
@@ -2310,7 +2314,7 @@ fn monitor_done_returns_envelope_and_evicts() {
 #[test]
 fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
     let _home = HomeSandbox::new();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-scalar-0",
         "work",
         1,
@@ -2358,7 +2362,7 @@ fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
 #[test]
 fn monitor_done_claims_the_job_before_the_result_renders() {
     let _home = HomeSandbox::new();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-keep-0",
         "work",
         1,
@@ -2404,7 +2408,7 @@ fn monitor_done_claims_the_job_before_the_result_renders() {
 #[test]
 fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
     let _home = HomeSandbox::new();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-render-0",
         "work",
         1,
@@ -2440,7 +2444,7 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
 #[test]
 fn monitor_batch_returns_one_result_per_id_in_order() {
     let _home = HomeSandbox::new();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-b1-0",
         "work",
         1,
@@ -2510,7 +2514,7 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
 #[test]
 fn monitor_batch_names_an_unknown_cause_once_at_the_tail() {
     let _home = HomeSandbox::new();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-cause-0",
         "work",
         1,
@@ -2603,7 +2607,7 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
     // The done result is multi-line on purpose: real delegate output wraps,
     // and a single-line fixture would let the line count pass for the wrong
     // reason (the count would pin the fixture, not the per-job shape).
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-b1-0",
         "work",
         1,
@@ -2673,7 +2677,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
     let _home = HomeSandbox::new();
     // Minted two hours ago, finalized a moment ago: the shape of any long run.
     let minted = now_ms() - 2 * 60 * 60 * 1000;
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-salvage-0",
         "work",
         minted,
@@ -2689,7 +2693,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
         }),
     )
     .unwrap();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-bystander-0",
         "work",
         minted,
@@ -2745,7 +2749,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
 #[test]
 fn monitor_batch_failed_job_is_a_protocol_error() {
     let _home = HomeSandbox::new();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-fail-0",
         "work",
         1,
@@ -2755,7 +2759,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         serde_json::json!({"profile": "work", "is_error": true, "result": "boom"}),
     )
     .unwrap();
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-ok-0",
         "work",
         1,
@@ -2792,7 +2796,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
     );
     assert!(jobs::read("d-ok-0").is_none(), "an ok job is still evicted");
 
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-ok2-0",
         "work",
         1,
@@ -2816,7 +2820,7 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
     // The unrelated file the stored `job_id` names: it must survive a fetch
     // of the mismatched file. With the pre-fix code the batch evicted by the
     // stored id, deleting whatever path the hand-written file pointed at.
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-decoy-0",
         "work",
         1,
@@ -2971,7 +2975,7 @@ fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_
          `d-<base36-ms>-<counter>`); check the id `delegate` handed back"
     );
 
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-pin-done-0",
         "work",
         1,
@@ -3859,6 +3863,7 @@ fn an_abandoned_blocking_fanout_hands_every_member_off() {
                     endpoint: None,
                     provider: None,
                     isolation: Isolation::Shared,
+                    origin: super::DelegateOrigin::default(),
                 });
                 handoff.mark_spawned();
                 handoff
@@ -6275,7 +6280,7 @@ fn an_in_band_error_envelope_carries_the_scan_to_the_recording_site() {
 fn a_done_jobs_listing_renders_the_resume_sentence() {
     let _home = HomeSandbox::new();
     let id = "d-779700-0";
-    jobs::write_done(
+    jobs::write_done_parts(
         id,
         "work",
         1,
@@ -6317,7 +6322,7 @@ fn a_done_jobs_listing_renders_the_resume_sentence() {
 fn a_resume_with_the_delivered_id_resolves_the_transcript() {
     let _home = HomeSandbox::new();
     let id = "d-779800-0";
-    jobs::write_done(
+    jobs::write_done_parts(
         id,
         "work",
         1,
@@ -6455,7 +6460,7 @@ fn the_cancel_registry_holds_a_flag_only_while_the_run_is_registered() {
 fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
     let _home = HomeSandbox::new();
     let id = "d-778000-0";
-    jobs::write_done(
+    jobs::write_done_parts(
         id,
         "work",
         1,
@@ -6517,7 +6522,7 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
 fn cancelling_a_finished_job_this_server_does_not_hold_says_it_finished() {
     let _home = HomeSandbox::new();
     let id = "d-779000-0";
-    jobs::write_done(
+    jobs::write_done_parts(
         id,
         "work",
         1,
@@ -6833,7 +6838,7 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
 
     // The finalize `launch_background_delegate` runs on every outcome.
     let id = "d-780000-0";
-    jobs::write_done(id, "work", 1, None, None, false, envelope).unwrap();
+    jobs::write_done_parts(id, "work", 1, None, None, false, envelope).unwrap();
     let record = jobs::read(id).expect("the job file is finalized");
     assert_eq!(
         record.state,
@@ -6912,7 +6917,7 @@ fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
     // `unknown` in its own slot — so the note is what has to leave it alone. A
     // done record for the safe id makes a note clause exist, so the pin reads
     // the NOTE itself rather than the batch's own first row.
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-1-0",
         "work",
         1,
@@ -6951,7 +6956,14 @@ fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
 #[test]
 fn a_reserved_job_is_cancellable_before_its_task_starts() {
     let _home = HomeSandbox::new();
-    let reserved = reserve_background_job("work", None, None, Isolation::Shared).expect("reserve");
+    let reserved = reserve_background_job(
+        "work",
+        None,
+        None,
+        Isolation::Shared,
+        super::DelegateOrigin::default(),
+    )
+    .expect("reserve");
     let job_id = reserved.spec.job_id.clone();
     assert!(
         super::cancel_job(&job_id),
@@ -7295,6 +7307,7 @@ fn mint_spec(profile: &str) -> super::MintSpec {
         endpoint: None,
         provider: None,
         isolation: Isolation::Shared,
+        origin: super::DelegateOrigin::default(),
     }
 }
 
@@ -7944,7 +7957,14 @@ fn a_spawn_write_that_lost_the_race_to_the_crossing_is_cleared_too() {
 #[test]
 fn a_reserved_run_is_already_across_the_seam_and_a_hand_off_cannot_move_it() {
     let _home = HomeSandbox::new();
-    let reserved = reserve_background_job("work", None, None, Isolation::Shared).expect("reserve");
+    let reserved = reserve_background_job(
+        "work",
+        None,
+        None,
+        Isolation::Shared,
+        super::DelegateOrigin::default(),
+    )
+    .expect("reserve");
     let job_id = reserved.spec.job_id.clone();
     let handoff = super::Handoff::reserved(reserved);
 
@@ -9082,4 +9102,144 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
         "profile not found: cx; cx names a CODEX account, which these tools do not manage — \
          they are Claude Code only. Switch it with `tollgate <name>`"
     );
+}
+
+/// The origin stamps the conversation that spawned the delegate from the
+/// server's own `CLAUDE_CODE_SESSION_ID`, and its host process from the
+/// server's parent; an empty or absent variable (a server launched outside
+/// Claude Code) stamps no session id rather than a blank one every such server
+/// would share.
+#[test]
+fn the_delegate_origin_stamps_the_host_session_off_the_server_env() {
+    let home = HomeSandbox::new();
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    let host = |value: Option<&str>| {
+        let _pin = crate::testutil::EnvPin::new(
+            &home,
+            &[("CLAUDE_CODE_SESSION_ID", value.map(std::ffi::OsStr::new))],
+        );
+        DelegateOrigin::resolve(&config, None, None).host_session
+    };
+    #[cfg(unix)]
+    assert_eq!(
+        DelegateOrigin::resolve(&config, None, None).host_pid,
+        std::os::unix::process::parent_id(),
+        "the host process is this server's parent"
+    );
+    assert_eq!(host(Some("sess-host-1")), Some("sess-host-1".to_string()));
+    assert_eq!(host(Some("")), None, "an empty id stamps nothing");
+    assert_eq!(host(None), None, "no id stamps nothing");
+}
+
+/// Off unix the host pid comes from Claude Code's session records: the
+/// `<pid>.json` whose `sessionId` names the server's session. A record for
+/// another session, a non-record file and an absent dir name no host.
+#[test]
+fn the_session_record_naming_the_session_gives_the_host_pid() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pid = std::process::id();
+    let expected = cfg!(unix).then_some(pid);
+    std::fs::write(
+        dir.path().join("4242.json"),
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-q"}).to_string(),
+    )
+    .expect("write host record");
+    std::fs::write(
+        dir.path().join("5151.json"),
+        r#"{"pid":5151,"sessionId":"sess-peer","name":"repo-p"}"#,
+    )
+    .expect("write peer record");
+    std::fs::write(dir.path().join("4242.abc.key"), "not json").expect("write key");
+    assert_eq!(session_record_pid(dir.path(), "sess-host"), expected);
+    assert_eq!(session_record_pid(dir.path(), "sess-none"), None);
+    assert_eq!(
+        session_record_pid(&dir.path().join("absent"), "sess-host"),
+        None
+    );
+    // Two live matching records:
+    // ambiguous, so no host rather than a wrong one.
+    std::fs::write(
+        dir.path().join("6060.json"),
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-q"}).to_string(),
+    )
+    .expect("write duplicate record");
+    assert_eq!(session_record_pid(dir.path(), "sess-host"), None);
+}
+
+/// The off-unix host lookup reads the server's `CLAUDE_CODE_SESSION_ID` and the
+/// session's config dir (`CLAUDE_CONFIG_DIR`, else `~/.claude`).
+#[test]
+fn the_session_host_pid_reads_the_server_env_and_config_dir() {
+    let home = HomeSandbox::new();
+    let pid = std::process::id();
+    let expected = cfg!(unix).then_some(pid);
+    let config = home.home().join("runtime-x");
+    std::fs::create_dir_all(config.join("sessions")).expect("sessions dir");
+    std::fs::write(
+        config.join("sessions").join("4242.json"),
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-q"}).to_string(),
+    )
+    .expect("write record");
+    assert_eq!(session_host_pid(), None, "no session id, no host");
+    let global = home.home().join(".claude").join("sessions");
+    std::fs::create_dir_all(&global).expect("global sessions dir");
+    std::fs::write(
+        global.join("5151.json"),
+        serde_json::json!({"pid":pid,"sessionId":"sess-host","name":"repo-g"}).to_string(),
+    )
+    .expect("write global record");
+    let _sid = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-host")),
+            ),
+            ("CLAUDE_CONFIG_DIR", Some(std::ffi::OsStr::new(""))),
+        ],
+    );
+    assert_eq!(
+        session_host_pid(),
+        expected,
+        "an empty CLAUDE_CONFIG_DIR falls back to ~/.claude"
+    );
+    drop(_sid);
+    std::fs::write(
+        global.join("5151.json"),
+        serde_json::json!({"pid":pid,"sessionId":"other-session"}).to_string(),
+    )
+    .expect("replace global record");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let _sid = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-host")),
+        )],
+    );
+    assert_eq!(session_host_pid(), expected);
+}
+
+#[test]
+fn a_sole_matching_dead_session_record_never_stamps_a_host_pid() {
+    let home = HomeSandbox::new();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    let sessions = home.home().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        serde_json::json!({"pid":pid,"sessionId":"same-id"}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(session_record_pid(&sessions, "same-id"), None);
 }

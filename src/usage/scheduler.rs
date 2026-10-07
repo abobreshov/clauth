@@ -248,12 +248,40 @@ pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQue
 /// dispatch revalidates the decision itself instead of inferring intent from the
 /// ambient broken map — a stale mark left beside a since-converted/re-keyed name
 /// must not drop an ordinary exhaustion switch.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub(crate) struct PendingSwitchTarget {
     pub(crate) target: String,
     /// `(active name, recorded fingerprint)` set only when the active's key
     /// rejection caused this switch-away.
     pub(crate) key_rejected_cause: Option<(String, u64)>,
+    pub(crate) reason: Option<String>,
+    pub(crate) proactive: bool,
+}
+
+impl PendingSwitchTarget {
+    /// Recheck a queued home move after an intervening successful switch.
+    pub(crate) fn cooldown_blocked(&self, state: &crate::profile::AppState) -> bool {
+        self.proactive
+            && state.last_switch_at.is_some_and(|last| {
+                (now_epoch_secs().max(0) as u64)
+                    .checked_sub(last)
+                    .is_some_and(|elapsed| elapsed < state.walk_cooldown_secs())
+            })
+    }
+}
+
+// A changing explanatory figure must not create a second queued action.
+impl PartialEq for PendingSwitchTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target && self.key_rejected_cause == other.key_rejected_cause
+    }
+}
+impl Eq for PendingSwitchTarget {}
+impl std::hash::Hash for PendingSwitchTarget {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.target.hash(state);
+        self.key_rejected_cause.hash(state);
+    }
 }
 
 /// Auto-switch targets posted by the scheduler when the active profile crosses its threshold.
@@ -3914,16 +3942,19 @@ fn apply_codex_switch(
             .map(|m| m.name.clone())
             .collect();
     }
-    let Some(action) = crate::fallback::next_auto_switch_target(&snapshot, &state.store) else {
+    let Some(decision) =
+        crate::fallback::next_auto_switch_decision(&snapshot, &snapshot, &state.store)
+    else {
         return;
     };
-    match action {
+    match decision.action {
         crate::fallback::SwitchAction::To(target) => {
             if let Err(e) = crate::actions::switch_codex_profile(target.as_str()) {
                 logline!("tollgate: codex auto-switch to '{target}' failed: {e:#}");
             } else {
                 logline!(
-                    "tollgate: codex auto-switched to '{target}' — live at the next codex session"
+                    "tollgate: codex auto-switched to '{target}' ({}) — live at the next codex session",
+                    decision.reason
                 );
             }
         }
@@ -3934,7 +3965,10 @@ fn apply_codex_switch(
             }) {
                 logline!("tollgate: codex switch-off failed: {e:#}");
             } else {
-                logline!("tollgate: every codex account is spent — codex active slot cleared");
+                logline!(
+                    "tollgate: every codex account is spent ({}) — codex active slot cleared",
+                    decision.reason
+                );
             }
         }
     }
@@ -4551,6 +4585,8 @@ pub(crate) fn scan_auto_switch(
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
             key_rejection_necessary,
+            reason,
+            proactive,
         }) => {
             // The record carries WHY this switch-away was queued: the active's
             // key rejection (its recorded fingerprint) only when the evaluator
@@ -4569,6 +4605,8 @@ pub(crate) fn scan_auto_switch(
                 p.insert(PendingSwitchTarget {
                     target: name,
                     key_rejected_cause,
+                    reason: Some(reason),
+                    proactive,
                 });
             }
         }
@@ -4693,6 +4731,9 @@ fn scan_session_switches(
         row,
     } in pending
     {
+        // Session swaps own their cooldown; a global switch does not relink
+        // this session's credentials. Registry swap times are milliseconds.
+        snapshot.last_switch_at = row.last_swap_at.map(|at| at / 1000);
         // Neither of these is config state, so `snapshot_session_chain` cannot fill
         // them — same split `scan_auto_switch` works to. `reading_dead` follows the
         // same split again (issue #83's dead-reading bypass).
@@ -4854,6 +4895,7 @@ fn scan_recovery(
                     let profile = cfg.find(name);
                     crate::fallback::ChainMember {
                         name: name.clone(),
+                        oauth: profile.is_some_and(crate::profile::Profile::is_oauth),
                         threshold: profile
                             .map(crate::fallback::threshold_for)
                             .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
@@ -4895,6 +4937,8 @@ fn scan_recovery(
         p.insert(PendingSwitchTarget {
             target: name,
             key_rejected_cause: None,
+            reason: Some("chain recovery: subscription headroom restored".into()),
+            proactive: false,
         });
     }
 }

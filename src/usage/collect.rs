@@ -278,7 +278,7 @@ fn apply_running_rates(
     now_ms: u64,
 ) {
     let windows = usage.windows();
-    let rates = super::burn::compute_burn_rates_at(
+    let rates = super::burn::compute_burn_rates_from_history_at(
         history,
         &windows,
         super::BURN_LOOKBACK_MS,
