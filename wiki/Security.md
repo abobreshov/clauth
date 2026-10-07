@@ -26,6 +26,8 @@ tollgate reads one credential it does not own: for a `nous` monitor, Hermes' Nou
 
 ## Secrets rules
 
+- **Login identity stays local.** The owner-only `account_identity.json` snapshot contains email and organization details, personal data rather than credentials. It appears only in the selected Setup pane, verify/login toasts and `tollgate login` stdout. Status, usage, MCP, APIs, hooks, tags and logs expose no login identity details; duplicate feeds carry a profile name only.
+
 - **Monitoring keys by name only.** `monitors.toml` and a profile's `billing_key_env` hold the NAME of an environment variable. The value is read from the fetching process's environment at fetch time, used for the one read that needs it, and dropped: never written to disk, logged, printed, or put in argv.
 - **Refused where a name goes.** A value shaped like a key (`sk-or-…`, a long mixed string), a secret-shaped key in a `[[monitor]]` table (`api_key`, `token`, …), and process variables (`PATH`, `HOME`, `XDG_*`, `HERDR_*`, `CLAUDE_CONFIG_DIR`, …) are all refused. A `monitors.toml` parse error names the line and column with quoted values and credential-shaped words redacted, so a pasted key never reaches the terminal or `daemon.log`.
 - **Scrubbed from children.** Every variable a monitor or a `billing_key_env` names is removed from each `claude` and `codex` session tollgate spawns (`tollgate start`, the MCP `delegate`). The shunt gateway does not inherit the monitoring-only ones either; a monitor's `api_key_env` is left for it, since that is an inference key.

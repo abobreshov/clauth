@@ -88,7 +88,7 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `new account` |
 | Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
-| Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` | none |
+| Setup | `duplicate account`, `save as preset`, `apply preset`, `verify login` (`v`), `open provider console` | none |
 | Status | none | `refresh status`, `open in browser` |
 | every tab | none | `start daemon` / `stop daemon`, last |
 
@@ -103,6 +103,7 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
 | `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
 | `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
+| `verify login` (`v`) | reads the stored OAuth login's account once, without rotating the token; available with credentials and hidden while verification runs. Reports identity changes and duplicate accounts in a local toast |
 | `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax, Ollama Cloud (and the local Ollama daemon, whose usage key is minted on the same page) and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint tollgate does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
 There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
@@ -119,6 +120,9 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `type` | read-only `api` or `oauth`, off the base-url row and tracking what you type into it |
 | `provider` | read-only, present only for an endpoint tollgate recognises: which provider it typed the account as |
 | `token` | read-only state of a stored long-lived setup token, above the editable rows, in one of eight states. Static: `long-lived · ~Nd left`, `expires in ~Nd` inside a month, `long-lived · no recorded expiry`, and `expired`. Rolling: `rolling · re-stamps in ~Nh`, `rolling · re-stamp due` inside the last hour, `rolling · no recorded expiry`, and `rolling token stalled` once nothing re-stamped it in time. `mis-filled` is neither: the sidecar holds a rotating pair the split cannot use. The charged states carry the fix beneath them ([Configuration](Configuration#account-types)) |
+| `login` / `usage login` | read-only stored OAuth email, or login availability/scope; static setup-token sessions carry a separate scope caveat |
+| `account` | read-only short account UUID, organization and plan, when anchored |
+| `identity` | read-only verification age, pending/unknown identity, details pending, stale-anchor warning or duplicate-account explanation. These lines sit after `token`, before the editable rows |
 | `name` | the profile name |
 | `auto-start` | whether tollgate opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
 | `base url` | the API endpoint; blank means an OAuth account |
@@ -127,7 +131,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
 | env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one removes the key |
 | `+ login` / `re-login` | what it runs depends on the account, the same three-way split `tollgate login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone. While a browser login runs its modal offers <kbd>r</kbd> to open the browser again, <kbd>c</kbd> to copy the sign-in link for another device to your local clipboard through the terminal (OSC 52: kitty, WezTerm, Windows Terminal, tmux with `set-clipboard on`, and iTerm2 once `General > Selection > Applications in terminal may access clipboard` is on), and <kbd>p</kbd> to turn that row into a code field: type or paste the code the link's page shows, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back; a bad paste clears the field and says why |
-| `log out` | drops the stored credentials, keeps the profile |
+| `log out` | drops stored credentials and all login identity files, keeps the profile |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again, or signs Claude Code out when the account has only an api key behind it; the row's hint names which. Appears while ANY long-lived piece exists — the token, the preserved mint backup, or a set `rolling_token` flag — arms on the first press, clears on the second (the full exit: flag, sidecar, and backup together). Faint and inert when clearing would strip the account's last credential; a flag-only account disarms regardless, since no credential is touched |
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
 | `delete account` | removes the profile; arms on the first press, deletes on the second |

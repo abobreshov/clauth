@@ -83,3 +83,90 @@ fn a_correctly_paired_read_still_returns_the_value() {
         "an absent foreign file still reads as no cache, guard or not",
     );
 }
+
+#[test]
+fn identity_snapshot_round_trips_and_is_private() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let mut identity = AccountIdentity::uuid_only(AccountId::from("account-uuid"), 1234);
+    identity.email = Some("canary@example.invalid".to_string());
+    identity.organization_name = Some("Canary Org".to_string());
+    assert!(write_profile_cache_reported(
+        &name,
+        ACCOUNT_IDENTITY_FILE,
+        &identity
+    ));
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(identity)
+    );
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(profile_cache_path(&name, ACCOUNT_IDENTITY_FILE).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn login_identity_pending_wins_over_anchor_and_snapshot() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    crate::usage::seed_login_identity(
+        &name,
+        Some(&AccountIdentity::uuid_only(AccountId::from("uuid"), 1)),
+    );
+    begin_login_install(&name).unwrap();
+    assert_eq!(login_identity(&name), LoginIdentity::Pending);
+}
+
+#[test]
+fn login_identity_rejects_details_bound_to_another_anchor() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let identity = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    assert!(write_profile_cache_reported(
+        &name,
+        ACCOUNT_IDENTITY_FILE,
+        &identity
+    ));
+    assert!(write_profile_cache_reported(
+        &name,
+        ACCOUNT_ID_CACHE_FILE,
+        &AccountId::from("new")
+    ));
+    assert_eq!(
+        login_identity(&name),
+        LoginIdentity::Anchored {
+            account: AccountId::from("new"),
+            details: None
+        }
+    );
+}
+
+#[test]
+fn login_identity_matching_details_are_available() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    assert_eq!(login_identity(&name), LoginIdentity::Unanchored);
+    let identity = AccountIdentity::uuid_only(AccountId::from("uuid"), 1);
+    crate::usage::seed_login_identity(&name, Some(&identity));
+    assert_eq!(
+        login_identity(&name),
+        LoginIdentity::Anchored {
+            account: identity.account_uuid.clone(),
+            details: Some(identity)
+        }
+    );
+}

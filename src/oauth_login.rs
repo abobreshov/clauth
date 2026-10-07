@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::logline::logline;
-use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
+use crate::profile::{ClaudeCredentials, OAuthToken};
 use crate::usage::now_ms;
 
 /// Claude Code's authorize endpoint for a Pro/Max **subscription** login
@@ -557,14 +557,14 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
     }
 }
 
-/// A completed interactive login: the minted credentials plus the account uuid
-/// the verification probe saw them authenticate as. `account_uuid` is `None` when
+/// A completed interactive login: the minted credentials plus the identity
+/// the verification probe saw them authenticate as. `identity` is `None` when
 /// the probe failed or the body carried no usable uuid — the login still stands,
 /// and the anchor is simply left to the hourly ride-along backfill.
 #[derive(Debug, Clone)]
 pub(crate) struct LoginOutcome {
     pub(crate) credentials: ClaudeCredentials,
-    pub(crate) account_uuid: Option<AccountId>,
+    pub(crate) identity: Option<crate::profile_cache::AccountIdentity>,
 }
 
 /// Why a `tollgate login` produced no credential.
@@ -673,7 +673,7 @@ fn finish_login(
     // second identical request. Best-effort: a probe failure never fails the login
     // — tollgate's usage poll re-derives the tier within a cycle and the anchor
     // backfills on the hourly ride-along.
-    let mut account_uuid = None;
+    let mut identity = None;
     if let Some(oauth) = creds.claude_ai_oauth.as_mut()
         && let Ok(probe) = crate::usage::probe_login_profile(&oauth.access_token)
     {
@@ -681,11 +681,11 @@ fn finish_login(
         if let Some(tier) = probe.rate_limit_tier {
             oauth.set_rate_limit_tier(tier);
         }
-        account_uuid = probe.account_uuid;
+        identity = probe.identity;
     }
     Ok(LoginOutcome {
         credentials: creds,
-        account_uuid,
+        identity,
     })
 }
 

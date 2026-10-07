@@ -2981,3 +2981,110 @@ pub(crate) fn seq_of(line: &str) -> u64 {
     }
     panic!("no --seq in report line: {line}");
 }
+
+/// Persist duplicate OAuth profiles with personal-data canaries. Caller owns a
+/// HomeSandbox; all feeds must retain only the twin's profile name.
+pub(crate) fn identity_canary_config() -> crate::profile::AppConfig {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    register_names(&["canary-one", "canary-two"]);
+    let profiles: Vec<_> = ["canary-one", "canary-two"]
+        .into_iter()
+        .map(|name| {
+            let mut p = Profile::new(name.to_string(), None, None);
+            p.credentials = Some(ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: format!("access-{name}"),
+                    refresh_token: Some(format!("refresh-{name}")),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            });
+            crate::profile::save_profile(&p).expect("save canary profile");
+            let mut identity = crate::profile_cache::AccountIdentity::uuid_only(
+                "a91fd47c-identity-canary-account".into(),
+                1,
+            );
+            identity.email = Some("canary@example.invalid".to_string());
+            identity.organization_name = Some("Canary Org".to_string());
+            identity.organization_uuid = Some("canary-org-uuid".to_string());
+            crate::usage::seed_login_identity(&p.name, Some(&identity));
+            assert!(matches!(
+                crate::profile_cache::login_identity(&p.name),
+                crate::profile_cache::LoginIdentity::Anchored {
+                    details: Some(_),
+                    ..
+                }
+            ));
+            p
+        })
+        .collect();
+    let config = AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..Default::default()
+        },
+        profiles,
+    };
+    crate::profile::save_app_state(&config.state).expect("save canary roster");
+    assert_eq!(
+        crate::profile_cache::same_account_as(&config, &"canary-two".into()).as_deref(),
+        Some("canary-one")
+    );
+    config
+}
+
+pub(crate) fn assert_no_identity_canary(text: &str) {
+    for personal in [
+        "canary@example.invalid",
+        "Canary Org",
+        "canary-org-uuid",
+        "a91fd47c-identity-canary-account",
+        "a91fd47c",
+    ] {
+        assert!(!text.contains(personal), "identity leaked: {personal}");
+    }
+}
+
+/// A single cache write failure, scoped to a home sandbox and exact payload
+/// file. It leaves filesystem permissions unchanged so stale-file deletion
+/// remains possible and replacement-write failures can be tested separately.
+static CACHE_WRITE_FAILURE: std::sync::Mutex<Option<(crate::profile::ProfileName, &'static str)>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) struct CacheWriteFailureSandbox<'a>(std::marker::PhantomData<&'a HomeSandbox>);
+
+impl<'a> CacheWriteFailureSandbox<'a> {
+    pub(crate) fn new(
+        _home: &'a HomeSandbox,
+        name: &crate::profile::ProfileName,
+        file: &'static str,
+    ) -> Self {
+        let mut failure = CACHE_WRITE_FAILURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            failure.is_none(),
+            "cache-write failure sandbox already active"
+        );
+        *failure = Some((name.clone(), file));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for CacheWriteFailureSandbox<'_> {
+    fn drop(&mut self) {
+        *CACHE_WRITE_FAILURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+pub(crate) fn cache_write_fails(name: &crate::profile::ProfileName, file: &str) -> bool {
+    CACHE_WRITE_FAILURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(target, cache)| target == name && *cache == file)
+}

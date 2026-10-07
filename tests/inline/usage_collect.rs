@@ -630,3 +630,18 @@ fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
     out.sort();
     out
 }
+
+#[test]
+fn identity_canary_stays_out_of_observations() {
+    let _home = HomeSandbox::new();
+    let config = crate::testutil::identity_canary_config();
+    let codex = CodexState::default();
+    let observations = collect_with(
+        &ctx(&config, &codex, crate::usage::now_ms()),
+        &CollectOpts::default(),
+        &[],
+        &[],
+    );
+    assert_eq!(observations.len(), 2);
+    crate::testutil::assert_no_identity_canary(&serde_json::to_string(&observations).unwrap());
+}

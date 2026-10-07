@@ -824,7 +824,7 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                 ),
                 (
                     "a",
-                    "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+                    "duplicate the account \u{b7} save / apply a preset \u{b7} verify login",
                 ),
                 (
                     "disable / enable",

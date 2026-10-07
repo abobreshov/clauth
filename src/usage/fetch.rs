@@ -8,7 +8,8 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
-    ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
+    ACCOUNT_ID_CACHE_FILE, ACCOUNT_IDENTITY_FILE, AccountIdentity, PROFILE_FETCHED_CACHE_FILE,
+    load_profile_cache, remove_profile_cache, write_profile_cache_reported,
 };
 
 use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
@@ -885,6 +886,10 @@ struct RawProfile {
 #[derive(Deserialize)]
 struct RawProfileAccount {
     #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    email_address: Option<String>,
+    #[serde(default)]
     uuid: Option<String>,
     #[serde(default)]
     has_claude_max: bool,
@@ -895,11 +900,62 @@ struct RawProfileAccount {
 #[derive(Deserialize)]
 struct RawProfileOrg {
     #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     organization_type: Option<String>,
     #[serde(default)]
     rate_limit_tier: Option<String>,
     #[serde(default)]
     subscription_status: Option<String>,
+}
+
+/// Retain only bounded, display-safe optional details. The binding uuid is
+/// deliberately only trimmed, matching the anchor exactly.
+fn identity_from_raw(profile: &RawProfile, now_ms: u64) -> Option<AccountIdentity> {
+    fn detail(value: Option<&str>) -> Option<String> {
+        value.and_then(crate::profile_cache::sanitize_identity_detail)
+    }
+    let account = profile.account.as_ref()?;
+    let uuid = account.uuid.as_deref()?.trim();
+    if uuid.is_empty() {
+        return None;
+    }
+    let org = profile.organization.as_ref();
+    Some(AccountIdentity {
+        account_uuid: AccountId::from(uuid),
+        email: detail(account.email.as_deref())
+            .or_else(|| detail(account.email_address.as_deref())),
+        organization_uuid: detail(org.and_then(|o| o.uuid.as_deref())),
+        organization_name: detail(org.and_then(|o| o.name.as_deref())),
+        organization_type: detail(org.and_then(|o| o.organization_type.as_deref())),
+        verified_at_ms: now_ms,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReconcileOutcome {
+    Same,
+    Replaced { previous: Option<AccountId> },
+    WriteFailed,
+    NoUuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerifyOutcome {
+    NoStoredLogin,
+    Expired,
+    RateLimited(Option<Duration>),
+    Refused,
+    NoProfileScope,
+    Network,
+    Unreadable,
+    StoreMoved,
+    Verified {
+        identity: AccountIdentity,
+        reconcile: ReconcileOutcome,
+    },
 }
 
 /// HTTP layer error. `Status` carries an HTTP code so the fetch path can
@@ -1115,7 +1171,7 @@ fn get_json(
             plan: None,
         });
     }
-    if status >= 400 {
+    if status >= 400 || (matches!(client, AuthClient::Profile) && status != 200) {
         return Err(FetchError::Status(status));
     }
     response
@@ -1301,23 +1357,11 @@ fn fetch_profile_plan(
     let p: RawProfile = serde_json::from_str(&text).ok()?;
     // Both ride-alongs in ONE state-flock hold behind ONE stored-token check:
     // the anchor reconcile and the rate-limit tier stamp share the body's guard.
-    let tier = raw_rate_limit_tier(&p);
     let ride_along = crate::lock::with_state_lock(|held| {
         if !crate::profile::stored_token_matches(name, &token) {
             return Ok(());
         }
-        reconcile_identity_anchor_held(name, &p, held);
-        if let Some(tier) = &tier {
-            match crate::profile::stamp_rate_limit_tier_if_missing_held(name, tier, held) {
-                Ok(true) => {
-                    logline!(
-                        "tollgate: {name}: backfilled the rate-limit tier into the stored chain"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => logline!("tollgate: {name}: rate-limit tier backfill failed: {e:#}"),
-            }
-        }
+        apply_profile_read_held(name, &p, held);
         Ok::<(), anyhow::Error>(())
     });
     if let Err(e) = ride_along {
@@ -1413,42 +1457,130 @@ pub(crate) fn fetch_raw(
 /// ride-alongs share ONE hold and ONE stored-token check). A same-account read
 /// keeps the anchor and clears any pending marker; a replacement atomically
 /// writes the resolved uuid. A failed write removes the displaced anchor,
-/// and both values are logged only when the write landed.
+/// and identity values never enter the logs.
 fn reconcile_identity_anchor_held(
     name: &ProfileName,
-    profile: &RawProfile,
+    identity: &AccountIdentity,
     _held: &crate::lock::StateLockHeld,
-) {
-    let Some(uuid) = profile
-        .account
-        .as_ref()
-        .and_then(|a| a.uuid.as_deref())
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-    else {
-        return;
-    };
-    let new_uuid = AccountId::from(uuid.to_string());
+) -> ReconcileOutcome {
     let current = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
-    if current.as_deref() == Some(uuid) {
+    if current.as_ref() == Some(&identity.account_uuid) {
         remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
-        return;
+        if !write_profile_cache_reported(name, ACCOUNT_IDENTITY_FILE, identity) {
+            logline!("tollgate: {name}: could not write its login identity details");
+            return ReconcileOutcome::WriteFailed;
+        }
+        return ReconcileOutcome::Same;
     }
-    // Replace atomically; remove the displaced anchor only on write failure.
-    let landed =
-        crate::profile_cache::write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid);
-    if !landed {
+    if !write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &identity.account_uuid) {
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
         logline!("tollgate: {name}: could not write the identity anchor");
-    } else {
-        remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
+        return ReconcileOutcome::WriteFailed;
     }
-    if landed
-        && let Some(old) = current
-        && old.trim() != uuid
+    remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
+    if !write_profile_cache_reported(name, ACCOUNT_IDENTITY_FILE, identity) {
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
+        logline!("tollgate: {name}: could not write its login identity details");
+        return ReconcileOutcome::WriteFailed;
+    }
+    if current.is_some() {
+        logline!("tollgate: {name}: reconciled its identity anchor");
+    }
+    ReconcileOutcome::Replaced { previous: current }
+}
+
+/// Apply the existing `/profile` ride-alongs under the caller's stored-token
+/// guard, shared by hourly reads and explicit verification. No TTL acquisition.
+fn apply_profile_read_held(
+    name: &ProfileName,
+    profile: &RawProfile,
+    held: &crate::lock::StateLockHeld,
+) -> (Option<AccountIdentity>, ReconcileOutcome) {
+    let identity = identity_from_raw(profile, now_ms());
+    let reconcile = identity
+        .as_ref()
+        .map_or(ReconcileOutcome::NoUuid, |identity| {
+            reconcile_identity_anchor_held(name, identity, held)
+        });
+    if let Some(tier) = raw_rate_limit_tier(profile) {
+        match crate::profile::stamp_rate_limit_tier_if_missing_held(name, &tier, held) {
+            Ok(true) => {
+                logline!("tollgate: {name}: backfilled the rate-limit tier into the stored chain")
+            }
+            Ok(false) => {}
+            Err(e) => logline!("tollgate: {name}: rate-limit tier backfill failed: {e:#}"),
+        }
+    }
+    (identity, reconcile)
+}
+
+/// Read the committed token directly and verify it once, without rotation or
+/// touching the hourly profile TTL. Guest mode changes only per-profile caches.
+pub(crate) fn verify_login(name: &ProfileName) -> VerifyOutcome {
+    let credentials = crate::profile::profile_subpath(name, "credentials.json")
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<crate::profile::ClaudeCredentials>(&bytes).ok());
+    let Some(oauth) = credentials
+        .and_then(|c| c.claude_ai_oauth)
+        .filter(|o| !o.access_token.is_empty())
+    else {
+        return VerifyOutcome::NoStoredLogin;
+    };
+    if oauth
+        .expires_at
+        .is_some_and(|expiry| i128::from(now_ms()) >= i128::from(expiry))
     {
-        logline!("tollgate: {name}: identity anchor {old:?} -> {new_uuid:?}");
+        return VerifyOutcome::Expired;
     }
+    let text = match get_json(
+        profile_endpoint().as_ref(),
+        &oauth.access_token,
+        None,
+        name,
+        AuthClient::Profile,
+    ) {
+        Ok(text) => text,
+        Err(FetchError::RateLimited { retry_after, .. }) => {
+            return VerifyOutcome::RateLimited(retry_after);
+        }
+        Err(FetchError::Status(status @ (401 | 403))) => {
+            return crate::lock::with_state_lock(|_| {
+                Ok::<_, anyhow::Error>(
+                    if !crate::profile::stored_token_matches(name, &oauth.access_token) {
+                        VerifyOutcome::StoreMoved
+                    } else if status == 401 {
+                        VerifyOutcome::Refused
+                    } else {
+                        VerifyOutcome::NoProfileScope
+                    },
+                )
+            })
+            .unwrap_or(VerifyOutcome::Network);
+        }
+        Err(_) => return VerifyOutcome::Network,
+    };
+    let Ok(profile) = serde_json::from_str::<RawProfile>(&text) else {
+        return VerifyOutcome::Unreadable;
+    };
+    if identity_from_raw(&profile, now_ms()).is_none() {
+        return VerifyOutcome::Unreadable;
+    }
+    crate::lock::with_state_lock(|held| {
+        if !crate::profile::stored_token_matches(name, &oauth.access_token) {
+            return Ok(VerifyOutcome::StoreMoved);
+        }
+        let (identity, reconcile) = apply_profile_read_held(name, &profile, held);
+        Ok::<_, anyhow::Error>(match identity {
+            Some(identity) => VerifyOutcome::Verified {
+                identity,
+                reconcile,
+            },
+            None => VerifyOutcome::Unreadable,
+        })
+    })
+    .unwrap_or(VerifyOutcome::Network)
 }
 
 /// Test-facing wrapper for [`reconcile_identity_anchor_held`]: take the state
@@ -1461,7 +1593,9 @@ fn reconcile_identity_anchor(name: &ProfileName, access_token: &str, profile: &R
         if !crate::profile::stored_token_matches(name, access_token) {
             return Ok(());
         }
-        reconcile_identity_anchor_held(name, profile, held);
+        if let Some(identity) = identity_from_raw(profile, now_ms()) {
+            reconcile_identity_anchor_held(name, &identity, held);
+        }
         Ok::<(), anyhow::Error>(())
     });
     if let Err(e) = result {
@@ -1478,7 +1612,7 @@ fn reconcile_identity_anchor(name: &ProfileName, access_token: &str, profile: &R
 pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
     pub(crate) rate_limit_tier: Option<String>,
-    pub(crate) account_uuid: Option<AccountId>,
+    pub(crate) identity: Option<AccountIdentity>,
 }
 
 /// The org's raw `rate_limit_tier` off a parsed `/profile` body, trimmed;
@@ -1518,11 +1652,7 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
             PlanTier::Free => Some("free".to_string()),
             PlanTier::Unknown => None,
         },
-        account_uuid: p
-            .account
-            .and_then(|a| a.uuid)
-            .filter(|u| !u.trim().is_empty())
-            .map(AccountId::from),
+        identity: identity_from_raw(&p, now_ms()),
     }
 }
 
@@ -1574,6 +1704,7 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
             logline!("tollgate: {name}: could not mark its identity unverified: {e:#}");
         }
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
         return;
     };
     // Atomic replacement: a proven login never passes through a missing anchor.
@@ -1588,7 +1719,10 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
             // Adoption may arrive without a pre-install marker. Never delete
             // its already-correct proof, or expose an unguarded unknown login.
             match crate::profile_cache::begin_login_install(name) {
-                Ok(()) => remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE),
+                Ok(()) => {
+                    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+                    remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
+                }
                 Err(e) => logline!(
                     "tollgate: {name}: could not mark its identity unverified; \
                      leaving its existing anchor untouched: {e:#}"
@@ -1596,6 +1730,29 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
             }
         }
         logline!("tollgate: {name}: could not write the identity anchor");
+    }
+    let anchor = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
+    if !load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
+        .is_some_and(|identity| Some(&identity.account_uuid) == anchor.as_ref())
+    {
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
+    }
+}
+
+/// Seed details only after the committed anchor proves the observed login.
+pub(crate) fn seed_login_identity(name: &ProfileName, identity: Option<&AccountIdentity>) {
+    seed_login_anchor(name, identity.map(|i| &i.account_uuid));
+    let anchor = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
+    if let Some(identity) = identity
+        && anchor.as_ref() == Some(&identity.account_uuid)
+    {
+        if !write_profile_cache_reported(name, ACCOUNT_IDENTITY_FILE, identity) {
+            logline!("tollgate: {name}: could not write its login identity details");
+        }
+    } else if !load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
+        .is_some_and(|snapshot| Some(&snapshot.account_uuid) == anchor.as_ref())
+    {
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
     }
 }
 
@@ -1623,6 +1780,7 @@ pub(crate) fn prepare_runtime_login_change(
     if current.is_none() || runtime_uuid.as_ref() != current.as_ref() {
         crate::profile_cache::begin_login_install(&name)?;
         remove_profile_cache(&name, ACCOUNT_ID_CACHE_FILE);
+        remove_profile_cache(&name, ACCOUNT_IDENTITY_FILE);
     }
     Ok(())
 }

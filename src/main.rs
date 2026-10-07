@@ -1204,6 +1204,18 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
         "tollgate: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
     );
+    if let Some(identity) = &outcome.identity
+        && let Some(email) = &identity.email
+    {
+        let org = identity
+            .organization_name
+            .as_deref()
+            .or(identity.organization_uuid.as_deref());
+        match org {
+            Some(org) => outln!("signed in as {email} · {org}"),
+            None => outln!("signed in as {email}"),
+        }
+    }
     // The uuid the login's own verification probe saw rides the snapshot to
     // whichever action commits it, which is what anchors the profile — so
     // `oauth::try_adopt_live_rotation` can prove a diverged live login is the
@@ -1214,7 +1226,7 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
         base_url: None,
         api_key: None,
         anchor: outcome
-            .account_uuid
+            .identity
             .map(actions::AnchorAction::Proven)
             .unwrap_or(actions::AnchorAction::Unproven),
     })

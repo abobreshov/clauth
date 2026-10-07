@@ -4725,7 +4725,8 @@ fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
 fn login_outcome(refresh: &str, uuid: Option<&str>) -> crate::oauth_login::LoginOutcome {
     crate::oauth_login::LoginOutcome {
         credentials: login_creds(refresh),
-        account_uuid: uuid.map(crate::profile::AccountId::from),
+        identity: uuid
+            .map(|uuid| crate::profile_cache::AccountIdentity::uuid_only(uuid.into(), 123)),
     }
 }
 
@@ -17023,4 +17024,352 @@ fn monitor_usage_cannot_toggle_local_profile_estimates_or_pace() {
             .iter()
             .any(|i| matches!(i.action, ActionMenuAction::ToggleEstimates))
     );
+}
+
+#[test]
+fn setup_oauth_login_verify_has_a_pinned_hotkey_and_hides_while_running() {
+    use super::{ConfigFocus, Tab, build_action_menu};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(login_creds("refresh"));
+    let mut app = app_with(vec![profile]);
+    app.tab = Tab::Setup;
+    for focus in [ConfigFocus::Profiles, ConfigFocus::Actions] {
+        app.config_focus = focus;
+        let menu = build_action_menu(&app);
+        assert!(
+            menu.items
+                .iter()
+                .any(|item| { (item.label, item.hotkey) == ("verify login", Some('v')) })
+        );
+        assert_eq!(menu.items[3].label, "verify login", "after apply preset");
+        app.verify_login_inflight = Some("acct".into());
+        assert!(
+            !build_action_menu(&app)
+                .items
+                .iter()
+                .any(|item| item.label == "verify login")
+        );
+        app.verify_login_inflight = None;
+    }
+    app.config().profiles[0].credentials = None;
+    assert!(
+        !build_action_menu(&app)
+            .items
+            .iter()
+            .any(|item| item.label == "verify login")
+    );
+    app.config().profiles[0].api_key = Some("test-key".to_string());
+    app.config().profiles[0].base_url = Some("https://provider.example.invalid".to_string());
+    assert!(
+        !build_action_menu(&app)
+            .items
+            .iter()
+            .any(|item| item.label == "verify login")
+    );
+}
+
+#[test]
+fn verify_login_dispatch_worker_and_drain_name_success_and_duplicates() {
+    use super::{ActionMenuAction, Tab, ToastKind, dispatch_action_menu_action};
+    use crate::profile::Profile;
+    use crate::testutil::{EndpointSandbox, HomeSandbox, register_names, serve_endpoints};
+    for state in ["same", "pending", "unanchored", "duplicate"] {
+        let home = HomeSandbox::new();
+        register_names(&["acct", "leadtone"]);
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.credentials = Some(login_creds("refresh"));
+        crate::profile::save_profile(&profile).unwrap();
+        let mut other = Profile::new("leadtone".to_string(), None, None);
+        other.credentials = Some(login_creds("other-refresh"));
+        if state == "same" {
+            crate::usage::seed_login_anchor(&profile.name, Some(&"uuid-account".into()));
+        } else if state == "pending" {
+            crate::profile_cache::begin_login_install(&profile.name).unwrap();
+        } else if state == "duplicate" {
+            crate::usage::seed_login_anchor(&other.name, Some(&"uuid-account".into()));
+        }
+        let (base, server) = serve_endpoints(3, |_, _| {
+            (200, r#"{"account":{"uuid":"uuid-account","email":"acct@example.invalid"},"organization":{"uuid":"org-acct","name":"Example Org"}}"#.to_string())
+        });
+        let _endpoints = EndpointSandbox::new(&home, &base);
+        let mut app = app_with(vec![profile, other]);
+        app.tab = Tab::Setup;
+        dispatch_action_menu_action(&mut app, ActionMenuAction::VerifyLogin);
+        assert_eq!(app.verify_login_inflight.as_deref(), Some("acct"));
+        assert_eq!(app.toasts.back().unwrap().body, "verifying 'acct'");
+        dispatch_action_menu_action(&mut app, ActionMenuAction::VerifyLogin);
+        assert_eq!(app.toasts.len(), 1, "an in-flight probe cannot start twice");
+        assert!(
+            !super::build_action_menu(&app)
+                .items
+                .iter()
+                .any(|item| item.label == "verify login")
+        );
+        super::join_test_workers();
+        super::drain_verify_login(&mut app);
+        assert!(app.verify_login_inflight.is_none());
+        let toast = app.toasts.back().unwrap();
+        if state == "duplicate" {
+            assert_eq!(toast.kind, ToastKind::Warning);
+            assert!(
+                toast
+                    .body
+                    .starts_with("'acct' is the same Anthropic account as 'leadtone'\n")
+            );
+            assert!(toast.body.contains("likely one quota"));
+        } else {
+            assert_eq!(toast.kind, ToastKind::Success, "{state}: {}", toast.body);
+            assert_eq!(
+                toast.body,
+                "verified 'acct'\nacct@example.invalid · acct uuid-acc"
+            );
+        }
+        assert_eq!(server.join().unwrap(), ["/api/oauth/profile"]);
+    }
+}
+
+#[test]
+fn verify_login_failure_toasts_name_the_outcome_and_rearm_the_action() {
+    use super::ToastKind;
+    use crate::usage::VerifyOutcome as V;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let cases = [
+        (
+            V::NoStoredLogin,
+            ToastKind::Warning,
+            "could not verify 'acct'\nno stored login",
+        ),
+        (
+            V::Expired,
+            ToastKind::Warning,
+            "could not verify 'acct'\naccess token expired · refresh it on Usage (r), then verify",
+        ),
+        (
+            V::Refused,
+            ToastKind::Warning,
+            "could not verify 'acct'\nstored access token refused (401) · refresh it on Usage (r); re-login if that fails",
+        ),
+        (
+            V::NoProfileScope,
+            ToastKind::Warning,
+            "could not verify 'acct'\nstored access token has no profile scope (403)",
+        ),
+        (
+            V::RateLimited(Some(std::time::Duration::from_secs(17))),
+            ToastKind::Warning,
+            "could not verify 'acct'\nrate limited (429) · try again in ~17s",
+        ),
+        (
+            V::RateLimited(None),
+            ToastKind::Warning,
+            "could not verify 'acct'\nrate limited (429) · try again later",
+        ),
+        (
+            V::Network,
+            ToastKind::Warning,
+            "could not verify 'acct'\nprofile request failed · try again",
+        ),
+        (
+            V::Unreadable,
+            ToastKind::Warning,
+            "could not verify 'acct'\nprofile identity unreadable",
+        ),
+        (
+            V::StoreMoved,
+            ToastKind::Info,
+            "'acct' changed login during verify · nothing saved",
+        ),
+    ];
+    for (outcome, kind, body) in cases {
+        app.verify_login_inflight = Some("acct".into());
+        app.verify_login_tx.send(("acct".into(), outcome)).unwrap();
+        super::drain_verify_login(&mut app);
+        let toast = app.toasts.back().unwrap();
+        assert_eq!((toast.kind, toast.body.as_str()), (kind, body));
+        assert!(app.verify_login_inflight.is_none());
+    }
+}
+
+#[test]
+fn verify_login_replacement_write_failure_and_org_aware_duplicates() {
+    use super::ToastKind;
+    use crate::profile_cache::AccountIdentity;
+    use crate::usage::{ReconcileOutcome as R, VerifyOutcome as V};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acct", "other"]);
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(login_creds("refresh"));
+    let mut other = crate::profile::Profile::new("other".to_string(), None, None);
+    other.credentials = Some(login_creds("other"));
+    let mut identity = AccountIdentity::uuid_only("uuid-new-account".into(), 123);
+    identity.email = Some("acct@example.invalid".to_string());
+    identity.organization_uuid = Some("org-new".to_string());
+    crate::usage::seed_login_identity(&profile.name, Some(&identity));
+    let mut app = app_with(vec![profile, other]);
+    let replaced = || R::Replaced {
+        previous: Some("uuid-old-account".into()),
+    };
+    let send = |app: &mut super::App, reconcile| {
+        app.verify_login_tx
+            .send((
+                "acct".into(),
+                V::Verified {
+                    identity: identity.clone(),
+                    reconcile,
+                },
+            ))
+            .unwrap();
+        super::drain_verify_login(app);
+    };
+    send(&mut app, replaced());
+    assert_eq!(app.toasts.back().unwrap().kind, ToastKind::Warning);
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "'acct' is now a different account\nacct@example.invalid · acct uuid-new (was uuid-old)"
+    );
+    send(&mut app, R::WriteFailed);
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "could not save the identity of 'acct'\nacct@example.invalid · acct uuid-new · see tollgate.log"
+    );
+    for (org, logged_in, reason) in [
+        (Some("org-new"), true, "both draw on one quota"),
+        (
+            Some("org-other"),
+            true,
+            "different organization · quotas may differ",
+        ),
+        (None, true, "likely one quota"),
+        (
+            Some("org-new"),
+            false,
+            "'other' is logged out but kept its old anchor",
+        ),
+    ] {
+        let mut twin = AccountIdentity::uuid_only(identity.account_uuid.clone(), 123);
+        twin.organization_uuid = org.map(str::to_string);
+        crate::usage::seed_login_identity(&"other".into(), Some(&twin));
+        app.config().profiles[1].credentials = logged_in.then(|| login_creds("other"));
+        send(&mut app, replaced());
+        let toast = app.toasts.back().unwrap();
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert!(
+            toast
+                .body
+                .starts_with("'acct' is the same Anthropic account as 'other'\n")
+        );
+        assert!(toast.body.contains(reason), "{}", toast.body);
+        assert!(toast.body.ends_with(" (was uuid-old)"));
+    }
+}
+
+#[test]
+fn login_email_toasts_stay_local_for_new_and_existing_accounts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acct"]);
+    let mut outcome = login_outcome("refresh", Some("uuid-account"));
+    outcome.identity.as_mut().unwrap().email = Some(" acct\u{202e}@\nexample.invalid ".to_string());
+    let mut new = bare_app();
+    new.config_draft = Some(super::build_draft_new());
+    super::apply_login(&mut new, login_session("acct", true, 1), outcome.clone());
+    assert_eq!(
+        new.toasts.back().unwrap().body,
+        "logged in as acct@example.invalid\ncreate account saves it"
+    );
+    let profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&profile).unwrap();
+    let mut existing = app_with(vec![profile]);
+    super::apply_login(&mut existing, login_session("acct", false, 1), outcome);
+    assert_eq!(
+        existing.toasts.back().unwrap().body,
+        "logged in 'acct'\nas acct@example.invalid"
+    );
+}
+
+#[test]
+fn verify_login_retry_after_toast_rounds_up_partial_seconds() {
+    use super::ToastKind;
+    use crate::usage::VerifyOutcome;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    for (delay, expected_seconds) in [
+        (Duration::ZERO, 0),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_millis(1), 1),
+        (Duration::from_millis(999), 1),
+        (Duration::from_secs(1), 1),
+        (Duration::from_millis(1001), 2),
+        (Duration::from_millis(1999), 2),
+        (Duration::from_secs(2), 2),
+        (Duration::from_millis(2001), 3),
+        (Duration::MAX, u64::MAX),
+    ] {
+        app.verify_login_tx
+            .send(("acct".into(), VerifyOutcome::RateLimited(Some(delay))))
+            .unwrap();
+        super::drain_verify_login(&mut app);
+        let toast = app.toasts.back().unwrap();
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(
+            toast.body,
+            format!(
+                "could not verify 'acct'\nrate limited (429) · try again in ~{expected_seconds}s"
+            ),
+            "{delay:?}"
+        );
+    }
+}
+
+#[test]
+fn verify_login_toasts_sanitize_email_and_both_organization_uuids() {
+    use crate::profile_cache::AccountIdentity;
+    use crate::usage::{ReconcileOutcome, VerifyOutcome};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acct", "twin"]);
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(login_creds("refresh"));
+    let mut twin_profile = crate::profile::Profile::new("twin".to_string(), None, None);
+    twin_profile.credentials = Some(login_creds("twin-refresh"));
+    let mut app = app_with(vec![profile, twin_profile]);
+    let mut identity = AccountIdentity::uuid_only("uuid-account".into(), 123);
+    identity.email = Some(" acct\u{202e}@\nexample.invalid ".to_string());
+    identity.organization_uuid = Some(" org-\u{2066}one ".to_string());
+    crate::usage::seed_login_identity(&"acct".into(), Some(&identity));
+    let send = |app: &mut super::App, identity: AccountIdentity| {
+        app.verify_login_tx
+            .send((
+                "acct".into(),
+                VerifyOutcome::Verified {
+                    identity,
+                    reconcile: ReconcileOutcome::Same,
+                },
+            ))
+            .unwrap();
+        super::drain_verify_login(app);
+    };
+    send(&mut app, identity.clone());
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "verified 'acct'\nacct@example.invalid · acct uuid-acc"
+    );
+    let mut twin = AccountIdentity::uuid_only(identity.account_uuid.clone(), 123);
+    twin.organization_uuid = Some(" org-\none\u{202d} ".to_string());
+    crate::usage::seed_login_identity(&"twin".into(), Some(&twin));
+    send(&mut app, identity.clone());
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "'acct' is the same Anthropic account as 'twin'\nboth draw on one quota · re-login one with the intended account"
+    );
+    identity.organization_uuid = Some("\u{202e}\u{2066}\n".to_string());
+    send(&mut app, identity.clone());
+    assert!(app.toasts.back().unwrap().body.contains("likely one quota"));
+    identity.organization_uuid = Some("org-one".to_string());
+    twin.organization_uuid = Some("\u{202e}\u{2066}\n".to_string());
+    crate::usage::seed_login_identity(&"twin".into(), Some(&twin));
+    send(&mut app, identity);
+    assert!(app.toasts.back().unwrap().body.contains("likely one quota"));
 }

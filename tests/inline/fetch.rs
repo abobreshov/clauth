@@ -194,9 +194,9 @@ fn a_profile_read_asks_about_the_stored_login() {
     );
 }
 
-/// A replacement that changes the uuid is logged with both values (`{:?}` each).
+/// Record an anchor change without placing either account uuid in the log.
 #[test]
-fn a_differing_account_replacement_logs_both_values() {
+fn a_differing_account_replacement_logs_no_identity_values() {
     use crate::profile_cache::load_profile_cache;
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["acme"]);
@@ -235,11 +235,8 @@ fn a_differing_account_replacement_logs_both_values() {
     );
     assert_eq!(
         sink.snapshot(),
-        vec![
-            "tollgate: acme: identity anchor AccountId(\"uuid-live\") -> AccountId(\"uuid-later\")"
-                .to_string()
-        ],
-        "a differing-account replacement logs both values"
+        vec!["tollgate: acme: reconciled its identity anchor".to_string()],
+        "a differing-account replacement logs no identity values"
     );
 }
 
@@ -745,7 +742,7 @@ fn one_login_body_yields_both_the_tier_and_the_uuid() {
         "the tier the login stamps onto the mint"
     );
     assert_eq!(
-        probe.account_uuid.as_deref(),
+        probe.identity.as_ref().map(|i| i.account_uuid.as_str()),
         Some("uuid-live"),
         "the identity the login anchors — from the SAME body, not a second request"
     );
@@ -792,7 +789,7 @@ fn a_login_body_without_a_uuid_still_yields_the_tier() {
     let probe = login_profile_from_raw(login_body(None, true));
     assert_eq!(probe.subscription_type.as_deref(), Some("max"));
     assert_eq!(
-        probe.account_uuid, None,
+        probe.identity, None,
         "no identity to anchor, but the tier still stands"
     );
 }
@@ -805,7 +802,7 @@ fn a_login_body_without_a_tier_still_yields_the_uuid() {
         "an unrecognized tier is None, exactly as the old probe reported it"
     );
     assert_eq!(
-        probe.account_uuid.as_deref(),
+        probe.identity.as_ref().map(|i| i.account_uuid.as_str()),
         Some("uuid-live"),
         "one absent value must not suppress the other"
     );
@@ -816,11 +813,11 @@ fn a_login_bodys_blank_uuid_reads_as_no_identity() {
     // Same contract as `fetch_account_uuid`: two blanks comparing equal must
     // never prove two tokens are the same account.
     assert_eq!(
-        login_profile_from_raw(login_body(Some("   "), true)).account_uuid,
+        login_profile_from_raw(login_body(Some("   "), true)).identity,
         None
     );
     assert_eq!(
-        login_profile_from_raw(login_body(Some(""), true)).account_uuid,
+        login_profile_from_raw(login_body(Some(""), true)).identity,
         None
     );
 }
@@ -845,7 +842,10 @@ fn a_login_body_yields_the_organizations_rate_limit_tier_verbatim() {
         Some("default_claude_max_5x"),
         "the tier is the org's raw string, exactly as Claude Code would store it"
     );
-    assert_eq!(probe.account_uuid.as_deref(), Some("uuid-live"));
+    assert_eq!(
+        probe.identity.as_ref().map(|i| i.account_uuid.as_str()),
+        Some("uuid-live")
+    );
     assert_eq!(
         body(r#"{"organization":{"organization_type":"claude_team"}}"#).rate_limit_tier,
         None,
@@ -2519,4 +2519,494 @@ fn duplicate_account_profile_replies_flag_render_and_block_the_walk() {
     assert!(json[1].get("walk_blocker").is_none());
     assert!(!crate::list::render_table(&config, &entries).contains("same account as"));
     assert!(crate::profile_cache::duplicate_login_warning(&config, &second).is_none());
+}
+
+fn identity_body(email_fields: &str) -> RawProfile {
+    serde_json::from_str(&format!(r#"{{"account":{{"uuid":"  uuid-binding  ","has_claude_pro":true,{email_fields}}},"organization":{{"uuid":" org-uuid ","name":" Example Org ","organization_type":"claude_pro"}}}}"#)).unwrap()
+}
+
+#[test]
+fn identity_parses_email_without_losing_plan_or_binding() {
+    let raw = identity_body(r#""email":"mail@example.invalid""#);
+    let identity = identity_from_raw(&raw, 42).unwrap();
+    assert_eq!(identity.email.as_deref(), Some("mail@example.invalid"));
+    assert_eq!(identity.account_uuid.as_str(), "uuid-binding");
+    assert_eq!(identity.verified_at_ms, 42);
+    assert_eq!(plan_from_profile(&raw).tier, PlanTier::Pro);
+}
+
+#[test]
+fn identity_parses_email_address_without_alias_collision() {
+    let raw = identity_body(r#""email_address":"fallback@example.invalid""#);
+    assert_eq!(
+        identity_from_raw(&raw, 1).unwrap().email.as_deref(),
+        Some("fallback@example.invalid")
+    );
+}
+
+#[test]
+fn identity_parses_both_email_keys_and_prefers_nonblank_email() {
+    let raw = identity_body(
+        r#""email":"mail@example.invalid","email_address":"fallback@example.invalid""#,
+    );
+    let identity = identity_from_raw(&raw, 1).unwrap();
+    assert_eq!(identity.email.as_deref(), Some("mail@example.invalid"));
+    assert_eq!(identity.organization_uuid.as_deref(), Some("org-uuid"));
+    assert_eq!(identity.organization_name.as_deref(), Some("Example Org"));
+    let blank = identity_body(r#""email":"  ","email_address":"fallback@example.invalid""#);
+    assert_eq!(
+        identity_from_raw(&blank, 1).unwrap().email.as_deref(),
+        Some("fallback@example.invalid")
+    );
+}
+
+#[test]
+fn identity_strips_controls_and_bidi_and_bounds_details() {
+    let raw = identity_body(r#""email":" a\u202eb\n@example.invalid ""#);
+    assert_eq!(
+        identity_from_raw(&raw, 1).unwrap().email.as_deref(),
+        Some("ab@example.invalid")
+    );
+    let long = identity_body(&format!(r#""email":"{}""#, "é".repeat(300)));
+    assert_eq!(
+        identity_from_raw(&long, 1)
+            .unwrap()
+            .email
+            .unwrap()
+            .chars()
+            .count(),
+        254
+    );
+    assert!(identity_from_raw(&raw_profile(Some("  ")), 1).is_none());
+}
+
+fn store_identity_test_login(name: &ProfileName, token: &str, expiry: Option<i64>) {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: token.to_string(),
+            refresh_token: Some("refresh-fixture".to_string()),
+            expires_at: expiry,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).unwrap();
+}
+
+#[test]
+fn reconcile_refreshes_same_account_details_and_replaces_old_details() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    seed_login_identity(
+        &name,
+        Some(&AccountIdentity::uuid_only(
+            AccountId::from("uuid-binding"),
+            0,
+        )),
+    );
+    let raw = identity_body(r#""email":"mail@example.invalid""#);
+    let outcome = crate::lock::with_state_lock(|held| {
+        Ok::<_, anyhow::Error>(reconcile_identity_anchor_held(
+            &name,
+            &identity_from_raw(&raw, now_ms()).unwrap(),
+            held,
+        ))
+    })
+    .unwrap();
+    assert_eq!(outcome, ReconcileOutcome::Same);
+    let refreshed = load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).unwrap();
+    assert_eq!(refreshed.email.as_deref(), Some("mail@example.invalid"));
+    assert!(refreshed.verified_at_ms > 0);
+    let outcome = crate::lock::with_state_lock(|held| {
+        Ok::<_, anyhow::Error>(reconcile_identity_anchor_held(
+            &name,
+            &identity_from_raw(&raw_profile(Some("replacement")), now_ms()).unwrap(),
+            held,
+        ))
+    })
+    .unwrap();
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::Replaced {
+            previous: Some(AccountId::from("uuid-binding"))
+        }
+    );
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE)
+            .unwrap()
+            .account_uuid
+            .as_str(),
+        "replacement"
+    );
+}
+
+#[test]
+fn failed_anchor_write_drops_identity_snapshot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    seed_login_identity(
+        &name,
+        Some(&AccountIdentity::uuid_only(AccountId::from("old"), 1)),
+    );
+    let mut state = crate::profile::load_app_state().unwrap();
+    state.profiles.clear();
+    crate::profile::save_app_state(&state).unwrap();
+    let outcome = crate::lock::with_state_lock(|held| {
+        Ok::<_, anyhow::Error>(reconcile_identity_anchor_held(
+            &name,
+            &identity_from_raw(&raw_profile(Some("new")), now_ms()).unwrap(),
+            held,
+        ))
+    })
+    .unwrap();
+    assert_eq!(outcome, ReconcileOutcome::WriteFailed);
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+    assert!(load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
+}
+
+#[test]
+fn token_mismatch_cannot_replace_identity_snapshot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    let old = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&old));
+    reconcile_identity_anchor(
+        &name,
+        "foreign",
+        &identity_body(r#""email":"foreign@example.invalid""#),
+    );
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(old)
+    );
+}
+
+#[test]
+fn seed_anchor_keeps_matching_details_and_drops_mismatched_and_unproven() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let identity = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&identity));
+    seed_login_anchor(&name, Some(&identity.account_uuid));
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(identity.clone())
+    );
+    seed_login_anchor(&name, Some(&AccountId::from("new")));
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+    seed_login_identity(&name, Some(&identity));
+    seed_login_anchor(&name, None);
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+}
+
+#[test]
+fn runtime_identity_invalidation_also_drops_details() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    seed_login_identity(
+        &name,
+        Some(&AccountIdentity::uuid_only(AccountId::from("old"), 1)),
+    );
+    let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    prepare_runtime_login_change(&store, runtime.path()).unwrap();
+    assert!(load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+}
+
+#[test]
+fn fetch_account_uuid_does_not_write_identity_details() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let (base, handle) = crate::testutil::serve_endpoints(3, |_, _| {
+        (
+            200,
+            r#"{"account":{"uuid":"foreign","email":"foreign@example.invalid"}}"#.to_string(),
+        )
+    });
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert_eq!(
+        fetch_account_uuid("foreign-token"),
+        Some(AccountId::from("foreign"))
+    );
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+    assert!(load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
+    assert_eq!(handle.join().unwrap(), vec!["/api/oauth/profile"]);
+}
+
+#[test]
+fn verify_login_without_a_token_makes_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, handle) = crate::testutil::serve_endpoints(3, |_, _| (500, String::new()));
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::testutil::register_names(&["ident"]);
+    assert_eq!(
+        verify_login(&ProfileName::from("ident")),
+        VerifyOutcome::NoStoredLogin
+    );
+    assert!(handle.join().unwrap().is_empty());
+}
+
+#[test]
+fn verify_login_expired_token_makes_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, handle) = crate::testutil::serve_endpoints(3, |_, _| (500, String::new()));
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", Some(now_ms() as i64));
+    assert_eq!(verify_login(&name), VerifyOutcome::Expired);
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+    assert!(handle.join().unwrap().is_empty());
+}
+
+fn verify_first_anchor(pending: bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    if pending {
+        crate::profile_cache::begin_login_install(&name).unwrap();
+    }
+    let (base, handle) = crate::testutil::serve_endpoints(3, |_, _| {
+        (200, r#"{"account":{"uuid":"verified","email":"verified@example.invalid"},"organization":{"name":"Example Org"}}"#.to_string())
+    });
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    let VerifyOutcome::Verified {
+        identity,
+        reconcile,
+    } = verify_login(&name)
+    else {
+        panic!("expected verified");
+    };
+    assert_eq!(reconcile, ReconcileOutcome::Replaced { previous: None });
+    assert_eq!(identity.email.as_deref(), Some("verified@example.invalid"));
+    assert_eq!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+        Some(identity.account_uuid.clone())
+    );
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(identity)
+    );
+    assert!(!crate::profile_cache::identity_pending(&name));
+    assert_eq!(handle.join().unwrap(), vec!["/api/oauth/profile"]);
+}
+
+#[test]
+fn verify_login_pending_profile_writes_first_anchor_in_one_profile_request() {
+    verify_first_anchor(true);
+}
+
+#[test]
+fn verify_login_unanchored_profile_writes_first_anchor_in_one_profile_request() {
+    verify_first_anchor(false);
+}
+
+#[test]
+fn verify_login_401_never_rotates() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    let (base, handle) = crate::testutil::serve_endpoints(3, |_, _| (401, "{}".to_string()));
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert_eq!(verify_login(&name), VerifyOutcome::Refused);
+    assert_eq!(handle.join().unwrap(), vec!["/api/oauth/profile"]);
+}
+
+fn verify_moved_store(status: u16) {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    let identity = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&identity));
+    let path = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+    let (base, handle) = crate::testutil::serve_endpoints(3, move |_, _| {
+        std::fs::write(&path, r#"{"claudeAiOauth":{"accessToken":"moved"}}"#).unwrap();
+        (
+            status,
+            r#"{"account":{"uuid":"new","email":"new@example.invalid"}}"#.to_string(),
+        )
+    });
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert_eq!(verify_login(&name), VerifyOutcome::StoreMoved);
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(identity)
+    );
+    assert_eq!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+        Some(AccountId::from("old"))
+    );
+    assert_eq!(handle.join().unwrap(), vec!["/api/oauth/profile"]);
+}
+
+#[test]
+fn verify_login_401_after_store_moved_is_not_a_refusal() {
+    verify_moved_store(401);
+}
+
+#[test]
+fn verify_login_success_after_store_moved_writes_nothing() {
+    verify_moved_store(200);
+}
+
+#[test]
+fn verify_login_429_makes_one_request_without_retry() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    let (base, handle) = crate::testutil::serve_endpoints_raw_with_headers(3, |_, _| {
+        (
+            429,
+            vec![("Retry-After".to_string(), "7".to_string())],
+            "{}".to_string(),
+        )
+    });
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert_eq!(
+        verify_login(&name),
+        VerifyOutcome::RateLimited(Some(Duration::from_secs(7)))
+    );
+    assert_eq!(
+        handle
+            .join()
+            .unwrap()
+            .iter()
+            .map(|raw| crate::testutil::request_path(raw))
+            .collect::<Vec<_>>(),
+        vec!["/api/oauth/profile"]
+    );
+}
+
+#[test]
+fn verify_login_403_after_store_moved_is_not_a_scope_refusal() {
+    verify_moved_store(403);
+}
+
+fn verify_classified_error(status: u16, body: &str, expected: VerifyOutcome) {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    store_identity_test_login(&name, "stored", None);
+    let body = body.to_string();
+    let (base, handle) = crate::testutil::serve_endpoints(3, move |_, _| (status, body.clone()));
+    let _endpoint = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert_eq!(verify_login(&name), expected);
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+    assert!(load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
+    assert_eq!(handle.join().unwrap(), vec!["/api/oauth/profile"]);
+}
+
+#[test]
+fn verify_login_403_is_missing_profile_scope() {
+    verify_classified_error(403, "{}", VerifyOutcome::NoProfileScope);
+}
+
+#[test]
+fn verify_login_other_http_failure_is_network() {
+    verify_classified_error(503, "{}", VerifyOutcome::Network);
+}
+
+#[test]
+fn verify_login_invalid_json_is_unreadable() {
+    verify_classified_error(200, "not JSON", VerifyOutcome::Unreadable);
+}
+
+#[test]
+fn verify_login_blank_uuid_is_unreadable() {
+    verify_classified_error(
+        200,
+        r#"{"account":{"uuid":"  "}}"#,
+        VerifyOutcome::Unreadable,
+    );
+}
+
+#[test]
+fn verify_login_unexpected_success_status_is_network() {
+    verify_classified_error(
+        201,
+        r#"{"account":{"uuid":"unexpected"}}"#,
+        VerifyOutcome::Network,
+    );
+}
+
+#[test]
+fn replacement_snapshot_write_failure_removes_displaced_details() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let old = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&old));
+    let replacement = AccountIdentity::uuid_only(AccountId::from("new"), 2);
+    let _failure =
+        crate::testutil::CacheWriteFailureSandbox::new(&home, &name, ACCOUNT_IDENTITY_FILE);
+    let outcome = crate::lock::with_state_lock(|held| {
+        Ok::<_, anyhow::Error>(reconcile_identity_anchor_held(&name, &replacement, held))
+    })
+    .unwrap();
+    assert_eq!(outcome, ReconcileOutcome::WriteFailed);
+    assert_eq!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+        Some(replacement.account_uuid)
+    );
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+}
+
+fn seed_double_write_failure_keeps_anchored_details(seed_details: bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let old = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&old));
+    let pending =
+        crate::profile::profile_subpath(&name, crate::profile_cache::IDENTITY_PENDING_FILE)
+            .unwrap();
+    // A directory blocks the atomic pending-marker rename while leaving the
+    // profile directory writable, so a buggy snapshot sweep could delete it.
+    std::fs::create_dir(&pending).unwrap();
+    let _failure =
+        crate::testutil::CacheWriteFailureSandbox::new(&home, &name, ACCOUNT_ID_CACHE_FILE);
+    let replacement = AccountIdentity::uuid_only(AccountId::from("new"), 2);
+    if seed_details {
+        seed_login_identity(&name, Some(&replacement));
+    } else {
+        seed_login_anchor(&name, Some(&replacement.account_uuid));
+    }
+    assert_eq!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+        Some(old.account_uuid.clone())
+    );
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(old)
+    );
+}
+
+#[test]
+fn seed_anchor_double_write_failure_keeps_correct_on_disk_details() {
+    seed_double_write_failure_keeps_anchored_details(false);
+}
+
+#[test]
+fn seed_identity_double_write_failure_keeps_correct_on_disk_details() {
+    seed_double_write_failure_keeps_anchored_details(true);
+}
+
+#[test]
+#[should_panic(expected = "identity leaked: a91fd47c")]
+fn privacy_canary_detects_a_short_account_id_only_leak() {
+    crate::testutil::assert_no_identity_canary("acct a91fd47c");
 }

@@ -151,6 +151,20 @@ struct Snap {
     /// Whether a preserved mint backup sits beside the sidecar — the clear
     /// row's disclosure that a second, restorable credential goes with it.
     has_static_backup: bool,
+    /// Stored login facts are read every frame, independently of draft buffers.
+    login: Option<LoginView>,
+}
+
+struct LoginView {
+    login_is_oauth: bool,
+    has_credentials: bool,
+    setup_token: bool,
+    split: bool,
+    identity: crate::profile_cache::LoginIdentity,
+    same_as: Option<crate::profile::ProfileName>,
+    other_has_credentials: bool,
+    other_identity: Option<crate::profile_cache::LoginIdentity>,
+    plan: Option<String>,
 }
 
 impl Snap {
@@ -200,6 +214,7 @@ impl Snap {
             rolling_token: false,
             rolling_armed: false,
             has_static_backup: false,
+            login: None,
         }
     }
 }
@@ -234,6 +249,23 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => {
             let sidecar = crate::claude::sidecar_summary(&p.name);
+            let same_as = crate::profile_cache::same_account_as(&cfg, &p.name);
+            let other = same_as.as_ref().and_then(|name| cfg.find(name));
+            let rolling = matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _)));
+            let long_lived = sidecar
+                .as_ref()
+                .is_some_and(|(kind, _)| !matches!(kind, crate::claude::SidecarKind::Misfilled));
+            let login = LoginView {
+                login_is_oauth: p.login_is_oauth(),
+                has_credentials: p.credentials.is_some(),
+                setup_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Mint, _))),
+                split: long_lived && !rolling,
+                identity: crate::profile_cache::login_identity(&p.name),
+                other_has_credentials: other.is_some_and(|p| p.credentials.is_some()),
+                other_identity: same_as.as_ref().map(crate::profile_cache::login_identity),
+                same_as,
+                plan: crate::format::account_tier(p).and_then(|t| t.short_label()),
+            };
             Snap {
                 title: p.name.to_string(),
                 name: if with_text {
@@ -295,6 +327,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
                 rolling_armed: p.rolling_token,
                 has_static_backup: crate::claude::has_static_backup(&p.name),
+                login: Some(login),
             }
         }
         None => Snap::blank("settings"),
@@ -420,6 +453,164 @@ fn session_token_lines(
     }
 }
 
+/// Read-only login details; the caller supplies time to keep rendering pure.
+fn login_lines(view: &LoginView, now_ms: i64, width: usize) -> Vec<Line<'static>> {
+    use crate::profile_cache::{LoginIdentity, sanitize_identity_detail};
+    let key = |name: &str| {
+        Span::styled(
+            key_cell(name, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        )
+    };
+    let value = |name: &str, text: &str, style: Style| {
+        super::panes::wrap_words(text, width.saturating_sub(16).max(8))
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| {
+                Line::from(vec![
+                    if i == 0 {
+                        key(name)
+                    } else {
+                        Span::raw("                ")
+                    },
+                    Span::styled(text, style),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    let hint = |text: &str| {
+        super::panes::wrap_words(text, width.saturating_sub(3).max(8))
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| {
+                Line::from(vec![
+                    Span::styled(if i == 0 { " └ " } else { "   " }, theme::faint()),
+                    Span::styled(text, theme::faint()),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    let warning = |name: &str, text: String| {
+        Line::from([vec![key(name)], pill(text, theme::warning().bold())].concat())
+    };
+    let short = |id: &str| id.chars().take(8).collect::<String>();
+
+    if !view.login_is_oauth {
+        return value("login", "not an OAuth login", theme::faint());
+    }
+    if !view.has_credentials {
+        if let Some(other) = &view.same_as {
+            let mut lines = vec![warning("identity", "stale anchor".into())];
+            lines.extend(hint(&format!(
+                "left by an old login · still flags '{other}' · log in again or delete this profile"
+            )));
+            return lines;
+        }
+        return value(
+            "login",
+            if view.setup_token {
+                "setup token only · its scope cannot read the account"
+            } else {
+                "none stored"
+            },
+            theme::faint(),
+        );
+    }
+    let (account, details) = match &view.identity {
+        LoginIdentity::Pending => {
+            let mut lines = vec![warning("identity", "pending".into())];
+            lines.extend(hint(
+                "account not confirmed yet · auto-switch skips it · a → verify login",
+            ));
+            return lines;
+        }
+        LoginIdentity::Unanchored => {
+            let mut lines = value("identity", "unknown", theme::faint());
+            lines.extend(hint("a → verify login reads it once"));
+            return lines;
+        }
+        LoginIdentity::Anchored { account, details } => (account, details),
+    };
+    let mut lines = Vec::new();
+    if let Some(email) = details
+        .as_ref()
+        .and_then(|d| d.email.as_deref())
+        .and_then(sanitize_identity_detail)
+    {
+        lines.extend(value(
+            if view.split { "usage login" } else { "login" },
+            &email,
+            theme::accent(),
+        ));
+    }
+    if view.split {
+        lines.extend(hint(
+            "sessions run on the setup token · its account cannot be read",
+        ));
+    }
+    let mut segments = vec![short(account)];
+    if let Some(details) = details {
+        if let Some(org) = details
+            .organization_name
+            .as_deref()
+            .and_then(sanitize_identity_detail)
+        {
+            segments.push(org);
+        } else if let Some(org) = details
+            .organization_uuid
+            .as_deref()
+            .and_then(sanitize_identity_detail)
+        {
+            segments.push(format!("org {}", short(&org)));
+        }
+    }
+    if let Some(plan) = &view.plan {
+        segments.push(plan.clone());
+    }
+    lines.extend(value("account", &segments.join(" · "), theme::accent()));
+    if let Some(details) = details {
+        let age = (now_ms.max(0) as u64).saturating_sub(details.verified_at_ms) / 1000;
+        lines.extend(value(
+            "identity",
+            &format!("verified {}", crate::format::humanize_age(age)),
+            theme::accent(),
+        ));
+    } else {
+        lines.extend(value(
+            "identity",
+            "anchored · details on next read",
+            theme::dim(),
+        ));
+    }
+    if let Some(other) = &view.same_as {
+        lines.push(warning("", format!("same account as {other}")));
+        let other_org = match &view.other_identity {
+            Some(LoginIdentity::Anchored {
+                details: Some(d), ..
+            }) => d
+                .organization_uuid
+                .as_deref()
+                .and_then(sanitize_identity_detail),
+            _ => None,
+        };
+        let org = details
+            .as_ref()
+            .and_then(|d| d.organization_uuid.as_deref())
+            .and_then(sanitize_identity_detail);
+        let reason = if !view.other_has_credentials {
+            format!("'{other}' is logged out but kept its old anchor · log it in or delete it")
+        } else {
+            match (org, other_org) {
+                (Some(a), Some(b)) if a != b => "different organization · quotas may differ; auto-switch still skips one".into(),
+                (None, _) | (_, None) => "same Anthropic account · likely one quota · re-login one with the intended account".into(),
+                _ => "both draw on one quota · re-login one with the intended account".into(),
+            }
+        };
+        lines.extend(hint(&reason));
+    }
+    lines
+}
+
 fn draw_settings_rows(
     frame: &mut Frame<'_>,
     inner: Rect,
@@ -488,10 +679,18 @@ fn draw_settings_rows(
         ));
     }
 
+    if let Some(login) = &snap.login {
+        lines.extend(login_lines(
+            login,
+            crate::usage::now_ms() as i64,
+            inner.width as usize,
+        ));
+    }
+
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
     // cursor placement after rendering. The header block above is variable
-    // (optional status + type + optional provider + optional session + blank),
+    // (optional status + type + optional provider + session + login + blank),
     // so the row loop's base index is simply what has been pushed so far.
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = lines.len() as u16;

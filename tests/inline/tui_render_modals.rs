@@ -292,7 +292,7 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
             ("env", "+ add env · ↵ edits a value"),
             (
                 "a",
-                "duplicate the account · save it as a preset · apply one",
+                "duplicate the account · save / apply a preset · verify login",
             ),
             (
                 "disable / enable",
