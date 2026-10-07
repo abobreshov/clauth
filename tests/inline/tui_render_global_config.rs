@@ -852,7 +852,7 @@ fn walk_order_renders_as_a_cycle_with_every_hint_pinned() {
     };
     // Focus brackets the ACTIVE option, so the bracket pins which value the
     // row holds (a substring alone also matches an inactive option).
-    let focused_soonest = line_text(&detail_row(
+    let focused_soonest = line_text(&one_row(
         GlobalConfigRow::WalkOrder,
         true,
         soonest,
@@ -863,7 +863,7 @@ fn walk_order_renders_as_a_cycle_with_every_hint_pinned() {
         focused_soonest.contains("[soonest weekly reset]"),
         "{focused_soonest}"
     );
-    let focused_headroom = line_text(&detail_row(
+    let focused_headroom = line_text(&one_row(
         GlobalConfigRow::WalkOrder,
         true,
         headroom,
