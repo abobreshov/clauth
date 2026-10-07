@@ -915,14 +915,7 @@ struct RawProfileOrg {
 /// deliberately only trimmed, matching the anchor exactly.
 fn identity_from_raw(profile: &RawProfile, now_ms: u64) -> Option<AccountIdentity> {
     fn detail(value: Option<&str>) -> Option<String> {
-        let value: String = value?
-            .trim()
-            .chars()
-            .filter(|c| !c.is_control() && !crate::jobs_cli::reorders_display(*c))
-            .take(254)
-            .collect();
-        let value = value.trim();
-        (!value.is_empty()).then(|| value.to_string())
+        value.and_then(crate::profile_cache::sanitize_identity_detail)
     }
     let account = profile.account.as_ref()?;
     let uuid = account.uuid.as_deref()?.trim();
@@ -1487,6 +1480,7 @@ fn reconcile_identity_anchor_held(
     }
     remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
     if !write_profile_cache_reported(name, ACCOUNT_IDENTITY_FILE, identity) {
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
         logline!("tollgate: {name}: could not write its login identity details");
         return ReconcileOutcome::WriteFailed;
     }
@@ -1737,8 +1731,9 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
         }
         logline!("tollgate: {name}: could not write the identity anchor");
     }
-    if load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
-        .is_some_and(|identity| identity.account_uuid.as_str() != uuid)
+    let anchor = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
+    if !load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
+        .is_some_and(|identity| Some(&identity.account_uuid) == anchor.as_ref())
     {
         remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
     }
@@ -1747,14 +1742,16 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
 /// Seed details only after the committed anchor proves the observed login.
 pub(crate) fn seed_login_identity(name: &ProfileName, identity: Option<&AccountIdentity>) {
     seed_login_anchor(name, identity.map(|i| &i.account_uuid));
+    let anchor = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
     if let Some(identity) = identity
-        && load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE).as_ref()
-            == Some(&identity.account_uuid)
+        && anchor.as_ref() == Some(&identity.account_uuid)
     {
         if !write_profile_cache_reported(name, ACCOUNT_IDENTITY_FILE, identity) {
             logline!("tollgate: {name}: could not write its login identity details");
         }
-    } else {
+    } else if !load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
+        .is_some_and(|snapshot| Some(&snapshot.account_uuid) == anchor.as_ref())
+    {
         remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
     }
 }

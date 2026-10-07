@@ -56,6 +56,19 @@ impl AccountIdentity {
     }
 }
 
+/// Bound optional identity details at both the provider and display boundaries.
+/// Account UUIDs are binding keys and must not pass through this sanitizer.
+pub(crate) fn sanitize_identity_detail(value: &str) -> Option<String> {
+    let value: String = value
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && !crate::jobs_cli::reorders_display(*c))
+        .take(254)
+        .collect();
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoginIdentity {
     Pending,
@@ -439,6 +452,10 @@ pub(crate) fn write_profile_cache_reported<T: Serialize>(
     file: &str,
     value: &T,
 ) -> bool {
+    #[cfg(test)]
+    if crate::testutil::cache_write_fails(name, file) {
+        return false;
+    }
     let configured = crate::profile::is_configured(name).unwrap_or(false)
         || crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()));
     if !configured {

@@ -1611,3 +1611,102 @@ fn setup_snap_relogin_never_shows_previous_email() {
         }
     }
 }
+
+fn login_from_disk_snapshots(
+    selected: crate::profile_cache::AccountIdentity,
+    other: crate::profile_cache::AccountIdentity,
+) -> LoginView {
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    for (name, details) in [("leadtone", other), ("scifoo", selected)] {
+        let name = crate::profile::ProfileName::from(name);
+        crate::usage::seed_login_anchor(&name, Some(&details.account_uuid));
+        assert!(crate::profile_cache::write_profile_cache_reported(
+            &name,
+            crate::profile_cache::ACCOUNT_IDENTITY_FILE,
+            &details,
+        ));
+    }
+    let mut app = App::new(setup_identity_config());
+    app.profile_cursor = 1;
+    build_snap(&app, false).login.unwrap()
+}
+
+#[test]
+fn setup_disk_snapshot_strips_control_and_bidi_before_rendering_details() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut selected = identity_fixture(
+        "account-one",
+        Some(" \u{202e}rea\u{0}der@example.invalid\u{2069} "),
+    );
+    selected.organization_name = Some(" \u{202e}Example\u{7} Org\u{2069} ".into());
+    selected.organization_uuid = Some(" \u{202e}organization-one\u{2069} ".into());
+    let view = login_from_disk_snapshots(selected, identity_fixture("account-one", None));
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "reader@example.invalid", theme::accent());
+    assert_login_text(&lines, "account- · Example Org", theme::accent());
+    assert_login_text(
+        &lines,
+        "both draw on one quota · re-login one with the intended account",
+        theme::faint(),
+    );
+    assert!(lines.iter().flat_map(|l| &l.spans).all(|s| {
+        !s.content
+            .chars()
+            .any(|c| c.is_control() || crate::jobs_cli::reorders_display(c))
+    }));
+}
+
+#[test]
+fn setup_disk_snapshot_blank_email_and_org_name_use_sanitized_uuid_fallback() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut selected = identity_fixture("account-one", Some(" \u{0}\u{202e}\u{2069} "));
+    selected.organization_name = Some(" \u{0}\u{202e}\u{2069} ".into());
+    selected.organization_uuid = Some(" \u{202e}1234\u{0}56789\u{2069} ".into());
+    let mut other = identity_fixture("account-one", None);
+    other.organization_uuid = Some("123456789".into());
+    let view = login_from_disk_snapshots(selected, other);
+    let lines = login_lines(&view, 61_000, WIDE);
+    assert_login_text(&lines, "account- · org 12345678", theme::accent());
+    assert!(!lines.iter().map(line_text).any(|l| l.starts_with("login")));
+    assert_login_text(
+        &lines,
+        "both draw on one quota · re-login one with the intended account",
+        theme::faint(),
+    );
+}
+
+#[test]
+fn setup_disk_snapshot_blank_org_uuid_is_unknown_for_duplicate_comparison() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for blank_other in [false, true] {
+        let mut selected = identity_fixture("account-one", None);
+        let mut other = identity_fixture("account-one", None);
+        selected.organization_name = Some(" \u{202e}\u{2069} ".into());
+        if blank_other {
+            other.organization_uuid = Some(" \u{0}\u{202e}\u{2069} ".into());
+        } else {
+            selected.organization_uuid = Some(" \u{0}\u{202e}\u{2069} ".into());
+        }
+        let view = login_from_disk_snapshots(selected, other);
+        let lines = login_lines(&view, 61_000, WIDE);
+        assert_login_text(
+            &lines,
+            "same Anthropic account · likely one quota · re-login one with the intended account",
+            theme::faint(),
+        );
+        if !blank_other {
+            assert_login_text(&lines, "account-", theme::accent());
+            assert_eq!(
+                line_text(&lines[0]),
+                format!(
+                    "{}account-",
+                    key_cell("account", DETAIL_KEY_W, DETAIL_KEY_GUTTER)
+                ),
+                "blank organization fields must omit the entire organization segment",
+            );
+        }
+    }
+}

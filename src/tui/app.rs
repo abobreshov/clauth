@@ -8507,7 +8507,15 @@ fn drain_verify_login(app: &mut App) {
                 reconcile,
             } => {
                 let account: String = identity.account_uuid.chars().take(8).collect();
-                let details = identity.email.as_ref().map_or_else(
+                let email = identity
+                    .email
+                    .as_deref()
+                    .and_then(crate::profile_cache::sanitize_identity_detail);
+                let organization_uuid = identity
+                    .organization_uuid
+                    .as_deref()
+                    .and_then(crate::profile_cache::sanitize_identity_detail);
+                let details = email.as_ref().map_or_else(
                     || format!("acct {account}"),
                     |email| format!("{email} · acct {account}"),
                 );
@@ -8528,13 +8536,14 @@ fn drain_verify_login(app: &mut App) {
                         let other_org = match crate::profile_cache::login_identity(&other) {
                             crate::profile_cache::LoginIdentity::Anchored {
                                 details: Some(details), ..
-                            } => details.organization_uuid,
+                            } => details.organization_uuid.as_deref()
+                                .and_then(crate::profile_cache::sanitize_identity_detail),
                             _ => None,
                         };
                         let reason = if !other_has_login {
                             format!("'{other}' is logged out but kept its old anchor · log it in or delete it")
                         } else {
-                            match (&identity.organization_uuid, other_org.as_ref()) {
+                            match (organization_uuid.as_ref(), other_org.as_ref()) {
                                 (Some(org), Some(other_org)) if org != other_org =>
                                     "different organization · quotas may differ; auto-switch still skips one".to_string(),
                                 (None, _) | (_, None) =>
@@ -8576,7 +8585,11 @@ fn drain_verify_login(app: &mut App) {
                     VerifyOutcome::NoProfileScope => "stored access token has no profile scope (403)".to_string(),
                     VerifyOutcome::RateLimited(retry_after) => retry_after.map_or_else(
                         || "rate limited (429) · try again later".to_string(),
-                        |delay| format!("rate limited (429) · try again in ~{}s", delay.as_secs()),
+                        |delay| {
+                            let seconds = delay.as_secs()
+                                .saturating_add(u64::from(delay.subsec_nanos() != 0));
+                            format!("rate limited (429) · try again in ~{seconds}s")
+                        },
                     ),
                     VerifyOutcome::Network => "profile request failed · try again".to_string(),
                     VerifyOutcome::Unreadable => "profile identity unreadable".to_string(),
@@ -11957,7 +11970,11 @@ fn drain_login_events(app: &mut App) {
 /// divergence, gates the overwrite on `AppState.default_divergence`: only an
 /// `Overwrite` default applies silently; anything else asks first.
 fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login::LoginOutcome) {
-    let email = outcome.identity.as_ref().and_then(|id| id.email.clone());
+    let email = outcome.identity.as_ref().and_then(|id| {
+        id.email
+            .as_deref()
+            .and_then(crate::profile_cache::sanitize_identity_detail)
+    });
     let duplicate_warning = outcome.identity.as_ref().and_then(|identity| {
         crate::profile_cache::duplicate_login_warning_for_account(
             &app.config(),

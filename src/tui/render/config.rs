@@ -455,7 +455,7 @@ fn session_token_lines(
 
 /// Read-only login details; the caller supplies time to keep rendering pure.
 fn login_lines(view: &LoginView, now_ms: i64, width: usize) -> Vec<Line<'static>> {
-    use crate::profile_cache::LoginIdentity;
+    use crate::profile_cache::{LoginIdentity, sanitize_identity_detail};
     let key = |name: &str| {
         Span::styled(
             key_cell(name, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
@@ -532,10 +532,14 @@ fn login_lines(view: &LoginView, now_ms: i64, width: usize) -> Vec<Line<'static>
         LoginIdentity::Anchored { account, details } => (account, details),
     };
     let mut lines = Vec::new();
-    if let Some(email) = details.as_ref().and_then(|d| d.email.as_deref()) {
+    if let Some(email) = details
+        .as_ref()
+        .and_then(|d| d.email.as_deref())
+        .and_then(sanitize_identity_detail)
+    {
         lines.extend(value(
             if view.split { "usage login" } else { "login" },
-            email,
+            &email,
             theme::accent(),
         ));
     }
@@ -546,10 +550,18 @@ fn login_lines(view: &LoginView, now_ms: i64, width: usize) -> Vec<Line<'static>
     }
     let mut segments = vec![short(account)];
     if let Some(details) = details {
-        if let Some(org) = &details.organization_name {
-            segments.push(org.clone());
-        } else if let Some(org) = &details.organization_uuid {
-            segments.push(format!("org {}", short(org)));
+        if let Some(org) = details
+            .organization_name
+            .as_deref()
+            .and_then(sanitize_identity_detail)
+        {
+            segments.push(org);
+        } else if let Some(org) = details
+            .organization_uuid
+            .as_deref()
+            .and_then(sanitize_identity_detail)
+        {
+            segments.push(format!("org {}", short(&org)));
         }
     }
     if let Some(plan) = &view.plan {
@@ -575,12 +587,16 @@ fn login_lines(view: &LoginView, now_ms: i64, width: usize) -> Vec<Line<'static>
         let other_org = match &view.other_identity {
             Some(LoginIdentity::Anchored {
                 details: Some(d), ..
-            }) => d.organization_uuid.as_deref(),
+            }) => d
+                .organization_uuid
+                .as_deref()
+                .and_then(sanitize_identity_detail),
             _ => None,
         };
         let org = details
             .as_ref()
-            .and_then(|d| d.organization_uuid.as_deref());
+            .and_then(|d| d.organization_uuid.as_deref())
+            .and_then(sanitize_identity_detail);
         let reason = if !view.other_has_credentials {
             format!("'{other}' is logged out but kept its old anchor · log it in or delete it")
         } else {

@@ -2942,3 +2942,71 @@ fn verify_login_unexpected_success_status_is_network() {
         VerifyOutcome::Network,
     );
 }
+
+#[test]
+fn replacement_snapshot_write_failure_removes_displaced_details() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let old = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&old));
+    let replacement = AccountIdentity::uuid_only(AccountId::from("new"), 2);
+    let _failure =
+        crate::testutil::CacheWriteFailureSandbox::new(&home, &name, ACCOUNT_IDENTITY_FILE);
+    let outcome = crate::lock::with_state_lock(|held| {
+        Ok::<_, anyhow::Error>(reconcile_identity_anchor_held(&name, &replacement, held))
+    })
+    .unwrap();
+    assert_eq!(outcome, ReconcileOutcome::WriteFailed);
+    assert_eq!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+        Some(replacement.account_uuid)
+    );
+    assert!(load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE).is_none());
+}
+
+fn seed_double_write_failure_keeps_anchored_details(seed_details: bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ident"]);
+    let name = ProfileName::from("ident");
+    let old = AccountIdentity::uuid_only(AccountId::from("old"), 1);
+    seed_login_identity(&name, Some(&old));
+    let pending =
+        crate::profile::profile_subpath(&name, crate::profile_cache::IDENTITY_PENDING_FILE)
+            .unwrap();
+    // A directory blocks the atomic pending-marker rename while leaving the
+    // profile directory writable, so a buggy snapshot sweep could delete it.
+    std::fs::create_dir(&pending).unwrap();
+    let _failure =
+        crate::testutil::CacheWriteFailureSandbox::new(&home, &name, ACCOUNT_ID_CACHE_FILE);
+    let replacement = AccountIdentity::uuid_only(AccountId::from("new"), 2);
+    if seed_details {
+        seed_login_identity(&name, Some(&replacement));
+    } else {
+        seed_login_anchor(&name, Some(&replacement.account_uuid));
+    }
+    assert_eq!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+        Some(old.account_uuid.clone())
+    );
+    assert_eq!(
+        load_profile_cache::<AccountIdentity>(&name, ACCOUNT_IDENTITY_FILE),
+        Some(old)
+    );
+}
+
+#[test]
+fn seed_anchor_double_write_failure_keeps_correct_on_disk_details() {
+    seed_double_write_failure_keeps_anchored_details(false);
+}
+
+#[test]
+fn seed_identity_double_write_failure_keeps_correct_on_disk_details() {
+    seed_double_write_failure_keeps_anchored_details(true);
+}
+
+#[test]
+#[should_panic(expected = "identity leaked: a91fd47c")]
+fn privacy_canary_detects_a_short_account_id_only_leak() {
+    crate::testutil::assert_no_identity_canary("acct a91fd47c");
+}

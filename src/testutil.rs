@@ -3002,8 +3002,10 @@ pub(crate) fn identity_canary_config() -> crate::profile::AppConfig {
                 }),
             });
             crate::profile::save_profile(&p).expect("save canary profile");
-            let mut identity =
-                crate::profile_cache::AccountIdentity::uuid_only("canary-account-uuid".into(), 1);
+            let mut identity = crate::profile_cache::AccountIdentity::uuid_only(
+                "a91fd47c-identity-canary-account".into(),
+                1,
+            );
             identity.email = Some("canary@example.invalid".to_string());
             identity.organization_name = Some("Canary Org".to_string());
             identity.organization_uuid = Some("canary-org-uuid".to_string());
@@ -3038,8 +3040,51 @@ pub(crate) fn assert_no_identity_canary(text: &str) {
         "canary@example.invalid",
         "Canary Org",
         "canary-org-uuid",
-        "canary-account-uuid",
+        "a91fd47c-identity-canary-account",
+        "a91fd47c",
     ] {
         assert!(!text.contains(personal), "identity leaked: {personal}");
     }
+}
+
+/// A single cache write failure, scoped to a home sandbox and exact payload
+/// file. It leaves filesystem permissions unchanged so stale-file deletion
+/// remains possible and replacement-write failures can be tested separately.
+static CACHE_WRITE_FAILURE: std::sync::Mutex<Option<(crate::profile::ProfileName, &'static str)>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) struct CacheWriteFailureSandbox<'a>(std::marker::PhantomData<&'a HomeSandbox>);
+
+impl<'a> CacheWriteFailureSandbox<'a> {
+    pub(crate) fn new(
+        _home: &'a HomeSandbox,
+        name: &crate::profile::ProfileName,
+        file: &'static str,
+    ) -> Self {
+        let mut failure = CACHE_WRITE_FAILURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            failure.is_none(),
+            "cache-write failure sandbox already active"
+        );
+        *failure = Some((name.clone(), file));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for CacheWriteFailureSandbox<'_> {
+    fn drop(&mut self) {
+        *CACHE_WRITE_FAILURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+pub(crate) fn cache_write_fails(name: &crate::profile::ProfileName, file: &str) -> bool {
+    CACHE_WRITE_FAILURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(target, cache)| target == name && *cache == file)
 }

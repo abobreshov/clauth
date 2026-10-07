@@ -17271,7 +17271,7 @@ fn login_email_toasts_stay_local_for_new_and_existing_accounts() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["acct"]);
     let mut outcome = login_outcome("refresh", Some("uuid-account"));
-    outcome.identity.as_mut().unwrap().email = Some("acct@example.invalid".to_string());
+    outcome.identity.as_mut().unwrap().email = Some(" acct\u{202e}@\nexample.invalid ".to_string());
     let mut new = bare_app();
     new.config_draft = Some(super::build_draft_new());
     super::apply_login(&mut new, login_session("acct", true, 1), outcome.clone());
@@ -17287,4 +17287,89 @@ fn login_email_toasts_stay_local_for_new_and_existing_accounts() {
         existing.toasts.back().unwrap().body,
         "logged in 'acct'\nas acct@example.invalid"
     );
+}
+
+#[test]
+fn verify_login_retry_after_toast_rounds_up_partial_seconds() {
+    use super::ToastKind;
+    use crate::usage::VerifyOutcome;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    for (delay, expected_seconds) in [
+        (Duration::ZERO, 0),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_millis(1), 1),
+        (Duration::from_millis(999), 1),
+        (Duration::from_secs(1), 1),
+        (Duration::from_millis(1001), 2),
+        (Duration::from_millis(1999), 2),
+        (Duration::from_secs(2), 2),
+        (Duration::from_millis(2001), 3),
+        (Duration::MAX, u64::MAX),
+    ] {
+        app.verify_login_tx
+            .send(("acct".into(), VerifyOutcome::RateLimited(Some(delay))))
+            .unwrap();
+        super::drain_verify_login(&mut app);
+        let toast = app.toasts.back().unwrap();
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(
+            toast.body,
+            format!(
+                "could not verify 'acct'\nrate limited (429) · try again in ~{expected_seconds}s"
+            ),
+            "{delay:?}"
+        );
+    }
+}
+
+#[test]
+fn verify_login_toasts_sanitize_email_and_both_organization_uuids() {
+    use crate::profile_cache::AccountIdentity;
+    use crate::usage::{ReconcileOutcome, VerifyOutcome};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acct", "twin"]);
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(login_creds("refresh"));
+    let mut twin_profile = crate::profile::Profile::new("twin".to_string(), None, None);
+    twin_profile.credentials = Some(login_creds("twin-refresh"));
+    let mut app = app_with(vec![profile, twin_profile]);
+    let mut identity = AccountIdentity::uuid_only("uuid-account".into(), 123);
+    identity.email = Some(" acct\u{202e}@\nexample.invalid ".to_string());
+    identity.organization_uuid = Some(" org-\u{2066}one ".to_string());
+    crate::usage::seed_login_identity(&"acct".into(), Some(&identity));
+    let send = |app: &mut super::App, identity: AccountIdentity| {
+        app.verify_login_tx
+            .send((
+                "acct".into(),
+                VerifyOutcome::Verified {
+                    identity,
+                    reconcile: ReconcileOutcome::Same,
+                },
+            ))
+            .unwrap();
+        super::drain_verify_login(app);
+    };
+    send(&mut app, identity.clone());
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "verified 'acct'\nacct@example.invalid · acct uuid-acc"
+    );
+    let mut twin = AccountIdentity::uuid_only(identity.account_uuid.clone(), 123);
+    twin.organization_uuid = Some(" org-\none\u{202d} ".to_string());
+    crate::usage::seed_login_identity(&"twin".into(), Some(&twin));
+    send(&mut app, identity.clone());
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "'acct' is the same Anthropic account as 'twin'\nboth draw on one quota · re-login one with the intended account"
+    );
+    identity.organization_uuid = Some("\u{202e}\u{2066}\n".to_string());
+    send(&mut app, identity.clone());
+    assert!(app.toasts.back().unwrap().body.contains("likely one quota"));
+    identity.organization_uuid = Some("org-one".to_string());
+    twin.organization_uuid = Some("\u{202e}\u{2066}\n".to_string());
+    crate::usage::seed_login_identity(&"twin".into(), Some(&twin));
+    send(&mut app, identity);
+    assert!(app.toasts.back().unwrap().body.contains("likely one quota"));
 }
