@@ -391,7 +391,7 @@ fn detail_row(
             if rows.reset_display.shows_clock() {
                 cycle_row(arrow, "clock", &options, selected, width)
             } else {
-                vec![dimmed_cycle_row("clock", &options, selected)]
+                dimmed_cycle_row("clock", &options, selected, width)
             }
         }
         GlobalConfigRow::HomeTab => {
@@ -496,7 +496,7 @@ fn detail_row(
             if rows.spend_budget {
                 cycle_row(arrow, "extra usage spent", &options, selected, width)
             } else {
-                vec![dimmed_cycle_row("extra usage spent", &options, selected)]
+                dimmed_cycle_row("extra usage spent", &options, selected, width)
             }
         }
         GlobalConfigRow::PreemptiveRotation => {
@@ -778,7 +778,7 @@ fn burn_floor_lines(
         .map(|(label, p)| (label.as_str(), *p == floor_pct))
         .collect();
     if !burn_aware {
-        return vec![dimmed_cycle_row("burn floor", &options, selected)];
+        return dimmed_cycle_row("burn floor", &options, selected, width);
     }
     let custom = (!BURN_FLOOR_PRESETS.contains(&floor_pct))
         .then(|| format!("{}%", format_weekly_pct(floor_pct)));
@@ -814,7 +814,7 @@ fn burn_horizon_lines(
         .map(|(label, ms)| (label.as_str(), *ms == horizon_ms))
         .collect();
     if !burn_aware {
-        return vec![dimmed_cycle_row("burn horizon", &options, selected)];
+        return dimmed_cycle_row("burn horizon", &options, selected, width);
     }
     let custom =
         (!BURN_HORIZON_PRESETS.contains(&horizon_ms)).then(|| format!("{}s", horizon_ms / 1000));
@@ -865,7 +865,12 @@ fn cycle_lead(arrow: Span<'static>, key: &str, row_selected: bool) -> Vec<Span<'
 /// highlight — just the current value. Focusable but inert (the key handler
 /// no-ops it), so `TEXT_FAINT` keeps meaning "can't touch this". The `draw` loop
 /// still tints + shows the `└` reason on focus.
-fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line<'static> {
+fn dimmed_cycle_row(
+    key: &str,
+    options: &[(&str, bool)],
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let arrow = if selected {
         Span::styled("❯ ", theme::faint())
     } else {
@@ -876,11 +881,17 @@ fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line
         .find(|(_, active)| *active)
         .map(|(label, _)| *label)
         .unwrap_or("");
-    Line::from(vec![
-        arrow,
-        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
-        Span::styled(value.to_string(), theme::faint()),
-    ])
+    cycle_row_lines(
+        vec![
+            arrow,
+            Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
+        ],
+        &[(value, false)],
+        None,
+        None,
+        selected,
+        width,
+    )
 }
 
 /// [`dimmed_cycle_row`]'s toggle sibling: the whole row — caret, key, knob —

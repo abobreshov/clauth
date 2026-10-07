@@ -119,3 +119,44 @@ fn invalid_utf8_is_visible_and_an_empty_absent_note_clears_harmlessly() {
     super::save_note(&name, "").unwrap();
     assert!(!path.exists());
 }
+
+#[test]
+fn note_save_waits_for_an_in_progress_roster_delete() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _home = HomeSandbox::new();
+    seed_roster("alice");
+    let name = ProfileName::from("alice");
+    let path = crate::profile_cache::profile_cache_path(&name, NOTE_FILE).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let (worker, finished_before_unlock) = crate::lock::with_state_lock(|_| {
+        // Match delete_profile's ordering: directory first, roster second.
+        std::fs::remove_dir_all(path.parent().unwrap())?;
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = save_note(&name, "old account's draft");
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = finished_rx.recv_timeout(Duration::from_millis(200));
+        crate::profile::save_app_state(&crate::profile::AppState::default())?;
+        Ok((worker, early))
+    })
+    .unwrap();
+    worker.join().unwrap();
+    assert!(
+        matches!(finished_before_unlock, Err(mpsc::RecvTimeoutError::Timeout)),
+        "save must wait while roster deletion holds the state lock"
+    );
+    assert!(
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        !path.parent().unwrap().exists(),
+        "a stale draft must not resurrect the deleted directory"
+    );
+}

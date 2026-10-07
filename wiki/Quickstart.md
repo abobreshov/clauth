@@ -17,7 +17,7 @@ tollgate usage --waybar # one {text, tooltip, class, percentage} line for a bar 
 
 Claude OAuth cards and Waybar tooltips also show the measured running rate and estimated time until 100%: `%/h` for 5h, `%/d` for 7d. Estimates need at least three distinct samples in the last hour, and retire after a ten-minute idle gap or a reset. `show_estimates = false` hides them. JSON adds an optional `windows[].running_rate` object with `pct_per_unit`, `unit` (`h` or `d`) and optional `time_left_secs`; `schema_version` is unchanged. Waybar's `percentage` stays an integer.
 
-In the TUI, select a Usage account and press <kbd>⏎</kbd> to scroll its detail with arrows or page keys. <kbd>n</kbd> edits a local profile's private note; <kbd>⏎</kbd> saves, <kbd>ctrl</kbd>+<kbd>j</kbd> inserts a newline and <kbd>esc</kbd> cancels. Tokens models offer the same detail scrolling. Codex accounts can be selected and switched directly from Overview.
+In the TUI, select a Usage account and press <kbd>⏎</kbd> to scroll its detail with arrows or page keys. <kbd>n</kbd> edits a local profile's private note; <kbd>⏎</kbd> saves, <kbd>ctrl</kbd>+<kbd>j</kbd> inserts a newline and <kbd>esc</kbd> cancels. Unreadable or invalid UTF-8 notes show an error instead of opening an editor. Tokens models offer the same detail scrolling. Codex accounts can be selected in Overview; switch a Codex account with `tollgate <name>`.
 
 ## Capture your first profile
 

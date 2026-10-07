@@ -278,3 +278,30 @@ fn wrapped_key_styling_reaches_the_terminal_buffer() {
     let buf = crate::testutil::lines_buffer(rows, 18);
     crate::testutil::assert_prose_part(&buf, "press d to resolve", "d", true);
 }
+
+#[test]
+fn fit_truncates_wide_text_by_cells_and_preserves_graphemes_and_styles() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let family = "👨‍👩‍👧‍👦";
+    for (marked, width, expected) in [
+        (cmd("漢漢漢"), 5, "漢漢…".to_string()),
+        (cmd(&format!("{family}x")), 2, "…".to_string()),
+        (cmd(&format!("{family}xy")), 3, format!("{family}…")),
+        (cmd("e\u{301}e\u{301}x"), 2, "e\u{301}…".to_string()),
+        (cmd("漢"), 1, "…".to_string()),
+    ] {
+        let fitted = fit(&marked, width, dim());
+        let visible: String = fitted.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(visible, expected);
+        assert!(fitted.iter().map(Span::width).sum::<usize>() <= width);
+        assert_eq!(fitted.last().unwrap().style, dim());
+        for span in &fitted[..fitted.len() - 1] {
+            assert_eq!(span.style, cmd_style(dim()));
+        }
+    }
+    assert_eq!(
+        fit(&key("e\u{301}"), 1, dim()),
+        spans(&key("e\u{301}"), dim())
+    );
+    assert_eq!(fit(&cmd(family), 2, dim()), spans(&cmd(family), dim()));
+}

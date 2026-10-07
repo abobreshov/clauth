@@ -3958,6 +3958,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
             app.overview_cursor = selected
                 .and_then(|item| app.main_items().iter().position(|row| *row == item))
+                .or_else(|| {
+                    app.main_items()
+                        .iter()
+                        .position(|row| *row == MainItemKind::Profile(app.profile_cursor))
+                })
                 .unwrap_or(0);
             app.sync_overview_profile_selection();
             app.overview_selector_offset.set(0);
@@ -4268,8 +4273,12 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
-    if tab == Tab::Overview && app.tab != Tab::Overview {
-        app.overview_cursor = app.profile_cursor;
+    if tab == Tab::Overview && app.tab != Tab::Overview && app.harness_filter.shows_claude() {
+        app.overview_cursor = app
+            .main_items()
+            .iter()
+            .position(|row| *row == MainItemKind::Profile(app.profile_cursor))
+            .unwrap_or(0);
     }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
@@ -4709,8 +4718,8 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
                     .saturating_add(viewport.max(1))
                     .min(max)
             }
-            KeyCode::Char('e') => toggle_show_estimates(app),
-            KeyCode::Char('p') => toggle_show_pace(app),
+            KeyCode::Char('e') if app.usage_extra_cursor.is_none() => toggle_show_estimates(app),
+            KeyCode::Char('p') if app.usage_extra_cursor.is_none() => toggle_show_pace(app),
             _ => {}
         }
         return;
@@ -4729,8 +4738,8 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
             app.usage_detail_focus = StatusFocus::Detail;
             app.usage_detail_scroll = 0;
         }
-        KeyCode::Char('e') => toggle_show_estimates(app),
-        KeyCode::Char('p') => toggle_show_pace(app),
+        KeyCode::Char('e') if app.usage_extra_cursor.is_none() => toggle_show_estimates(app),
+        KeyCode::Char('p') if app.usage_extra_cursor.is_none() => toggle_show_pace(app),
         _ => {}
     }
 }
@@ -4744,7 +4753,13 @@ fn open_note_editor(app: &mut App) {
     let Some(name) = app.profile_name_at(app.profile_cursor) else {
         return;
     };
-    let text = crate::profile_notes::load_note(&name).unwrap_or_default();
+    let text = match crate::profile_notes::load_note_for_edit(&name) {
+        Ok(text) => text.unwrap_or_default(),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("couldn't read the note: {e}"));
+            return;
+        }
+    };
     app.note_editor = Some(NoteEditor {
         profile: name,
         buf: NoteBuffer::new(&text),
@@ -4792,9 +4807,25 @@ fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
     let action = match key.code {
         KeyCode::Enter => NoteKey::Commit,
         KeyCode::Esc => NoteKey::Cancel,
-        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Newline,
-        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Word,
-        KeyCode::Char(ch) => NoteKey::Char(ch),
+        KeyCode::Char('j')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            NoteKey::Newline
+        }
+        KeyCode::Char('w')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            NoteKey::Word
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            NoteKey::Char(ch)
+        }
         KeyCode::Backspace => NoteKey::Backspace,
         KeyCode::Delete => NoteKey::Delete,
         KeyCode::Left => NoteKey::Left,
@@ -8124,8 +8155,10 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         Tab::Usage => {
             context = push_account_scope(app, &mut scoped);
             actions.push(RefreshAll);
-            actions.push(ToggleEstimates);
-            actions.push(TogglePace);
+            if app.usage_extra_cursor.is_none() {
+                actions.push(ToggleEstimates);
+                actions.push(TogglePace);
+            }
         }
         // Tokens: the period + model-filter lenses (minus the ones already
         // active) plus the page keys (`c` cache basis, `r` reload) for
@@ -12075,7 +12108,20 @@ fn poll_codex_rows(app: &mut App) {
     }
     app.last_codex_rows_refresh = Some(Instant::now());
     let selected = app.current_main_item();
+    let selected_codex = match selected {
+        Some(MainItemKind::Codex(i)) => app.codex_rows.get(i).map(|row| row.name.clone()),
+        _ => None,
+    };
     app.codex_rows = codex_rows();
+    if let Some(name) = selected_codex
+        && let Some(i) = app.codex_rows.iter().position(|row| row.name == name)
+        && let Some(pos) = app
+            .main_items()
+            .iter()
+            .position(|item| *item == MainItemKind::Codex(i))
+    {
+        app.overview_cursor = pos;
+    }
     app.clamp_overview_cursor();
     if app.tab == Tab::Overview && selected != app.current_main_item() {
         app.sync_overview_profile_selection();

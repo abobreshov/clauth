@@ -1042,3 +1042,33 @@ fn reset_rows_hints_track_their_value() {
     rows.clock_format = ClockFormat::H12;
     assert!(hint(rows, GlobalConfigRow::ClockNotation).contains("9:20pm"));
 }
+
+#[test]
+fn disabled_cycles_stack_their_complete_faint_values_in_narrow_panes() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (row, width, expected) in [
+        (GlobalConfigRow::ClockNotation, 23, "24h"),
+        (GlobalConfigRow::BurnFloor, 23, "98%"),
+        (GlobalConfigRow::BurnHorizon, 23, "60s"),
+        (
+            GlobalConfigRow::SwitchOffWhenBudgetSpent,
+            30,
+            "switch off all",
+        ),
+    ] {
+        for selected in [false, true] {
+            let lines = detail_row(row, selected, toggles(), tunables(), None, width);
+            assert_eq!(lines.len(), 2, "{row:?}: {lines:?}");
+            assert_eq!(line_text(&lines[1]).trim(), expected);
+            for line in &lines {
+                assert!(line.width() <= width, "{row:?}: {line:?}");
+                for span in &line.spans {
+                    if !span.content.trim().is_empty() {
+                        assert_eq!(span.style.fg, theme::faint().fg);
+                        assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+        }
+    }
+}

@@ -8,6 +8,7 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::super::theme;
 use super::panes::wrap_words;
@@ -122,13 +123,24 @@ pub(crate) fn spans(text: &str, base: Style) -> Vec<Span<'static>> {
     runs(&classify(text), base)
 }
 
-/// [`spans`] cut to `width` visible characters the way
-/// [`crate::format::truncate`] cuts plain copy: a trailing `…` in `base` when
-/// anything was dropped.
+/// [`spans`] cut to `width` cells on grapheme boundaries, reserving a cell
+/// for a trailing `…` in `base` whenever text is dropped.
 pub(crate) fn fit(text: &str, width: usize, base: Style) -> Vec<Span<'static>> {
     let mut chars = classify(text);
-    if chars.len() > width {
-        chars.truncate(width.saturating_sub(1));
+    let visible: String = chars.iter().map(|(ch, _)| *ch).collect();
+    if Span::raw(&visible).width() > width {
+        let budget = width.saturating_sub(1);
+        let mut used = 0;
+        let mut kept = 0;
+        for grapheme in visible.graphemes(true) {
+            let cells = Span::raw(grapheme).width();
+            if used + cells > budget {
+                break;
+            }
+            used += cells;
+            kept += grapheme.chars().count();
+        }
+        chars.truncate(kept);
         if width > 0 {
             chars.push(('…', Kind::Prose));
         }

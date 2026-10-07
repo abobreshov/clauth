@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::super::app::{App, NoteBuffer, StatusFocus};
 use super::super::theme;
@@ -1826,6 +1827,26 @@ fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
 /// (the contract's auto-grow 1→8) before the draft scrolls inside.
 const NOTE_SLOT_MAX_ROWS: usize = 8;
 
+/// Remove display cells without splitting graphemes. A wide grapheme cut by
+/// the viewport's left edge leaves blank cells so the caret keeps its column.
+fn note_after_cells(text: &str, mut cells: usize) -> String {
+    let mut visible = String::new();
+    for grapheme in text.graphemes(true) {
+        if cells == 0 {
+            visible.push_str(grapheme);
+            continue;
+        }
+        let width = Span::raw(grapheme).width();
+        if width <= cells {
+            cells -= width;
+        } else {
+            visible.push_str(&" ".repeat(width - cells));
+            cells = 0;
+        }
+    }
+    visible
+}
+
 /// The note editor's docked slot: a `╭─ ✎ ───╮` sub-block, LINE_STRONG border,
 /// the draft inside, the native cursor at the caret, and the draft scrolling
 /// cursor-first once it passes [`NOTE_SLOT_MAX_ROWS`]. Wide chars are counted
@@ -1834,31 +1855,26 @@ fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer) {
     let block = edit_slot_block();
     let slot_inner = block.inner(area);
     frame.render_widget(block, area);
+    let (crow, ccol) = buf.cursor_pos();
+    let horizontal = ccol.saturating_sub(slot_inner.width.saturating_sub(1) as usize);
+    let viewport = slot_inner.height as usize;
+    let total = buf.row_count();
+    let offset = scroll_offset(total, viewport, (crow, crow + 1));
     let empty = buf.row_count() == 1 && buf.line(0).is_empty();
     let lines: Vec<Line<'static>> = if empty {
         vec![Line::from(Span::styled("add a note…", theme::faint()))]
     } else {
-        (0..buf.row_count())
-            .map(|i| Line::from(Span::styled(buf.line(i).to_string(), theme::body())))
+        (offset..total)
+            .take(viewport)
+            .map(|i| {
+                Line::from(Span::styled(
+                    note_after_cells(buf.line(i), horizontal),
+                    theme::body(),
+                ))
+            })
             .collect()
     };
-    let (crow, ccol) = buf.cursor_pos();
-    let viewport = slot_inner.height as usize;
-    let total = lines.len();
-    let offset = scroll_offset(total, viewport, (crow, crow + 1));
-    let horizontal = ccol.saturating_sub(slot_inner.width.saturating_sub(1) as usize);
-    frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(offset)
-                .take(viewport)
-                .collect::<Vec<_>>(),
-        )
-        .style(theme::base())
-        .scroll((0, horizontal.min(u16::MAX as usize) as u16)),
-        slot_inner,
-    );
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), slot_inner);
     draw_scrollbar(frame, slot_inner, total, offset, viewport);
     let x = slot_inner.x
         + (ccol.saturating_sub(horizontal) as u16).min(slot_inner.width.saturating_sub(1));

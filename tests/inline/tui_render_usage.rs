@@ -3097,6 +3097,48 @@ fn note_slot_horizontal_scroll_keeps_the_end_of_a_long_draft_visible() {
 }
 
 #[test]
+fn note_slot_horizontal_scroll_passes_the_u16_cell_limit() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let buf = NoteBuffer::new(&format!("{} END", "a".repeat(70_000)));
+    let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    assert!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .concat()
+            .contains("END"),
+        "the actual caret's text stays visible beyond column 65535"
+    );
+    assert_eq!(term.get_cursor_position().unwrap().x, 17);
+}
+
+#[test]
+fn note_slot_scrolls_large_wide_drafts_without_splitting_graphemes() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let draft = format!("{}e\u{301}👩‍💻 END", "界".repeat(35_000));
+    let buf = NoteBuffer::new(&draft);
+    let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    let screen = term.backend().buffer();
+    assert_eq!(screen[(10, 1)].symbol(), "e\u{301}");
+    assert_eq!(screen[(11, 1)].symbol(), "👩‍💻");
+    assert_eq!(screen[(14, 1)].symbol(), "E");
+    assert_eq!(screen[(16, 1)].symbol(), "D");
+    assert_eq!(term.get_cursor_position().unwrap().x, 17);
+}
+
+#[test]
+fn note_cell_slice_keeps_wide_boundaries_and_combining_clusters_aligned() {
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 1), " e\u{301}👩‍💻 END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 2), "e\u{301}👩‍💻 END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 3), "👩‍💻 END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 4), "  END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 5), " END");
+    assert_eq!(note_after_cells("界", 10), "");
+    let large = format!("{}e\u{301}👩‍💻 END", "界".repeat(32_769));
+    assert_eq!(note_after_cells(&large, 65_537), " e\u{301}👩‍💻 END");
+}
+
+#[test]
 fn usage_detail_can_scroll_past_u16_rows_of_saved_notes() {
     use ratatui::{Terminal, backend::TestBackend};
     let _home = crate::testutil::HomeSandbox::new();

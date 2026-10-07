@@ -14323,14 +14323,14 @@ fn filtering_a_codex_selection_back_to_claude_targets_the_visible_account() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
     assert!(matches!(
         app.current_main_item(),
-        Some(MainItemKind::Profile(0))
+        Some(MainItemKind::Profile(1))
     ));
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
     assert!(
-        matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.context.as_deref() == Some("a"))
+        matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.context.as_deref() == Some("b"))
     );
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor, 1,
         "account actions follow the visible caret"
     );
 }
@@ -14399,9 +14399,10 @@ fn codex_rows_can_be_selected_without_acting_on_a_claude_account() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
     assert_eq!(app.harness_filter, HarnessFilter::All);
     assert_eq!(
-        app.overview_cursor, 0,
-        "the native Hermes filter returns to the first account on All"
+        app.overview_cursor, 1,
+        "returning through Hermes restores the last Claude account"
     );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(
         app.overview_cursor, 1,
@@ -16534,4 +16535,186 @@ fn note_buffer_unicode_edits_and_cursor_width_follow_the_renderer() {
     buf.home();
     buf.backspace();
     assert_eq!(buf.text(), "界\u{301}🙂");
+}
+
+#[test]
+fn note_read_errors_block_the_editor_and_preserve_the_note() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_notes::NOTE_FILE).unwrap();
+    // EISDIR is deterministic even when tests run with elevated permissions.
+    std::fs::create_dir(&path).unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_none(),
+        "a read error must not seed an empty draft"
+    );
+    assert!(app.toasts.iter().any(
+        |t| t.kind == super::ToastKind::Danger && t.body.starts_with("couldn't read the note:")
+    ));
+    super::commit_note(&mut app);
+    assert!(path.is_dir());
+}
+
+#[test]
+fn invalid_utf8_notes_cannot_be_saved_as_replacement_characters() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_notes::NOTE_FILE).unwrap();
+    std::fs::write(&path, b"caf\xe9").unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    assert_eq!(
+        app.note_text.as_deref(),
+        Some("caf\u{fffd}"),
+        "the read-only view can show lossy text"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_none(),
+        "editing invalid UTF-8 would destroy the original bytes"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body.contains("UTF-8"))
+    );
+    super::commit_note(&mut app);
+    assert_eq!(std::fs::read(&path).unwrap(), b"caf\xe9");
+}
+
+#[test]
+fn note_editor_ignores_shortcut_chords_but_accepts_text_and_quit() {
+    use super::{KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::open_note_editor(&mut app);
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ] {
+        for ch in ['a', 'e', 'u', 'x'] {
+            super::handle_key(&mut app, KeyEvent::new(KeyCode::Char(ch), modifiers));
+        }
+    }
+    assert_eq!(draft(&app), "");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('É'), KeyModifiers::SHIFT),
+    );
+    assert_eq!(draft(&app), "É", "shifted Unicode text is still data");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert!(app.quit, "Ctrl-C still owns quit before the editor");
+    assert_eq!(draft(&app), "É");
+}
+
+#[test]
+fn codex_roster_refresh_keeps_the_selected_name_after_delete_and_reorder() {
+    use super::{HarnessFilter, MainItemKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Overview;
+    for filter in [HarnessFilter::All, HarnessFilter::Codex] {
+        app.harness_filter = filter;
+        app.overview_cursor = app
+            .main_items()
+            .iter()
+            .position(|r| *r == MainItemKind::Codex(1))
+            .unwrap();
+        crate::testutil::write_codex_roster(&["cx2", "cx3"]);
+        app.last_codex_rows_refresh = None;
+        super::poll_codex_rows(&mut app);
+        assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+        assert_eq!(app.codex_rows[0].name, "cx2");
+        crate::testutil::write_codex_roster(&["cx3", "cx2", "cx1"]);
+        app.last_codex_rows_refresh = None;
+        super::poll_codex_rows(&mut app);
+        assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(1)));
+        assert_eq!(app.codex_rows[1].name, "cx2");
+        crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+        app.last_codex_rows_refresh = None;
+        super::poll_codex_rows(&mut app);
+    }
+}
+
+#[test]
+fn overview_filter_cycle_and_tab_return_preserve_the_last_account() {
+    use super::{HarnessFilter, MainItemKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = notes_app(
+        (0..6)
+            .map(|i| mini_profile(&format!("a{i}"), None))
+            .collect(),
+    );
+    app.tab = Tab::Overview;
+    app.profile_cursor = 5;
+    app.overview_cursor = 5;
+    for _ in 0..4 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    }
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(5)));
+    assert_eq!(app.profile_cursor, 5);
+    app.harness_filter = HarnessFilter::Codex;
+    app.overview_cursor = 1;
+    super::switch_tab(&mut app, Tab::Usage);
+    super::switch_tab(&mut app, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(1)));
+    assert_eq!(app.profile_cursor, 5);
+}
+
+#[test]
+fn monitor_usage_cannot_toggle_local_profile_estimates_or_pace() {
+    use super::{ActionMenuAction, StatusFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    app.usage_extras = vec![overview_monitor_extra()];
+    app.usage_extra_cursor = Some(0);
+    let toggles = |app: &App| {
+        let config = app.config();
+        (config.state.show_estimates, config.state.show_pace)
+    };
+    let before = toggles(&app);
+    for focus in [StatusFocus::List, StatusFocus::Detail] {
+        app.usage_detail_focus = focus;
+        for ch in ['e', 'p'] {
+            super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
+        }
+        assert_eq!(toggles(&app), before);
+        assert!(
+            !super::build_action_menu(&app)
+                .items
+                .iter()
+                .any(|i| matches!(
+                    i.action,
+                    ActionMenuAction::ToggleEstimates | ActionMenuAction::TogglePace
+                ))
+        );
+    }
+    app.usage_extra_cursor = None;
+    super::handle_usage_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+    super::handle_usage_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    assert_eq!(toggles(&app), (!before.0, !before.1));
+    assert!(
+        super::build_action_menu(&app)
+            .items
+            .iter()
+            .any(|i| matches!(i.action, ActionMenuAction::ToggleEstimates))
+    );
 }
