@@ -59,11 +59,19 @@ fn a_session_share_reads_as_the_bare_percent() {
     o.windows.push(window(WINDOW_WEEKLY, 40.0));
     let tag = format_tag("leadtone", &o, NOW);
     assert_eq!(
-        tag.text, "leadtone 2%",
+        tag.text, "leadtone 2.4%",
         "the lead (session) window, rounded"
     );
     assert_eq!(tag.severity, Some(Severity::Ok));
-    assert_eq!(tag_lines(&tag), ["leadtone 2%", "ok"]);
+    assert_eq!(tag_lines(&tag), ["leadtone 2.4%", "ok"]);
+}
+
+#[test]
+fn tag_percentages_round_to_two_decimals_and_preserve_the_measurement() {
+    let mut o = obs(Origin::Profile, "work", SourceId::AnthropicOauth);
+    o.windows.push(window(WINDOW_SESSION, 2.4567));
+    assert_eq!(format_tag("work", &o, NOW).text, "work 2.46%");
+    assert_eq!(o.windows[0].used_pct, Some(2.4567));
 }
 
 #[test]

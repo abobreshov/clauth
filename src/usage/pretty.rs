@@ -126,7 +126,7 @@ fn compact(o: &AccountObservation, now_secs: i64) -> Option<String> {
     if let Some(w) = lead_window(&o.windows, now_secs) {
         let pct = w
             .used_pct
-            .map_or_else(|| "—".to_string(), |p| format!("{p:.0}%"));
+            .map_or_else(|| "—".to_string(), crate::format::format_pct);
         return Some(match w.resets_at {
             Some(_) => format!("{pct} · {}", countdown_to(w.resets_at, now_secs)),
             None => pct,
@@ -143,15 +143,19 @@ fn tooltip_line(o: &AccountObservation, offset_secs: i32) -> String {
         .map(|w| {
             let pct = w
                 .used_pct
-                .map_or_else(|| "—".to_string(), |p| format!("{p:.0}%"));
-            match w.resets_at {
+                .map_or_else(|| "—".to_string(), crate::format::format_pct);
+            let mut text = match w.resets_at {
                 Some(at) => format!(
                     "{} {pct} resets {}",
                     w.label,
                     hhmm_at_offset(at, offset_secs)
                 ),
                 None => format!("{} {pct}", w.label),
+            };
+            if let Some(rate) = &w.running_rate {
+                text.push_str(&format!(" · {}", rate.display()));
             }
+            text
         })
         .collect();
     parts.extend(

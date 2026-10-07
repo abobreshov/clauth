@@ -148,7 +148,11 @@ pub(crate) fn evaluate(
         if !state.sent.contains(&key) {
             out.push(Notification {
                 key,
-                summary: format!("{}: {label} past {threshold}%", crate::identity::NAME),
+                summary: format!(
+                    "{}: {label} past {}",
+                    crate::identity::NAME,
+                    crate::format::format_pct(threshold)
+                ),
                 body: detail,
                 critical: pct >= 100.0,
             });
@@ -179,9 +183,10 @@ fn severity_anchor(
         .filter(|w| window_severity(w) == Some(sev))
         .min_by_key(|w| w.resets_at)
     {
-        let pct = w
-            .used_pct
-            .map_or_else(|| "spent".to_string(), |p| format!("{p:.0}% used"));
+        let pct = w.used_pct.map_or_else(
+            || "spent".to_string(),
+            |p| format!("{} used", crate::format::format_pct(p)),
+        );
         let reset = w
             .resets_at
             .map(|t| {
@@ -238,7 +243,7 @@ fn alert_share(obs: &AccountObservation, now_secs: i64) -> Option<(f64, String, 
             (
                 p,
                 format!("{}:{}", w.id, reset_anchor(w.resets_at)),
-                format!("{} {p:.0}% used", w.label),
+                format!("{} {} used", w.label, crate::format::format_pct(p)),
             )
         })
 }

@@ -98,6 +98,17 @@ fn the_waybar_line_leads_with_the_active_account() {
 }
 
 #[test]
+fn waybar_rounds_visible_percentages_but_keeps_its_percentage_integer() {
+    let mut accounts = sample_accounts();
+    accounts[0].windows[0].used_pct = Some(42.4567);
+    let out = waybar(&accounts, SAMPLE_NOW, SAMPLE_OFFSET);
+    assert_eq!(out.text, "42.46% · 3h 05m");
+    assert!(out.tooltip.contains("5h 42.46% resets"));
+    assert_eq!(out.percentage, Some(42));
+    assert_eq!(accounts[0].windows[0].used_pct, Some(42.4567));
+}
+
+#[test]
 fn waybar_falls_back_to_money_then_to_an_empty_state() {
     let mut accounts = sample_accounts();
     accounts.retain(|o| o.label == "or-main");

@@ -107,12 +107,10 @@ fn gap_boundary(entries: &[(u64, f64)], max_gap_ms: u64) -> usize {
 /// entirely (for windows where idle stretches should count toward the rate).
 ///
 /// Returns rates in %/h. Drives the 5-hour window's `%/h` rate and the overview
-/// burn-ETA. The 7-day windows show a window-anchored average pace instead
-/// (`window_avg_pace_per_day`): utilization is whole percents, so a week's series
-/// yields distinct samples far too slowly to slope, and the log holds only 2 days
-/// either way. Not for the reason this comment used to give — the log lives under
-/// `profiles/<name>/` and is read by name, so it never carries another account's
-/// numbers.
+/// burn-ETA. Cache-only usage reports also measure weekly windows with this
+/// fit and scale them to `%/d`; thin weekly series omit the rate. The TUI's
+/// weekly windows instead show a window-anchored average pace
+/// (`window_avg_pace_per_day`), because weekly utilization changes slowly.
 pub(crate) fn compute_burn_rates_from_history(
     history: &[(u64, UsageInfo)],
     windows: &[(&str, &UsageWindow)],
@@ -124,6 +122,25 @@ pub(crate) fn compute_burn_rates_from_history(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    compute_burn_rates_at(
+        history,
+        windows,
+        lookback_ms,
+        min_samples,
+        gap_cut_ms,
+        now_ms,
+    )
+}
+
+/// The history fit with an explicit clock, shared by cache-only reports.
+pub(crate) fn compute_burn_rates_at(
+    history: &[(u64, UsageInfo)],
+    windows: &[(&str, &UsageWindow)],
+    lookback_ms: u64,
+    min_samples: usize,
+    gap_cut_ms: u64,
+    now_ms: u64,
+) -> HashMap<String, Option<f64>> {
     let half_life_ms = (lookback_ms as f64 / 4.0).max(1.0);
 
     let mut rates = HashMap::new();
@@ -170,6 +187,17 @@ pub(crate) fn compute_burn_rates_from_history(
         rates.insert(label.to_string(), rate);
     }
     rates
+}
+
+/// Seconds until a quota window reaches 100% at its measured rate.
+/// `rate_unit` is `h` or `d`, matching the displayed rate.
+pub(crate) fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64> {
+    if !rate.is_finite() || !pct.is_finite() || rate <= 0.0 || pct >= 100.0 {
+        return None;
+    }
+    let rate_per_h = if rate_unit == "d" { rate / 24.0 } else { rate };
+    let secs = ((100.0 - pct) / rate_per_h * 3600.0) as i64;
+    (secs > 0).then_some(secs)
 }
 
 /// The funded wallet's burn figure — the one derivation every surface renders

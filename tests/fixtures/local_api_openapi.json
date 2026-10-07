@@ -2871,6 +2871,41 @@
             "items": {
               "$ref": "#/components/schemas/Share"
             }
+          },
+          "running_rate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunningRate",
+                "description": "Measured utilization slope and exhaustion estimate, when history is sufficient."
+              }
+            ]
+          }
+        }
+      },
+      "RunningRate": {
+        "type": "object",
+        "required": [
+          "pct_per_unit",
+          "unit"
+        ],
+        "properties": {
+          "pct_per_unit": {
+            "type": "number",
+            "format": "double"
+          },
+          "unit": {
+            "type": "string",
+            "description": "`h` for the session window, `d` for weekly windows."
+          },
+          "time_left_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },

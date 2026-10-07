@@ -4,13 +4,13 @@ tollgate usage · 4 accounts · guest mode (clauth owns ~/.claude)
 work · Anthropic · Max 20x · ● active [guest]
   Session · 5h                                                                                  resets in 3h 05m (15:05)
   ███████████████████████████████████████│███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           42% →
-  38% elapsed · on pace
+  38.33% elapsed · on pace
   Weekly · 7d                                                                                    resets in 4d 1h (13:00)
   ███████████████████████████████████████████│███████████████████████████████████████░░░░░░░░░░░░░░░░░░░      81% ↑ HIGH
-  42% elapsed · 38 pts ahead
+  42.26% elapsed · 38 pts ahead
   Weekly · 7d opus                                                                               resets in 1d 1h (13:00)
   ██████████████████████████████████████████████████████████████████████████████████████│███████████████ 100% ↑ CRITICAL
-  exhausted · 85% elapsed · 14 pts ahead
+  exhausted · 85.12% elapsed · 14 pts ahead
   Extra usage                                                                                   $12.50 of $50.00 monthly
   ██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░        25% used
 

@@ -307,7 +307,13 @@ impl SessionFields<'_> {
 /// child dropping A's tokens, so A must not rotate), which makes a marker sum
 /// report one child as two sessions on two accounts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LiveTally(std::collections::BTreeMap<String, MemberSessions>);
+pub(crate) struct LiveTally {
+    members: std::collections::BTreeMap<String, MemberSessions>,
+    /// Bare sessions whose credential link resolves to no enabled profile.
+    unattributed: usize,
+    /// The registry or bare-marker directory could not be listed.
+    unread: bool,
+}
 
 /// One account's slice of a [`LiveTally`]. All-zero for an account hosting none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -331,12 +337,15 @@ impl LiveTally {
     /// the same predicate the decision leg does, so a row cannot be live for one
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
-        let mut tally = Self::from_live_rows(list().into_iter().filter(|row| {
+        let rows = read_registry();
+        let unread = rows.is_none();
+        let mut tally = Self::from_live_rows(rows.unwrap_or_default().into_iter().filter(|row| {
             let probe = crate::profile::ProfileName::from(
                 row.current_member.as_deref().unwrap_or(&row.start_profile),
             );
             crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
         }));
+        tally.unread = unread;
         tally.add_bare_sessions(config);
         tally
     }
@@ -358,21 +367,21 @@ impl LiveTally {
     /// They count as `following` as well, because the chain genuinely moves them:
     /// a global auto-switch repoints the link and Claude Code re-reads it.
     ///
-    /// An unreadable marker dir counts as ZERO — the OPPOSITE direction to
-    /// [`crate::runtime::has_live_session`], which gates delete, disable,
-    /// rename and rotation and so must read an unknown as live. This tally
-    /// only renders, so
-    /// folding an unknown in as live would put a session on screen that nothing
-    /// produced.
+    /// An unreadable marker dir leaves the fleet total unread. This tally only
+    /// renders; it must neither invent sessions nor report a zero it did not read.
     fn add_bare_sessions(&mut self, config: &AppConfig) {
-        let bare = crate::runtime::live_bare_sessions().unwrap_or(0);
+        let Some(bare) = crate::runtime::live_bare_sessions() else {
+            self.unread = true;
+            return;
+        };
         if bare == 0 {
             return;
         }
         let Some((member, _)) = crate::which::resolve_global(config) else {
+            self.unattributed += bare;
             return;
         };
-        let slot = self.0.entry(member).or_default();
+        let slot = self.members.entry(member).or_default();
         slot.sessions += bare;
         slot.following += bare;
     }
@@ -409,7 +418,11 @@ impl LiveTally {
                 crate::hot_swap::SwapState::Swapping | crate::hot_swap::SwapState::Stalled
             ));
         }
-        Self(per_member)
+        Self {
+            members: per_member,
+            unattributed: 0,
+            unread: false,
+        }
     }
 
     /// A tally straight from rows, for tests in other modules that need a fleet
@@ -422,7 +435,22 @@ impl LiveTally {
 
     /// One account's sessions.
     pub(crate) fn member(&self, name: &crate::profile::ProfileName) -> MemberSessions {
-        self.0.get(name.as_str()).copied().unwrap_or_default()
+        self.members.get(name.as_str()).copied().unwrap_or_default()
+    }
+
+    /// Every live session, including deleted accounts and unattributed bare ones.
+    /// `None` when one of the directories it counts could not be listed.
+    pub(crate) fn total(&self) -> Option<usize> {
+        (!self.unread)
+            .then(|| self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unread() -> Self {
+        Self {
+            unread: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -474,19 +502,24 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 /// copies, so nothing a caller does to one reaches disk. An unreadable or
 /// unparseable file is skipped rather than failing the sweep.
 pub(crate) fn list() -> Vec<LiveSession> {
-    let Ok(dir) = registry_dir() else {
-        return Vec::new();
+    read_registry().unwrap_or_default()
+}
+
+/// An absent registry is empty; an unlistable registry has no reading.
+fn read_registry() -> Option<Vec<LiveSession>> {
+    let dir = registry_dir().ok()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    // By NAME, not by parse failure: the registry dir also holds each
-    // session's `.helper`, `.helper.lock` and `.relaunch*` sidecars.
-    entries
-        .flatten()
-        .filter(|entry| is_row_file_name(&entry.file_name()))
-        .filter_map(|entry| read_row(&entry.path()))
-        .collect()
+    Some(
+        entries
+            .flatten()
+            .filter(|entry| is_row_file_name(&entry.file_name()))
+            .filter_map(|entry| read_row(&entry.path()))
+            .collect(),
+    )
 }
 
 /// `<sid>.json` with a valid session id stem, and nothing else.

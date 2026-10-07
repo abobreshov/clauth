@@ -5145,7 +5145,7 @@ fn the_quarantine_logline_splits_the_recovery_like_every_other_surface() {
         sink.snapshot(),
         vec![
             "tollgate: login for 'ql-oauth' has expired: refresh token revoked or invalid: \
-             run tollgate login ql-oauth (flagged auth_broken)"
+             run `tollgate login ql-oauth` (flagged auth_broken)"
                 .to_string(),
             "tollgate: stored OAuth chain is dead, its api key still works: ql-keyed (run \
              `tollgate login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken)"
@@ -5291,7 +5291,7 @@ fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
     assert_eq!(
         lines[0],
         "tollgate: login for 'qp-set' has expired: refresh token revoked or \
-         invalid: run tollgate login qp-set (flagged auth_broken)"
+         invalid: run `tollgate login qp-set` (flagged auth_broken)"
     );
     assert!(
         lines[1].starts_with(

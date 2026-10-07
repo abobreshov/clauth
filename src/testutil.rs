@@ -2781,3 +2781,71 @@ impl LockHolder {
         Self { _file: file }
     }
 }
+
+/// The cells of the first occurrence of `needle` in a rendered buffer, matched
+/// cell by cell (one narrow glyph per cell), so a multibyte glyph earlier on
+/// the row cannot shift the column the way a byte offset would.
+pub(crate) fn needle_cells<'a>(
+    buf: &'a ratatui::buffer::Buffer,
+    needle: &str,
+) -> Option<Vec<&'a ratatui::buffer::Cell>> {
+    let want: Vec<String> = needle.chars().map(String::from).collect();
+    let w = buf.area.width as usize;
+    let h = buf.area.height as usize;
+    (0..h).find_map(|y| {
+        let row = &buf.content[y * w..(y + 1) * w];
+        (0..=w.checked_sub(want.len())?).find_map(|x| {
+            let cells = &row[x..x + want.len()];
+            cells
+                .iter()
+                .zip(&want)
+                .all(|(cell, ch)| cell.symbol() == ch)
+                .then(|| cells.iter().collect())
+        })
+    })
+}
+
+/// `lines` drawn top-down into a `w`-wide buffer one row per line, so a span
+/// builder's output can be read cell by cell like a full frame.
+pub(crate) fn lines_buffer(
+    lines: Vec<ratatui::text::Line<'static>>,
+    w: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::widgets::Widget;
+    let h = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
+    ratatui::widgets::Paragraph::new(lines).render(buf.area, &mut buf);
+    buf
+}
+
+/// Asserts how `phrase` renders where its `part` is a key or a typed command
+/// in prose (TUI "Keys and commands inside prose"): every non-space
+/// cell of `part` is `ACCENT`, bold for a key and not for a command, and no
+/// other non-space cell of `phrase` is `ACCENT`.
+pub(crate) fn assert_prose_part(
+    buf: &ratatui::buffer::Buffer,
+    phrase: &str,
+    part: &str,
+    is_key: bool,
+) {
+    let cells = needle_cells(buf, phrase)
+        .unwrap_or_else(|| panic!("`{phrase}` missing:\n{}", buffer_rows(buf).join("\n")));
+    let at = phrase
+        .find(part)
+        .map(|byte| phrase[..byte].chars().count())
+        .unwrap_or_else(|| panic!("`{part}` is not inside `{phrase}`"));
+    let len = part.chars().count();
+    let accent = crate::tui::theme::accent_color();
+    for (i, cell) in cells.iter().enumerate() {
+        if cell.symbol() == " " {
+            continue;
+        }
+        let bold = cell.modifier.contains(ratatui::style::Modifier::BOLD);
+        if (at..at + len).contains(&i) {
+            assert_eq!(cell.fg, accent, "`{part}` in `{phrase}`: cell {i} fg");
+            assert_eq!(bold, is_key, "`{part}` in `{phrase}`: cell {i} bold");
+        } else {
+            assert_ne!(cell.fg, accent, "`{phrase}` outside `{part}`: cell {i} fg");
+        }
+    }
+}

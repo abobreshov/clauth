@@ -856,3 +856,113 @@ fn a_generation_zero_helper_failure_counts_as_swapping() {
         1
     );
 }
+
+/// A bare `claude` on a link no profile matches (rotated tokens, an account
+/// tollgate never captured) is attributed to no account, but it is still a live
+/// session: the fleet total counts it.
+#[test]
+fn an_unattributed_bare_session_still_counts_toward_the_fleet_total() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("work", "rt-work")], "work");
+    write_linked_credentials("rt-unknown");
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&crate::profile::ProfileName::from("work")),
+        MemberSessions::default(),
+        "no account hosts it"
+    );
+    assert_eq!(tally.total(), Some(1));
+}
+
+/// `total` counts sessions, never `following`, and a session whose account was
+/// deleted stays in it: the tally is keyed by the row's member, not the config.
+#[test]
+fn the_fleet_total_counts_every_session_whatever_its_account_or_chain_flag() {
+    let tally = LiveTally::of([
+        LiveSession {
+            follows_chain: true,
+            ..crate::testutil::live_row("4242-0", "work")
+        },
+        LiveSession {
+            follows_chain: false,
+            ..crate::testutil::live_row("4242-1", "work")
+        },
+        crate::testutil::live_row("4343-0", "deleted-account"),
+    ]);
+
+    assert_eq!(tally.total(), Some(3));
+}
+
+/// Put a regular file where a dir tollgate lists should be: `read_dir` then fails
+/// with something other than `NotFound` (ENOTDIR on unix).
+#[cfg(unix)]
+fn block_dir(dir: &Path) {
+    std::fs::create_dir_all(dir.parent().expect("the blocked dir has a parent"))
+        .expect("create the parent");
+    std::fs::write(dir, b"").expect("write the blocking file");
+}
+
+#[test]
+fn an_absent_registry_and_bare_dir_read_as_zero() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work")).total(),
+        Some(0)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unlistable_registry_reads_as_no_total() {
+    let _home = HomeSandbox::new();
+    block_dir(&registry_dir().expect("registry dir"));
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work")).total(),
+        None
+    );
+}
+
+/// A readable registry holding a live row does not rescue the total when the
+/// bare-marker dir cannot be listed: `Some(1)` would still claim a reading of
+/// the bare half.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_bare_dir_reads_as_no_total_even_beside_live_rows() {
+    let _home = HomeSandbox::new();
+    let live = row("4242-0", "work");
+    register(&live).expect("register the live row");
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("work"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the live session's marker");
+    block_dir(
+        &crate::profile::tollgate_dir()
+            .expect("tollgate dir")
+            .join("live_bare"),
+    );
+
+    let tally = LiveTally::collect(&config_with(vec![], "work"));
+    assert_eq!(tally.total(), None);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
+        1,
+        "the per-account slice keeps the rows it did read"
+    );
+}
+
+/// `list` keeps its best-effort contract for the decision leg and GC: an
+/// unlistable registry is an empty sweep there, never an error.
+#[cfg(unix)]
+#[test]
+fn list_stays_empty_on_an_unlistable_registry() {
+    let _home = HomeSandbox::new();
+    block_dir(&registry_dir().expect("registry dir"));
+    assert!(list().is_empty());
+}

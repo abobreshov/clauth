@@ -20,6 +20,7 @@ mod modals;
 mod overview;
 mod panes;
 mod plugin;
+pub(super) mod prose;
 mod status;
 mod tabs;
 mod toasts;

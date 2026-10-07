@@ -39,7 +39,7 @@ fn every_sub_focus_tab_documents_esc_in_help() {
             continue;
         }
 
-        let rows = tab_specific_rows(tab);
+        let rows = tab_specific_rows(&app);
         let has_esc_row = rows
             .iter()
             .flat_map(|(_, entries)| entries.iter())
@@ -57,11 +57,18 @@ fn every_sub_focus_tab_documents_esc_in_help() {
 /// drops section titles: every current tab documents exactly one, so nothing
 /// is lost. Add another tab's row list to this loop by extending the call.
 fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
-    let rows: Vec<(&str, &str)> = tab_specific_rows(tab)
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = empty_app(tab);
+    let rows: Vec<(&str, &str)> = tab_specific_rows(&app)
         .iter()
         .flat_map(|(_, entries)| entries.iter().copied())
         .collect();
-    assert_eq!(rows, expected, "{tab:?} help-modal row list drifted");
+    let actual: Vec<_> = rows
+        .iter()
+        .map(|(k, d)| (*k, super::prose::plain(d)))
+        .collect();
+    let expected: Vec<_> = expected.iter().map(|(k, d)| (*k, d.to_string())).collect();
+    assert_eq!(actual, expected, "{tab:?} help-modal row list drifted");
 }
 
 #[test]
@@ -639,4 +646,375 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
         !screen.contains(" confirm "),
         "the generic `confirm` label must not appear for AddChainCandidate:\n{screen}"
     );
+}
+
+#[test]
+fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut usage = app_on(
+        Tab::Usage,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
+    let mut tokens = empty_app(Tab::Tokens);
+    let empty_usage = empty_app(Tab::Usage);
+
+    let usage_at_rest = app_on(
+        Tab::Usage,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
+    usage.usage_detail_focus = StatusFocus::Detail;
+    let dashboard = empty_app(Tab::Tokens);
+    let mut model_selector = empty_app(Tab::Tokens);
+    model_selector.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![crate::tokens::ModelTokens {
+            model: "claude-opus-4-8".into(),
+            input: 12,
+            output: 8,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    model_selector.token_view = TokenView::Models;
+    let mut empty_model_selector = empty_app(Tab::Tokens);
+    empty_model_selector.token_view = TokenView::Models;
+    let mut populated_dashboard = empty_app(Tab::Tokens);
+    populated_dashboard.token_stats = model_selector.token_stats.clone();
+    tokens.token_stats = model_selector.token_stats.clone();
+    tokens.token_view = TokenView::Models;
+    tokens.model_detail_focus = StatusFocus::Detail;
+
+    let cases: [(&str, &App, &str, &[&str]); 8] = [
+        (
+            "usage selector",
+            &usage_at_rest,
+            "USAGE",
+            &[
+                "│    ↑ ↓                 pick account to inspect",
+                "│    ↵                   open account detail",
+                "│    r                   refresh account",
+                "│    n                   edit the account's note",
+                "│    e                   toggle estimates",
+                "│    p                   toggle pace marker",
+            ],
+        ),
+        (
+            "empty usage",
+            &empty_usage,
+            "USAGE",
+            &[
+                "│    ↑ ↓                 pick account to inspect",
+                "│    e                   toggle estimates",
+                "│    p                   toggle pace marker",
+            ],
+        ),
+        (
+            "usage detail",
+            &usage,
+            "USAGE",
+            &[
+                "│    ↑ ↓                 scroll account detail",
+                "│    page up             scroll account detail up a viewport",
+                "│    page down           scroll account detail down a viewport",
+                "│    esc                 return to account selector",
+                "│    ←                   return to account selector",
+                "│    r                   refresh account",
+                "│    n                   edit the account's note",
+                "│    e                   toggle estimates",
+                "│    p                   toggle pace marker",
+            ],
+        ),
+        (
+            "empty tokens dashboard",
+            &dashboard,
+            "TOKENS",
+            &[
+                "│    c                   count cache in token figures",
+                "│    t                   cycle period · lifetime / daily / weekly / monthly",
+                "│    r                   reload on-disk stats",
+            ],
+        ),
+        (
+            "populated tokens dashboard",
+            &populated_dashboard,
+            "TOKENS",
+            &[
+                "│    ↵                   open per-model breakdown",
+                "│    c                   count cache in token figures",
+                "│    t                   cycle period · lifetime / daily / weekly / monthly",
+                "│    r                   reload on-disk stats",
+            ],
+        ),
+        (
+            "empty model selector",
+            &empty_model_selector,
+            "TOKENS",
+            &[
+                "│    ↑ ↓                 pick model",
+                "│    esc                 back to dashboard",
+                "│    c                   count cache in token figures",
+                "│    t                   cycle period · lifetime / daily / weekly / monthly",
+                "│    r                   reload on-disk stats",
+            ],
+        ),
+        (
+            "model selector",
+            &model_selector,
+            "TOKENS",
+            &[
+                "│    ↑ ↓                 pick model",
+                "│    ↵                   open model detail",
+                "│    esc                 back to dashboard",
+                "│    c                   count cache in token figures",
+                "│    t                   cycle period · lifetime / daily / weekly / monthly",
+                "│    r                   reload on-disk stats",
+            ],
+        ),
+        (
+            "model detail",
+            &tokens,
+            "TOKENS",
+            &[
+                "│    ↑ ↓                 scroll model detail",
+                "│    page up             scroll model detail up a viewport",
+                "│    page down           scroll model detail down a viewport",
+                "│    esc                 return to model selector",
+                "│    ←                   return to model selector",
+                "│    c                   count cache in token figures",
+                "│    t                   cycle period · lifetime / daily / weekly / monthly",
+                "│    r                   reload on-disk stats",
+            ],
+        ),
+    ];
+    for (name, app, section, expected) in cases {
+        let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        term.draw(|f| draw_help(f, f.area(), app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let section_row = rows
+            .iter()
+            .position(|row| row.contains(&format!("  {section} ")))
+            .unwrap_or_else(|| panic!("{name}: missing {section} section"));
+        let actual: Vec<String> = rows[section_row + 2..section_row + 2 + expected.len()]
+            .iter()
+            .map(|row| {
+                let left = row.find('│').expect("modal border");
+                row[left..]
+                    .trim_end_matches([' ', '│'])
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        let projected = TestBackend::with_lines(actual);
+        projected.assert_buffer_lines(expected.iter().copied());
+    }
+}
+
+#[test]
+fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut usage = app_on(
+        Tab::Usage,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
+    usage.usage_detail_focus = StatusFocus::Detail;
+    let mut models = empty_app(Tab::Tokens);
+    models.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![crate::tokens::ModelTokens {
+            model: "claude-opus-4-8".into(),
+            input: 12,
+            output: 8,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    models.token_view = TokenView::Models;
+    models.model_detail_focus = StatusFocus::Detail;
+
+    let cases: [(&str, &App, &[&str]); 2] = [
+        (
+            "usage detail",
+            &usage,
+            &[
+                "│  USAGE",
+                "│",
+                "│    ↑ ↓                 scroll account detail",
+                "│    page up             scroll account detail up a viewport",
+                "│    page down           scroll account detail down a viewport",
+                "│    esc                 return to account selector",
+                "│    ←                   return to account selector",
+                "│    r                   refresh account",
+                "│    n                   edit the account's note",
+                "│    e                   toggle estimates",
+                "│    p                   toggle pace marker",
+            ],
+        ),
+        (
+            "model detail",
+            &models,
+            &[
+                "│  TOKENS",
+                "│",
+                "│    ↑ ↓                 scroll model detail",
+                "│    page up             scroll model detail up a viewport",
+                "│    page down           scroll model detail down a viewport",
+                "│    esc                 return to model selector",
+                "│    ←                   return to model selector",
+                "│    c                   count cache in token figures",
+                "│    t                   cycle period · lifetime / daily / weekly / monthly",
+                "│    r                   reload on-disk stats",
+            ],
+        ),
+    ];
+    for (name, app, screen) in cases {
+        let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        term.draw(|f| draw_help(f, f.area(), app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let tabs = rows
+            .iter()
+            .position(|row| row.contains("  TABS "))
+            .expect("tabs section");
+        let modal = rows
+            .iter()
+            .position(|row| row.contains("  THIS MODAL "))
+            .expect("modal section");
+        let screen_start = rows
+            .iter()
+            .position(|row| {
+                row.contains(if app.tab == Tab::Usage {
+                    "  USAGE "
+                } else {
+                    "  TOKENS "
+                })
+            })
+            .expect("screen section");
+        let screen_end = rows
+            .iter()
+            .position(|row| row.contains("  GLOBAL "))
+            .expect("global section");
+        let tabs_rows: Vec<String> = rows[tabs..modal]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip_while(|ch| *ch != '│')
+                    .collect::<String>()
+                    .trim_end()
+                    .trim_end_matches('│')
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        let expected_tabs = [
+            "│  TABS",
+            "│",
+            "│    ←                   return to selector",
+            "│    →                   stays on detail",
+            "│    tab                 next tab",
+            "│    shift tab           previous tab",
+            "│",
+        ];
+        assert_eq!(
+            tabs_rows.len(),
+            expected_tabs.len(),
+            "{name}: entire TABS section"
+        );
+        let tabs_expected = TestBackend::with_lines(tabs_rows.iter().map(String::as_str));
+        tabs_expected.assert_buffer_lines(expected_tabs);
+        let screen_rows: Vec<String> = rows[screen_start..screen_end]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip_while(|ch| *ch != '│')
+                    .collect::<String>()
+                    .trim_end()
+                    .trim_end_matches('│')
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        let screen_expected =
+            TestBackend::with_lines(screen_rows[..screen.len()].iter().map(String::as_str));
+        screen_expected.assert_buffer_lines(screen.iter().copied());
+        assert_eq!(
+            screen_rows.len(),
+            screen.len() + 1,
+            "{name}: only the section's trailing blank precedes global"
+        );
+        assert_eq!(screen_rows[screen.len()], "│");
+        assert!(
+            modal < screen_start,
+            "{name}: this modal section precedes the screen"
+        );
+    }
+}
+
+#[test]
+fn empty_tokens_hides_enter_in_dashboard_and_model_selector_footer() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut empty = empty_app(Tab::Tokens);
+    let mut populated = empty_app(Tab::Tokens);
+    populated.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![crate::tokens::ModelTokens {
+            model: "claude-opus-4-8".into(),
+            input: 12,
+            output: 8,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    for (name, app, expected) in [
+        (
+            "empty dashboard",
+            &empty,
+            " ←→ tabs   r reload   c count cache   t period   a actions   ? help   q quit ",
+        ),
+        (
+            "populated dashboard",
+            &populated,
+            " ←→ tabs   ↵ models   r reload   c count cache   t period   a actions   ? help   q quit ",
+        ),
+    ] {
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| super::super::footer::draw(f, f.area(), app))
+            .unwrap();
+        let rendered = crate::testutil::buffer_rows(term.backend().buffer());
+        let exact = TestBackend::with_lines([rendered[0].trim_end()]);
+        exact.assert_buffer_lines([expected.trim_end()]);
+        assert_eq!(rendered.len(), 1, "{name}: one footer row");
+    }
+    empty.token_view = TokenView::Models;
+    populated.token_view = TokenView::Models;
+    for (name, app, expected) in [
+        (
+            "empty model selector",
+            &empty,
+            " ←→ tabs   ↑↓ model   c count cache   t period   a actions   ? help   q back ",
+        ),
+        (
+            "populated model selector",
+            &populated,
+            " ←→ tabs   ↑↓ model   ↵ detail   c count cache   t period   a actions   ? help   q back ",
+        ),
+    ] {
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        term.draw(|f| super::super::footer::draw(f, f.area(), app))
+            .unwrap();
+        let rendered = crate::testutil::buffer_rows(term.backend().buffer());
+        let exact = TestBackend::with_lines([rendered[0].trim_end()]);
+        exact.assert_buffer_lines([expected.trim_end()]);
+        assert_eq!(rendered.len(), 1, "{name}: one footer row");
+    }
 }

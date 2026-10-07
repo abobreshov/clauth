@@ -236,7 +236,7 @@ fn hermes_estimate_metric(obs: &AccountObservation) -> Option<String> {
     Some(format!("{}/mo", format_money(&e.amount, &e.currency)))
 }
 
-/// A window's used share, rounded to a whole percent, with a suffix naming a
+/// A window's used share, rounded to two decimals, with a suffix naming a
 /// non-session window: `w` weekly (any model), ` mo` monthly.
 fn window_metric(w: &QuotaWindow) -> Option<String> {
     let pct = w.used_pct.or(w.exhausted.then_some(100.0))?;
@@ -250,7 +250,10 @@ fn window_metric(w: &QuotaWindow) -> Option<String> {
     } else {
         ""
     };
-    Some(format!("{}%{suffix}", pct.round().max(0.0) as i64))
+    Some(format!(
+        "{}{suffix}",
+        crate::format::format_pct(pct.max(0.0))
+    ))
 }
 
 /// The first meter by kind preference — balance, cap, budget, spend — as a

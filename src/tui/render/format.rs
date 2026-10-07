@@ -146,38 +146,40 @@ pub(crate) fn window_summary_spans_bracketed_at(
         Style::default().fg(theme::util_color(pct))
     };
 
-    if include_bar && width >= 26 {
+    let figure = crate::format::format_pct(pct);
+    let figure_w = figure.len().max(4);
+    if include_bar && width >= 22 + figure_w {
         // [██████░░░░] XX% (reset)
         let mut spans = vec![
             Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, 10), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
+            Span::styled(format!(" {figure:>4}"), fill_style),
         ];
         if let Some(secs) = reset_in_secs_at(window, now) {
             let style = reset_style.unwrap_or_else(theme::faint);
             spans.extend(reset_suffix_spans(secs, fmt, width, style));
         }
         spans
-    } else if include_bar && width >= 17 {
+    } else if include_bar && width >= 13 + figure_w {
         // [██████░░░░] XX%
         vec![
             Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, 10), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
+            Span::styled(format!(" {figure:>4}"), fill_style),
         ]
-    } else if include_bar && width >= 12 {
+    } else if include_bar && width >= 8 + figure_w {
         // [███░░░] XX%  — bar shrinks to fit
-        let bar_cells = width.saturating_sub(7).clamp(3, 7);
+        let bar_cells = width.saturating_sub(3 + figure_w).clamp(3, 7);
         vec![
             Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, bar_cells), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
+            Span::styled(format!(" {figure:>4}"), fill_style),
         ]
     } else {
-        vec![Span::styled(format!("{pct:>3.0}%"), fill_style)]
+        vec![Span::styled(format!("{figure:>4}"), fill_style)]
     }
 }
 

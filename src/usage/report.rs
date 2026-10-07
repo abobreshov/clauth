@@ -104,8 +104,13 @@ pub(crate) fn plain_line(obs: &AccountObservation, now_secs: i64) -> String {
             let pace = window_pace(w, now_secs)
                 .map(|p| format!(" {} {}", p.glyph(), p.label()))
                 .unwrap_or_default();
+            let rate = w
+                .running_rate
+                .as_ref()
+                .map(|r| format!(" · {}", r.display()))
+                .unwrap_or_default();
             format!(
-                "{} {pct}{sev}{pace} ({})",
+                "{} {pct}{sev}{pace}{rate} ({})",
                 w.label,
                 countdown_with_local(w.resets_at, now_secs)
             )

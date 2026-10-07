@@ -11,6 +11,30 @@ fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Wide enough that no row wraps: these pins are about one line's geometry.
+const WIDE: usize = 200;
+
+/// [`detail_row`] in a pane wide enough that the row is one line.
+fn one_row(
+    row: ConfigRow,
+    selected: bool,
+    editing: bool,
+    armed_action: Option<ConfigRow>,
+    snap: &Snap,
+    input: &InputState,
+) -> Line<'static> {
+    let mut lines = detail_row(row, selected, editing, armed_action, snap, input, WIDE);
+    assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+    lines.remove(0)
+}
+
+/// [`model_cycle_lines`] in a pane wide enough that the row is one line.
+fn model_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
+    let mut lines = model_cycle_lines(arrow, current, selected, WIDE);
+    assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+    lines.remove(0)
+}
+
 // Blurred: bare labels, no brackets anywhere. Focused: the active preset wraps
 // in `[]` and that bracket pair is the only width change (the old shape padded
 // the blurred active option to ` label `, so blurred==focused in width — this
@@ -18,8 +42,8 @@ fn line_text(line: &Line<'static>) -> String {
 #[test]
 fn model_cycle_brackets_the_active_option_only_on_focus() {
     let arrow = Span::raw("  ");
-    let blurred = line_text(&model_cycle_line(arrow.clone(), "sonnet", false));
-    let focused = line_text(&model_cycle_line(arrow, "sonnet", true));
+    let blurred = line_text(&model_line(arrow.clone(), "sonnet", false));
+    let focused = line_text(&model_line(arrow, "sonnet", true));
 
     assert!(
         blurred.contains("sonnet"),
@@ -37,13 +61,26 @@ fn model_cycle_brackets_the_active_option_only_on_focus() {
     );
 }
 
+#[test]
+fn model_cycle_lists_fable_first_after_default() {
+    let line = line_text(&model_line(Span::raw("  "), "", false));
+    let options = line
+        .trim_start()
+        .strip_prefix("model")
+        .expect("the row opens on its key");
+    assert_eq!(
+        options.split_whitespace().collect::<Vec<_>>(),
+        ["default", "fable", "opus", "sonnet", "haiku", "opusplan"]
+    );
+}
+
 // A custom id (no preset match) appends in ACCENT instead of mis-bracketing the
 // nearest alias — and stays bracket-free when blurred.
 #[test]
 fn model_cycle_appends_a_custom_id_without_brackets() {
     let arrow = Span::raw("  ");
-    let blurred = line_text(&model_cycle_line(arrow.clone(), "claude-fable-5", false));
-    let focused = line_text(&model_cycle_line(arrow, "claude-fable-5", true));
+    let blurred = line_text(&model_line(arrow.clone(), "claude-fable-5", false));
+    let focused = line_text(&model_line(arrow, "claude-fable-5", true));
 
     assert!(
         blurred.contains("claude-fable-5"),
@@ -67,7 +104,7 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let snap = Snap::blank("acct");
     let input = InputState::new("x");
-    let editing = detail_row(ConfigRow::Name, true, true, None, &snap, &input);
+    let editing = one_row(ConfigRow::Name, true, true, None, &snap, &input);
     let glyph = &editing.spans[0];
     assert!(
         glyph.style.add_modifier.contains(Modifier::BOLD),
@@ -87,7 +124,7 @@ fn selection_caret_is_bold_like_every_other_card() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let snap = Snap::blank("acct");
     let input = InputState::new("x");
-    let line = detail_row(ConfigRow::Name, true, false, None, &snap, &input);
+    let line = one_row(ConfigRow::Name, true, false, None, &snap, &input);
     let caret = &line.spans[0];
     assert!(
         caret.style.add_modifier.contains(Modifier::BOLD),
@@ -120,8 +157,8 @@ fn action_rows_bold_on_select_and_keep_their_color() {
         (ConfigRow::Login, theme::accent()),
     ];
     for (row, want) in cases {
-        let blurred = detail_row(row, false, false, None, &snap, &input);
-        let focused = detail_row(row, true, false, None, &snap, &input);
+        let blurred = one_row(row, false, false, None, &snap, &input);
+        let focused = one_row(row, true, false, None, &snap, &input);
         let (b, f) = (&blurred.spans[1], &focused.spans[1]);
         assert_eq!(
             b.content, f.content,
@@ -144,8 +181,8 @@ fn action_rows_bold_on_select_and_keep_their_color() {
 
     // The `✓ logged in` state is the same row in SUCCESS — same promotion rule.
     snap.captured = true;
-    let blurred = detail_row(ConfigRow::Login, false, false, None, &snap, &input);
-    let focused = detail_row(ConfigRow::Login, true, false, None, &snap, &input);
+    let blurred = one_row(ConfigRow::Login, false, false, None, &snap, &input);
+    let focused = one_row(ConfigRow::Login, true, false, None, &snap, &input);
     assert!(line_text(&focused).contains("✓ logged in"));
     assert!(!blurred.spans[1].style.add_modifier.contains(Modifier::BOLD));
     assert!(focused.spans[1].style.add_modifier.contains(Modifier::BOLD));
@@ -253,7 +290,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
 
     for selected in [false, true] {
         let arrow = if selected { "❯ " } else { "  " };
-        let unarmed = detail_row(ConfigRow::Disabled, selected, false, None, &snap, &input);
+        let unarmed = one_row(ConfigRow::Disabled, selected, false, None, &snap, &input);
         assert_eq!(
             line_text(&unarmed),
             format!("{arrow}disable account"),
@@ -269,7 +306,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
             "disable is always bold, unlike the accent bold-on-select class (selected={selected})"
         );
 
-        let armed = detail_row(
+        let armed = one_row(
             ConfigRow::Disabled,
             selected,
             false,
@@ -288,7 +325,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
 
     // `armed_action` naming a DIFFERENT row (e.g. `Delete`) must not bleed
     // into this row's confirm copy — only its own row name arms it.
-    let cross_armed = detail_row(
+    let cross_armed = one_row(
         ConfigRow::Disabled,
         true,
         false,
@@ -310,8 +347,8 @@ fn enable_button_is_accent_class_bold_only_on_select() {
     snap.disabled = true; // currently disabled → the enable direction
     let input = InputState::new("");
 
-    let blurred = detail_row(ConfigRow::Disabled, false, false, None, &snap, &input);
-    let focused = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    let blurred = one_row(ConfigRow::Disabled, false, false, None, &snap, &input);
+    let focused = one_row(ConfigRow::Disabled, true, false, None, &snap, &input);
     assert_eq!(line_text(&blurred), "  enable account");
     assert_eq!(line_text(&focused), "❯ enable account");
     assert_eq!(blurred.spans[1].style.fg, theme::accent().fg);
@@ -328,7 +365,7 @@ fn enable_button_is_accent_class_bold_only_on_select() {
     // An armed_action left over from the disable direction must not surface
     // a "press again" copy once the account is actually disabled — enabling
     // never arms, so it has nothing to confirm.
-    let stale_armed = detail_row(
+    let stale_armed = one_row(
         ConfigRow::Disabled,
         true,
         false,
@@ -353,7 +390,7 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
     let input = InputState::new("");
 
     snap.is_active = true;
-    let gated_active = detail_row(
+    let gated_active = one_row(
         ConfigRow::Disabled,
         true,
         false,
@@ -375,12 +412,12 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
 
     snap.is_active = false;
     snap.has_live_session = true;
-    let gated_session = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    let gated_session = one_row(ConfigRow::Disabled, true, false, None, &snap, &input);
     assert_eq!(gated_session.spans[1].style.fg, theme::faint().fg);
 
     // Gated while already disabled reads "enable account", still faint.
     snap.disabled = true;
-    let gated_enable = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    let gated_enable = one_row(ConfigRow::Disabled, true, false, None, &snap, &input);
     assert_eq!(line_text(&gated_enable), "❯ enable account");
     assert_eq!(gated_enable.spans[1].style.fg, theme::faint().fg);
 
@@ -388,7 +425,7 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
     // ungated action row's — proves the dim is a real style branch, not an
     // accident of the two colors overlapping.
     let normal_snap = Snap::blank("a");
-    let normal_action = detail_row(ConfigRow::Login, true, false, None, &normal_snap, &input);
+    let normal_action = one_row(ConfigRow::Login, true, false, None, &normal_snap, &input);
     assert_ne!(
         gated_session.spans[1].style.fg, normal_action.spans[1].style.fg,
         "a gated account-action row must render distinctly from a normal one"
@@ -654,7 +691,7 @@ fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
 
     for selected in [false, true] {
         let arrow = if selected { "❯ " } else { "  " };
-        let unarmed = detail_row(
+        let unarmed = one_row(
             ConfigRow::ClearSessionToken,
             selected,
             false,
@@ -673,7 +710,7 @@ fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
             "always bold, like `delete account` (selected={selected})"
         );
 
-        let armed = detail_row(
+        let armed = one_row(
             ConfigRow::ClearSessionToken,
             selected,
             false,
@@ -691,7 +728,7 @@ fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
     }
 
     // Another row's arm must not bleed into this row's confirm copy.
-    let cross_armed = detail_row(
+    let cross_armed = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -713,7 +750,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
     let snap = Snap::blank("a"); // has_other_login: false
     let input = InputState::new("");
 
-    let gated = detail_row(
+    let gated = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -735,7 +772,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
 
     let mut ungated_snap = Snap::blank("a");
     ungated_snap.has_other_login = true;
-    let ungated = detail_row(
+    let ungated = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -754,7 +791,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
     // lie. `Snap::clear_gated` is the one spelling all three surfaces share.
     let mut flag_only = Snap::blank("a");
     flag_only.rolling_armed = true;
-    let acting = detail_row(
+    let acting = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -767,7 +804,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
         theme::danger().fg,
         "a flag-only account renders the acting button, not the dim"
     );
-    let armed = detail_row(
+    let armed = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -1088,7 +1125,7 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
 fn login_labels_read_the_same_for_every_flow() {
     let input = InputState::new("");
     let text = |snap: &Snap, row: ConfigRow| {
-        line_text(&detail_row(row, false, false, None, snap, &input))
+        line_text(&one_row(row, false, false, None, snap, &input))
             .trim()
             .to_string()
     };
