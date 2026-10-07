@@ -2172,12 +2172,9 @@ pub(crate) fn capture_into_profile(
             .filter(|m| !m.is_empty())
             .map(str::to_string);
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
-        // hand-edited roster, a crash before the record landed): remove it before
-        // the store write, like every other install.
-        crate::profile_cache::remove_profile_cache(
-            &name,
-            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-        );
+        // hand-edited roster, a crash before the record landed): mark it pending
+        // before writing, so the displaced anchor cannot authorize a walk.
+        crate::profile_cache::begin_login_install(&name)?;
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2204,14 +2201,19 @@ pub(crate) fn capture_into_profile(
             let profile = config.find(&name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
-        save_app_state(&config.state)
+        save_app_state(&config.state)?;
+        crate::usage::seed_login_anchor(
+            &seed_name,
+            match &anchor {
+                AnchorAction::Proven(uuid) => Some(uuid),
+                _ => None,
+            },
+        );
+        Ok(())
     })?;
-    // Only once the credentials are committed, and only here — no caller seeds
-    // its own anchor, so no caller can forget to. The old anchor (if any orphan
-    // dir held one) is already gone from the in-hold removal; a proven uuid
-    // re-anchors now.
-    if let AnchorAction::Proven(uuid) = &anchor {
-        crate::usage::seed_login_anchor(&seed_name, Some(uuid));
+    // The login and identity were committed together inside the hold; only
+    // the user-facing warning remains outside it.
+    if matches!(anchor, AnchorAction::Proven(_)) {
         warn_duplicate_login(config, &seed_name);
     }
     Ok(())
@@ -2238,12 +2240,9 @@ pub(crate) fn create_profile_from_login(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
-        // Same orphan-dir guard as `capture_into_profile`: remove any stale
-        // anchor before the store write.
-        crate::profile_cache::remove_profile_cache(
-            &name,
-            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-        );
+        // Same orphan-dir guard as `capture_into_profile`: mark the install
+        // pending before the store write.
+        crate::profile_cache::begin_login_install(&name)?;
         profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2265,11 +2264,12 @@ pub(crate) fn create_profile_from_login(
             let profile = config.find(&name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
-        save_app_state(&config.state)
+        save_app_state(&config.state)?;
+        crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
+        Ok(())
     })?;
     // The draft parked the login's uuid until `create account` fixed the name;
     // this is that name, so the anchor lands here rather than at the call site.
-    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
     warn_duplicate_login(config, &seed_name);
     Ok(())
 }
@@ -2396,15 +2396,7 @@ pub(crate) fn overwrite_captured_profile(
         profile.base_url = base_url;
         profile.api_key = api_key;
         if installs_login {
-            // Remove the old anchor BEFORE the store write, inside the same hold
-            // that commits the credentials: a later failure in this hold (the
-            // relink, the settings write) leaves the profile unanchored, never
-            // on the account the overwrite just displaced. A proven uuid
-            // re-anchors after the hold.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-            );
+            crate::profile_cache::begin_login_install(name)?;
         }
         profile.set_credentials(credentials, held);
         profile.provider = provider;
@@ -2417,6 +2409,11 @@ pub(crate) fn overwrite_captured_profile(
         profile.fetch_status = None;
         profile.third_party_usage = None;
         save_profile(profile)?;
+        match &anchor {
+            AnchorAction::Proven(uuid) => crate::usage::seed_login_anchor(name, Some(uuid)),
+            AnchorAction::Unproven => crate::usage::seed_login_anchor(name, None),
+            AnchorAction::Unchanged => {}
+        }
 
         for file in [
             crate::profile_cache::USAGE_CACHE_FILE,
@@ -2504,11 +2501,9 @@ pub(crate) fn overwrite_captured_profile(
     // tick racing the gap between the flock release and this expire spends the
     // stale stamp once or loses a fresh one and re-pulls once.
     crate::usage::expire_profile_ttl(name);
-    // The old anchor is already gone (removed before `save_profile` inside the
-    // hold). A proven uuid re-anchors now, after the commit; an unproven or
-    // unchanged one has nothing left to do.
-    if let AnchorAction::Proven(uuid) = &anchor {
-        crate::usage::seed_login_anchor(name, Some(uuid));
+    // The identity committed with the login inside the hold. Unproven
+    // installs stay walk-blocked until the normal profile read resolves them.
+    if matches!(anchor, AnchorAction::Proven(_)) {
         warn_duplicate_login(config, name);
     }
     Ok(())

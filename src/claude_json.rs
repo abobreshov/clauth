@@ -20,7 +20,7 @@
 //! fails to parse and is simply skipped until the next tick. The merge itself
 //! lives in [`crate::jsonsync`], shared with the `settings.json` reconciler.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -133,8 +133,11 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
 /// re-derive it from a swapped credentials file — so a hit is "CC's last booted
 /// identity", not fresh proof of the live token's account.
 pub(crate) fn home_oauth_account_uuid() -> Option<AccountId> {
-    let path = home_dir().ok()?.join(".claude.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    oauth_account_uuid_at(&home_dir().ok()?.join(".claude.json"))
+}
+
+pub(crate) fn oauth_account_uuid_at(path: &Path) -> Option<AccountId> {
+    let Ok(bytes) = std::fs::read(path) else {
         return None; // missing — never create
     };
     let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&bytes) else {

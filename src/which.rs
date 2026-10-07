@@ -462,7 +462,7 @@ fn resolve_profile<'a>(
     in_session: bool,
     session_profile: Option<&str>,
     installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
-    keychain_login: &dyn Fn() -> Option<serde_json::Value>,
+    keychain_login: &dyn Fn() -> Option<String>,
 ) -> Option<(&'a crate::profile::ProfileName, Source)> {
     let (name, source) = resolve_profile_candidate(
         config,
@@ -495,7 +495,7 @@ fn resolve_profile_candidate<'a>(
     in_session: bool,
     session_profile: Option<&str>,
     installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
-    keychain_login: &dyn Fn() -> Option<serde_json::Value>,
+    keychain_login: &dyn Fn() -> Option<String>,
 ) -> Option<(&'a crate::profile::ProfileName, Source)> {
     if let Some(name) = creds
         .and_then(ClaudeCredentials::refresh_token)
@@ -523,7 +523,7 @@ fn resolve_profile_candidate<'a>(
     // A blank or absent login is a logged-out shell: no evidence, fall through.
     if let Some(name) = keychain_login()
         .as_ref()
-        .and_then(|blob| match_by_keychain_blob(config, blob))
+        .and_then(|blob| match_by_keychain_digest(config, blob))
     {
         return Some((name, Source::KeychainMatch));
     }
@@ -567,21 +567,45 @@ fn match_by_refresh_token<'a>(
     fallback
 }
 
-/// The pure core of the Keychain tier: attribute an already-read item blob's
-/// login by its refresh token. The `login_blob_is_ours` pattern — a blank or
+/// The pure core of the Keychain tier: match a refresh-token digest. The `login_blob_is_ours` pattern — a blank or
 /// absent login is a logged-out shell, never a match — over
 /// [`match_by_refresh_token`], so the tier shares tier 1's active-first
 /// tie-break. Pure and pinned cross-platform; only the READ is macOS's.
-fn match_by_keychain_blob<'a>(
+fn match_by_keychain_digest<'a>(
     config: &'a AppConfig,
-    blob: &serde_json::Value,
+    digest: &str,
 ) -> Option<&'a crate::profile::ProfileName> {
-    let refresh_token = blob
-        .get("claudeAiOauth")
-        .and_then(|login| login.get("refreshToken"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|rt| !rt.is_empty())?;
-    match_by_refresh_token(config, refresh_token)
+    let mut fallback = None;
+    for profile in &config.profiles {
+        if profile
+            .refresh_token()
+            .filter(|rt| !rt.is_empty())
+            .is_some_and(|rt| digest_refresh_token(rt) == digest)
+        {
+            if config.is_active(&profile.name) {
+                return Some(&profile.name);
+            }
+            fallback.get_or_insert(&profile.name);
+        }
+    }
+    fallback
+}
+
+fn digest_refresh_token(token: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn keychain_refresh_digest(blob: &serde_json::Value) -> Option<String> {
+    blob.get("claudeAiOauth")?
+        .get("refreshToken")?
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .map(digest_refresh_token)
 }
 
 /// Active-first tie-break, same as [`match_by_refresh_token`]: two profiles can
@@ -671,13 +695,13 @@ fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_j
 // accepted race ("N stale panes re-resolve once") costs one subprocess, and
 // no caller thread (the TUI render thread included) ever waits on a
 // concurrent switch. A locked Keychain stalls the caller once per TTL per
-// service rather than once per call. Each write sweeps entries older than a
+// service rather than once per call. Each read and write sweeps entries older than a
 // day, so session churn cannot grow the dir unbounded. Compiled off non-macOS
 // shipped builds: the tier is inert there and Linux stays byte-identical
 // (test builds keep the pure logic pinned).
 
 #[cfg(target_os = "macos")]
-fn keychain_evidence(config_dir: Option<&Path>) -> Option<serde_json::Value> {
+fn keychain_evidence(config_dir: Option<&Path>) -> Option<String> {
     if !crate::keychain::enabled() {
         return None;
     }
@@ -687,22 +711,23 @@ fn keychain_evidence(config_dir: Option<&Path>) -> Option<serde_json::Value> {
     if let Some(entry) =
         keychain_cache_entry(read_keychain_cache_entry(&dir, &service).as_ref(), now)
     {
-        return entry.blob.clone();
+        return entry.refresh_token_sha256.clone();
     }
     // Cache miss or stale entry: one `security` subprocess per TTL per
     // service, bounded by keychain::SECURITY_TIMEOUT.
     let blob = crate::keychain::read_blob_for_service(&service)
         .ok()
         .flatten();
+    let digest = blob.as_ref().and_then(keychain_refresh_digest);
     let entry = KeychainEvidenceEntry {
         at: now,
-        blob: blob.clone(),
+        refresh_token_sha256: digest.clone(),
     };
     if write_keychain_cache_entry(&dir, &service, &entry).is_err() {
         // Best-effort: a read-only home must not fail `which`; the next call
         // pays one more subprocess.
     }
-    blob
+    digest
 }
 
 /// The Keychain service holding the login this resolution asks: the bare
@@ -728,19 +753,20 @@ fn keychain_evidence_service(config_dir: Option<&Path>) -> Option<String> {
 #[cfg(any(target_os = "macos", test))]
 const KEYCHAIN_EVIDENCE_TTL_SECS: u64 = 30;
 
-/// Entries older than this are swept on the next write, so session churn
+/// Entries older than this are swept on the next read or write, so session churn
 /// cannot grow the cache dir unbounded.
 #[cfg(any(target_os = "macos", test))]
 const KEYCHAIN_EVIDENCE_RETENTION_SECS: u64 = 86_400;
 
-/// One service's cached read: the item's login blob, or `None` when the item
+/// One service's cached read: a refresh-token SHA-256 digest, or `None` when the item
 /// was absent or unreadable (both read as "no evidence").
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeychainEvidenceEntry {
     at: u64,
     #[serde(default)]
-    blob: Option<serde_json::Value>,
+    refresh_token_sha256: Option<String>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -771,8 +797,17 @@ fn keychain_cache_entry(
 
 #[cfg(any(target_os = "macos", test))]
 fn read_keychain_cache_entry(dir: &Path, service: &str) -> Option<KeychainEvidenceEntry> {
-    let bytes = std::fs::read(keychain_cache_entry_path(dir, service)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    sweep_keychain_cache(dir);
+    let path = keychain_cache_entry_path(dir, service);
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(entry) => Some(entry),
+        Err(_) => {
+            // Discard legacy whole-blob entries as well as malformed caches.
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
 }
 
 /// Write `service`'s entry (atomic 0600, the security.md tree invariant) and
@@ -795,7 +830,7 @@ fn write_keychain_cache_entry(
 
 /// Drop entries older than [`KEYCHAIN_EVIDENCE_RETENTION_SECS`], by file
 /// mtime (the write time, which is the entry's `at`). Best-effort throughout:
-/// a failed sweep leaves a stale file the next write sweeps again.
+/// a failed sweep leaves a stale file the next read or write sweeps again.
 #[cfg(any(target_os = "macos", test))]
 fn sweep_keychain_cache(dir: &Path) {
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(

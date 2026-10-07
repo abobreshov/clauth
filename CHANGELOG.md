@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Pasted setup tokens park account-specific credential keys before remint; per-session macOS Keychain switches and sign-outs save those keys into the outgoing store.
+- Proven login identity commits with credentials. Unverified new logins block fallback walks until the normal profile probe resolves them; runtime copy-back clears displaced account anchors.
+- Live-file rotation publication checks for intervening Claude Code writes. Rolling re-stamps recover and report poisoned config locks. Duplicate walk-blocker warnings name the matching profile.
+- The macOS `which` cache persists only refresh-token SHA-256 evidence and sweeps on reads as well as writes. A failed non-login-key toggle save rolls back and reports the error.
+
 ### Authentication and account identity
 
 - Claude Code's usage, artifact, organization and feature caches now follow each profile, preventing cached figures and flags from leaking across accounts.

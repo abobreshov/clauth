@@ -1411,9 +1411,9 @@ pub(crate) fn fetch_raw(
 ///
 /// Run inside the caller's state-flock hold (the `/profile` read's two
 /// ride-alongs share ONE hold and ONE stored-token check). A same-account read
-/// writes nothing; a replacement removes the known-wrong anchor before writing
-/// (a failed write leaves the profile unanchored, never on the displaced
-/// account) and logs both values only when the write landed.
+/// keeps the anchor and clears any pending marker; a replacement atomically
+/// writes the resolved uuid. A failed write removes the displaced anchor,
+/// and both values are logged only when the write landed.
 fn reconcile_identity_anchor_held(
     name: &ProfileName,
     profile: &RawProfile,
@@ -1431,16 +1431,20 @@ fn reconcile_identity_anchor_held(
     let new_uuid = AccountId::from(uuid.to_string());
     let current = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
     if current.as_deref() == Some(uuid) {
+        remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
         return;
     }
-    // Remove the known-wrong anchor before writing, so a failed write leaves
-    // the profile unanchored, never on the displaced account.
-    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+    // Replace atomically; remove the displaced anchor only on write failure.
     let landed =
         crate::profile_cache::write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid);
     if !landed {
+        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("tollgate: {name}: could not write the identity anchor");
-    } else if let Some(old) = current
+    } else {
+        remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
+    }
+    if landed
+        && let Some(old) = current
         && old.trim() != uuid
     {
         logline!("tollgate: {name}: identity anchor {old:?} -> {new_uuid:?}");
@@ -1565,19 +1569,51 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
 /// for a login it never proved.
 pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&AccountId>) {
     let Some(uuid) = account_uuid.map(|u| u.trim()).filter(|u| !u.is_empty()) else {
+        if let Err(e) = crate::profile_cache::begin_login_install(name) {
+            logline!("tollgate: {name}: could not mark its identity unverified: {e:#}");
+        }
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         return;
     };
-    // Remove before writing: a failed write leaves the profile unanchored,
-    // never on the account the write was meant to replace.
-    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
-    if !crate::profile_cache::write_profile_cache_reported(
+    // Atomic replacement: a proven login never passes through a missing anchor.
+    if crate::profile_cache::write_profile_cache_reported(
         name,
         ACCOUNT_ID_CACHE_FILE,
         &AccountId::from(uuid.to_string()),
     ) {
+        remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
+    } else {
+        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("tollgate: {name}: could not write the identity anchor");
     }
+}
+
+/// Before a runtime login-changing write, invalidate identity only when the
+/// runtime's cached account differs or cannot be read. A same-account refresh
+/// keeps its anchor. The pending marker blocks walks until the normal probe.
+pub(crate) fn prepare_runtime_login_change(
+    store: &std::path::Path,
+    runtime: &std::path::Path,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return Ok(());
+    }
+    let Some(name) = store
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(ProfileName::from)
+    else {
+        return Ok(());
+    };
+    let current = load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE);
+    let runtime_uuid = crate::claude_json::oauth_account_uuid_at(&runtime.join(".claude.json"));
+    if current.is_none() || runtime_uuid.as_ref() != current.as_ref() {
+        crate::profile_cache::begin_login_install(&name)?;
+        remove_profile_cache(&name, ACCOUNT_ID_CACHE_FILE);
+    }
+    Ok(())
 }
 
 /// Remove a profile's durable `/profile` stamp — the cross-process half of

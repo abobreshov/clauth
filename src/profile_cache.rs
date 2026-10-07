@@ -25,11 +25,57 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 
+/// A login was installed without a resolved identity. Persisted before the
+/// credential write so cross-process walks never use the displaced anchor.
+pub(crate) const IDENTITY_PENDING_FILE: &str = "identity_pending.json";
+
+pub(crate) fn begin_login_install(name: &ProfileName) -> anyhow::Result<()> {
+    let path = crate::profile::profile_subpath(name, IDENTITY_PENDING_FILE)?;
+    crate::profile::atomic_write_600(&path, b"true")?;
+    Ok(())
+}
+
+pub(crate) fn identity_pending(name: &ProfileName) -> bool {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return false;
+    }
+    profile_cache_path(name, IDENTITY_PENDING_FILE).is_some_and(|path| path.exists())
+}
+
+/// Only newly unproven installs are blocked: legacy profiles without anchors
+/// keep their existing behavior. An unknown active login also cannot walk to
+/// another OAuth account it might duplicate, until its normal probe resolves.
+pub(crate) fn unverified_walk_member(
+    config: &crate::profile::AppConfig,
+    name: &ProfileName,
+    active: Option<&ProfileName>,
+) -> Option<ProfileName> {
+    let profile = config.find(name)?;
+    if !profile.is_oauth() {
+        return None;
+    }
+    if identity_pending(name) {
+        return Some(name.clone());
+    }
+    active
+        .filter(|active| {
+            config
+                .find(active)
+                .is_some_and(crate::profile::Profile::is_oauth)
+                && identity_pending(active)
+        })
+        .cloned()
+}
+
 /// Read a usable identity anchor. In-memory-only test profiles have no home
 /// or persisted anchor; never resolve the operator's home for those fixtures.
 fn account_anchor(name: &ProfileName) -> Option<crate::profile::AccountId> {
     #[cfg(test)]
     if !crate::profile::home_override_active() {
+        return None;
+    }
+    if identity_pending(name) {
         return None;
     }
     load_profile_cache::<crate::profile::AccountId>(name, ACCOUNT_ID_CACHE_FILE)

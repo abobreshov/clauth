@@ -3492,8 +3492,8 @@ impl SessionSwap {
             // saves them: a static-token member's sidecar through its sync, a
             // `credentials.json` member when the runtime file wins the drain.
             // On macOS the session's store is its per-session Keychain item, and
-            // the swap's install replaces it without saving what sat beside the
-            // outgoing member's login (`keychain::keychain_install_for_config_dir`).
+            // matching-login carry and the install/sign-out owner search save
+            // its sibling keys before replacing the outgoing item.
             relink_to_canonical(&link, &plan.store)?;
 
             // Past here the session IS on the new member, so nothing may report
@@ -6968,6 +6968,14 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
                  not overwriting with runtime re-login bytes"
             );
         } else {
+            if crate::profile::login_changed(canonical_creds.as_ref(), &runtime_creds) {
+                crate::usage::prepare_runtime_login_change(
+                    canonical,
+                    link_path
+                        .parent()
+                        .context("runtime credentials have no parent")?,
+                )?;
+            }
             atomic_write_600(canonical, &runtime_bytes)?;
             // Mark the `/profile` reading stale only when the copied LOGIN
             // changed, never for a rewrite that touched only other keys (an
@@ -7093,6 +7101,14 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<bool> {
     let dst_creds = dst_bytes
         .as_deref()
         .and_then(|b| serde_json::from_slice::<ClaudeCredentials>(b).ok());
+    if dst.file_name().is_some_and(|f| f == "credentials.json")
+        && crate::profile::login_changed(dst_creds.as_ref(), &creds)
+    {
+        crate::usage::prepare_runtime_login_change(
+            dst,
+            src.parent().context("runtime credentials have no parent")?,
+        )?;
+    }
     atomic_write_600(dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))?;
     // Mark the `/profile` reading stale only when the copied LOGIN changed.
     Ok(crate::profile::login_changed(dst_creds.as_ref(), &creds))

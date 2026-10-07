@@ -4627,6 +4627,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
             | BlockedReason::ScopedSpent { .. }
             | BlockedReason::WeeklySoft { .. }
             | BlockedReason::SameAccount { .. }
+            | BlockedReason::IdentityUnverified { .. }
             | BlockedReason::Stale => false,
         }
     }
@@ -6951,20 +6952,20 @@ fn a_day_list_blocker_names_the_first_thing_in_the_way() {
     config.profiles.push(off_chain);
 
     assert_eq!(
-        day_claim_blocker(&config, &ProfileName::from("work"), &HashSet::new()),
+        day_claim_blocker(&config, &ProfileName::from("work"), &HashSet::new()).as_deref(),
         None,
         "a healthy chain member can claim"
     );
     assert_eq!(
-        day_claim_blocker(&config, &ProfileName::from("spare"), &HashSet::new()),
+        day_claim_blocker(&config, &ProfileName::from("spare"), &HashSet::new()).as_deref(),
         Some("it is not on the fallback chain")
     );
     assert_eq!(
-        day_claim_blocker(&config, &ProfileName::from("old"), &HashSet::new()),
+        day_claim_blocker(&config, &ProfileName::from("old"), &HashSet::new()).as_deref(),
         Some("the account is disabled")
     );
     assert_eq!(
-        day_claim_blocker(&config, &ProfileName::from("gone"), &HashSet::new()),
+        day_claim_blocker(&config, &ProfileName::from("gone"), &HashSet::new()).as_deref(),
         Some("no such account")
     );
 }
@@ -7278,7 +7279,7 @@ fn walk_blocker_reports_a_key_rejected_member() {
     let config = config_with_chain(vec![zai], "zai");
     let key_rejected = HashSet::from([ProfileName::from("zai")]);
     assert_eq!(
-        walk_blocker(&config, &ProfileName::from("zai"), &key_rejected),
+        walk_blocker(&config, &ProfileName::from("zai"), &key_rejected).as_deref(),
         Some("its api key was rejected"),
         "a key-rejected member's day-list reason must name the key, not the login"
     );
@@ -7328,6 +7329,7 @@ fn a_key_rejected_members_day_list_claims_nothing() {
     );
     assert!(
         crate::fallback::day_claim_blocker(&config, &ProfileName::from("zai"), &key_rejected)
+            .as_deref()
             .is_some(),
         "the day-list editor names the key rejection instead of saving a dead list"
     );
@@ -7378,4 +7380,107 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         None,
         "a console-lapsed Alibaba member is not refused by the start walk"
     );
+}
+
+#[test]
+fn round1_duplicate_blocker_names_an_active_profile_outside_the_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["outside", "candidate"]);
+    for name in ["outside", "candidate"] {
+        crate::usage::seed_login_anchor(&name.into(), Some(&"shared-uuid".into()));
+    }
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("outside", Some(10.0), Some(10.0)),
+            profile_with_util("candidate", Some(10.0), Some(10.0)),
+        ],
+        "outside",
+    );
+    config.state.fallback_chain = vec!["candidate".into()];
+    for reason in [
+        walk_blocker(&config, &"candidate".into(), &HashSet::new()),
+        day_claim_blocker(&config, &"candidate".into(), &HashSet::new()),
+    ] {
+        assert_eq!(
+            reason.as_deref(),
+            Some("it is the same account as 'outside'")
+        );
+    }
+}
+
+#[test]
+fn round1_unverified_installs_block_walks_in_both_directions_until_proven() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["first", "second"]);
+    let config = config_with_chain(
+        vec![
+            profile_with_util("first", Some(90.0), Some(10.0)),
+            profile_with_util("second", Some(10.0), Some(10.0)),
+        ],
+        "first",
+    );
+    for (name, uuid) in [("first", "uuid-a"), ("second", "uuid-b")] {
+        crate::usage::seed_login_anchor(&name.into(), Some(&uuid.into()));
+    }
+    for pending in ["second", "first"] {
+        crate::profile_cache::begin_login_install(&pending.into()).unwrap();
+        assert!(candidate_excluded(
+            &config,
+            &"second".into(),
+            &HashSet::new()
+        ));
+        assert!(
+            walk_blocker(&config, &"second".into(), &HashSet::new())
+                .unwrap()
+                .contains(pending)
+        );
+        assert!(matches!(
+            blocked_reason(
+                &config,
+                config.find(&"second".into()).unwrap(),
+                None,
+                &HashSet::new()
+            ),
+            Some(BlockedReason::IdentityUnverified { .. })
+        ));
+        crate::usage::seed_login_anchor(
+            &pending.into(),
+            Some(
+                &if pending == "first" {
+                    "uuid-a"
+                } else {
+                    "uuid-b"
+                }
+                .into(),
+            ),
+        );
+        assert!(!candidate_excluded(
+            &config,
+            &"second".into(),
+            &HashSet::new()
+        ));
+    }
+    crate::usage::seed_login_anchor(&"second".into(), Some(&"uuid-a".into()));
+    assert!(
+        candidate_excluded(&config, &"second".into(), &HashSet::new()),
+        "a proven duplicate remains excluded"
+    );
+}
+
+#[test]
+fn round1_an_unverified_endpoint_profile_does_not_block_an_oauth_walk() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["endpoint", "oauth"]);
+    let mut endpoint = profile_with_util("endpoint", Some(90.0), Some(10.0));
+    endpoint.base_url = Some("https://proxy.example.test".into());
+    let config = config_with_chain(
+        vec![endpoint, profile_with_util("oauth", Some(10.0), Some(10.0))],
+        "endpoint",
+    );
+    crate::profile_cache::begin_login_install(&"endpoint".into()).unwrap();
+    assert!(!candidate_excluded(
+        &config,
+        &"oauth".into(),
+        &HashSet::new()
+    ));
 }

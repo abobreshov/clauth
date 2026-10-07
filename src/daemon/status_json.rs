@@ -545,7 +545,15 @@ pub(crate) fn build_profile_entries(
                     name,
                     config.state.active_profile.as_ref(),
                 )
-                .map(|other| format!("same account as '{other}'")),
+                .map(|other| format!("same account as '{other}'"))
+                .or_else(|| {
+                    crate::profile_cache::unverified_walk_member(
+                        config,
+                        name,
+                        config.state.active_profile.as_ref(),
+                    )
+                    .map(|profile| format!("account identity is unverified for '{profile}'"))
+                }),
                 rolling_token: matches!(
                     crate::claude::sidecar_summary(name),
                     Some((crate::claude::SidecarKind::Rolling, _))

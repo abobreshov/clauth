@@ -127,7 +127,7 @@ fn no_sidecars(_name: &crate::profile::ProfileName) -> Option<String> {
 
 /// A tree with no Keychain evidence — the shape every pre-keychain-tier test
 /// resolves under.
-fn no_keychain() -> Option<serde_json::Value> {
+fn no_keychain() -> Option<String> {
     None
 }
 
@@ -155,8 +155,8 @@ fn keychain_blob(refresh: Option<&str>) -> serde_json::Value {
 
 /// The keychain read the resolution tier asks, standing in for the macOS
 /// `security` subprocess (test builds gate the real one off).
-fn keychain_holding(refresh: Option<&'static str>) -> impl Fn() -> Option<serde_json::Value> {
-    move || Some(keychain_blob(refresh))
+fn keychain_holding(refresh: Option<&'static str>) -> impl Fn() -> Option<String> {
+    move || keychain_refresh_digest(&keychain_blob(refresh))
 }
 
 /// A stub CLA-SPLIT lookup over `(profile, installed access token)` pairs,
@@ -887,7 +887,7 @@ fn the_global_keychain_evidence_service_is_the_bare_item() {
 fn keychain_cache_entry_serves_fresh_and_rejects_stale() {
     let entry = KeychainEvidenceEntry {
         at: 1000,
-        blob: Some(keychain_blob(Some("rt-work"))),
+        refresh_token_sha256: keychain_refresh_digest(&keychain_blob(Some("rt-work"))),
     };
     let entry = Some(&entry);
     assert!(
@@ -917,7 +917,7 @@ fn keychain_cache_write_reads_back_owner_only_and_preserves_other_services() {
         "svc-a",
         &KeychainEvidenceEntry {
             at: 1000,
-            blob: Some(keychain_blob(Some("rt-a"))),
+            refresh_token_sha256: keychain_refresh_digest(&keychain_blob(Some("rt-a"))),
         },
     )
     .expect("write a");
@@ -926,19 +926,22 @@ fn keychain_cache_write_reads_back_owner_only_and_preserves_other_services() {
         "svc-b",
         &KeychainEvidenceEntry {
             at: 2000,
-            blob: None,
+            refresh_token_sha256: None,
         },
     )
     .expect("write b");
     let a = read_keychain_cache_entry(&dir, "svc-a").expect("read a");
     assert_eq!(a.at, 1000);
     assert_eq!(
-        a.blob.as_ref().expect("a holds a blob")["claudeAiOauth"]["refreshToken"],
-        "rt-a"
+        a.refresh_token_sha256.as_deref(),
+        Some(digest_refresh_token("rt-a").as_str())
     );
     let b = read_keychain_cache_entry(&dir, "svc-b").expect("read b");
     assert_eq!(b.at, 2000);
-    assert_eq!(b.blob, None, "an absent item caches as no evidence");
+    assert_eq!(
+        b.refresh_token_sha256, None,
+        "an absent item caches as no evidence"
+    );
     #[cfg(unix)]
     {
         assert_eq!(
@@ -959,7 +962,7 @@ fn an_unparseable_keychain_cache_is_a_miss() {
         "svc",
         &KeychainEvidenceEntry {
             at: 1000,
-            blob: None,
+            refresh_token_sha256: None,
         },
     )
     .expect("seed the file (and its dir)");
@@ -979,7 +982,7 @@ fn a_stale_keychain_cache_entry_is_swept_on_the_next_write() {
         "svc-old",
         &KeychainEvidenceEntry {
             at: 1000,
-            blob: None,
+            refresh_token_sha256: None,
         },
     )
     .expect("write old");
@@ -994,7 +997,7 @@ fn a_stale_keychain_cache_entry_is_swept_on_the_next_write() {
         "svc-new",
         &KeychainEvidenceEntry {
             at: 2000,
-            blob: Some(keychain_blob(Some("rt-new"))),
+            refresh_token_sha256: keychain_refresh_digest(&keychain_blob(Some("rt-new"))),
         },
     )
     .expect("write new");
@@ -1780,4 +1783,57 @@ fn which_answers_from_a_tollgate_hermes_home_and_scrub_tollgate_homes_drops_it()
     };
     assert!(removed(&member), "a tollgate Hermes home is dropped");
     assert!(!removed(&operator), "the operator's own home stays");
+}
+
+#[test]
+fn round1_keychain_cache_persists_only_a_refresh_digest_and_sweeps_on_read() {
+    let _home = HomeSandbox::new();
+    let dir = keychain_cache_dir().unwrap();
+    let blob = serde_json::json!({"claudeAiOauth":{"accessToken":"secret-access","refreshToken":"secret-refresh"},"designOauth":{"refreshToken":"secret-design"},"mcpOAuth":{"secret":"secret-mcp"}});
+    write_keychain_cache_entry(
+        &dir,
+        "current",
+        &KeychainEvidenceEntry {
+            at: crate::usage::now_ms() / 1000,
+            refresh_token_sha256: keychain_refresh_digest(&blob),
+        },
+    )
+    .unwrap();
+    let bytes = std::fs::read_to_string(keychain_cache_entry_path(&dir, "current")).unwrap();
+    assert!(!bytes.contains("secret"));
+    assert!(!bytes.contains("designOauth"));
+    assert!(!bytes.contains("mcpOAuth"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&bytes).unwrap()["refresh_token_sha256"],
+        digest_refresh_token("secret-refresh")
+    );
+    let legacy = keychain_cache_entry_path(&dir, "legacy");
+    std::fs::write(
+        &legacy,
+        serde_json::to_vec(&serde_json::json!({"at":crate::usage::now_ms() / 1000,"blob":blob}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(read_keychain_cache_entry(&dir, "legacy").is_none());
+    assert!(!legacy.exists(), "legacy raw grants are discarded");
+    let old = keychain_cache_entry_path(&dir, "old");
+    std::fs::write(&old, b"old").unwrap();
+    crate::testutil::set_mtime(
+        &old,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_secs(KEYCHAIN_EVIDENCE_RETENTION_SECS * 2),
+    );
+    assert!(read_keychain_cache_entry(&dir, "current").is_some());
+    assert!(!old.exists(), "cache hits also sweep");
+    let config = config_with(
+        vec![
+            oauth_profile("first", "shared"),
+            oauth_profile("active", "shared"),
+        ],
+        Some("active"),
+    );
+    assert_eq!(
+        match_by_keychain_digest(&config, &digest_refresh_token("shared")).map(|n| n.as_str()),
+        Some("active")
+    );
 }

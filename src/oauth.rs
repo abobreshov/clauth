@@ -1892,7 +1892,6 @@ pub(crate) fn try_adopt_live_rotation(
 ) -> Option<(String, Option<String>)> {
     use crate::profile_cache::{
         ACCOUNT_ID_CACHE_FILE, ADOPT_REFUSAL_FILE, load_profile_cache, remove_profile_cache,
-        write_profile_cache,
     };
 
     // Guest mode (plan §4.0): the live `~/.claude/.credentials.json` is
@@ -2047,7 +2046,7 @@ pub(crate) fn try_adopt_live_rotation(
         // above compared the mirror probe against it), so the anchor rides the
         // SAME hold that committed the store: a cross-process install's removal
         // landing in between cannot be overwritten by a stale uuid.
-        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
+        crate::usage::seed_login_anchor(name, Some(&live_id));
         Ok::<bool, anyhow::Error>(true)
     })
     .unwrap_or(false);
@@ -2666,11 +2665,16 @@ pub(crate) fn restamp_rolling_token(
     // by holding the config mutex across it — the `apply_rotated_tokens_locked`
     // mirror discipline (the state FLOCK is what must never span the
     // `/usr/bin/security` subprocess; the config mutex is expected to).
+    let ready_config = matches!(gate, AuthGate::Ready).then(|| {
+        config.lock().unwrap_or_else(|poison| {
+            logline!("tollgate: re-stamped '{name}' with a poisoned config lock; following the live login anyway");
+            poison.into_inner()
+        })
+    });
     #[cfg(target_os = "macos")]
     if matches!(gate, AuthGate::Ready)
         && crate::keychain::enabled()
-        && let Ok(cfg) = config.lock()
-        && cfg.is_active(name)
+        && ready_config.as_ref().is_some_and(|cfg| cfg.is_active(name))
         && let Ok(path) = crate::claude::install_source_path(name)
         && let Ok(creds) =
             crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path)
@@ -2715,9 +2719,7 @@ pub(crate) fn restamp_rolling_token(
     // rotation hook, whose own follower leg covers the live slot. The
     // re-read legs fail LOUD: a silent skip here reproduces the exact #104
     // symptom through the fix's own failure path.
-    if matches!(gate, AuthGate::Ready)
-        && let Ok(cfg) = config.lock()
-    {
+    if let Some(cfg) = ready_config.as_ref() {
         if !cfg.is_active(name) {
             return gate;
         }

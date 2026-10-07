@@ -722,7 +722,12 @@ pub(crate) enum BlockedReason {
     /// would describe a member nothing is going to pick anyway.
     Disabled,
     /// Same quota as another chain member; changing logins would only churn.
-    SameAccount { profile: ProfileName },
+    SameAccount {
+        profile: ProfileName,
+    },
+    IdentityUnverified {
+        profile: ProfileName,
+    },
     /// Subscription canceled (`/profile` `subscription_status == "canceled"`):
     /// the org dropped to `claude_free` and `/v1/messages` 403s, so it can't
     /// serve at all — dead-first, above every quota/limiter block.
@@ -738,12 +743,16 @@ pub(crate) enum BlockedReason {
     /// 7d window at/over the hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
     /// weekly reset. `resets_in` is seconds to that reset when the window carries
     /// a parseable `resets_at`.
-    WeeklySpent { resets_in: Option<i64> },
+    WeeklySpent {
+        resets_in: Option<i64>,
+    },
     /// The messages limiter refused this member's 5h auto-start kick (switch-grade
     /// — the same block the walk routes around): tollgate can't bring it online
     /// regardless of its usage headroom. `lifts_in` is seconds to the limiter's
     /// advertised ceiling (an upper bound it usually undercuts).
-    KickRejected { lifts_in: i64 },
+    KickRejected {
+        lifts_in: i64,
+    },
     /// Billing member that is out of free 5h quota AND has spent the
     /// `max_auto_spend` budget the operator allowed it (see [`budget_spent`]) — so
     /// it can neither serve free nor be paid-rescued. With 5h headroom the walk
@@ -751,14 +760,22 @@ pub(crate) enum BlockedReason {
     BudgetSpent,
     /// 5h window at/over the member's rotate threshold: exhausted for now, resets
     /// within hours. `pct` is the current utilization.
-    FiveHour { pct: f64, resets_in: Option<i64> },
+    FiveHour {
+        pct: f64,
+        resets_in: Option<i64>,
+    },
     /// A per-model weekly window (e.g. "7d fable") past the weekly line while
     /// this member's `check_scoped` gate is on: out of rotation, though it
     /// still serves other models. `label`/`pct` name the worst such window.
-    ScopedSpent { label: String, pct: f64 },
+    ScopedSpent {
+        label: String,
+        pct: f64,
+    },
     /// 7d window over the soft switch line but under the hard cap: still serves
     /// every request, just won't be picked. `pct` is the current utilization.
-    WeeklySoft { pct: f64 },
+    WeeklySoft {
+        pct: f64,
+    },
     /// Last read wasn't live (cached / endpoint-429): the numbers are old, so the
     /// chain distrusts this member's apparent headroom.
     Stale,
@@ -795,6 +812,13 @@ pub(crate) fn blocked_reason(
     // would be the second opinion this function must never be.
     if profile.is_disabled() && !config.is_active(&profile.name) {
         return Some(BlockedReason::Disabled);
+    }
+    if let Some(profile) = crate::profile_cache::unverified_walk_member(
+        config,
+        &profile.name,
+        config.state.active_profile.as_ref(),
+    ) {
+        return Some(BlockedReason::IdentityUnverified { profile });
     }
     if let Some(other) = crate::profile_cache::duplicate_walk_member(
         config,
@@ -1231,6 +1255,8 @@ fn build_chain_snapshot(
                 || (profile.is_some()
                     && !profile.is_some_and(Profile::is_disabled)
                     && !skip_candidate(profile)
+                    && crate::profile_cache::unverified_walk_member(config, name, Some(&active))
+                        .is_none()
                     && crate::profile_cache::duplicate_walk_member(config, name, Some(&active))
                         .is_none())
         })
@@ -1411,6 +1437,7 @@ fn ordered_walk(
 pub(crate) enum StartBlock {
     Disabled,
     SameAccount { profile: ProfileName },
+    IdentityUnverified { profile: ProfileName },
     AuthBroken,
     Canceled,
     KickRejected,
@@ -1451,6 +1478,10 @@ pub(crate) fn start_block(
 ) -> Option<StartBlock> {
     if profile.is_disabled() {
         return Some(StartBlock::Disabled);
+    }
+    if let Some(profile) = crate::profile_cache::unverified_walk_member(config, &member.name, None)
+    {
+        return Some(StartBlock::IdentityUnverified { profile });
     }
     if let Some(other) = crate::profile_cache::duplicate_walk_member(config, &member.name, None) {
         return Some(StartBlock::SameAccount { profile: other });
@@ -1664,6 +1695,12 @@ pub(crate) fn walk_excluded(
         || config.is_auth_broken(name)
         || p.is_some_and(Profile::is_disabled)
         || key_rejected.contains(name)
+        || crate::profile_cache::unverified_walk_member(
+            config,
+            name,
+            config.state.active_profile.as_ref(),
+        )
+        .is_some()
         || crate::profile_cache::duplicate_walk_member(
             config,
             name,
@@ -1701,9 +1738,9 @@ pub(crate) fn day_claim_blocker(
     config: &AppConfig,
     name: &ProfileName,
     key_rejected: &HashSet<ProfileName>,
-) -> Option<&'static str> {
+) -> Option<std::borrow::Cow<'static, str>> {
     if config.find(name).is_some() && !config.state.fallback_chain.iter().any(|n| n == name) {
-        return Some("it is not on the fallback chain");
+        return Some("it is not on the fallback chain".into());
     }
     walk_blocker(config, name, key_rejected)
 }
@@ -1715,27 +1752,32 @@ pub(crate) fn walk_blocker(
     config: &AppConfig,
     name: &ProfileName,
     key_rejected: &HashSet<ProfileName>,
-) -> Option<&'static str> {
+) -> Option<std::borrow::Cow<'static, str>> {
     let Some(profile) = config.find(name) else {
-        return Some("no such account");
+        return Some("no such account".into());
     };
-    if crate::profile_cache::duplicate_walk_member(
+    if let Some(profile) = crate::profile_cache::unverified_walk_member(
         config,
         name,
         config.state.active_profile.as_ref(),
-    )
-    .is_some()
-    {
-        return Some("it is the same account as another chain member");
+    ) {
+        return Some(format!("account identity is unverified for '{profile}'").into());
+    }
+    if let Some(other) = crate::profile_cache::duplicate_walk_member(
+        config,
+        name,
+        config.state.active_profile.as_ref(),
+    ) {
+        return Some(format!("it is the same account as '{other}'").into());
     }
     if profile.is_disabled() {
-        return Some("the account is disabled");
+        return Some("the account is disabled".into());
     }
     if config.is_auth_broken(name) {
-        return Some("its login is auth-broken");
+        return Some("its login is auth-broken".into());
     }
     if key_rejected.contains(name) {
-        return Some("its api key was rejected");
+        return Some("its api key was rejected".into());
     }
     None
 }

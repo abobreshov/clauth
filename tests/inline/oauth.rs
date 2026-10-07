@@ -6484,3 +6484,43 @@ fn a_rotation_never_puts_an_older_live_copy_over_the_stores() {
     assert_eq!(after["claudeAiOauth"]["accessToken"], "at-rotated");
     assert_eq!(after["mcpOAuth"]["linear"]["refreshToken"], "v2");
 }
+
+#[test]
+fn round1_restamp_reports_and_recovers_a_poisoned_config_lock() {
+    let _home = HomeSandbox::new();
+    let name = "poisoned-restamp";
+    let mut config = rolling_config(name, Some("rt-old"), Some(beyond_horizon_expiry()));
+    config.state.active_profile = Some(name.into());
+    crate::profile::save_profile(&config.profiles[0]).unwrap();
+    crate::claude::stamp_rolling_token(
+        &name.into(),
+        config.profiles[0]
+            .credentials
+            .as_ref()
+            .unwrap()
+            .claude_ai_oauth
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.lock().unwrap();
+            panic!("test poison");
+        }))
+        .is_err()
+    );
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    assert!(matches!(
+        restamp_rolling_token(&handle, &name.into(), never_refresh),
+        AuthGate::Ready
+    ));
+    assert!(
+        sink.snapshot()
+            .iter()
+            .any(|line| line.contains("poisoned config lock")
+                && line.contains("following the live login"))
+    );
+}

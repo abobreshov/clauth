@@ -3113,6 +3113,9 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
 #[test]
 fn overwrite_captured_profile_anchors_the_account_it_committed() {
     let _home = HomeSandbox::new();
+    // An overwrite targets an existing roster entry; seed inside the commit
+    // uses that persisted membership, just as a real loaded config does.
+    crate::testutil::register_names(&["swap"]);
     let target = Profile::new("swap".to_string(), None, None);
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
@@ -6868,4 +6871,67 @@ fn duplicate_account_login_warns_and_keeps_the_other_profile() {
         && l.contains("leadtone")
         && l.contains("the browser was signed in as the other account")));
     assert_eq!(std::fs::read(&first_path).expect("other config"), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn round1_proven_overwrite_seeds_identity_before_later_settings_failure() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p5");
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-a"));
+    save_profile(&profile).expect("save");
+    crate::testutil::register_names(&["p5"]);
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.active_profile = Some("p5".into());
+    crate::profile::save_app_state(&state).expect("save state");
+    let mut config = AppConfig {
+        state,
+        profiles: vec![profile],
+    };
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir .claude");
+    // A settings.json whose `env` is not an object: the active-profile settings
+    // write after the credential commit fails.
+    std::fs::write(claude_dir.join("settings.json"), br#"{"env": 5}"#).expect("settings");
+    let r = overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(tok("at-b")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Proven("uuid-b".into()),
+        },
+    );
+    assert!(
+        r.is_err(),
+        "precondition: the settings write after the commit fails"
+    );
+    let stored = crate::profile::load_profile(&name).expect("load");
+    assert_eq!(
+        stored.access_token(),
+        Some("at-b"),
+        "precondition: the store took the new login"
+    );
+    assert_eq!(
+        anchor_of("p5").as_deref(),
+        Some("uuid-b"),
+        "the proven anchor must commit with the login even if later settings fail"
+    );
+    assert!(!crate::profile_cache::identity_pending(&name));
 }

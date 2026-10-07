@@ -15606,3 +15606,18 @@ fn duplicate_account_relogin_warns_before_confirmation_without_reanchoring() {
         );
     }
 }
+
+#[test]
+fn round1_non_login_keys_toggle_rolls_back_and_reports_a_save_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let path = crate::profile::tollgate_dir()
+        .unwrap()
+        .join("profiles.toml");
+    std::fs::create_dir_all(&path).unwrap(); // atomic rename cannot replace a directory
+    super::toggle_preserve_non_login_keys(&mut app);
+    assert!(app.config().state.preserve_non_login_keys);
+    assert!(crate::claude::preserve_non_login_keys());
+    assert!(app.toasts.iter().any(|t| t.kind == super::ToastKind::Danger
+        && t.body.contains("could not save preserve_non_login_keys")));
+}

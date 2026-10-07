@@ -5228,17 +5228,18 @@ fn a_live_file_holding_another_login_syncs_nothing_into_the_sidecar() {
     );
 }
 
-/// Every sidecar writer rebuilds the file from its token, so a re-mint must put
-/// the sidecar's non-login keys back or the next `tollgate login <name>
-/// --setup-token` drops what the account kept there. The re-mint with backup
-/// writes the same bytes into the static backup, the account's own file too.
+/// A pasted setup token can belong to another account, so a re-mint must not
+/// mix the old design identity into it. Save the design login into the profile's
+/// usage store and carry only MCP-server keys onto the new mint and backup.
 #[test]
-fn a_re_mint_keeps_every_non_login_key_its_sidecar_holds() {
+fn a_re_mint_parks_account_keys_and_carries_only_mcp_logins() {
     let _home = HomeSandbox::new();
     seed_static_token_accounts(&["a"], "a", None);
     let sidecar = sidecar_of("a");
     let mut held = read_value(&sidecar);
     held["designOauth"] = design_login();
+    held["mcpOAuth"] = serde_json::json!({"server": {"accessToken": "mcp-token"}});
+    held["futureAccountKey"] = serde_json::json!("account-a-data");
     held["organizationUuid"] = serde_json::json!("a-org");
     write_value(&sidecar, &held);
     let name = crate::profile::ProfileName::from("a");
@@ -5247,7 +5248,10 @@ fn a_re_mint_keeps_every_non_login_key_its_sidecar_holds() {
     write_session_token(&name, &mint_for("a2"), now).expect("re-mint");
     let after = read_value(&sidecar);
     assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
-    assert_eq!(after["designOauth"], design_login());
+    assert!(after.get("designOauth").is_none());
+    assert!(after.get("futureAccountKey").is_none());
+    assert_eq!(after["mcpOAuth"], held["mcpOAuth"]);
+    assert_eq!(read_value(&store_of("a"))["designOauth"], design_login());
     assert!(
         after.get("organizationUuid").is_none(),
         "the login's identity keys go with the login they came with: a re-mint can be \
@@ -5257,7 +5261,10 @@ fn a_re_mint_keeps_every_non_login_key_its_sidecar_holds() {
     write_session_token_with_backup(&name, &mint_for("a3"), now).expect("re-mint with backup");
     let after = read_value(&sidecar);
     assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a3"));
-    assert_eq!(after["designOauth"], design_login());
+    assert!(after.get("designOauth").is_none());
+    assert!(after.get("futureAccountKey").is_none());
+    assert_eq!(after["mcpOAuth"], held["mcpOAuth"]);
+    assert_eq!(read_value(&store_of("a"))["designOauth"], design_login());
     assert_eq!(
         fs::read(sidecar.with_file_name("session-token.static.json")).expect("read backup"),
         fs::read(&sidecar).expect("read sidecar"),
@@ -5481,9 +5488,9 @@ fn an_unreadable_profiles_toml_preserves() {
     )
     .expect("re-mint");
     assert_eq!(
-        read_value(&sidecar_of("a"))["designOauth"],
+        read_value(&store_of("a"))["designOauth"],
         design_login(),
-        "the re-mint keeps it too"
+        "the remint parks it because a pasted token has no identity proof"
     );
 }
 
@@ -5742,7 +5749,7 @@ fn rolling_chain(access: &str) -> crate::profile::OAuthToken {
 /// rolling re-stamp does.
 #[cfg(unix)]
 #[test]
-fn a_re_mint_keeps_a_design_login_only_the_live_file_holds() {
+fn a_re_mint_parks_a_design_login_only_the_live_file_holds() {
     let _home = HomeSandbox::new();
     seed_static_token_accounts(&["a"], "a", None);
     design_login_on_the_live_slot("a");
@@ -5752,27 +5759,28 @@ fn a_re_mint_keeps_a_design_login_only_the_live_file_holds() {
 
     let after = read_value(&sidecar_of("a"));
     assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert!(after.get("designOauth").is_none());
     assert_eq!(
-        after["designOauth"],
+        read_value(&store_of("a"))["designOauth"],
         design_login(),
-        "the re-mint saved the live file's design login into the sidecar first"
+        "the live design login is saved into its account store before remint"
     );
     force_link_profile_credentials(&name).expect("relink");
     let live = read_value(&claude_credentials_path().expect("creds path"));
     assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("a2"));
     assert_eq!(
-        live["designOauth"],
-        design_login(),
-        "and it goes live with the new mint"
+        live.get("designOauth"),
+        None,
+        "an unproven pasted mint cannot inherit the old account's design login"
     );
 }
 
 /// The re-mint on a rolling profile writes the sidecar and the static backup
-/// from the same bytes, over the rolling bearer the live file holds: the design
-/// login Claude Code saved beside that bearer lands in both.
+/// from the same bytes. A pasted token may belong to another account, so the
+/// live design login is parked in credentials.json before either mint is written.
 #[cfg(unix)]
 #[test]
-fn a_re_mint_with_backup_keeps_a_design_login_only_the_live_file_holds() {
+fn a_re_mint_with_backup_parks_a_design_login_only_the_live_file_holds() {
     let _home = HomeSandbox::new();
     seed_static_token_accounts(&["a"], "a", None);
     let name = crate::profile::ProfileName::from("a");
@@ -5784,10 +5792,11 @@ fn a_re_mint_with_backup_keeps_a_design_login_only_the_live_file_holds() {
 
     let after = read_value(&sidecar_of("a"));
     assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert!(after.get("designOauth").is_none());
     assert_eq!(
-        after["designOauth"],
+        read_value(&store_of("a"))["designOauth"],
         design_login(),
-        "the design login the live file held beside the rolling bearer is kept"
+        "the design login is parked in the account store"
     );
     assert_eq!(
         fs::read(sidecar_of("a").with_file_name("session-token.static.json")).expect("read backup"),
@@ -5929,7 +5938,8 @@ fn a_stamp_or_clear_over_a_misfill_saves_the_live_keys_beside_the_login() {
 /// Clearing a long-lived token makes `credentials.json` the install source
 /// again, and the design login the sidecar held moves there instead of going
 /// with the file. The reverse holds too: a first setup token on an account
-/// running on its OAuth login takes that login's design login along.
+/// running on its OAuth login parks that design grant in the account store;
+/// the pasted token may belong to another account.
 #[test]
 fn a_design_login_survives_the_install_source_flipping_either_way() {
     let _home = HomeSandbox::new();
@@ -5943,9 +5953,9 @@ fn a_design_login_survives_the_install_source_flipping_either_way() {
 
     write_session_token(&name, &mint_for("a"), crate::usage::now_ms() as i64).expect("mint");
     assert_eq!(
-        read_value(&sidecar_of("a"))["designOauth"],
-        design_login(),
-        "the first setup token takes the OAuth store's design login"
+        read_value(&sidecar_of("a")).get("designOauth"),
+        None,
+        "the first pasted setup token cannot prove it owns the design login"
     );
 
     let mut held = read_value(&sidecar_of("a"));
@@ -6105,8 +6115,8 @@ fn a_token_is_never_mixed_field_by_field() {
 /// A design login the live file alone holds survives the install source
 /// flipping. Clearing a long-lived token saves it into the sidecar while the
 /// sidecar's token is still live, then hands it on; a first setup token saves
-/// it into `credentials.json` while the OAuth login is still live, then seeds
-/// the sidecar from there.
+/// it into `credentials.json` while the OAuth login is still live. A pasted
+/// token cannot prove account continuity, so it inherits only MCP logins.
 #[cfg(unix)]
 #[test]
 fn a_design_login_the_live_file_alone_holds_survives_the_flip() {
@@ -6121,7 +6131,8 @@ fn a_design_login_the_live_file_alone_holds_survives_the_flip() {
     claude_code_saves(&live);
 
     write_session_token(&name, &mint_for("a"), crate::usage::now_ms() as i64).expect("mint");
-    assert_eq!(read_value(&sidecar_of("a"))["designOauth"], design_login());
+    assert!(read_value(&sidecar_of("a")).get("designOauth").is_none());
+    assert_eq!(read_value(&store_of("a"))["designOauth"], design_login());
 
     force_link_profile_credentials(&name).expect("link the sidecar");
     let mut live = read_value(&sidecar_of("a"));
@@ -6261,9 +6272,8 @@ fn the_keychain_sign_outs_pass_the_preservation_reading() {
             && clear.contains("preserve && sync_item_into_its_store(item, None)"),
         "both sign-outs let the owner search take the item's keys first"
     );
-    // The per-session items keep the strip preservation off gives: nothing
-    // saves what they hold beside a login, and keeping it would hand it to the
-    // session's next member.
+    // Per-session items save to their owner first, then always strip account
+    // keys so the next member cannot inherit the outgoing design login.
     let keychain = include_str!("../../src/keychain.rs");
     let per_session = keychain
         .split_once("pub(crate) fn keychain_sign_out_for_config_dir(")
@@ -6272,7 +6282,26 @@ fn the_keychain_sign_outs_pass_the_preservation_reading() {
         .split_once("\n}\n")
         .expect("fn body closes")
         .0;
-    assert!(per_session.contains("sign_out_at(&service, &account()?, false)"));
+    assert!(per_session.contains("sign_out_saving_at("));
+    assert!(per_session.contains("preserve_non_login_keys(),\n        false,"));
+    assert!(per_session.contains("save_session_non_login_keys"));
+    let install = keychain
+        .split_once("pub(crate) fn keychain_install_for_config_dir(")
+        .unwrap()
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    assert!(install.contains("save_session_non_login_keys(item)"));
+    let saver = keychain
+        .split_once("fn save_session_non_login_keys(")
+        .unwrap()
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    assert!(saver.contains("with_state_lock"));
+    assert!(saver.contains("sync_item_into_its_store(item, None)"));
 }
 
 /// A sign-out keeps the design login in the item only while preservation is on
@@ -6441,4 +6470,135 @@ fn live_file_follow_and_rotation_key_sync_stand_down_in_guest_mode() {
     sync_live_extra_after_rotation(&"work".into(), "old");
     assert_eq!(std::fs::read(&live).expect("live after"), bytes);
     assert_eq!(std::fs::read(&store).expect("store after"), before);
+}
+
+/// A Claude Code /login landing after staging must win the publication check.
+#[test]
+fn round1_live_follower_preserves_an_external_write_after_staging() {
+    let _home = HomeSandbox::new();
+    let path = claude_credentials_path().expect("live path");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let before = serde_json::json!({"claudeAiOauth":{"accessToken":"ours","expiresAt":1000}});
+    write_value(&path, &before);
+    let external = br#"{"claudeAiOauth":{"accessToken":"external","refreshToken":"external-rt"},"designOauth":{"accessToken":"new-design"}}"#;
+    let incoming = crate::profile::OAuthToken {
+        access_token: "ours-new".into(),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    let result = follow_live_file_login_before_publish(&["ours"], &incoming, |live| {
+        fs::write(live, external).expect("external login");
+    })
+    .expect("follow");
+    assert!(matches!(result, LiveSlotFollow::NotOurs));
+    assert_eq!(fs::read(&path).unwrap(), external);
+    assert_eq!(
+        fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1,
+        "staged file removed"
+    );
+}
+
+/// Even an identical-byte external rename changes ownership of the live slot.
+#[cfg(unix)]
+#[test]
+fn round1_live_follower_detects_an_external_inode_change() {
+    let _home = HomeSandbox::new();
+    let path = claude_credentials_path().unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = br#"{"claudeAiOauth":{"accessToken":"ours"}}"#;
+    fs::write(&path, bytes).unwrap();
+    let incoming = crate::profile::OAuthToken {
+        access_token: "next".into(),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    let result = follow_live_file_login_before_publish(&["ours"], &incoming, |live| {
+        let replacement = live.with_file_name("external");
+        fs::write(&replacement, bytes).unwrap();
+        fs::rename(replacement, live).unwrap();
+    })
+    .unwrap();
+    assert!(matches!(result, LiveSlotFollow::NotOurs));
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+/// A per-session item can contain the only design grant even when its inference
+/// login loses the expiry comparison, or when the install source is a mint.
+#[test]
+fn round1_session_item_saves_keys_without_replacing_its_matching_login() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["session-keys"]);
+    let store_dir = crate::profile::profile_dir(&"session-keys".into()).unwrap();
+    fs::create_dir_all(&store_dir).unwrap();
+    let runtime = store_dir.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    for (file, expiry) in [
+        ("credentials.json", 1000),
+        ("credentials.json", 2000),
+        ("session-token.json", 1000),
+    ] {
+        let store = store_dir.join(file);
+        let stored = serde_json::json!({"claudeAiOauth":{"accessToken":"same","expiresAt":expiry},"futureKey":"held"});
+        let item = serde_json::json!({"claudeAiOauth":{"accessToken":"same","expiresAt":1000},"designOauth":design_login()});
+        write_value(&store, &stored);
+        carry_session_blob_into(&store, &runtime, &item).unwrap();
+        let after = read_value(&store);
+        assert_eq!(after["claudeAiOauth"], stored["claudeAiOauth"]);
+        assert_eq!(after["designOauth"], design_login());
+        assert_eq!(after["futureKey"], "held");
+        // Foreign, staged and opted-out items must not merge their keys.
+        for mode in ["foreign", "staged", "off"] {
+            if mode == "staged" && file == "session-token.json" {
+                continue;
+            }
+            write_value(&store, &stored);
+            let mut candidate = item.clone();
+            if mode == "foreign" {
+                candidate["claudeAiOauth"]["accessToken"] = "foreign".into();
+            }
+            if mode == "staged" {
+                fs::write(store_dir.join("credentials.json.pending"), b"staged").unwrap();
+            }
+            if mode == "off" {
+                let mut state = crate::profile::load_app_state().unwrap();
+                state.preserve_non_login_keys = false;
+                crate::profile::save_app_state(&state).unwrap();
+            }
+            carry_session_blob_into(&store, &runtime, &candidate).unwrap();
+            assert_eq!(read_value(&store), stored, "{file}: {mode}");
+            let _ = fs::remove_file(store_dir.join("credentials.json.pending"));
+            let mut state = crate::profile::load_app_state().unwrap();
+            state.preserve_non_login_keys = true;
+            crate::profile::save_app_state(&state).unwrap();
+        }
+    }
+}
+
+/// Saving must precede replacing either mint. A pending rotation cannot be
+/// overwritten just to park keys, so a remint leaves the outgoing token intact.
+#[test]
+fn round1_remint_refuses_to_drop_keys_when_the_account_store_cannot_take_them() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let sidecar = sidecar_of("a");
+    let mut held = read_value(&sidecar);
+    held["designOauth"] = design_login();
+    write_value(&sidecar, &held);
+    write_value(
+        &store_of("a"),
+        &serde_json::json!({"claudeAiOauth":{"accessToken":"usage"}}),
+    );
+    fs::write(
+        store_of("a").with_file_name("credentials.json.pending"),
+        b"rotation",
+    )
+    .unwrap();
+    let before = fs::read(&sidecar).unwrap();
+    let name = "a".into();
+    assert!(write_session_token(&name, &mint_for("b"), crate::usage::now_ms() as i64).is_err());
+    assert_eq!(fs::read(&sidecar).unwrap(), before);
+    assert!(
+        write_session_token_with_backup(&name, &mint_for("b"), crate::usage::now_ms() as i64)
+            .is_err()
+    );
+    assert_eq!(fs::read(sidecar).unwrap(), before);
 }

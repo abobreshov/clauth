@@ -325,10 +325,11 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
     with_state_lock(|_held| {
         // A re-mint relinks nothing, so a live file Claude Code wrote beside
         // the mint this replaces stops matching any store; saved first, the
-        // keep below carries it onto the new mint. Over a mis-fill, whose keys
-        // the keep never takes, it waits in `credentials.json` instead.
+        // old account keys are parked in credentials.json. Only MCP logins
+        // can follow a pasted mint whose account cannot be verified.
         sync_live_extra_into_install_source(name);
-        let bytes = keep_non_login_in_sidecar(&bytes, &path);
+        park_sidecar_keys_for_remint(&path)?;
+        let bytes = keep_carried_in_mint(&bytes, &path);
         atomic_write_600(&path, bytes).context("write session-token.json")
     })?;
     Ok(expires_at)
@@ -531,11 +532,11 @@ pub(crate) fn write_session_token_with_backup(
         // As in `write_session_token`: what the live file holds beside the
         // bearer this replaces is saved before it stops matching.
         sync_live_extra_into_install_source(name);
-        // Both files from the SAME bytes, the sidecar's non-login keys
-        // included: the backup is this account's own file too, and the roll's
-        // `preserve_static_mint` already copies the sidecar into it raw.
+        // Both files get the SAME bytes: only MCP logins accompany this
+        // unproven pasted mint; the old account keys are parked first.
         let sidecar = dir.join("session-token.json");
-        let bytes = keep_non_login_in_sidecar(&bytes, &sidecar);
+        park_sidecar_keys_for_remint(&sidecar)?;
+        let bytes = keep_carried_in_mint(&bytes, &sidecar);
         atomic_write_600(&sidecar, &bytes).context("write session-token.json")?;
         atomic_write_600(&dir.join("session-token.static.json"), &bytes)
             .context("write session-token.static.json")
@@ -1087,11 +1088,21 @@ pub(crate) enum LiveSlotFollow {
 /// shell. The write replaces the `claudeAiOauth` block alone — every other
 /// block (`mcpOAuth` included) survives, the file-layer `Keep::Everything`.
 /// The write is atomic; callers hold their own locks, as with the mirror. The
-/// recognize-then-write gap is the same accepted race the mirror carries: the
-/// next poll's content check self-heals a lost interleaving with a publish.
+/// live bytes and metadata are checked again after staging, before publication.
+/// This narrows the external-writer race; Claude Code does not take our flock,
+/// so a write in the final check-to-rename gap remains possible and is not
+/// self-healed. A later tollgate publish can heal only its own interleaving.
 pub(crate) fn follow_live_file_login(
     candidates: &[&str],
     incoming: &crate::profile::OAuthToken,
+) -> Result<LiveSlotFollow> {
+    follow_live_file_login_before_publish(candidates, incoming, |_| {})
+}
+
+fn follow_live_file_login_before_publish(
+    candidates: &[&str],
+    incoming: &crate::profile::OAuthToken,
+    before_publish: impl FnOnce(&Path),
 ) -> Result<LiveSlotFollow> {
     if crate::identity::upstream_active() {
         return Ok(LiveSlotFollow::Noop);
@@ -1119,12 +1130,34 @@ pub(crate) fn follow_live_file_login(
         serde_json::from_slice(&bytes).context("failed to parse .credentials.json")?;
     value["claudeAiOauth"] =
         serde_json::to_value(incoming).context("failed to serialize the incoming login")?;
-    atomic_write_600(
+    let published = crate::profile::atomic_write_600_checked(
         &link,
         serde_json::to_vec(&value).context("failed to serialize .credentials.json")?,
+        || {
+            before_publish(&link);
+            let current = match link.symlink_metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if current.ino() != meta.ino() || current.dev() != meta.dev() {
+                    return Ok(false);
+                }
+            }
+            Ok(!current.file_type().is_symlink()
+                && current.modified().ok() == meta.modified().ok()
+                && std::fs::read(&link)? == bytes)
+        },
     )
     .context("failed to follow the live login")?;
-    Ok(LiveSlotFollow::Followed)
+    Ok(if published {
+        LiveSlotFollow::Followed
+    } else {
+        LiveSlotFollow::NotOurs
+    })
 }
 
 /// True when the profile has no stored credentials but the live path is a regular
@@ -1409,7 +1442,17 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         }
         Err(e) => return Err(e),
     };
-    let bytes = serde_json::to_vec(&blob).context("failed to serialize the Keychain item")?;
+    carry_session_blob_into(store, config_dir, &blob)
+}
+
+/// The per-session item carry, separated from its macOS read for sandbox tests.
+#[cfg(any(target_os = "macos", test))]
+fn carry_session_blob_into(
+    store: &Path,
+    config_dir: &Path,
+    blob: &serde_json::Value,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(blob).context("failed to serialize the Keychain item")?;
     let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "the Keychain item for {} is not Claude credentials",
@@ -1424,24 +1467,30 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         if store_bytes.as_deref() == Some(bytes.as_slice()) {
             return Ok(());
         }
-        if store.file_name().is_some_and(|f| f == "session-token.json") {
-            logline!(
-                "tollgate: kept the static session token (a session-side re-login \
-                 found in the per-session Keychain item is never adopted over it)"
-            );
-            return Ok(());
-        }
         let store_value = store_bytes
             .as_deref()
             .and_then(|sb| serde_json::from_slice::<serde_json::Value>(sb).ok());
-        if !item_login_outranks_store(&blob, store_value.as_ref()) {
-            // The store moved after the item was last written (a recapture, a
-            // switch-away snapshot): keep it, the carry must not revert it.
+        if store.file_name().is_some_and(|f| f == "session-token.json")
+            || !item_login_outranks_store(blob, store_value.as_ref())
+        {
+            // A login with equal expiry may still carry a new design login.
+            // Merge only into the exact login's store, including static tokens.
+            if preserve_non_login_keys()
+                && !crate::profile::rotation_staged_beside(store)
+                && let Some(synced) = store_value
+                    .as_ref()
+                    .and_then(|stored| non_login_keys_onto_own_store(blob, stored))
+            {
+                atomic_write_600(store, serde_json::to_vec(&synced)?)?;
+            }
             return Ok(());
         }
         let store_creds = store_bytes
             .as_deref()
             .and_then(|sb| serde_json::from_slice::<ClaudeCredentials>(sb).ok());
+        if crate::profile::login_changed(store_creds.as_ref(), &parsed) {
+            crate::usage::prepare_runtime_login_change(store, config_dir)?;
+        }
         crate::profile::atomic_write_600(store, &bytes)
             .with_context(|| format!("failed to write {}", store.display()))?;
         // Mark the `/profile` reading stale only when the carried LOGIN changed,
@@ -2353,15 +2402,29 @@ fn non_login_key_names(value: &serde_json::Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// Keep only account-independent keys on an unproven pasted mint. Its outgoing
+/// account keys have already been saved by `park_sidecar_keys_for_remint`.
+fn keep_carried_in_mint(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
+    let kept = keep_non_login_in_sidecar(fresh, sidecar);
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&kept) else {
+        return fresh.to_vec();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.retain(|key, _| {
+            key == "claudeAiOauth" || CARRIED_CREDENTIAL_KEYS.contains(&key.as_str())
+        });
+    }
+    serde_json::to_vec_pretty(&value).unwrap_or_else(|_| fresh.to_vec())
+}
+
 /// The bytes a static-token sidecar writer publishes at `sidecar`: `fresh`, the
 /// file rebuilt from a token, plus every non-login key the current sidecar
 /// holds, a `/design-login` a sync put there among them. Every sidecar writer
-/// rebuilds the file from its token alone, so without this a re-mint, a rolling
-/// re-stamp or a restore drops what the account kept beside its login. The
+/// rebuilds the file from its token alone, so without this a rolling re-stamp
+/// or a restore drops what the account kept beside its login. The
 /// keep-everything rule an account's own `credentials.json` gets on every token
 /// write ([`crate::profile::preserve_extra_blocks`]), minus the login's identity
-/// keys ([`LOGIN_CREDENTIAL_KEYS`]): those belong to the login being replaced,
-/// and a re-mint can be another account's token.
+/// keys ([`LOGIN_CREDENTIAL_KEYS`]). Pasted mints use the stricter helper above.
 ///
 /// With no sidecar yet (the first mint on this profile, or the first roll) the
 /// keys come from the profile's `credentials.json`, the same account's other
@@ -2641,6 +2704,43 @@ pub(crate) fn sync_item_into_its_store(item: &serde_json::Value, relinked: Optio
             false
         }
     }
+}
+
+/// A pasted mint cannot prove account continuity. Save the outgoing sidecar's
+/// keys before replacement, creating a login-less store when it has no OAuth
+/// pair. Failure leaves the original sidecar intact for an operator retry.
+fn park_sidecar_keys_for_remint(sidecar: &Path) -> Result<()> {
+    if !preserve_non_login_keys() {
+        return Ok(());
+    }
+    // Keep the existing corrupt-sidecar repair policy: unreadable keys are
+    // logged, and a valid mint can replace the torn file.
+    let Some(held) = read_store_for_merge(sidecar, "the remint cannot save its non-login keys")
+    else {
+        return Ok(());
+    };
+    if serde_json::from_value::<ClaudeCredentials>(held.clone())
+        .ok()
+        .and_then(|creds| creds.claude_ai_oauth)
+        .is_some_and(|oauth| sidecar_kind_of(&oauth) == SidecarKind::Misfilled)
+    {
+        return Ok(());
+    }
+    let store = sidecar.with_file_name("credentials.json");
+    let mut stored = match std::fs::read(&store) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("parse account store before remint")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).context("read account store before remint"),
+    };
+    if copy_non_login_keys(&mut stored, &held) {
+        anyhow::ensure!(
+            !crate::profile::rotation_staged_beside(&store),
+            "a rotation is staged; remint deferred until the account keys can be saved"
+        );
+        atomic_write_600(&store, serde_json::to_vec_pretty(&stored)?)
+            .context("save outgoing account keys before remint")?;
+    }
+    Ok(())
 }
 
 /// Move the sidecar's non-login keys into the profile's `credentials.json`
@@ -3459,6 +3559,7 @@ fn snapshot_active_credentials_unchecked(
     }
     if let Some(profile) = config.find_mut(active) {
         if remove_anchor {
+            crate::profile_cache::begin_login_install(active)?;
             crate::profile_cache::remove_profile_cache(
                 active,
                 crate::profile_cache::ACCOUNT_ID_CACHE_FILE,

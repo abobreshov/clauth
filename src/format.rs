@@ -647,6 +647,9 @@ pub(crate) fn humanize_age(secs: u64) -> String {
 /// one exists ([`crate::fallback::StartBlock`]).
 pub(crate) fn start_block_label(block: &StartBlock) -> String {
     match block {
+        StartBlock::IdentityUnverified { profile } => {
+            format!("account identity is unverified for '{profile}'")
+        }
         StartBlock::SameAccount { profile } => format!("same account as {profile}"),
         StartBlock::Disabled => DIAG_DISABLED.to_string(),
         StartBlock::AuthBroken => DIAG_AUTH_BROKEN.to_string(),

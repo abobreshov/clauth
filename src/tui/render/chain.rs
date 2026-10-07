@@ -347,6 +347,7 @@ fn draw_chain_detail(
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
+        BlockedReason::IdentityUnverified { .. } => ("?", theme::warning()),
         BlockedReason::SameAccount { .. } => ("=", theme::warning()),
         BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => (theme::dead_credential_glyph(), theme::danger()),
@@ -377,6 +378,11 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
     // serving") — never crammed inside with a `·`, so the whole card and the
     // Usage-tab pills read one shape.
     let (label, style, suffix) = match reason {
+        BlockedReason::IdentityUnverified { profile } => (
+            format!("identity unverified: {profile}"),
+            theme::warning(),
+            None,
+        ),
         BlockedReason::SameAccount { profile } => (
             format!("same account as {profile}"),
             theme::warning().bold(),
@@ -443,6 +449,9 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
             "that model's weekly window is spent, other models still serve".to_string()
         }
         BlockedReason::WeeklySoft { .. } => DIAG_WEEKLY_SOFT.to_string(),
+        BlockedReason::IdentityUnverified { profile } => {
+            format!("wait for the next /profile identity read for '{profile}', or log in again")
+        }
         BlockedReason::SameAccount { profile } => {
             format!("same account as {profile}; no separate quota")
         }

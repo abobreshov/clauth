@@ -6936,7 +6936,7 @@ fn step_preferred_days(app: &mut App) {
         }
     };
     if let Some(reason) = write_preferred_days(app, &name, move |_| next) {
-        warn_list_claims_nothing(app, reason);
+        warn_list_claims_nothing(app, &reason);
     }
 }
 
@@ -7014,7 +7014,7 @@ fn toggle_picked_day(app: &mut App) {
     if let Some(reason) = write_preferred_days(app, &member, toggle)
         && !state.warned
     {
-        warn_list_claims_nothing(app, reason);
+        warn_list_claims_nothing(app, &reason);
         if let Some(MemberEdit {
             state: CardEdit::Days(picker),
             ..
@@ -7036,7 +7036,7 @@ fn write_preferred_days(
     app: &mut App,
     name: &ProfileName,
     edit: impl FnOnce(&[Weekday]) -> Vec<Weekday>,
-) -> Option<&'static str> {
+) -> Option<std::borrow::Cow<'static, str>> {
     let result = {
         let mut cfg = app.config();
         crate::actions::edit_profile_preferred_days(&mut cfg, name, edit)
@@ -12055,10 +12055,22 @@ fn toast_duplicate_login(app: &mut App, name: &ProfileName) {
 /// moment it relinks or rewrites a store (`claude::preserve_non_login_keys`),
 /// so the next relink in any process acts on the flip.
 fn toggle_preserve_non_login_keys(app: &mut App) {
-    {
+    let error = {
         let mut cfg = app.config();
         cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
-        let _ = save_app_state(&cfg.state);
+        match save_app_state(&cfg.state) {
+            Ok(()) => None,
+            Err(e) => {
+                cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
+                Some(e)
+            }
+        }
+    };
+    if let Some(error) = error {
+        app.toast(
+            ToastKind::Danger,
+            format!("could not save preserve_non_login_keys: {error:#}"),
+        );
     }
     app.last_reload_fp = reload_fingerprint();
 }

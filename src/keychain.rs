@@ -1405,10 +1405,8 @@ pub(crate) fn keychain_install(store: &Value, on_replaced: impl FnOnce(&Value)) 
 /// no rule of its own), and the same non-object refusal as [`keychain_install`]:
 /// one Keychain path, two service names.
 ///
-/// Known gap: what the replaced item held beside the outgoing member's login
-/// (a `/design-login` made inside the session, which on macOS lives in this
-/// item alone) is not saved into that member's store, so `preserve_non_login_keys`
-/// does not reach inside a `tollgate start` session here.
+/// Save the replaced item's sibling keys into their recognized owner's store
+/// before publishing the new member. Unknown owners are logged, never guessed.
 pub(crate) fn keychain_install_for_config_dir(
     store: &Value,
     config_dir: &Path,
@@ -1421,7 +1419,9 @@ pub(crate) fn keychain_install_for_config_dir(
          `{}`",
         owned.service()
     );
-    install_at(&service, store, |_| {})
+    install_at(&service, store, |item| {
+        save_session_non_login_keys(item);
+    })
 }
 
 /// Read the whole JSON object the per-config-dir item for `config_dir` holds,
@@ -1566,7 +1566,7 @@ pub(crate) fn keychain_sign_out(
     preserve: bool,
     saved_elsewhere: impl FnOnce(&Value) -> bool,
 ) -> Result<SignOutOutcome> {
-    sign_out_saving_at(SERVICE, &account()?, preserve, saved_elsewhere)
+    sign_out_saving_at(SERVICE, &account()?, preserve, true, saved_elsewhere)
 }
 
 /// Sign out the NAMESPACED item for a config dir — the start-site twin of
@@ -1586,19 +1586,34 @@ pub(crate) fn keychain_sign_out_for_config_dir(
          `{}`",
         owned.service()
     );
-    // Known gap: the strip `preserve_non_login_keys` off gives, whatever it
-    // says. Nothing saves a per-session item's non-login keys into a member's
-    // store (no owner search runs for these items, and the swap's
-    // `carry_session_item_into` adopts a login, not what sits beside it), so
-    // keeping a design login here would only hand the member the swap left to
-    // the next one, a login-less member of the same runtime dir included.
-    sign_out_at(&service, &account()?, false)
+    // Always strip account-specific keys from a per-session item: retaining
+    // them here would hand them to the next member of this runtime directory.
+    sign_out_saving_at(
+        &service,
+        &account()?,
+        crate::claude::preserve_non_login_keys(),
+        false,
+        save_session_non_login_keys,
+    )
 }
 
-/// [`sign_out_saving_at`] with nothing saved elsewhere: the per-session items
-/// and the e2e leg, whose items no account store takes over.
+fn save_session_non_login_keys(item: &Value) -> bool {
+    if !crate::claude::preserve_non_login_keys() {
+        return false;
+    }
+    crate::lock::with_state_lock(|_held| Ok(crate::claude::sync_item_into_its_store(item, None)))
+        .unwrap_or_else(|e| {
+            logline!(
+                "tollgate: could not save the per-session Keychain item's non-login keys: {e:#}"
+            );
+            false
+        })
+}
+
+/// Test-only sign-out wrapper for throwaway items with no owning store.
+#[cfg(test)]
 fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
-    sign_out_saving_at(service, account, preserve, |_| false)
+    sign_out_saving_at(service, account, preserve, true, |_| false)
 }
 
 /// What a sign-out actually did, so a caller whose downstream state follows
@@ -1647,6 +1662,7 @@ fn sign_out_saving_at(
     service: &str,
     account: &str,
     preserve: bool,
+    keep_unsaved: bool,
     saved_elsewhere: impl FnOnce(&Value) -> bool,
 ) -> Result<SignOutOutcome> {
     // Guest mode, ahead of the read: see `merge_and_put_at`.
@@ -1688,7 +1704,7 @@ fn sign_out_saving_at(
         }
     };
     let saved = preserve && saved_elsewhere(&blob);
-    let keep = crate::claude::sign_out_keeps_non_login_keys(preserve, saved);
+    let keep = keep_unsaved && crate::claude::sign_out_keeps_non_login_keys(preserve, saved);
     match crate::claude::strip_account_credentials(&mut blob, keep) {
         crate::claude::SignOut::Delete => {
             logline!(

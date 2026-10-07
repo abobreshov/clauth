@@ -2421,6 +2421,16 @@ pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::R
 /// so the file is never world-readable even for the instant before the rename.
 /// On non-Unix this is identical to [`atomic_write`].
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_600_checked(path, content, || Ok(true)).map(|_| ())
+}
+
+/// Recheck a caller's publication precondition after staging the bytes, just
+/// before the rename. A refusal removes the staged file and preserves `path`.
+pub(crate) fn atomic_write_600_checked(
+    path: &Path,
+    content: impl AsRef<[u8]>,
+    check: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
         // A 0o600 file under a world-readable dir still leaks via the dir entry;
@@ -2448,8 +2458,15 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
     }
     #[cfg(not(unix))]
     std::fs::write(&tmp, content)?;
+    match check() {
+        Ok(true) => {}
+        result => {
+            let _ = std::fs::remove_file(&tmp);
+            return result;
+        }
+    }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)

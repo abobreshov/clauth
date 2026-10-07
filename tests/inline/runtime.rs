@@ -13483,3 +13483,58 @@ fn the_watchdog_keeps_what_a_session_saved_beside_a_static_token() {
         "a re-login syncs nothing"
     );
 }
+
+/// Both real symlink drains and the fake-files copy-back carry the runtime
+/// identity proof; an absent proof blocks walks instead of keeping an old uuid.
+#[cfg(unix)]
+#[test]
+fn round1_runtime_copyback_keeps_only_a_proven_same_account_anchor() {
+    let home = HomeSandbox::new();
+    for (index, uuid) in [Some("uuid-a"), Some("uuid-b"), None]
+        .into_iter()
+        .enumerate()
+    {
+        for fake in [false, true] {
+            let name = format!("identity-{index}-{fake}");
+            let launch = member(&name);
+            let store = member_store(&launch);
+            let pname = armed_durable_stamp(&name);
+            let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+            if let Some(uuid) = uuid {
+                fs::write(
+                    swap.runtime.join(".claude.json"),
+                    serde_json::to_vec(&serde_json::json!({"oauthAccount":{"accountUuid":uuid}}))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+            let live = cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+            if fake {
+                copy_if_valid_creds(&live, &store).unwrap();
+            } else {
+                tick(&fake_claude_home(home.home()), &swap).unwrap();
+            }
+            assert_eq!(fs::read(&store).unwrap(), CREDS_V2);
+            let anchor = crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+                &pname,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+            assert_eq!(
+                anchor.as_deref(),
+                if uuid == Some("uuid-a") {
+                    Some("uuid-a")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                crate::profile_cache::identity_pending(&pname),
+                uuid != Some("uuid-a")
+            );
+            if !fake {
+                assert!(durable_stamp(&pname).is_none());
+            }
+        }
+    }
+}
