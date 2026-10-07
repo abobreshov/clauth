@@ -21,6 +21,18 @@ The token outranks the profile's OAuth pair at every switch for as long as it ex
 
 A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back — or arm `tollgate rolling-token <name>`, which has the daemon re-stamp the sidecar from the profile's own usage chain: still no refresh token in front of sessions, but the chain's full scope set, plan stamp and `rateLimitTier`, so plan-gated models and flags work. A second live session holding one rotating login earns a warning naming `tollgate rolling-token <name>` before a refresh signs the others out, and a session started before the arming converges onto the sidecar on its own next poll. The superseded mint waits at `session-token.static.json` and the bare `tollgate static-token <name>` puts it back.
 
+### Login identity and duplicate accounts
+
+A completed OAuth login resolves its Anthropic account UUID through the existing profile probe. If another profile holds that UUID, tollgate warns by name that the browser was signed in as the other account; the TUI shows a warning toast, including before a re-login confirmation. The other profile stays intact. Choose the intended account in the browser and log in again to repair the duplicate.
+
+If saving a proven identity fails, tollgate keeps an existing anchor for that same account. If the anchor differs or is missing, it marks the login unverified before removing the displaced anchor, so fallback walks stay blocked until a later successful identity write. Failure to save the pending marker leaves the existing anchor untouched and logs the error.
+
+The regular `/profile` poll uses the profile's stored login to repair its identity anchor, including an old anchor that names another account. `tollgate list`, `tollgate usage` and the TUI Overview row show `same account as <name>` while the duplicate stands. [Fallback walks](Auto-Switch) skip later duplicates; a session already on the later member cannot switch back to its duplicate either. These checks reuse cached anchors and add no network requests per tick. A proven login writes its identity in the same lock hold as its credentials. A freshly installed login whose account is unverified cannot be walked onto, and an unverified active OAuth login cannot walk to another OAuth profile until the normal profile probe resolves its identity. Existing profiles with no anchor retain their previous behavior. Runtime copy-back keeps an anchor only when the runtime's `.claude.json` proves the same account; a different or missing UUID makes the new login pending.
+
+Claude Code's logout-cleared usage, artifact, organization and feature caches are saved per profile. Rotations and rolling-token re-stamps update a recognized regular live credentials file as well as the stored login, preserving sibling keys. A current static or rolling login is accepted at startup without a divergence prompt.
+
+On macOS, `tollgate which` checks the relevant Keychain item after file matching misses. Only a refresh-token SHA-256 digest or negative result is cached per service for 30 seconds under `~/.tollgate/keychain-which-cache/`; entries older than a day are swept on cache reads and writes.
+
 ### Third-party usage data
 
 Six providers get typed usage panels (the full per-provider reference, including what is read and the limitations, is [Providers](Providers)):
@@ -212,6 +224,7 @@ How the Omarchy keys map onto tollgate's colour roles:
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
 | `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard` |
+| `preserve_non_login_keys` | bool | `true` | keep non-login credential keys with their account; the Config tab calls this `non-login keys`. Off restores the earlier behavior. See [Security](Security#non-login-credential-keys) |
 | `theme` | string | auto | `full` or `compatible` |
 | `palette` | string | `auto` | `auto`, `omarchy` or `catppuccin`. `auto` uses the running Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, then `~/.config/omarchy/current/theme/colors.toml`) when one exists, else Catppuccin Mocha. The TUI reloads it within 2 s of a theme switch; an unreadable file keeps the last palette. `theme` still picks the colour depth |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |

@@ -497,7 +497,7 @@ fn mirror_credentials_newer_runtime_wins() {
     set_mtime(&canonical, past);
     set_mtime(&runtime, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V2);
 }
 
@@ -513,7 +513,7 @@ fn mirror_credentials_newer_canonical_wins() {
     set_mtime(&runtime, past);
     set_mtime(&canonical, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&runtime).expect("read"), CREDS_V2);
 }
 
@@ -529,7 +529,7 @@ fn mirror_credentials_skips_invalid_json() {
     set_mtime(&canonical, past);
     set_mtime(&runtime, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1); // canonical untouched; partial JSON ignored
 }
 
@@ -546,7 +546,7 @@ fn mirror_credentials_skips_empty_credentials() {
     set_mtime(&canonical, past);
     set_mtime(&runtime, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
@@ -557,7 +557,7 @@ fn mirror_credentials_seeds_missing_side() {
     let runtime = tmp.path().join(".credentials.json");
     fs::write(&runtime, CREDS_V1).expect("write runtime");
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
@@ -5870,6 +5870,48 @@ fn lone_session(
     (swap, markers)
 }
 
+/// [`lone_session`] under [`LinkMode::Fake`] (a regular-file credential copy
+/// instead of a symlink), so a test can drive the fake-mode watchdog tick arms.
+fn fake_session(
+    launch: &Profile,
+    isolation: Isolation,
+) -> (std::sync::Arc<SessionSwap>, SwappedMarkers) {
+    let name = launch.name.as_str();
+    let session = SessionId::mint();
+    let store = crate::claude::install_source_path(&crate::profile::ProfileName::from(name))
+        .expect("install source");
+    let paths = SessionPaths::resolve(
+        &crate::profile::ProfileName::from(name),
+        isolation,
+        &session,
+        LinkMode::Fake,
+    )
+    .expect("session paths");
+    crate::profile::mkdir_700(&paths.runtime).expect("mkdir runtime");
+    fs::copy(&store, paths.runtime.join(".credentials.json")).expect("copy creds");
+    let markers = stamp_swapped_markers(&paths)
+        .expect("stamp the launch marker")
+        .expect("the launch member's marker must be free in a fresh sandbox");
+    let row = crate::live_sessions::LiveSession::starting(
+        &session,
+        name,
+        crate::harness::Harness::Claude,
+        isolation == Isolation::Isolated,
+        false,
+        Some(store.to_path_buf()),
+    );
+    crate::live_sessions::register(&row).expect("register row");
+    let swap = std::sync::Arc::new(SessionSwap::new(
+        session,
+        isolation,
+        LinkMode::Fake,
+        launch,
+        store,
+        &paths,
+    ));
+    (swap, markers)
+}
+
 /// The decision leg gates on `follows_chain` and nothing sets it true yet, so an
 /// acquire-shaped registration must leave a session opted OUT — otherwise landing
 /// the leg would move EVERY live session off the account it launched on.
@@ -6557,6 +6599,351 @@ fn a_swap_drains_a_pending_relogin_into_the_launch_store() {
             "the intended member's own chain must be untouched by the drain"
         );
     });
+}
+
+fn armed_durable_stamp(name: &str) -> crate::profile::ProfileName {
+    let pname = crate::profile::ProfileName::from(name);
+    crate::usage::seed_login_anchor(
+        &pname,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    assert!(
+        crate::usage::take_profile_fetch(&pname, false, 1_000_000_000_000u64),
+        "precondition: the durable /profile stamp is armed"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<u64>(
+            &pname,
+            crate::profile_cache::PROFILE_FETCHED_CACHE_FILE
+        )
+        .is_some(),
+        "precondition: the durable stamp exists"
+    );
+    pname
+}
+
+fn durable_stamp(name: &crate::profile::ProfileName) -> Option<u64> {
+    crate::profile_cache::load_profile_cache::<u64>(
+        name,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    )
+}
+
+/// A watchdog tick drain that copied a session-side `/login` into the store
+/// marks that account's `/profile` reading stale (removes the durable stamp) —
+/// no network call.
+#[test]
+fn a_tick_drain_marks_the_profile_reading_stale() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("tick-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("tick-stale");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    tick(&claude_home, &swap).expect("tick");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the tick drained the session's login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "a tick drain that wrote the store marks the profile's /profile reading stale"
+    );
+}
+
+/// The swap executor's drain (swap_to) marks the OUTGOING member's `/profile`
+/// reading stale after it wrote the drained login.
+#[test]
+fn a_swap_drain_marks_the_outgoing_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("sw-stale-a");
+    let intended = member("sw-stale-b");
+    let launch_store = member_store(&launch);
+    let _intended_store = member_store(&intended);
+    let pname = armed_durable_stamp("sw-stale-a");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    set_mtime(&launch_store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    assert_eq!(
+        swap.swap_to("sw-stale-b").expect("swap"),
+        SwapOutcome::Swapped
+    );
+
+    assert_eq!(
+        fs::read(&launch_store).expect("read launch store"),
+        CREDS_V2,
+        "precondition: the swap drained into the outgoing member"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the swap's drain marks the outgoing profile's /profile reading stale"
+    );
+}
+
+/// A converge (the poll onto an armed rolling sidecar, same member) that drained
+/// a session-side login marks the member's `/profile` reading stale.
+#[test]
+fn a_converge_drain_marks_the_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("conv-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("conv-stale");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+    // Arm the sidecar so the converge transition holds (current refreshable,
+    // selected refreshless).
+    let sidecar = crate::profile::profile_dir(&pname)
+        .expect("profile_dir")
+        .join("session-token.json");
+    write_creds(&sidecar, None);
+
+    swap.poll();
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the converge drained the session's login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the converge's drain marks the profile's /profile reading stale"
+    );
+}
+
+/// The build-time drain (`reconcile_credentials`) marks the profile's `/profile`
+/// reading stale after a session→store copy, and leaves it untouched when the
+/// copy wrote nothing.
+#[test]
+fn a_build_drain_marks_the_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("build-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("build-stale");
+    let runtime = crate::profile::profile_subpath(&pname, "runtime").expect("runtime path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    let runtime_creds = runtime.join(".credentials.json");
+    fs::write(&runtime_creds, CREDS_V2).expect("session relogin");
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    set_mtime(&runtime_creds, SystemTime::now());
+
+    reconcile_credentials(&runtime_creds, &store, LinkMode::Fake).expect("reconcile");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the build drained the newer runtime copy"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the build drain marks the profile's /profile reading stale"
+    );
+
+    // A second reconcile over equal bytes writes nothing and must not re-mark.
+    crate::usage::take_profile_fetch(&pname, false, 2_000_000_000_000u64);
+    assert!(
+        durable_stamp(&pname).is_some(),
+        "precondition: the stamp is re-armed"
+    );
+    reconcile_credentials(&runtime_creds, &store, LinkMode::Fake).expect("reconcile");
+    assert!(
+        durable_stamp(&pname).is_some(),
+        "a drain that wrote nothing leaves the durable stamp untouched"
+    );
+}
+
+/// A copy-back whose bytes differ only in a non-login key (Claude Code rewriting
+/// the file for an MCP-server token refresh) must NOT mark the `/profile`
+/// reading stale — the mark fires only when the copied login changed.
+#[test]
+fn a_non_login_rewrite_does_not_mark_the_reading_stale() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("mcpprobe");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("mcpprobe");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("store json");
+    v["mcpOAuth"] = serde_json::json!({});
+    v["mcpOAuth"]["srv|https://mcp.example"]["accessToken"] = "mcp-2".into();
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(
+        &swap.runtime,
+        &serde_json::to_vec(&v).expect("ser"),
+        SystemTime::now(),
+    );
+    tick(&claude_home, &swap).expect("tick");
+    let after: ClaudeCredentials =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("parse store");
+    assert_eq!(
+        after.claude_ai_oauth.map(|o| o.access_token).as_deref(),
+        Some("at-mcpprobe"),
+        "precondition: the copy-back kept the same login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        Some(1_000_000_000_000),
+        "a copy-back that refreshed no token must not spend a /profile read"
+    );
+}
+
+/// The fake-transport login-change gate (`copy_if_valid_creds`): P4's shape
+/// through a fake-mode session (Windows' default), so an MCP-only rewrite marks
+/// nothing.
+#[test]
+fn a_fake_mode_non_login_rewrite_marks_nothing() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("mcpprobef");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("mcpprobef");
+    let (swap, _markers) = fake_session(&launch, Isolation::Shared);
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("store json");
+    v["mcpOAuth"] = serde_json::json!({});
+    v["mcpOAuth"]["srv|https://mcp.example"]["accessToken"] = "mcp-2".into();
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(
+        &swap.runtime,
+        &serde_json::to_vec(&v).expect("ser"),
+        SystemTime::now(),
+    );
+    tick(&claude_home, &swap).expect("tick");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("parse store");
+    assert_eq!(
+        after["mcpOAuth"]["srv|https://mcp.example"]["accessToken"], "mcp-2",
+        "precondition: the fake copy-back landed the MCP refresh"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        Some(1_000_000_000_000),
+        "a fake-mode copy-back that moved no login must not mark"
+    );
+}
+
+/// The fake-mode (shared) watchdog tick arm marks the `/profile` reading stale
+/// after a session→store copy of a different login, and keeps it after a
+/// store→session copy.
+#[test]
+fn a_fake_mode_tick_marks_the_reading_stale_only_on_a_store_copy() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("fake-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("fake-stale");
+    let (swap, _markers) = fake_session(&launch, Isolation::Shared);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    tick(&claude_home, &swap).expect("tick");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the session login was copied into the store"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "a session→store copy marks the reading stale"
+    );
+
+    // A store→session copy (tollgate rotated the store to a different pair; the
+    // session's fake-mode copy is older) writes no store, so it must not mark.
+    crate::usage::take_profile_fetch(&pname, false, 2_000_000_000_000u64);
+    assert!(durable_stamp(&pname).is_some(), "precondition: re-armed");
+    let runtime_creds = swap.runtime.join(".credentials.json");
+    set_mtime(&runtime_creds, SystemTime::now() - Duration::from_secs(60));
+    let mut rotated = serde_json::json!({"claudeAiOauth": {"expiresAt": 9_999_999_999_999u64}});
+    rotated["claudeAiOauth"]["accessToken"] = "at-rotated".into();
+    rotated["claudeAiOauth"]["refreshToken"] = "rt-rotated".into();
+    fs::write(&store, serde_json::to_vec(&rotated).expect("rotated json"))
+        .expect("rotate the store");
+    set_mtime(&store, SystemTime::now());
+    tick(&claude_home, &swap).expect("tick");
+    let runtime_now: ClaudeCredentials =
+        serde_json::from_slice(&fs::read(&runtime_creds).expect("read runtime"))
+            .expect("parse runtime");
+    assert_eq!(
+        runtime_now
+            .claude_ai_oauth
+            .map(|o| o.access_token)
+            .as_deref(),
+        Some("at-rotated"),
+        "precondition: the store→session copy landed a different login in the session"
+    );
+    assert!(
+        durable_stamp(&pname).is_some(),
+        "a store→session copy writes no store and leaves the stamp untouched"
+    );
+}
+
+/// The fake-mode ISOLATED watchdog tick arm marks the reading stale after a
+/// session→store copy, the same wiring as the shared arm.
+#[test]
+fn a_fake_mode_isolated_tick_marks_the_reading_stale() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("fake-iso-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("fake-iso-stale");
+    let (swap, _markers) = fake_session(&launch, Isolation::Isolated);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    tick(&claude_home, &swap).expect("tick");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the isolated tick drained the session's login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the isolated tick marks the reading stale after a store copy"
+    );
+}
+
+/// The Real-mode build drain (`reconcile_credentials`'s Real arm) marks the
+/// profile's `/profile` reading stale after a session→store copy.
+#[test]
+fn a_real_mode_build_drain_marks_the_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("build-real");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("build-real");
+    let runtime = crate::profile::profile_subpath(&pname, "runtime").expect("runtime path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    let runtime_creds = runtime.join(".credentials.json");
+    fs::write(&runtime_creds, CREDS_V2).expect("session relogin");
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    set_mtime(&runtime_creds, SystemTime::now());
+
+    reconcile_credentials(&runtime_creds, &store, LinkMode::Real).expect("reconcile");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the Real build drained the newer runtime copy"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the Real-mode build drain marks the profile's /profile reading stale"
+    );
 }
 
 /// B5. The watchdog thread and `Drop`'s final tick both used to read a MOVED
@@ -13049,4 +13436,105 @@ fn a_repeated_refused_switch_is_refused_and_switching_back_withdraws_the_intent(
     let row = row_of(&swap);
     assert_eq!(row.current_member.as_deref().unwrap_or("rr-a"), "rr-a");
     assert_eq!(row.key_generation, Some(0));
+}
+
+/// The watchdog keeps a static token over a differing runtime file, and what
+/// the session's Claude Code saved beside that same token (a `/design-login`)
+/// went with the file. It is synced into the sidecar first. A runtime file
+/// holding another login (a session-side re-login) syncs nothing.
+#[test]
+fn the_watchdog_keeps_what_a_session_saved_beside_a_static_token() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("session-token.json");
+    let link_path = tmp.path().join(".credentials.json");
+    let token =
+        br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-static","expiresAt":4102444800000}}"#;
+    fs::write(&canonical, token).expect("write sidecar");
+    fs::write(
+        &link_path,
+        br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-static","expiresAt":4102444800000},"designOauth":{"accessToken":"design-1"}}"#,
+    )
+    .expect("write runtime file");
+
+    assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
+
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&canonical).expect("read")).expect("parse");
+    assert_eq!(
+        sidecar["claudeAiOauth"]["accessToken"],
+        "sk-ant-oat01-static"
+    );
+    assert_eq!(sidecar["designOauth"]["accessToken"], "design-1");
+
+    fs::write(&canonical, token).expect("reset sidecar");
+    // The watchdog relinked the slot onto the sidecar; a write through that link
+    // would land in the sidecar itself, so the re-login replaces the link.
+    fs::remove_file(&link_path).expect("drop the relinked slot");
+    fs::write(
+        &link_path,
+        br#"{"claudeAiOauth":{"accessToken":"relogin","refreshToken":"r"},"designOauth":{"accessToken":"design-2"}}"#,
+    )
+    .expect("write re-login");
+    assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
+    assert_eq!(
+        fs::read(&canonical).expect("read"),
+        token.to_vec(),
+        "a re-login syncs nothing"
+    );
+}
+
+/// Both real symlink drains and the fake-files copy-back carry the runtime
+/// identity proof; an absent proof blocks walks instead of keeping an old uuid.
+#[cfg(unix)]
+#[test]
+fn round1_runtime_copyback_keeps_only_a_proven_same_account_anchor() {
+    let home = HomeSandbox::new();
+    for (index, uuid) in [Some("uuid-a"), Some("uuid-b"), None]
+        .into_iter()
+        .enumerate()
+    {
+        for fake in [false, true] {
+            let name = format!("identity-{index}-{fake}");
+            let launch = member(&name);
+            let store = member_store(&launch);
+            let pname = armed_durable_stamp(&name);
+            let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+            if let Some(uuid) = uuid {
+                fs::write(
+                    swap.runtime.join(".claude.json"),
+                    serde_json::to_vec(&serde_json::json!({"oauthAccount":{"accountUuid":uuid}}))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+            let live = cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+            if fake {
+                copy_if_valid_creds(&live, &store).unwrap();
+            } else {
+                tick(&fake_claude_home(home.home()), &swap).unwrap();
+            }
+            assert_eq!(fs::read(&store).unwrap(), CREDS_V2);
+            let anchor = crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+                &pname,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+            assert_eq!(
+                anchor.as_deref(),
+                if uuid == Some("uuid-a") {
+                    Some("uuid-a")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                crate::profile_cache::identity_pending(&pname),
+                uuid != Some("uuid-a")
+            );
+            if !fake {
+                assert!(durable_stamp(&pname).is_none());
+            }
+        }
+    }
 }

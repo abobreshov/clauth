@@ -25,6 +25,123 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 
+/// A login was installed without a resolved identity. Persisted before the
+/// credential write so cross-process walks never use the displaced anchor.
+pub(crate) const IDENTITY_PENDING_FILE: &str = "identity_pending.json";
+
+pub(crate) fn begin_login_install(name: &ProfileName) -> anyhow::Result<()> {
+    let path = crate::profile::profile_subpath(name, IDENTITY_PENDING_FILE)?;
+    crate::profile::atomic_write_600(&path, b"true")?;
+    Ok(())
+}
+
+pub(crate) fn identity_pending(name: &ProfileName) -> bool {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return false;
+    }
+    profile_cache_path(name, IDENTITY_PENDING_FILE).is_some_and(|path| path.exists())
+}
+
+/// Only newly unproven installs are blocked: legacy profiles without anchors
+/// keep their existing behavior. An unknown active login also cannot walk to
+/// another OAuth account it might duplicate, until its normal probe resolves.
+pub(crate) fn unverified_walk_member(
+    config: &crate::profile::AppConfig,
+    name: &ProfileName,
+    active: Option<&ProfileName>,
+) -> Option<ProfileName> {
+    let profile = config.find(name)?;
+    if !profile.is_oauth() {
+        return None;
+    }
+    if identity_pending(name) {
+        return Some(name.clone());
+    }
+    active
+        .filter(|active| {
+            config
+                .find(active)
+                .is_some_and(crate::profile::Profile::is_oauth)
+                && identity_pending(active)
+        })
+        .cloned()
+}
+
+/// Read a usable identity anchor. In-memory-only test profiles have no home
+/// or persisted anchor; never resolve the operator's home for those fixtures.
+fn account_anchor(name: &ProfileName) -> Option<crate::profile::AccountId> {
+    #[cfg(test)]
+    if !crate::profile::home_override_active() {
+        return None;
+    }
+    if identity_pending(name) {
+        return None;
+    }
+    load_profile_cache::<crate::profile::AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Another roster profile holding the same resolved Anthropic account. Reads
+/// the anchors the login and hourly `/profile` legs already derive; no HTTP.
+pub(crate) fn same_account_as(
+    config: &crate::profile::AppConfig,
+    name: &ProfileName,
+) -> Option<ProfileName> {
+    let account = account_anchor(name)?;
+    config.profiles.iter().find_map(|p| {
+        (p.name != *name && account_anchor(&p.name).as_ref() == Some(&account))
+            .then(|| p.name.clone())
+    })
+}
+
+/// A later duplicate is not a walk candidate. Also exclude the earlier member
+/// when walking FROM its duplicate, including a session on a non-global member:
+/// either direction would switch credentials without moving quota.
+pub(crate) fn duplicate_walk_member(
+    config: &crate::profile::AppConfig,
+    name: &ProfileName,
+    active: Option<&ProfileName>,
+) -> Option<ProfileName> {
+    let account = account_anchor(name)?;
+    if let Some(active) = active
+        && active != name
+        && account_anchor(active).as_ref() == Some(&account)
+    {
+        return Some(active.clone());
+    }
+    config
+        .state
+        .fallback_chain
+        .iter()
+        .take_while(|n| *n != name)
+        .find(|n| config.find(n).is_some() && account_anchor(n).as_ref() == Some(&account))
+        .cloned()
+}
+
+/// The login warning is shared by the CLI commit and TUI toast paths.
+pub(crate) fn duplicate_login_warning(
+    config: &crate::profile::AppConfig,
+    name: &ProfileName,
+) -> Option<String> {
+    duplicate_login_warning_for_account(config, name, &account_anchor(name)?)
+}
+
+/// A completed login can still be waiting in a TUI draft or confirmation. Its
+/// proven uuid is enough to warn before the new anchor is committed.
+pub(crate) fn duplicate_login_warning_for_account(
+    config: &crate::profile::AppConfig,
+    name: &ProfileName,
+    account: &crate::profile::AccountId,
+) -> Option<String> {
+    config.profiles.iter().find_map(|p| {
+        (p.name != *name && account_anchor(&p.name).as_ref() == Some(account))
+            .then(|| p.name.clone())
+    }).map(|other| format!(
+        "WARNING: '{name}' is the same Anthropic account as '{other}'; the browser was signed in as the other account. These profiles share quota; duplicate fallback members are skipped."
+    ))
+}
+
 /// The last adopt refusal announced for this profile, as one of the reason
 /// keys `oauth::try_adopt_live_rotation` refuses with (a bare JSON string).
 /// The refusal is a STANDING state while the live slot stays unadoptable, and
@@ -250,26 +367,43 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned + 'static>(
 /// every codex usage reading, so the cache the published feed and the Overview
 /// resolve BY NAME stayed empty forever while the fetch itself succeeded.
 pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
+    let _ = write_profile_cache_reported(name, file, value);
+}
+
+/// [`write_profile_cache`] that reports whether the file write actually landed,
+/// so a caller whose cache is load-bearing (the identity anchor) can log a
+/// failure instead of taking the default silent swallow. `false` covers every
+/// skip (off-roster, unresolvable path, serialization) and a failed write alike.
+pub(crate) fn write_profile_cache_reported<T: Serialize>(
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+) -> bool {
     let configured = crate::profile::is_configured(name).unwrap_or(false)
         || crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()));
     if !configured {
-        return;
+        return false;
     }
+    let Some(path) = profile_cache_path(name, file) else {
+        return false;
+    };
+    let Ok(json) = serde_json::to_string(value) else {
+        return false;
+    };
+    crate::profile::atomic_write_600(&path, json.as_bytes()).is_ok()
+}
+
+/// Delete `<profile_dir>/<file>`. Best-effort: an already-absent file is the
+/// intended post-state, and every other removal error is logged (never surfaced
+/// as a failure) — a stale cache is worse than the log line that names it.
+pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
     let Some(path) = profile_cache_path(name, file) else {
         return;
     };
-    let Ok(json) = serde_json::to_string(value) else {
-        return;
-    };
-    let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
-}
-
-/// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an
-/// already-absent file and any removal error alike leave the caller with "no
-/// cache", which is the intended post-state either way.
-pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
-    if let Some(path) = profile_cache_path(name, file) {
-        let _ = std::fs::remove_file(path);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logline::logline!("tollgate: {name}: could not remove its {file} cache: {e}");
     }
 }
 

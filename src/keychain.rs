@@ -757,12 +757,25 @@ fn security_quote(s: &str) -> Result<String> {
 /// Whether a write happens at all is [`merge_write`]'s call, which is where the
 /// skip and its reasons live.
 fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
+    merge_and_put_reporting_at(service, account, incoming, keep, |_| {})
+}
+
+fn merge_and_put_reporting_at(
+    service: &str,
+    account: &str,
+    incoming: &Value,
+    keep: Keep,
+    on_read: impl FnOnce(&Value),
+) -> Result<()> {
     // Guest mode, ahead of the read: no `security` subprocess (or access
     // prompt) for a write `put_blob_at` would refuse anyway.
     if crate::identity::guest_refuses_keychain_service(service) {
         return Err(crate::identity::GuestRefusal.into());
     }
     let existing = blob_to_merge_with(service, account);
+    if let Some(item) = existing.as_ref() {
+        on_read(item);
+    }
     match merge_write(incoming, existing.as_ref(), keep) {
         Some(blob) => put_blob_at(service, account, &blob),
         None => Ok(()),
@@ -1373,8 +1386,11 @@ pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitC
 /// input to this layer, and CC parses the item's password as one JSON object, so
 /// anything else would leave CC with a credential it cannot read and tollgate with
 /// no signal that it happened.
-pub(crate) fn keychain_install(store: &Value) -> Result<()> {
-    install_at(SERVICE, store)
+///
+/// `on_replaced` gets the item this is about to replace, as read, before the
+/// write ([`merge_and_put_reporting_at`]).
+pub(crate) fn keychain_install(store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
+    install_at(SERVICE, store, on_replaced)
 }
 
 /// Install `store` as the login for a SPECIFIC config dir's item: the
@@ -1388,6 +1404,9 @@ pub(crate) fn keychain_install(store: &Value) -> Result<()> {
 /// Same merge codepath, same [`Keep::CarriedOnly`] (the MCP-login carry needs
 /// no rule of its own), and the same non-object refusal as [`keychain_install`]:
 /// one Keychain path, two service names.
+///
+/// Save the replaced item's sibling keys into their recognized owner's store
+/// before publishing the new member. Unknown owners are logged, never guessed.
 pub(crate) fn keychain_install_for_config_dir(
     store: &Value,
     config_dir: &Path,
@@ -1400,7 +1419,9 @@ pub(crate) fn keychain_install_for_config_dir(
          `{}`",
         owned.service()
     );
-    install_at(&service, store)
+    install_at(&service, store, |item| {
+        save_session_non_login_keys(item);
+    })
 }
 
 /// Read the whole JSON object the per-config-dir item for `config_dir` holds,
@@ -1413,6 +1434,13 @@ pub(crate) fn read_config_dir_item(config_dir: &Path) -> Result<Option<Value>> {
     read_blob_at(&service, &account()?)
 }
 
+/// Read the item at an explicitly named service: the bare
+/// `Claude Code-credentials` item (the global login) or a derived
+/// per-config-dir one. The `which` resolution tier is the reader.
+pub(crate) fn read_blob_for_service(service: &str) -> Result<Option<Value>> {
+    read_blob_at(service, &account()?)
+}
+
 /// Whether a failed item read failed because the bytes were unparseable — the
 /// truncated-write class (`UnparseableItem`, #66/#76). The carry-back treats
 /// this as "nothing to carry" rather than an error, so the swap's item write
@@ -1421,12 +1449,12 @@ pub(crate) fn read_failed_unparseable(e: &anyhow::Error) -> bool {
     carried_raw(e).is_some()
 }
 
-fn install_at(service: &str, store: &Value) -> Result<()> {
+fn install_at(service: &str, store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
     anyhow::ensure!(
         store.is_object(),
         "refusing to install a credential store that is not a JSON object into the Keychain"
     );
-    merge_and_put_at(service, &account()?, store, Keep::CarriedOnly)
+    merge_and_put_reporting_at(service, &account()?, store, Keep::CarriedOnly, on_replaced)
 }
 
 /// Mirror `creds` after tollgate rotated THIS account's own chain (`oauth.rs`).
@@ -1527,8 +1555,18 @@ fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
 /// `force_link_profile_credentials` and `clear_claude_credentials` reach it,
 /// never the guarded relink, so a path that never meant to change accounts
 /// cannot destroy a login tollgate does not hold (`claude::keychain_mirror_source`).
-pub(crate) fn keychain_sign_out() -> Result<SignOutOutcome> {
-    sign_out_at(SERVICE, &account()?)
+///
+/// `preserve` is the caller's `preserve_non_login_keys` reading, handed in so
+/// this module never reads profiles.toml itself and its tests stay pure.
+/// `saved_elsewhere` gets the item as read, before the strip, and reports
+/// whether its non-login keys now sit in their account's store; the strip then
+/// drops the design login too ([`crate::claude::sign_out_keeps_non_login_keys`]).
+/// Not called over an item that is absent or could not be read.
+pub(crate) fn keychain_sign_out(
+    preserve: bool,
+    saved_elsewhere: impl FnOnce(&Value) -> bool,
+) -> Result<SignOutOutcome> {
+    sign_out_saving_at(SERVICE, &account()?, preserve, true, saved_elsewhere)
 }
 
 /// Sign out the NAMESPACED item for a config dir — the start-site twin of
@@ -1548,7 +1586,34 @@ pub(crate) fn keychain_sign_out_for_config_dir(
          `{}`",
         owned.service()
     );
-    sign_out_at(&service, &account()?)
+    // Always strip account-specific keys from a per-session item: retaining
+    // them here would hand them to the next member of this runtime directory.
+    sign_out_saving_at(
+        &service,
+        &account()?,
+        crate::claude::preserve_non_login_keys(),
+        false,
+        save_session_non_login_keys,
+    )
+}
+
+fn save_session_non_login_keys(item: &Value) -> bool {
+    if !crate::claude::preserve_non_login_keys() {
+        return false;
+    }
+    crate::lock::with_state_lock(|_held| Ok(crate::claude::sync_item_into_its_store(item, None)))
+        .unwrap_or_else(|e| {
+            logline!(
+                "tollgate: could not save the per-session Keychain item's non-login keys: {e:#}"
+            );
+            false
+        })
+}
+
+/// Test-only sign-out wrapper for throwaway items with no owning store.
+#[cfg(test)]
+fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
+    sign_out_saving_at(service, account, preserve, true, |_| false)
 }
 
 /// What a sign-out actually did, so a caller whose downstream state follows
@@ -1576,7 +1641,8 @@ pub(crate) enum SignOutOutcome {
 ///
 /// Drop the account-scoped keys and keep what belongs to no account, so a
 /// wrap-off or a forced relink onto a login-less profile stops the item serving
-/// an account without taking every MCP-server login with it. An item left
+/// an account without taking every MCP-server login with it. With `preserve`
+/// the design login stays as well ([`crate::claude::strip_account_credentials`]). An item left
 /// holding nothing else is deleted outright, which keeps the clean-absence
 /// state this had before the strip. Idempotent, and an absent item is success.
 ///
@@ -1592,7 +1658,13 @@ pub(crate) enum SignOutOutcome {
 /// where the delete is not. A read that failed WITH BYTES quarantines them
 /// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
 /// the evidence survives it, and the event line says where.
-fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
+fn sign_out_saving_at(
+    service: &str,
+    account: &str,
+    preserve: bool,
+    keep_unsaved: bool,
+    saved_elsewhere: impl FnOnce(&Value) -> bool,
+) -> Result<SignOutOutcome> {
     // Guest mode, ahead of the read: see `merge_and_put_at`.
     if crate::identity::guest_refuses_keychain_service(service) {
         return Err(crate::identity::GuestRefusal.into());
@@ -1631,7 +1703,9 @@ fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
             return delete_at(service, account).map(|_| SignOutOutcome::SignedOut);
         }
     };
-    match crate::claude::strip_account_credentials(&mut blob) {
+    let saved = preserve && saved_elsewhere(&blob);
+    let keep = keep_unsaved && crate::claude::sign_out_keeps_non_login_keys(preserve, saved);
+    match crate::claude::strip_account_credentials(&mut blob, keep) {
         crate::claude::SignOut::Delete => {
             logline!(
                 "tollgate: signed Claude Code out of the macOS Keychain (the profile now active \
@@ -1640,10 +1714,34 @@ fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
             delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }
         crate::claude::SignOut::Write => {
-            logline!(
-                "tollgate: signed Claude Code out of the macOS Keychain (the profile now active \
-                 stores no Claude login); its MCP server logins were kept"
-            );
+            if keep {
+                // Names only, never values: the event line says which logins
+                // the item still holds, a design login among them.
+                let kept = blob
+                    .as_object()
+                    .map(|obj| {
+                        obj.keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                logline!(
+                    "tollgate: signed Claude Code out of the macOS Keychain (the profile now \
+                     active stores no Claude login); kept in the item: {kept}"
+                );
+            } else if saved {
+                logline!(
+                    "tollgate: signed Claude Code out of the macOS Keychain (the profile now \
+                     active stores no Claude login); its MCP server logins were kept and what \
+                     else it held beside the login was saved into the account's store"
+                );
+            } else {
+                logline!(
+                    "tollgate: signed Claude Code out of the macOS Keychain (the profile now \
+                     active stores no Claude login); its MCP server logins were kept"
+                );
+            }
             put_blob_at(service, account, &blob).map(|_| SignOutOutcome::SignedOut)
         }
         crate::claude::SignOut::Nothing => Ok(SignOutOutcome::SignedOut),

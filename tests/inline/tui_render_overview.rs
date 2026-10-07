@@ -3728,6 +3728,33 @@ fn the_hermes_section_renders_read_only_under_its_filter() {
 }
 
 #[test]
+fn duplicate_account_overview_row_names_the_other_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    let config = config_with(
+        vec![
+            profile("leadtone", 95.0, 10.0, 3600),
+            profile("scifoo", 95.0, 10.0, 3600),
+        ],
+        Some("leadtone"),
+        vec!["leadtone", "scifoo"],
+    );
+    for name in ["leadtone", "scifoo"] {
+        crate::usage::seed_login_anchor(&name.into(), Some(&"same-uuid".into()));
+    }
+    let app = App::new(config);
+    let widths = OverviewWidths::new(160, &app);
+    let text = line_text(&render_overview_row(&app, 1, &widths, false, true));
+    assert!(
+        text.chars()
+            .take(80)
+            .collect::<String>()
+            .contains("same account as leadtone"),
+        "flag must be visible within a normal terminal row: {text}"
+    );
+}
+
+#[test]
 fn selecting_the_active_codex_row_keeps_its_active_name_color() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);

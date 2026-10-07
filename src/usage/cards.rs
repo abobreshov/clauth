@@ -566,6 +566,12 @@ pub(crate) fn status_lines(obs: &AccountObservation, ctx: &CardCtx) -> Vec<CardL
             ink,
         )]));
     }
+    if let Some(other) = &obs.same_account_as {
+        rows.push(indented(vec![Seg::new(
+            format!("same account as {other}"),
+            Ink::Warning,
+        )]));
+    }
     if let Some(note) = &obs.note {
         rows.push(indented(vec![Seg::new(
             super::observation::sanitize_message(note),

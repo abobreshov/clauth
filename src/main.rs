@@ -938,8 +938,10 @@ fn resolve_reauth_base_url(
 /// silently drop the chain `rolling-token` and usage polling roll from (owner
 /// ruling). Keyed on api-mode reauth alone — every other credentials-less
 /// snapshot keeps replacing (a third-party recapture is a deliberate
-/// sign-out). `account_uuid` stays `None`: an api-key login proves no
-/// Anthropic identity, and seeding `None` leaves the existing anchor alone.
+/// sign-out). The anchor action is `Unchanged`: an api-key login proves no
+/// Anthropic identity of its own, and the carried chain did not move, so the
+/// re-key must leave the OAuth account's anchor untouched rather than clearing
+/// it as if a new login had landed.
 fn api_reauth_snapshot(
     base_url: Option<String>,
     api_key: Option<String>,
@@ -949,7 +951,7 @@ fn api_reauth_snapshot(
         credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
         base_url,
         api_key,
-        account_uuid: None,
+        anchor: actions::AnchorAction::Unchanged,
     }
 }
 
@@ -1211,7 +1213,10 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: outcome.account_uuid,
+        anchor: outcome
+            .account_uuid
+            .map(actions::AnchorAction::Proven)
+            .unwrap_or(actions::AnchorAction::Unproven),
     })
 }
 

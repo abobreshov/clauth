@@ -35,7 +35,7 @@ Per-profile state lives under `~/.tollgate/`. Nothing under upstream's `~/.claut
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
-| `~/.tollgate/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
+| `~/.tollgate/profiles/<name>/credentials.json` | OAuth token snapshot and the account's non-login credential keys | file `0600`, dirs `0700` |
 | `~/.tollgate/profiles/<name>/mcp-logins.json` | Claude Code's MCP-server OAuth logins, parked here whenever the profile stores no Claude login of its own and merged back once it regains one. Live bearer credentials, minted against each server and belonging to no Claude account | file `0600`, dirs `0700` |
 | `~/.tollgate/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
 | `~/.tollgate/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `tollgate static-token <p>` (or a dead chain) can restore it | file `0600`, dirs `0700` |
@@ -59,6 +59,7 @@ Per-profile state lives under `~/.tollgate/`. Nothing under upstream's `~/.claut
 | `~/.tollgate/api.sock` | the local agent API's unix socket; no token needed, so its mode is the access control | `0600` |
 | `~/.tollgate/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.tollgate/live_sessions/<sid>.json`, `~/.tollgate/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
+| `~/.tollgate/keychain-which-cache/<service>` | macOS `which` evidence: a refresh-token SHA-256 digest or absent-item result, cached for 30 seconds per service; reads and writes sweep entries older than a day; legacy raw-blob entries are discarded when read | file `0600`, dir `0700` |
 | `~/.tollgate/keychain-quarantine/<UTC>-<pid>-<service>.json` | macOS only: raw bytes of a Keychain item that read back as anything other than the JSON object Claude Code expects, preserved before the write or sign-out that would otherwise destroy them — live credential bytes, which is why nothing prunes the dir | file `0600`, dir `0700` |
 | usage and price caches, session history, logs, lock files (`~/.tollgate/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
 | `~/.local/share/tollgate/` (macOS `~/Library/Application Support/tollgate/`, Windows `%APPDATA%\tollgate\`) | the bundled Claude Code plugin, laid down where `claude plugin` can register it: `plugin.json`, the `hooks/` dir, a generated `marketplace.json`, and an install marker under `markers/`. Content-keyed under `versions/`, with a `current@claude` pointer at the live one. No credentials | your umask; not re-tightened |
@@ -217,3 +218,9 @@ On the first TUI launch tollgate offers to install shell completions. For bash a
 | `allow extra usage` off (the default) | no auto-switch can reach an account that bills money |
 | `auto_start = false` (the default) | tollgate sends no inference of its own |
 | self-update | compiled out of this build; nothing to switch off |
+
+## Account-specific credential keys
+
+Non-login keys such as `designOauth` stay with the account whose login they accompany. Preservation defaults on (`preserve_non_login_keys`, Config → `non-login keys`); only MCP-server logins cross accounts. Login identity keys are excluded from this preservation. Same-chain rolling re-stamps and restores keep sibling keys. Pasting a setup token parks old account keys in credentials.json and carries only MCP logins onto the mint and backup. Global and per-session macOS switch/sign-out paths save a replaced Keychain item's keys into its recognized owner's store. Pending rotations prevent competing writes.
+
+An unrecognized owner or a failed save may lose sibling keys when the global item is replaced; the event log names that loss. Per-session items always strip account keys on replacement/sign-out after attempting save-back, so they cannot hand those keys to the next member. Static-token file operations still sync the file layer rather than reading the Keychain item. See [the credential-key behavior and limits](wiki/Security.md#non-login-credential-keys).

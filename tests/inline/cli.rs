@@ -1873,6 +1873,9 @@ fn resolve_reauth_base_url_headless_with_no_stored_endpoint_bails() {
 
 #[test]
 fn api_reauth_snapshot_carries_the_stored_chain_through() {
+    // The snapshot now reads the stored chain's anchor off the home-derived
+    // profile dir, so the whole test holds a sandbox fence.
+    let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
     let snap = api_reauth_snapshot(
         Some("https://api.deepseek.com/anthropic".to_string()),
@@ -1895,7 +1898,34 @@ fn api_reauth_snapshot_carries_the_stored_chain_through() {
         Some("https://api.deepseek.com/anthropic")
     );
     assert_eq!(snap.api_key.as_deref(), Some("sk-new"));
-    assert_eq!(snap.account_uuid, None);
+    assert_eq!(snap.anchor, crate::actions::AnchorAction::Unchanged);
+}
+
+/// An api re-key carries the stored (stored, unchanged) OAuth chain, so its
+/// anchor action is `Unchanged` — never a read-back of the anchor, and never
+/// `Unproven`, either of which could clear a correct anchor. The anchor is
+/// simply not spelled.
+#[test]
+fn api_reauth_snapshot_leaves_the_anchor_untouched() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
+    let acme = acme_with_chain();
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        Some(&crate::profile::AccountId::from("uuid-stored".to_string())),
+    );
+
+    let snap = api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-new".to_string()),
+        Some(&acme),
+    );
+
+    assert_eq!(
+        snap.anchor,
+        crate::actions::AnchorAction::Unchanged,
+        "an api re-key leaves the stored chain's anchor untouched"
+    );
 }
 
 #[test]
@@ -1937,6 +1967,9 @@ fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
 
 #[test]
 fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
+    // Same fence as the snapshot-level pin: the composed helper reaches the
+    // anchor read too.
+    let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
     let snap = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&acme), false)
         .expect("a headless re-key with a stored endpoint must not prompt");

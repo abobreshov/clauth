@@ -24,6 +24,20 @@
 - Added `most-weekly-headroom` walk order to the Config tab and chain walks, with a 5-percentage-point tie band. It ranks OAuth hop targets only and leaves healthy accounts parked.
 - Prevented auto-switch home walks from ping-ponging on weekly reset jitter: a 60-minute minimum gain, stable reset tolerance bands and a persisted 30-minute proactive cooldown. Exhaustion still switches immediately; daemon switch logs name the trigger and deciding figures.
 
+### Authentication and account identity
+
+- Claude Code's usage, artifact, organization and feature caches now follow each profile, preventing cached figures and flags from leaking across accounts.
+- Rotations and rolling-token re-stamps follow recognized regular live credential files written by Claude Code. Current static and rolling logins no longer trigger startup divergence prompts.
+- Account anchors now follow the stored login: a `/profile` read repairs an incorrect anchor, and login changes invalidate the previous reading.
+- Login warns when another profile holds the same Anthropic account, naming the likely browser-account mix-up. List, usage, Overview and status JSON expose the duplicate; fallback walks skip the later duplicate and never switch between the two members. Status schema stays unchanged.
+- Non-login credential keys, including design logins and future keys, stay with their account across relinks and token writes. The Config tab's `non-login keys` toggle defaults on; only MCP-server logins carry across accounts. Replaced macOS Keychain items save their account's keys before replacement when their owner can be recognized.
+- On macOS, `which` matches a Keychain login when file matching misses, through an owner-only per-service cache with a 30-second TTL.
+- A failed proven-account anchor write retains an already-matching anchor or marks the login unverified before removing a displaced anchor, preserving duplicate-account walk guards after live-token adoption.
+- Pasted setup tokens park account-specific credential keys before remint; per-session macOS Keychain switches and sign-outs save those keys into the outgoing store.
+- Proven login identity commits with credentials. Unverified new logins block fallback walks until the normal profile probe resolves them; runtime copy-back clears displaced account anchors.
+- Live-file rotation publication checks for intervening Claude Code writes. Rolling re-stamps recover and report poisoned config locks. Duplicate walk-blocker warnings name the matching profile.
+- The macOS `which` cache persists only refresh-token SHA-256 evidence and sweeps on reads as well as writes. A failed non-login-key toggle save rolls back and reports the error.
+
 ### Import
 
 - A profile's `throughput_cache.json` (upstream 0.16.0 keeps its per-model throughput samples in each profile) is copied as a profile cache instead of blocking the import as an unknown entry.
