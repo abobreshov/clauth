@@ -887,6 +887,104 @@ fn a_login_anchor_overwrites_the_previous_account() {
     );
 }
 
+/// Adoption seeds after its credential commit without an earlier pending
+/// marker. A failed best-effort cache write must still keep duplicate walks
+/// blocked, whether the proven uuid already has an anchor or needs a new one.
+#[test]
+fn round2_failed_proven_anchor_write_keeps_duplicate_walks_blocked() {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, identity_pending, load_profile_cache};
+    use std::collections::HashSet;
+
+    for prior in [Some("uuid-proven"), Some("uuid-displaced"), None] {
+        let _home = crate::testutil::HomeSandbox::new();
+        crate::testutil::register_names(&["active", "duplicate"]);
+        let name = ProfileName::from("active");
+        let duplicate = ProfileName::from("duplicate");
+        let proven = AccountId::from("uuid-proven");
+        seed_login_anchor(&duplicate, Some(&proven));
+        if let Some(prior) = prior {
+            seed_login_anchor(&name, Some(&AccountId::from(prior)));
+        }
+        assert!(
+            !identity_pending(&name),
+            "no pre-install marker, as in adoption"
+        );
+        let anchor_path = crate::profile::profile_subpath(&name, ACCOUNT_ID_CACHE_FILE).unwrap();
+        let before = std::fs::read(&anchor_path).ok();
+        let mut active = Profile::new(name.to_string(), None, None);
+        active.credentials = Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "adopted-access".into(),
+                refresh_token: Some("adopted-refresh".into()),
+                ..OAuthToken::default_extra()
+            }),
+        });
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec![name.clone(), duplicate.clone()],
+                active_profile: Some(name.clone()),
+                fallback_chain: vec![name.clone(), duplicate.clone()],
+                ..Default::default()
+            },
+            profiles: vec![active, Profile::new(duplicate.to_string(), None, None)],
+        };
+        // The real cache writer fails closed when profiles.toml cannot be read.
+        // No disk exhaustion or production credentials are needed to pose it.
+        let state_path = crate::profile::tollgate_dir()
+            .unwrap()
+            .join("profiles.toml");
+        crate::lock::with_state_lock(|_| {
+            crate::profile::save_profile(&config.profiles[0])?;
+            std::fs::write(&state_path, "profiles = [")?;
+            seed_login_anchor(&name, Some(&proven));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            crate::profile::stored_access_token(&name).as_deref(),
+            Some("adopted-access")
+        );
+        if prior == Some("uuid-proven") {
+            assert_eq!(
+                std::fs::read(&anchor_path).ok(),
+                before,
+                "keep the proven anchor byte-for-byte"
+            );
+            assert!(!identity_pending(&name));
+            assert!(
+                matches!(crate::fallback::blocked_reason(&config, &config.profiles[1], None, &HashSet::new()),
+                Some(crate::fallback::BlockedReason::SameAccount { profile }) if profile == name)
+            );
+        } else {
+            assert!(load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
+            assert!(identity_pending(&name));
+            assert!(
+                matches!(crate::fallback::blocked_reason(&config, &config.profiles[1], None, &HashSet::new()),
+                Some(crate::fallback::BlockedReason::IdentityUnverified { profile }) if profile == name)
+            );
+        }
+        assert!(crate::fallback::walk_excluded(
+            &config,
+            &duplicate,
+            &HashSet::new()
+        ));
+        // A later successful write resolves pending identity normally.
+        crate::profile::save_app_state(&config.state).unwrap();
+        seed_login_anchor(&name, Some(&proven));
+        assert_eq!(
+            load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE),
+            Some(proven)
+        );
+        assert!(!identity_pending(&name));
+        assert!(crate::fallback::walk_excluded(
+            &config,
+            &duplicate,
+            &HashSet::new()
+        ));
+    }
+}
+
 #[test]
 fn a_login_with_no_proven_uuid_removes_the_anchor() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};

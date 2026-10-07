@@ -1562,7 +1562,8 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
 /// reauth that swaps a DIFFERENT account onto the name must replace the old
 /// anchor rather than keep proving the old identity. Best-effort — a login is
 /// never failed over its anchor — but a write that does not land is logged, never
-/// silent.
+/// silent. A failed write retains an anchor that already proves this uuid;
+/// otherwise mark identity pending before removing the displaced anchor.
 ///
 /// A `None`/blank uuid (a failed probe, an off-disk snapshot, or shape drift) is
 /// NOT proof of identity, so the old anchor is removed rather than left vouching
@@ -1583,7 +1584,17 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
     ) {
         remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
     } else {
-        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+        if load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE).as_deref() != Some(uuid) {
+            // Adoption may arrive without a pre-install marker. Never delete
+            // its already-correct proof, or expose an unguarded unknown login.
+            match crate::profile_cache::begin_login_install(name) {
+                Ok(()) => remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE),
+                Err(e) => logline!(
+                    "tollgate: {name}: could not mark its identity unverified; \
+                     leaving its existing anchor untouched: {e:#}"
+                ),
+            }
+        }
         logline!("tollgate: {name}: could not write the identity anchor");
     }
 }

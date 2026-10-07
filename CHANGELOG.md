@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A failed proven-account anchor write retains an already-matching anchor or marks the login unverified before removing a displaced anchor, preserving duplicate-account walk guards after live-token adoption.
 - Pasted setup tokens park account-specific credential keys before remint; per-session macOS Keychain switches and sign-outs save those keys into the outgoing store.
 - Proven login identity commits with credentials. Unverified new logins block fallback walks until the normal profile probe resolves them; runtime copy-back clears displaced account anchors.
 - Live-file rotation publication checks for intervening Claude Code writes. Rolling re-stamps recover and report poisoned config locks. Duplicate walk-blocker warnings name the matching profile.
