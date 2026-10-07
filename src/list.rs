@@ -68,6 +68,7 @@ struct Row {
     canceled: bool,
     /// The entry's distrusted-reading flag, rendered as `(stale)`.
     stale: bool,
+    same_account_as: Option<crate::profile::ProfileName>,
     /// Labels for dead credentials the user must act on. Two sources that
     /// can both fire on one hybrid (an OAuth pair plus a provider endpoint):
     /// `auth_status: "broken"` (the OAuth credential is dead — re-auth) and
@@ -137,6 +138,7 @@ impl Row {
                 .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
             canceled: claude && crate::profile_json::is_canceled_cached(typed_name),
             stale: entry.stale,
+            same_account_as: entry.same_account_as.clone(),
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
                 (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
@@ -184,6 +186,13 @@ impl Row {
                 states.push(l);
             }
         }
+        let duplicate = self
+            .same_account_as
+            .as_ref()
+            .map(|p| format!("same account as {p}"));
+        if let Some(duplicate) = duplicate.as_deref() {
+            states.push(duplicate);
+        }
         if states.is_empty() {
             return String::new();
         }
@@ -212,7 +221,7 @@ fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
         .unwrap_or(0)
 }
 
-fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
+pub(crate) fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
     let codex_entries = build_codex_entries(
         &CodexState::load().unwrap_or_default(),
         config.state.refresh_interval_ms,

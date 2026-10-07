@@ -82,6 +82,9 @@ pub(crate) fn plain_line(obs: &AccountObservation, now_secs: i64) -> String {
         };
         parts.push(format!("key {} · {age}", health.state.display_name()));
     }
+    if let Some(other) = &obs.same_account_as {
+        parts.push(format!("(same account as {other})"));
+    }
     if let Some(note) = &obs.note {
         parts.push(super::observation::sanitize_message(note));
     }

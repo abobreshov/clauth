@@ -1670,7 +1670,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
                 credentials: None,
                 base_url: None,
                 api_key: None,
-                account_uuid: None,
+                anchor: crate::actions::AnchorAction::Unproven,
             }),
             "zai".to_string(),
             false,
@@ -5105,7 +5105,7 @@ fn login_row_over_a_stashed_live_login_confirms_first() {
         credentials: None,
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     })));
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
@@ -8931,7 +8931,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
         credentials: None,
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     app.modals
         .push(super::Modal::CaptureName(super::CaptureNameForm {
@@ -8987,7 +8987,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         credentials: None,
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
         message: "account 'acme' already exists.".to_string(),
@@ -15355,4 +15355,254 @@ fn m_moves_a_committed_but_unserved_session_back_to_the_served_member() {
         .map(|t| t.body.clone())
         .unwrap_or_default();
     assert_eq!(toast, "session 4242-0: swapping… onto tb-a");
+}
+
+// ── #104: startup reconcile flags a current refreshless bearer ──────────────
+
+/// #104: `reconcile_startup` compares the live login against the profile's
+/// tollgate-private usage pair (`credentials_diverged`), which requires the
+/// refresh token to match. A rolling-token profile's live slot holds the
+/// refreshless bearer, so the current bearer still reads as diverged and every
+/// launch applies `default_divergence` (discard confirm) or flashes the banner.
+/// The live login must be judged against what a switch installs — the
+/// sidecar — where an access-token match is no divergence at all.
+#[test]
+fn repro_104_startup_reconcile_accepts_a_current_rolling_bearer() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName, save_profile,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "repro-104-rolling";
+    let pair = OAuthToken {
+        access_token: "at-chain".to_string(),
+        refresh_token: Some("rt-chain".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+        subscription_type: Some("max".into()),
+        ..OAuthToken::default_extra()
+    };
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(pair.clone()),
+    });
+    save_profile(&profile).expect("save profile");
+    // The sidecar is the chain's refreshless projection: the SAME access token.
+    crate::claude::stamp_rolling_token(&ProfileName::from(name), &pair).expect("stamp");
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir");
+    // Typed fixture: no added line spells a JSON credential key (the
+    // pre-commit secret scan refuses that shape outright).
+    let live = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-chain".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+            ..OAuthToken::default_extra()
+        }),
+    };
+    std::fs::write(
+        claude_dir.join(".credentials.json"),
+        serde_json::to_vec(&live).expect("ser"),
+    )
+    .expect("write live");
+    let state = AppState {
+        active_profile: Some(ProfileName::from(name)),
+        profiles: vec![ProfileName::from(name)],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    });
+    super::reconcile_startup(&mut app);
+    let signal = app.startup_results.try_recv();
+    assert!(
+        matches!(signal, Ok(crate::usage::StartupSignal::ReconcileDone)),
+        "a live slot holding the CURRENT rolling bearer is not a divergence (#104): {signal:?}"
+    );
+}
+
+/// The same class, wider: a static-mint profile's live slot holds the mint, a
+/// DIFFERENT token than the tollgate-private usage pair. The pair-compare reads
+/// that as a divergence on every launch too; against the install source it is
+/// not one.
+#[test]
+fn repro_104_startup_reconcile_accepts_a_current_static_mint() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName, save_profile,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "repro-104-static";
+    let pair = OAuthToken {
+        access_token: "at-chain".to_string(),
+        refresh_token: Some("rt-chain".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+        subscription_type: Some("max".into()),
+        ..OAuthToken::default_extra()
+    };
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(pair),
+    });
+    save_profile(&profile).expect("save profile");
+    crate::claude::write_session_token(
+        &ProfileName::from(name),
+        "setup-mint-fixture",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir");
+    let live = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "setup-mint-fixture".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    std::fs::write(
+        claude_dir.join(".credentials.json"),
+        serde_json::to_vec(&live).expect("ser"),
+    )
+    .expect("write live");
+    let state = AppState {
+        active_profile: Some(ProfileName::from(name)),
+        profiles: vec![ProfileName::from(name)],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    });
+    super::reconcile_startup(&mut app);
+    let signal = app.startup_results.try_recv();
+    assert!(
+        matches!(signal, Ok(crate::usage::StartupSignal::ReconcileDone)),
+        "a live slot holding the current static mint is not a divergence: {signal:?}"
+    );
+}
+
+#[test]
+fn duplicate_account_login_warning_is_a_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    let mut app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![
+            crate::profile::Profile::new("leadtone".into(), None, None),
+            crate::profile::Profile::new("scifoo".into(), None, None),
+        ],
+    });
+    for name in ["leadtone", "scifoo"] {
+        crate::usage::seed_login_anchor(&name.into(), Some(&"same-uuid".into()));
+    }
+    super::toast_duplicate_login(&mut app, &"scifoo".into());
+    assert!(app.toasts.iter().any(|t| {
+        t.body.contains("leadtone")
+            && t.body
+                .contains("the browser was signed in as the other account")
+    }));
+}
+// ── non-login keys (preserve_non_login_keys) ─────────────────────────────────
+
+/// The row flips the persisted `preserve_non_login_keys` through the real
+/// Config router: space off writes `preserve_non_login_keys = false`
+/// explicitly, ⏎ back on omits the key again (on is the default), and the
+/// reader every relink consults follows the file.
+#[test]
+fn non_login_keys_row_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::PreserveNonLoginKeys)
+        .unwrap();
+    assert!(app.config().state.preserve_non_login_keys, "on by default");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.preserve_non_login_keys,
+        "space toggles it off"
+    );
+    let path = crate::profile::tollgate_dir()
+        .unwrap()
+        .join("profiles.toml");
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        on_disk.contains("preserve_non_login_keys = false"),
+        "an explicit off must render or the next load reverts it to on:\n{on_disk}"
+    );
+    assert!(
+        !crate::claude::preserve_non_login_keys(),
+        "the reader the relinks consult follows the file"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config().state.preserve_non_login_keys,
+        "⏎ mirrors space"
+    );
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !on_disk.contains("preserve_non_login_keys"),
+        "on (default) omits the key:\n{on_disk}"
+    );
+    assert!(crate::claude::preserve_non_login_keys());
+}
+
+#[test]
+fn duplicate_account_relogin_warns_before_confirmation_without_reanchoring() {
+    use super::{Modal, apply_login};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    crate::usage::seed_login_anchor(&"leadtone".into(), Some(&"same-uuid".into()));
+    crate::usage::seed_login_anchor(&"scifoo".into(), Some(&"old-uuid".into()));
+    for (uuid, warns) in [("same-uuid", true), ("distinct-uuid", false)] {
+        let mut second = crate::profile::Profile::new("scifoo".into(), None, None);
+        second.credentials = Some(login_creds("old"));
+        let mut app = App::new(crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: vec![
+                crate::profile::Profile::new("leadtone".into(), None, None),
+                second,
+            ],
+        });
+        apply_login(
+            &mut app,
+            login_session("scifoo", false, 1),
+            login_outcome("new", Some(uuid)),
+        );
+        assert!(matches!(app.modals.last(), Some(Modal::Confirm(_))));
+        assert_eq!(
+            app.toasts.iter().any(|t| t
+                .body
+                .contains("the browser was signed in as the other account")
+                && t.body.contains("leadtone")),
+            warns
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &"scifoo".into(),
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+            )
+            .as_deref(),
+            Some("old-uuid")
+        );
+        assert_eq!(
+            app.config()
+                .find(&"scifoo".into())
+                .and_then(|p| p.refresh_token()),
+            Some("old")
+        );
+    }
 }

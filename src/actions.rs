@@ -360,19 +360,26 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = with_state_lock(|held| {
+    let (changed, outgoing) = with_state_lock(|held| {
         let config = &mut *guard;
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok(false);
+            return Ok((false, None));
         }
+        let outgoing = config.state.active_profile.as_ref().cloned();
         force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
         finish_switch(config, name, held)?;
-        Ok(true)
+        Ok((true, outgoing))
     })?;
     drop(guard);
     if changed {
+        // The reconcile captured a live login that may be a DIFFERENT account:
+        // expire the outgoing profile's `/profile` clock (ranked below the flock,
+        // so after the hold), the way `overwrite_captured_profile` does.
+        if let Some(out) = outgoing {
+            crate::usage::expire_profile_ttl(&out);
+        }
         crate::daemon::publish_status(config);
     }
     Ok(())
@@ -2052,19 +2059,32 @@ pub(crate) fn find_matching_oauth_profile(
         .map(|p| p.name.clone())
 }
 
+/// What committing a [`CaptureSnapshot`] must do to the profile's identity
+/// anchor. Three-valued rather than an `Option`, so "leave the anchor untouched"
+/// is its own spelling and can never be mistaken for "no proven identity".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnchorAction {
+    /// The snapshot's OAuth login provably belongs to this account uuid — an
+    /// interactive login's own `/profile` probe. Write it on commit.
+    Proven(AccountId),
+    /// The snapshot proves no identity (an off-disk read, a failed probe):
+    /// remove the anchor on commit, so the old account's cannot vouch for the
+    /// login the snapshot just installed.
+    Unproven,
+    /// The snapshot's OAuth login is the profile's own, carried unchanged (an
+    /// api re-key): leave the anchor untouched.
+    Unchanged,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CaptureSnapshot {
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    /// The account uuid an interactive login's own `/profile` probe saw these
-    /// credentials authenticate as. Travels with the snapshot so whichever
-    /// function COMMITS it seeds the identity anchor — including the paths that
-    /// park the snapshot in a confirm modal first. `None` for a snapshot with no
-    /// proven identity (a probe failure, or [`capture_snapshot`] reading live
-    /// credentials off disk); that seeds nothing and leaves any existing anchor
-    /// alone, exactly as before.
-    pub(crate) account_uuid: Option<AccountId>,
+    /// What the commit must do to the anchor. Travels with the snapshot so
+    /// whichever function COMMITS it acts — including the paths that park the
+    /// snapshot in a confirm modal first.
+    pub(crate) anchor: AnchorAction,
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
@@ -2080,7 +2100,7 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
         base_url,
         api_key,
         // Read off disk, not from a login — this snapshot proves no identity.
-        account_uuid: None,
+        anchor: AnchorAction::Unproven,
     })
 }
 
@@ -2140,7 +2160,7 @@ pub(crate) fn capture_into_profile(
         credentials,
         base_url,
         api_key,
-        account_uuid,
+        anchor,
     } = snapshot;
     let name = ProfileName::from(name);
     let seed_name = name.clone();
@@ -2151,6 +2171,13 @@ pub(crate) fn capture_into_profile(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
+        // A fresh profile can sit on an orphan dir holding a stale anchor (a
+        // hand-edited roster, a crash before the record landed): remove it before
+        // the store write, like every other install.
+        crate::profile_cache::remove_profile_cache(
+            &name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        );
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2180,8 +2207,13 @@ pub(crate) fn capture_into_profile(
         save_app_state(&config.state)
     })?;
     // Only once the credentials are committed, and only here — no caller seeds
-    // its own anchor, so no caller can forget to.
-    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
+    // its own anchor, so no caller can forget to. The old anchor (if any orphan
+    // dir held one) is already gone from the in-hold removal; a proven uuid
+    // re-anchors now.
+    if let AnchorAction::Proven(uuid) = &anchor {
+        crate::usage::seed_login_anchor(&seed_name, Some(uuid));
+        warn_duplicate_login(config, &seed_name);
+    }
     Ok(())
 }
 
@@ -2206,6 +2238,12 @@ pub(crate) fn create_profile_from_login(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
+        // Same orphan-dir guard as `capture_into_profile`: remove any stale
+        // anchor before the store write.
+        crate::profile_cache::remove_profile_cache(
+            &name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        );
         profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2232,6 +2270,7 @@ pub(crate) fn create_profile_from_login(
     // The draft parked the login's uuid until `create account` fixed the name;
     // this is that name, so the anchor lands here rather than at the call site.
     crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
+    warn_duplicate_login(config, &seed_name);
     Ok(())
 }
 
@@ -2301,10 +2340,9 @@ fn rollback_first_account_create(
 /// `/profile` TTL clock describes the old account too and is expired for the
 /// same reason — otherwise the swapped-in account's tier stays unfetched (and,
 /// with `usage_cache.json` just dropped, unrendered) for up to an hour. A
-/// snapshot carrying a proven identity (`account_uuid`, from an interactive
-/// login's probe) re-anchors the profile here, on the commit — the confirm-gated
-/// relogin parks the snapshot in a modal, so the anchor can only be seeded by
-/// whoever finally commits it.
+/// snapshot carrying a proven identity (an interactive login's probe) re-anchors
+/// the profile here, on the commit — the confirm-gated relogin parks the snapshot
+/// in a modal, so the anchor can only be seeded by whoever finally commits it.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -2314,8 +2352,12 @@ pub(crate) fn overwrite_captured_profile(
         credentials,
         base_url,
         api_key,
-        account_uuid,
+        anchor,
     } = snapshot;
+    // An api re-key carries the stored OAuth chain unchanged, so it is not a
+    // login install: the anchor stays exactly as found. Every other overwrite
+    // installs a login that may be a different account.
+    let installs_login = !matches!(anchor, AnchorAction::Unchanged);
     with_state_lock(|held| {
         let was_active = config.is_active(name);
         let profile = config
@@ -2353,6 +2395,17 @@ pub(crate) fn overwrite_captured_profile(
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         profile.base_url = base_url;
         profile.api_key = api_key;
+        if installs_login {
+            // Remove the old anchor BEFORE the store write, inside the same hold
+            // that commits the credentials: a later failure in this hold (the
+            // relink, the settings write) leaves the profile unanchored, never
+            // on the account the overwrite just displaced. A proven uuid
+            // re-anchors after the hold.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+        }
         profile.set_credentials(credentials, held);
         profile.provider = provider;
         // Same rule as `edit_profile_endpoint`: a reauth replaces the credential
@@ -2451,13 +2504,13 @@ pub(crate) fn overwrite_captured_profile(
     // tick racing the gap between the flock release and this expire spends the
     // stale stamp once or loses a fresh one and re-pulls once.
     crate::usage::expire_profile_ttl(name);
-    // Same commit-or-nothing rule for the identity: only credentials this profile
-    // now actually holds may be vouched for by its anchor. The same
-    // failure-after-`save_profile` window is NOT bounded here the way the stamp's
-    // is: the anchor would keep proving the old account against the new pair, and
-    // `seed_identity_anchor`'s ride-along is write-if-missing, so nothing corrects
-    // it until the next successful login.
-    crate::usage::seed_login_anchor(name, account_uuid.as_ref());
+    // The old anchor is already gone (removed before `save_profile` inside the
+    // hold). A proven uuid re-anchors now, after the commit; an unproven or
+    // unchanged one has nothing left to do.
+    if let AnchorAction::Proven(uuid) = &anchor {
+        crate::usage::seed_login_anchor(name, Some(uuid));
+        warn_duplicate_login(config, name);
+    }
     Ok(())
 }
 
@@ -2681,3 +2734,10 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/inline/mcp_switch.rs"]
 mod tests_mcp_switch;
+
+fn warn_duplicate_login(config: &AppConfig, name: &ProfileName) {
+    if let Some(warning) = crate::profile_cache::duplicate_login_warning(config, name) {
+        crate::out::errln!("{warning}");
+        crate::logline::logline!("{warning}");
+    }
+}

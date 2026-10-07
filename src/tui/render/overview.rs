@@ -912,6 +912,13 @@ fn render_overview_row(
     );
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
+    if let Some(other) = crate::profile_cache::same_account_as(&cfg, &profile.name) {
+        spans.push(Span::styled(
+            format!("  same account as {other}"),
+            theme::warning(),
+        ));
+    }
+
     spans.push(gap(widths));
     let label = account_type_label(profile);
     // Read before the tag: a no-data dash is not a tier, and the row must not

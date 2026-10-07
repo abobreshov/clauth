@@ -4626,6 +4626,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
             | BlockedReason::FiveHour { .. }
             | BlockedReason::ScopedSpent { .. }
             | BlockedReason::WeeklySoft { .. }
+            | BlockedReason::SameAccount { .. }
             | BlockedReason::Stale => false,
         }
     }

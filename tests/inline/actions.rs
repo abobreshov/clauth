@@ -1878,7 +1878,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         }),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
 
     overwrite_captured_profile(
@@ -2025,7 +2025,7 @@ fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
             credentials: Some(pair(access)),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         };
         overwrite_captured_profile(
             &mut config,
@@ -2219,7 +2219,7 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
                 credentials: Some(oauth_pair("new-access")),
                 base_url: None,
                 api_key: None,
-                account_uuid: None,
+                anchor: crate::actions::AnchorAction::Unproven,
             },
         )
         .expect("reauth");
@@ -2312,7 +2312,7 @@ fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
                 }),
                 base_url: None,
                 api_key: None,
-                account_uuid: None,
+                anchor: crate::actions::AnchorAction::Unproven,
             },
         )
         .expect("reauth");
@@ -2425,7 +2425,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth");
@@ -2644,7 +2644,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("endpoint-only capture");
@@ -2668,7 +2668,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
             credentials: None,
             base_url: None,
             api_key: Some("sk-foreign".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("key-only capture");
@@ -2730,7 +2730,7 @@ fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth");
@@ -2801,7 +2801,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth the active profile");
@@ -2874,7 +2874,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth");
@@ -2894,7 +2894,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("api-mode reauth");
@@ -2962,7 +2962,7 @@ fn a_credentials_less_recapture_still_drops_the_stored_chain() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("recapture");
@@ -3103,7 +3103,10 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
         }),
         base_url: None,
         api_key: None,
-        account_uuid: account_uuid.map(crate::profile::AccountId::from),
+        anchor: account_uuid
+            .map(crate::profile::AccountId::from)
+            .map(AnchorAction::Proven)
+            .unwrap_or(AnchorAction::Unproven),
     }
 }
 
@@ -3482,7 +3485,7 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
 }
 
 #[test]
-fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
+fn a_snapshot_with_no_proven_identity_removes_the_anchor() {
     let _home = HomeSandbox::new();
     // The seed below is a cache write, gated on the on-disk record.
     crate::testutil::register_names(&["unproven"]);
@@ -3497,8 +3500,9 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     );
 
     // `capture_snapshot()` reads live creds off disk and proves no identity; a
-    // failed login probe reports none either. Neither may mint OR clear an anchor
-    // — a `None` stays the silent no-op it has always been.
+    // failed login probe reports none either. The old anchor names the account
+    // the credentials USED to prove, so it must go — the next `/profile` read
+    // backfills it from the new login's own body.
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("unproven"),
@@ -3507,9 +3511,164 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     .expect("overwrite in place");
 
     assert_eq!(
-        anchor_of("unproven").as_deref(),
+        anchor_of("unproven"),
+        None,
+        "an unproven swap removes the stale anchor rather than leaving it vouching for a login it never proved"
+    );
+}
+
+/// A capture onto an orphan dir (a dir holding a stale anchor with no roster
+/// row) removes that anchor inside the committing hold, and a capture onto a
+/// brand-new name logs no removal line.
+#[test]
+fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
+    let _home = HomeSandbox::new();
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("orphan")).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+        br#""uuid-stale""#,
+    )
+    .expect("seed");
+    assert_eq!(
+        anchor_of("orphan").as_deref(),
+        Some("uuid-stale"),
+        "precondition"
+    );
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("someone-else".into()),
+            ..AppState::default()
+        },
+        profiles: vec![],
+    };
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    capture_into_profile(
+        &mut config,
+        "orphan".to_string(),
+        None,
+        login_snapshot("minted", None),
+    )
+    .expect("capture");
+    capture_into_profile(
+        &mut config,
+        "brandnew".to_string(),
+        None,
+        login_snapshot("minted2", None),
+    )
+    .expect("capture brand new");
+    let lines = sink.snapshot();
+    assert_eq!(
+        anchor_of("orphan"),
+        None,
+        "the orphan dir's stale anchor is removed"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("could not remove")),
+        "a brand-new name logs no removal line"
+    );
+}
+
+/// The commit-side `AnchorAction::Unchanged` arm (the api re-key) leaves a
+/// present anchor byte-for-byte: it is a not-a-login-write, never an install.
+#[test]
+fn an_unchanged_commit_keeps_the_anchor() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["unchanged"]);
+    let target = Profile::new("unchanged".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    let mut config = inactive_config(target);
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("unchanged"),
+        Some(&crate::profile::AccountId::from(
+            "uuid-existing".to_string(),
+        )),
+    );
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("unchanged"),
+        CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("sk-new".to_string()),
+            anchor: AnchorAction::Unchanged,
+        },
+    )
+    .expect("overwrite in place");
+
+    assert_eq!(
+        anchor_of("unchanged").as_deref(),
         Some("uuid-existing"),
-        "an unproven swap must not clear a live anchor"
+        "an Unchanged commit leaves the anchor byte-for-byte"
+    );
+}
+
+/// A settings write failing AFTER `overwrite_captured_profile`'s store commit
+/// must still leave the old anchor gone: the removal happens inside the hold,
+/// before `save_profile`, so the failure never strands the new login under the
+/// old account's anchor.
+#[cfg(unix)]
+#[test]
+fn a_failed_overwrite_after_the_commit_leaves_no_stale_anchor() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p5");
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-a"));
+    save_profile(&profile).expect("save");
+    crate::testutil::register_names(&["p5"]);
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.active_profile = Some("p5".into());
+    crate::profile::save_app_state(&state).expect("save state");
+    let mut config = AppConfig {
+        state,
+        profiles: vec![profile],
+    };
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir .claude");
+    // A settings.json whose `env` is not an object: the active-profile settings
+    // write after the credential commit fails.
+    std::fs::write(claude_dir.join("settings.json"), br#"{"env": 5}"#).expect("settings");
+    let r = overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(tok("at-b")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    );
+    assert!(
+        r.is_err(),
+        "precondition: the settings write after the commit fails"
+    );
+    let stored = crate::profile::load_profile(&name).expect("load");
+    assert_eq!(
+        stored.access_token(),
+        Some("at-b"),
+        "precondition: the store took the new login"
+    );
+    assert_eq!(
+        anchor_of("p5"),
+        None,
+        "the store holds a login the anchor never proved, so the old anchor must not survive the failed overwrite"
     );
 }
 
@@ -3526,7 +3685,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
             credentials: None,
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("new-api-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("overwrite in place");
@@ -3662,7 +3821,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
         }),
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -3722,7 +3881,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         credentials: None,
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -3819,7 +3978,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
         }),
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -3890,7 +4049,7 @@ fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file
         credentials: None,
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -5247,7 +5406,7 @@ fn reauth_overwrite_clears_broken_flag() {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("re-auth overwrite");
@@ -5811,7 +5970,7 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("overwrite_captured_profile");
@@ -6680,4 +6839,33 @@ fn codex_browser_preflight_refuses_in_guest_mode() {
             .is_some(),
         "{err:#}"
     );
+}
+
+#[test]
+fn duplicate_account_login_warns_and_keeps_the_other_profile() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["leadtone", "scifoo"]);
+    let first = Profile::new("leadtone".to_string(), None, None);
+    let second = Profile::new("scifoo".to_string(), None, None);
+    save_profile(&first).expect("save first");
+    save_profile(&second).expect("save second");
+    let mut config = inactive_config(second);
+    config.profiles.insert(0, first);
+    crate::usage::seed_login_anchor(&"leadtone".into(), Some(&"same-uuid".into()));
+    let first_path = crate::profile::profile_dir(&"leadtone".into())
+        .expect("first dir")
+        .join("config.toml");
+    let before = std::fs::read(&first_path).expect("first config");
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    overwrite_captured_profile(
+        &mut config,
+        &"scifoo".into(),
+        login_snapshot("fresh-login", Some("same-uuid")),
+    )
+    .expect("login commit");
+    assert!(sink.snapshot().iter().any(|l| l.contains("WARNING")
+        && l.contains("leadtone")
+        && l.contains("the browser was signed in as the other account")));
+    assert_eq!(std::fs::read(&first_path).expect("other config"), before);
 }

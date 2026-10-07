@@ -6,6 +6,8 @@ Edit the chain on the Fallback tab, as `fallback_chain` in `profiles.toml`, or o
 
 Only windows marked chain-eligible can move the chain: the 5h and 7d windows of Claude Code, codex, Z.ai, MiniMax, Alibaba and legacy Ollama Cloud accounts ([Providers](Providers#at-a-glance)). Monitors are never chain members. In [guest mode](Guest-Mode) the chain never switches the global account, since upstream clauth owns it; a `tollgate start --with-fallback` session still moves along its own chain inside its own runtime.
 
+Profiles whose cached account anchors name the same Anthropic UUID share quota. The later chain member is ineligible until its login resolves to a distinct account, and the Fallback tab names the other member as its blocker. Walks never switch between duplicate members, including a session already on the later member. This guard does not add a network request.
+
 ## The decision
 
 On every scheduler tick, and once at startup:

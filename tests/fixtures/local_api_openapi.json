@@ -1517,6 +1517,13 @@
               "null"
             ]
           },
+          "same_account_as": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Another profile resolved to the same Anthropic account uuid."
+          },
           "active": {
             "type": "boolean",
             "description": "This account is the one the harness is using now (the global active\nprofile of its roster)."
@@ -2639,6 +2646,18 @@
           "active": {
             "type": "boolean",
             "description": "Active-profile marker source. The active profile is always kept, disabled\nor not: the top-level `active_profile` field names it unconditionally,\nand a reader resolves that name against `profiles[]`."
+          },
+          "same_account_as": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "walk_blocker": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "rolling_token": {
             "type": "boolean",

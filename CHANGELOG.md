@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Authentication and account identity
+
+- Claude Code's usage, artifact, organization and feature caches now follow each profile, preventing cached figures and flags from leaking across accounts.
+- Rotations and rolling-token re-stamps follow recognized regular live credential files written by Claude Code. Current static and rolling logins no longer trigger startup divergence prompts.
+- Account anchors now follow the stored login: a `/profile` read repairs an incorrect anchor, and login changes invalidate the previous reading.
+- Login warns when another profile holds the same Anthropic account, naming the likely browser-account mix-up. List, usage, Overview and status JSON expose the duplicate; fallback walks skip the later duplicate and never switch between the two members. Status schema stays unchanged.
+- Non-login credential keys, including design logins and future keys, stay with their account across relinks and token writes. The Config tab's `non-login keys` toggle defaults on; only MCP-server logins carry across accounts. Replaced macOS Keychain items save their account's keys before replacement when their owner can be recognized.
+- On macOS, `which` matches a Keychain login when file matching misses, through an owner-only per-service cache with a 30-second TTL.
+
 ### Import
 
 - A profile's `throughput_cache.json` (upstream 0.16.0 keeps its per-model throughput samples in each profile) is copied as a profile cache instead of blocking the import as an unknown entry.

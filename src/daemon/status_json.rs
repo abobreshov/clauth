@@ -189,6 +189,11 @@ pub(crate) struct ProfileEntry {
     /// or not: the top-level `active_profile` field names it unconditionally,
     /// and a reader resolves that name against `profiles[]`.
     pub(crate) active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub(crate) same_account_as: Option<ProfileName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) walk_blocker: Option<String>,
     /// Additive (CLA-ROLL): what the sidecar actually HOLDS — the same content
     /// classification the TUI renders, not the config flag. The two part ways
     /// exactly when honesty matters: a dead chain degrades the sidecar onto its
@@ -534,6 +539,13 @@ pub(crate) fn build_profile_entries(
             ProfileEntry {
                 name: name.clone(),
                 active: config.is_active(name),
+                same_account_as: crate::profile_cache::same_account_as(config, name),
+                walk_blocker: crate::profile_cache::duplicate_walk_member(
+                    config,
+                    name,
+                    config.state.active_profile.as_ref(),
+                )
+                .map(|other| format!("same account as '{other}'")),
                 rolling_token: matches!(
                     crate::claude::sidecar_summary(name),
                     Some((crate::claude::SidecarKind::Rolling, _))
@@ -593,6 +605,8 @@ pub(crate) fn build_codex_entries(
             ProfileEntry {
                 name: name.clone(),
                 active: active.is_some_and(|a| a == name),
+                same_account_as: None,
+                walk_blocker: None,
                 // Rolling tokens are a claude-side mechanism (a `session-token`
                 // sidecar); codex holds one chain in one auth.json.
                 rolling_token: false,

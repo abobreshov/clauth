@@ -6,7 +6,7 @@ This page covers where your logins sit, how they move between accounts, how moni
 
 | Path | Holds |
 |------|-------|
-| `~/.tollgate/profiles/<name>/credentials.json` | that account's OAuth token pair, plus the MCP-server logins described below |
+| `~/.tollgate/profiles/<name>/credentials.json` | that account's OAuth token pair and its non-login keys described below |
 | `~/.tollgate/profiles/<name>/mcp-logins.json` | those MCP-server logins alone, parked whenever the account stores no Claude login of its own and merged back once it regains one |
 | `~/.tollgate/profiles/<name>/session-token.json` | a long-lived `claude setup-token` login, when captured |
 | `~/.tollgate/profiles/<name>/config.toml` | the endpoint API key, for endpoint accounts |
@@ -92,3 +92,13 @@ If Claude Code logged into a different account while tollgate was closed, the ne
 The off-switches are SECURITY.md's table: `TOLLGATE_NO_COMPLETIONS=1`, `TOLLGATE_NO_API=1`, `TOLLGATE_NO_LOCAL_API=1` or `local_api.enabled = false`, an empty `fallback_chain`, `allow extra usage` off, and `auto_start = false` are all default-safe and named there with their effects. Self-update needs no switch: it is compiled out of this build.
 
 Found something exploitable? Report it privately through the fork's [security advisories](https://github.com/abobreshov/clauth/security/advisories/new), not a public issue.
+
+## Non-login credential keys
+
+With `preserve_non_login_keys = true` (the default; Config → `non-login keys`), keys beside the Claude login stay in the account's store. This includes `designOauth`, MCP-server logins, and keys added by future Claude Code versions. The login and its identity keys are replaced together; only `mcpOAuth` is carried across accounts. Static and rolling sidecars preserve their sibling keys across writes, with the freshest token kept as a whole. Pending rotations prevent competing store writes.
+
+On macOS, a global Keychain item being replaced is saved into its recognized owner's store first. Signing out removes account-specific sibling keys once they are saved, while keeping MCP-server logins available. If the owner cannot be found or saving fails, signing out leaves those keys in the logged-out item. A failed item read follows the existing quarantine and timeout policy above.
+
+The macOS save-back covers the global switch/sign-out path. Per-session Keychain installation carries MCP-server logins but does not yet save every account-specific sibling from the replaced session item; static-token mint/clear/restore/heal also sync the file layer rather than reading the Keychain item. An item whose owner cannot be recognized before replacement may lose account-specific sibling keys; the event log reports this.
+
+The `which` Keychain evidence cache may hold a credential blob. Its files are atomic `0600` under an owner-only directory in `~/.tollgate`, with a 30-second read TTL and a one-day retention sweep. Guest-mode refusal still protects writes to the upstream-owned global Claude files and Keychain service.

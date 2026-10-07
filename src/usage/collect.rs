@@ -228,6 +228,7 @@ pub(crate) fn observe_profile(
     );
     obs.active = config.is_active(name);
     obs.disabled = p.is_disabled();
+    obs.same_account_as = crate::profile_cache::same_account_as(config, name);
     obs.endpoint = p.base_url.clone();
     obs.plan = crate::profile_json::tier_label(p);
     obs.failure = profile_failure(config, p);

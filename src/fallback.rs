@@ -721,6 +721,8 @@ pub(crate) enum BlockedReason {
     /// what its usage says, so this outranks every quota/liveness block — those
     /// would describe a member nothing is going to pick anyway.
     Disabled,
+    /// Same quota as another chain member; changing logins would only churn.
+    SameAccount { profile: ProfileName },
     /// Subscription canceled (`/profile` `subscription_status == "canceled"`):
     /// the org dropped to `claude_free` and `/v1/messages` 403s, so it can't
     /// serve at all — dead-first, above every quota/limiter block.
@@ -793,6 +795,13 @@ pub(crate) fn blocked_reason(
     // would be the second opinion this function must never be.
     if profile.is_disabled() && !config.is_active(&profile.name) {
         return Some(BlockedReason::Disabled);
+    }
+    if let Some(other) = crate::profile_cache::duplicate_walk_member(
+        config,
+        &profile.name,
+        config.state.active_profile.as_ref(),
+    ) {
+        return Some(BlockedReason::SameAccount { profile: other });
     }
     health_blocked_reason(config, profile, kick_lift, key_rejected)
 }
@@ -1221,7 +1230,9 @@ fn build_chain_snapshot(
             *name == active.as_str()
                 || (profile.is_some()
                     && !profile.is_some_and(Profile::is_disabled)
-                    && !skip_candidate(profile))
+                    && !skip_candidate(profile)
+                    && crate::profile_cache::duplicate_walk_member(config, name, Some(&active))
+                        .is_none())
         })
         .map(|name| chain_member(config, name, weekly_pct, key_rejected))
         .collect();
@@ -1399,6 +1410,7 @@ fn ordered_walk(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StartBlock {
     Disabled,
+    SameAccount { profile: ProfileName },
     AuthBroken,
     Canceled,
     KickRejected,
@@ -1439,6 +1451,9 @@ pub(crate) fn start_block(
 ) -> Option<StartBlock> {
     if profile.is_disabled() {
         return Some(StartBlock::Disabled);
+    }
+    if let Some(other) = crate::profile_cache::duplicate_walk_member(config, &member.name, None) {
+        return Some(StartBlock::SameAccount { profile: other });
     }
     if usage
         .and_then(|u| u.plan.as_ref())
@@ -1632,7 +1647,7 @@ pub(crate) fn durable_key_rejected(config: &AppConfig) -> HashSet<ProfileName> {
 
 /// Config-side exclusions every fallback-chain walk applies before it weighs
 /// usage headroom: an unresolvable, auth-broken, key-rejected, or user-disabled
-/// member is never a candidate. Pure state (no usage read, no disk read) —
+/// member is never a candidate. No usage read; duplicate identity comes from cached anchors —
 /// `key_rejected` is the key-rejected set the caller computed once outside the
 /// config guard, so it holds in both the UI and daemon contexts. Shared by
 /// `next_target`, `fully_clear_target`, and `scan_recovery` so their skip lists
@@ -1649,6 +1664,12 @@ pub(crate) fn walk_excluded(
         || config.is_auth_broken(name)
         || p.is_some_and(Profile::is_disabled)
         || key_rejected.contains(name)
+        || crate::profile_cache::duplicate_walk_member(
+            config,
+            name,
+            config.state.active_profile.as_ref(),
+        )
+        .is_some()
 }
 
 /// Whether the chain walk would ever visit `name`: a member of the chain, and
@@ -1698,6 +1719,15 @@ pub(crate) fn walk_blocker(
     let Some(profile) = config.find(name) else {
         return Some("no such account");
     };
+    if crate::profile_cache::duplicate_walk_member(
+        config,
+        name,
+        config.state.active_profile.as_ref(),
+    )
+    .is_some()
+    {
+        return Some("it is the same account as another chain member");
+    }
     if profile.is_disabled() {
         return Some("the account is disabled");
     }
@@ -1745,9 +1775,8 @@ fn candidate_excluded(
 /// `active_burn_pct_per_hour` is the caller's in-memory 5h burn rate for the
 /// active profile, forwarded to [`is_exhausted_active`] for step 3's
 /// burn-aware projection; ignored unless `burn_aware_switching` is on. This
-/// function never reads disk — `key_rejected` is the key-rejected set the
-/// caller read once outside the config guard, and the rate must be supplied
-/// too.
+/// function reads cached account anchors to exclude duplicate logins; the
+/// caller supplies the key-rejected set and burn rate. No network IO.
 pub(crate) fn next_target(
     config: &AppConfig,
     active_burn_pct_per_hour: Option<f64>,

@@ -33,9 +33,9 @@ use crate::actions::{
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
-    credentials_diverged, detach_credentials_link, force_link_profile_credentials,
-    force_snapshot_active_credentials, is_first_login, link_profile_credentials,
-    live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
+    detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
+    is_first_login, link_profile_credentials, live_credentials_are_shell, read_claude_credentials,
+    snapshot_active_credentials,
 };
 use crate::fallback::{
     DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
@@ -405,6 +405,13 @@ pub(crate) enum GlobalConfigRow {
     ContextNudge,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
+    /// Keep every key of a credential store other than the login and its
+    /// identity keys with the account whose store it is
+    /// (`AppState.preserve_non_login_keys`) — ON by default. A `/design-login`
+    /// then stays with the account it was made on across switches and relinks.
+    /// Read off disk where it is used, so a flip applies to the next relink.
+    /// ENUMERATED on/off, ⏎ mirrors space.
+    PreserveNonLoginKeys,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
@@ -3432,9 +3439,12 @@ pub(crate) fn read_only_hint(obs: &crate::usage::observation::AccountObservation
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
 
-/// Startup credential reconciliation, non-blocking. Compares the live
-/// `~/.claude/.credentials.json` to the active profile's stored creds inline.
-/// No divergence → snapshot + `ReconcileDone` immediately.
+/// Startup credential reconciliation, non-blocking. Judges the live
+/// `~/.claude/.credentials.json` through the SAME cascade the 1Hz poll uses
+/// ([`reconcile_decision`]): against the install source, never the
+/// tollgate-private usage pair — a refreshless live login (a rolling bearer, a
+/// static mint) is no divergence (#104). No divergence → snapshot +
+/// `ReconcileDone` immediately.
 ///
 /// On divergence we never probe the stored chain via OAuth refresh — a refresh
 /// *spends* the single-use refresh token server-side and would rotate the stored
@@ -3448,28 +3458,20 @@ pub(super) fn reconcile_startup(app: &mut App) {
         return;
     };
 
-    // Read live credentials under the state lock to avoid torn snapshots.
-    let live = with_state_lock(|_held| Ok(read_claude_credentials().ok().flatten()))
-        .ok()
-        .flatten();
-    let diverged = {
-        let cfg = app.config();
-        let stored = cfg.find(&active).and_then(|p| p.credentials.as_ref());
-        credentials_diverged(stored, live.as_ref())
-    };
+    let verdict = reconcile_decision(app, &active);
 
-    if !diverged {
+    if matches!(verdict, DivergenceVerdict::Clean) {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
-        let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
-        return;
     }
-
-    // Diverged: hand the verdict to the user. No network, no FS write here.
     let _ = app
         .startup_sender
-        .send(StartupSignal::ReconcileNeedsPrompt {
-            active: active.to_string(),
+        .send(if matches!(verdict, DivergenceVerdict::Clean) {
+            StartupSignal::ReconcileDone
+        } else {
+            StartupSignal::ReconcileNeedsPrompt {
+                active: active.to_string(),
+            }
         });
 }
 
@@ -5649,12 +5651,13 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 19] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 20] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
     GlobalConfigRow::DivergenceDefault,
+    GlobalConfigRow::PreserveNonLoginKeys,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
     GlobalConfigRow::ContextNudge,
@@ -5683,6 +5686,7 @@ impl GlobalConfigRow {
             | GlobalConfigRow::ClockNotation
             | GlobalConfigRow::HomeTab => "appearance",
             GlobalConfigRow::DivergenceDefault
+            | GlobalConfigRow::PreserveNonLoginKeys
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
             | GlobalConfigRow::ContextNudge
@@ -5789,6 +5793,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
+        GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
         // Inert while no account has `auto_start` on (rendered dimmed): a
         // queue with no possible member spaces nothing, so it stays a true
@@ -9773,6 +9778,7 @@ fn commit_new_account(app: &mut App) {
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
             app.toast(ToastKind::Success, format!("created '{name}'"));
+            toast_duplicate_login(app, &ProfileName::from(name.clone()));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("create failed\n{e}")),
     }
@@ -10402,6 +10408,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         ToastKind::Success,
                         format!("overwrote '{name}' with the captured login"),
                     );
+                    toast_duplicate_login(app, &name);
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("overwrite failed\n{e}")),
             }
@@ -10712,6 +10719,10 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
                 return;
             }
+            // The overwrite captured a live login that may be a DIFFERENT
+            // account: expire the clock so the next `/profile` read re-seeds the
+            // anchor, the way `overwrite_captured_profile` does.
+            crate::usage::expire_profile_ttl(&ProfileName::from(active));
             if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
                 app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
                 return;
@@ -11162,6 +11173,13 @@ fn drain_login_events(app: &mut App) {
 /// divergence, gates the overwrite on `AppState.default_divergence`: only an
 /// `Overwrite` default applies silently; anything else asks first.
 fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login::LoginOutcome) {
+    let duplicate_warning = outcome.account_uuid.as_ref().and_then(|account| {
+        crate::profile_cache::duplicate_login_warning_for_account(
+            &app.config(),
+            &ProfileName::from(session.name.clone()),
+            account,
+        )
+    });
     if session.is_new {
         // The `+ new` form may have been closed during the browser round-trip;
         // the mint lives only in the draft, so without one it is dropped. The
@@ -11170,6 +11188,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         let stashed = stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome)));
         if stashed {
             app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+            if let Some(warning) = duplicate_warning {
+                app.toast(ToastKind::Warning, warning);
+            }
         } else {
             app.toast(
                 ToastKind::Warning,
@@ -11200,7 +11221,10 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: outcome.account_uuid,
+        anchor: outcome
+            .account_uuid
+            .map(crate::actions::AnchorAction::Proven)
+            .unwrap_or(crate::actions::AnchorAction::Unproven),
     };
     // No stored creds → nothing diverges; adopt silently (mirrors the
     // first-login adopt in `poll_credentials_divergence`).
@@ -11231,6 +11255,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             choice: false,
             on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
         }));
+        if let Some(warning) = duplicate_warning {
+            app.toast(ToastKind::Warning, warning);
+        }
         return;
     }
     let result = {
@@ -11244,6 +11271,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
+            toast_duplicate_login(app, &ProfileName::from(session.name.clone()));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
     }
@@ -11741,8 +11769,8 @@ fn maybe_spawn_bootstrap(app: &mut App) {
 }
 
 /// 1Hz check: keep [`App::divergence_pending`] (the non-blocking banner) in
-/// sync with whether `.credentials.json` matches the active profile's stored
-/// creds. Never pushes the modal — a divergence must not lock the whole TUI out
+/// sync with whether the live login matches what a switch to the active
+/// profile installs (the install source). Never pushes the modal — a divergence must not lock the whole TUI out
 /// of browsing usage; <kbd>d</kbd> opens the resolver on demand, and
 /// switch-shaped actions raise it themselves when resolution is actually
 /// required. First-login adoption resolves automatically here, as does a
@@ -11781,23 +11809,56 @@ fn poll_credentials_divergence(app: &mut App) {
         return;
     };
     if !matches!(
-        classify_credentials_link(&active).ok(),
+        reconcile_decision(app, &active),
+        DivergenceVerdict::NeedsPrompt
+    ) {
+        return;
+    }
+    resolve_or_note_divergence(app, active.as_ref());
+}
+
+/// What the shared divergence cascade ([`reconcile_decision`]) makes of the
+/// live slot.
+enum DivergenceVerdict {
+    /// Linked, adopted, or already stored — no divergence to resolve.
+    Clean,
+    /// A logged-out shell. The poll exempts it outright (no nag, no banner);
+    /// the startup reconcile treats it as a divergence so a configured
+    /// `default_divergence` Overwrite still performs the boot heal (relink
+    /// the stored login over the shell) — the shipped pin's behavior.
+    Shell,
+    /// A genuine divergence — the user's verdict is needed.
+    NeedsPrompt,
+}
+
+/// The ONE divergence decision, shared by the startup reconcile and the 1Hz
+/// poll (#104): the live login is judged against what a switch INSTALLS
+/// (the install source — the sidecar for split profiles), never the
+/// tollgate-private usage pair, so a refreshless live login (a rolling bearer,
+/// a static mint) is no divergence. Side effects: a first-login adoption runs
+/// here; exempt states clear the banner. A logged-out shell is reported as
+/// its own verdict so the two callers can disagree on it (see
+/// [`DivergenceVerdict::Shell`]).
+fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict {
+    if !matches!(
+        classify_credentials_link(active).ok(),
         Some(LinkState::Diverged)
     ) {
         app.divergence_pending = None; // resolved; a later divergence re-flags
-        return;
+        return DivergenceVerdict::Clean;
     }
-    // A logged-out shell is nothing to resolve: don't nag, and never let a
-    // `default_divergence` Overwrite capture its blank tokens over the stored chain.
+    // A logged-out shell is nothing the poll must resolve: don't nag, and
+    // never let a `default_divergence` Overwrite capture its blank tokens
+    // over the stored chain.
     if live_credentials_are_shell() {
         app.divergence_pending = None;
-        return;
+        return DivergenceVerdict::Shell;
     }
     // First login on a credential-less profile: adopt silently, don't prompt.
-    if is_first_login(&active).unwrap_or(false) {
+    if is_first_login(active).unwrap_or(false) {
         let result = {
             let mut cfg = app.config();
-            adopt_first_login(&mut cfg, &active)
+            adopt_first_login(&mut cfg, active)
         };
         match result {
             Ok(()) => {
@@ -11805,14 +11866,14 @@ fn poll_credentials_divergence(app: &mut App) {
                 // AUTH-1: an adopted first login is a fresh login — lift a
                 // standing auth_broken quarantine like the sibling fresh-login
                 // paths do.
-                oauth::mark_auth_broken(&app.config, &active, false);
+                oauth::mark_auth_broken(&app.config, active, false);
                 app.last_reload_fp = reload_fingerprint();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
         }
-        return;
+        return DivergenceVerdict::Clean;
     }
     // A login already saved in the active profile's store holds nothing unsaved —
     // the next switch re-installs it, losing no login — so it must not raise the
@@ -11820,11 +11881,11 @@ fn poll_credentials_divergence(app: &mut App) {
     // writes over it. The switch/defer gates apply the same exemption through
     // `live_diverged_and_unsaved`; the poll must adopt a first login before this
     // point, so it checks the predicate directly here instead.
-    if crate::claude::live_login_is_stored(&active) {
+    if crate::claude::live_login_is_stored(active) {
         app.divergence_pending = None;
-        return;
+        return DivergenceVerdict::Clean;
     }
-    resolve_or_note_divergence(app, active.as_ref());
+    DivergenceVerdict::NeedsPrompt
 }
 
 /// Apply the configured `default_divergence`, or flag the non-blocking banner
@@ -11981,3 +12042,23 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/inline/tui_app.rs"]
 mod tests;
+
+fn toast_duplicate_login(app: &mut App, name: &ProfileName) {
+    let warning = crate::profile_cache::duplicate_login_warning(&app.config(), name);
+    if let Some(warning) = warning {
+        app.toast(ToastKind::Warning, warning);
+    }
+}
+/// Flip whether non-login keys stay with their account
+/// (`preserve_non_login_keys`, default on). Same persistence shape as
+/// `toggle_preemptive_rotation`; every reader loads the flag off disk at the
+/// moment it relinks or rewrites a store (`claude::preserve_non_login_keys`),
+/// so the next relink in any process acts on the flip.
+fn toggle_preserve_non_login_keys(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}

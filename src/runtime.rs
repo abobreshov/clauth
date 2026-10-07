@@ -3453,6 +3453,9 @@ impl SessionSwap {
         // inside the hold, spent after it (the carry's read is a subprocess).
         #[cfg(target_os = "macos")]
         let mut previous_store: Option<std::path::PathBuf> = None;
+        // The drain may copy a session-side `/login` of a DIFFERENT account into
+        // the store: mark that account's `/profile` reading stale (no network
+        // call) inside the same hold that committed the store.
         let outcome = with_state_lock(|_held| {
             let current = self.canonical();
             #[cfg(target_os = "macos")]
@@ -3463,7 +3466,9 @@ impl SessionSwap {
             // the member the link STILL resolves to; once canonical moves, the
             // next tick would write those bytes into the new member's store and
             // its refresh token would be gone.
-            sync_credentials_unlocked(&link, &current)?;
+            if sync_credentials_unlocked(&link, &current)? {
+                crate::usage::mark_profile_read_stale(&current);
+            }
 
             let paths =
                 SessionPaths::resolve(&plan.member, self.isolation, &self.session, self.mode)?;
@@ -3481,6 +3486,14 @@ impl SessionSwap {
                 return Ok(SwapOutcome::Refused(SwapRefused::NoCredentialStore));
             }
             touch_store(&plan, file_mtime(&current))?;
+            // Known gap: nothing is carried onto the incoming member's store
+            // here (the global switch's `mcpOAuth` carry). The outgoing member
+            // keeps the runtime file's non-login keys only where the drain above
+            // saves them: a static-token member's sidecar through its sync, a
+            // `credentials.json` member when the runtime file wins the drain.
+            // On macOS the session's store is its per-session Keychain item, and
+            // the swap's install replaces it without saving what sat beside the
+            // outgoing member's login (`keychain::keychain_install_for_config_dir`).
             relink_to_canonical(&link, &plan.store)?;
 
             // Past here the session IS on the new member, so nothing may report
@@ -3699,6 +3712,9 @@ impl SessionSwap {
         // writes the session's Keychain pair into. Captured inside the hold.
         #[cfg(target_os = "macos")]
         let mut previous_store: Option<std::path::PathBuf> = None;
+        // The drain may copy a session-side `/login` of a DIFFERENT account into
+        // the store: mark that account's `/profile` reading stale (no network
+        // call) inside the same hold that committed the store.
         with_state_lock(|_held| {
             let current = self.canonical();
             #[cfg(target_os = "macos")]
@@ -3709,7 +3725,9 @@ impl SessionSwap {
             // to the member the link STILL resolves to; once canonical moves,
             // the next tick would write those bytes into the sidecar and the
             // refresh token would be gone.
-            sync_credentials_unlocked(&link, &current)?;
+            if sync_credentials_unlocked(&link, &current)? {
+                crate::usage::mark_profile_read_stale(&current);
+            }
             Ok(())
         })?;
         // macOS: CARRY, then SIGN OUT — in that order, and the sign-out only
@@ -6723,20 +6741,25 @@ fn retry_seeded_keychain_item(swap: &SessionSwap, seed_retry: &std::sync::Mutex<
 }
 
 fn reconcile_credentials(runtime_path: &Path, canonical: &Path, mode: LinkMode) -> Result<()> {
-    match mode {
+    let wrote = match mode {
         LinkMode::Real => {
-            sync_credentials_unlocked(runtime_path, canonical)?;
+            let wrote = sync_credentials_unlocked(runtime_path, canonical)?;
             let meta = runtime_path.symlink_metadata().ok();
-            if meta.is_some_and(|m| m.file_type().is_symlink() || m.is_file()) {
-                return Ok(());
-            }
-            if canonical.exists() {
+            if !meta.is_some_and(|m| m.file_type().is_symlink() || m.is_file())
+                && canonical.exists()
+            {
                 create_symlink(canonical, runtime_path)?;
             }
+            wrote
         }
-        LinkMode::Fake => {
-            mirror_credentials(runtime_path, canonical)?;
-        }
+        LinkMode::Fake => mirror_credentials(runtime_path, canonical)?,
+    };
+    if wrote {
+        // The build drained a session-side `/login` into the store: mark the
+        // account's `/profile` reading stale (no network call). This runs inside
+        // `acquire_synced`'s hold, and the durable-stamp removal takes no ranked
+        // lock, so it is legal there.
+        crate::usage::mark_profile_read_stale(canonical);
     }
     Ok(())
 }
@@ -6805,13 +6828,14 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
     let runtime = swap.runtime.as_path();
     let link = runtime.join(".credentials.json");
-    match swap.mode {
+    let canonical = swap.canonical();
+    let wrote = match swap.mode {
         LinkMode::Real => with_state_lock(|_held| {
-            sync_credentials_unlocked(&link, &swap.canonical())?;
-            Ok::<_, anyhow::Error>(())
-        }),
+            let wrote = sync_credentials_unlocked(&link, &canonical)?;
+            Ok::<_, anyhow::Error>(wrote)
+        })?,
         LinkMode::Fake if swap.isolation == Isolation::Isolated => {
-            with_state_lock(|_held| mirror_credentials(&link, &swap.canonical()))
+            with_state_lock(|_held| mirror_credentials(&link, &canonical))?
         }
         LinkMode::Fake => {
             // Bulk tree walk + copies run WITHOUT the state lock: on a large
@@ -6831,16 +6855,25 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
             // interleave with acquire/switch credential writes) stays under the
             // lock.
             mirror_tree(claude_home, runtime)?;
-            with_state_lock(|_held| mirror_credentials(&link, &swap.canonical()))
+            with_state_lock(|_held| mirror_credentials(&link, &canonical))?
         }
+    };
+    if wrote {
+        // A session-side `/login` may have been copied into the store: mark the
+        // account's `/profile` reading stale (no network call); the next
+        // `/profile` read re-anchors from the body it gets.
+        crate::usage::mark_profile_read_stale(&canonical);
     }
+    Ok(())
 }
 
 /// If Claude Code's internal refresh replaced `<runtime>/.credentials.json` with
 /// a regular file, copy its bytes into canonical creds and swap the file back to
 /// a symlink so canonical stays the single source of truth. Returns `true` when
-/// bytes were written. Real-symlink mode only — fake mode uses
-/// [`mirror_credentials`].
+/// the copied claude OAuth login changed (access or refresh token), which is what
+/// the copy-back's `/profile`-stale mark keys on — a rewrite that touched only
+/// other keys (an MCP-server token) returns `false`. Real-symlink mode only —
+/// fake mode uses [`mirror_credentials`].
 ///
 /// Running this outside the state flock races the credential writes of a
 /// concurrent `acquire` or switch, which is what that flock exists to serialize.
@@ -6883,11 +6916,19 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     // canonical and relink; the re-login stays recoverable in the runtime
     // file's lineage, and `tollgate login` is the supported way to refresh the
     // profile's usage OAuth pair.
+    //
+    // What the session's Claude Code saved beside the static token (a
+    // `/design-login`, an MCP login, a refresh of either) is the member's own:
+    // with `preserve_non_login_keys` on it is synced into the sidecar before
+    // the file goes, only when the runtime login still IS the token.
     if differs
         && canonical
             .file_name()
             .is_some_and(|f| f == "session-token.json")
     {
+        if crate::claude::preserve_non_login_keys() {
+            crate::claude::sync_live_extra_best_effort(link_path, canonical);
+        }
         logline!(
             "tollgate: watchdog kept the static session token \
              (a session-side re-login is never adopted over it)"
@@ -6895,15 +6936,19 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
         relink_to_canonical(link_path, canonical)?;
         return Ok(false);
     }
-    let mut wrote_canonical = false;
+    let mut wrote = false;
     if differs {
         // Bytes differ. The keep-canonical-vs-adopt-runtime decision (write
         // recency primary, `expires_at` as the tie-break) lives in
         // `resolve_credential_winner` — see its doc for why mtime, not expiry,
         // is the signal.
-        let canonical_exp = canonical_bytes.as_deref().and_then(|cb| {
-            let c = serde_json::from_slice::<ClaudeCredentials>(cb).ok()?;
-            Some(c.claude_ai_oauth?.expires_at.unwrap_or(0))
+        let canonical_creds = canonical_bytes
+            .as_deref()
+            .and_then(|cb| serde_json::from_slice::<ClaudeCredentials>(cb).ok());
+        let canonical_exp = canonical_creds.as_ref().and_then(|c| {
+            c.claude_ai_oauth
+                .as_ref()
+                .map(|o| o.expires_at.unwrap_or(0))
         });
         let runtime_exp = runtime_creds
             .claude_ai_oauth
@@ -6924,11 +6969,14 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             );
         } else {
             atomic_write_600(canonical, &runtime_bytes)?;
-            wrote_canonical = true;
+            // Mark the `/profile` reading stale only when the copied LOGIN
+            // changed, never for a rewrite that touched only other keys (an
+            // MCP-server token refresh).
+            wrote = crate::profile::login_changed(canonical_creds.as_ref(), &runtime_creds);
         }
     }
     relink_to_canonical(link_path, canonical)?;
-    Ok(wrote_canonical)
+    Ok(wrote)
 }
 
 /// Decide whether to keep the canonical credentials instead of adopting the
@@ -6986,8 +7034,10 @@ fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
 
 /// Bidirectional mtime mirror between `runtime/.credentials.json` and canonical
 /// creds: "latest mtime wins", newer side copied over older. Skips partial
-/// writes (invalid JSON). Fake-symlink mode only.
-fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
+/// writes (invalid JSON). Fake-symlink mode only. Returns `true` only for a
+/// session→store copy whose claude OAuth login changed; a store→session copy
+/// writes no store and returns `false`.
+fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<bool> {
     // Same flock requirement and same test ceiling as `sync_credentials_unlocked`.
     debug_assert!(
         cfg!(test) || crate::lockorder::holds::<crate::lockorder::rank::State>(),
@@ -6998,9 +7048,12 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
     let canonical_meta = canonical.metadata().ok();
 
     if let Some((src, dst)) = newer_side(runtime_path, canonical, runtime_meta, canonical_meta) {
-        copy_if_valid_creds(src, dst)?;
+        let wrote = copy_if_valid_creds(src, dst)?;
+        if src == runtime_path {
+            return Ok(wrote);
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Resolve which credential side is newer or sole-present. Returns `(src, dst)`
@@ -7023,20 +7076,26 @@ fn newer_side<'a>(
     }
 }
 
-fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
+fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<bool> {
     let bytes = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
     // Same guard as sync_credentials_unlocked: reject partial, invalid, or
     // empty-object writes before letting them stomp the canonical file.
     let Ok(creds) = serde_json::from_slice::<ClaudeCredentials>(&bytes) else {
-        return Ok(());
+        return Ok(false);
     };
     if creds.claude_ai_oauth.is_none() {
-        return Ok(());
+        return Ok(false);
     }
-    if std::fs::read(dst).ok().as_deref() == Some(bytes.as_slice()) {
-        return Ok(());
+    let dst_bytes = std::fs::read(dst).ok();
+    if dst_bytes.as_deref() == Some(bytes.as_slice()) {
+        return Ok(false);
     }
-    atomic_write_600(dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))
+    let dst_creds = dst_bytes
+        .as_deref()
+        .and_then(|b| serde_json::from_slice::<ClaudeCredentials>(b).ok());
+    atomic_write_600(dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))?;
+    // Mark the `/profile` reading stale only when the copied LOGIN changed.
+    Ok(crate::profile::login_changed(dst_creds.as_ref(), &creds))
 }
 
 /// Walk both `~/.claude/` and the runtime tree; copy the newer bytes onto the

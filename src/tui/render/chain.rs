@@ -347,6 +347,7 @@ fn draw_chain_detail(
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
+        BlockedReason::SameAccount { .. } => ("=", theme::warning()),
         BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::KeyRejected => (theme::dead_credential_glyph(), theme::danger()),
@@ -376,6 +377,11 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
     // serving") — never crammed inside with a `·`, so the whole card and the
     // Usage-tab pills read one shape.
     let (label, style, suffix) = match reason {
+        BlockedReason::SameAccount { profile } => (
+            format!("same account as {profile}"),
+            theme::warning().bold(),
+            None,
+        ),
         BlockedReason::Disabled => (DIAG_DISABLED.to_string(), theme::dim().bold(), None),
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
@@ -437,6 +443,9 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
             "that model's weekly window is spent, other models still serve".to_string()
         }
         BlockedReason::WeeklySoft { .. } => DIAG_WEEKLY_SOFT.to_string(),
+        BlockedReason::SameAccount { profile } => {
+            format!("same account as {profile}; no separate quota")
+        }
         BlockedReason::Stale => "last usage check failed".to_string(),
     }
 }

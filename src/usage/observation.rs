@@ -443,6 +443,10 @@ pub(crate) struct AccountObservation {
     pub(crate) key_health: Option<KeyHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
+    /// Another profile resolved to the same Anthropic account uuid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub(crate) same_account_as: Option<crate::profile::ProfileName>,
     /// This account is the one the harness is using now (the global active
     /// profile of its roster).
     pub(crate) active: bool,
@@ -497,6 +501,7 @@ impl AccountObservation {
             plan: None,
             key_health: None,
             note: None,
+            same_account_as: None,
             active: false,
             disabled: false,
             origin,

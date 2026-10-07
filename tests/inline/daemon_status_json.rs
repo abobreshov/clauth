@@ -1770,6 +1770,8 @@ fn status_body_matches_legacy_json_bytes() {
         gateway: None,
         profiles: vec![
             ProfileEntry {
+                same_account_as: None,
+                walk_blocker: None,
                 name: "all-some".into(),
                 active: true,
                 rolling_token: true,
@@ -1809,6 +1811,8 @@ fn status_body_matches_legacy_json_bytes() {
                 third_party: Some(ThirdPartyAvailability { available: true }),
             },
             ProfileEntry {
+                same_account_as: None,
+                walk_blocker: None,
                 name: "all-none".into(),
                 active: false,
                 rolling_token: false,
@@ -1830,6 +1834,8 @@ fn status_body_matches_legacy_json_bytes() {
                 third_party: None,
             },
             ProfileEntry {
+                same_account_as: None,
+                walk_blocker: None,
                 name: "null-stamp".into(),
                 active: false,
                 rolling_token: false,
