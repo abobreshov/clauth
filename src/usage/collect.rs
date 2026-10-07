@@ -257,8 +257,58 @@ pub(crate) fn observe_profile(
     }
     if let Some(usage) = &usage {
         apply_oauth_usage(&mut obs, usage, now_secs);
+        if config.state.show_estimates {
+            apply_running_rates(
+                &mut obs,
+                usage,
+                &crate::profile::load_usage_history(name),
+                ctx.now_ms,
+            );
+        }
     }
     obs
+}
+
+/// Cache-only reports use the TUI's measured history fit, including its
+/// sample floor, recent lookback, reset boundary and idle-gap cutoff.
+fn apply_running_rates(
+    obs: &mut AccountObservation,
+    usage: &UsageInfo,
+    history: &[(u64, UsageInfo)],
+    now_ms: u64,
+) {
+    let windows = usage.windows();
+    let rates = super::burn::compute_burn_rates_at(
+        history,
+        &windows,
+        super::BURN_LOOKBACK_MS,
+        super::BURN_MIN_SAMPLES,
+        super::BURN_GAP_CUT_MS,
+        now_ms,
+    );
+    for window in &mut obs.windows {
+        let Some(rate) = rates
+            .get(&window.label)
+            .copied()
+            .flatten()
+            .filter(|r| r.is_finite() && *r > 0.0)
+        else {
+            continue;
+        };
+        let unit = if window.label.starts_with("7d") {
+            "d"
+        } else {
+            "h"
+        };
+        let rate = if unit == "d" { rate * 24.0 } else { rate };
+        window.running_rate = Some(super::observation::RunningRate {
+            pct_per_unit: rate,
+            unit: unit.to_string(),
+            time_left_secs: window
+                .used_pct
+                .and_then(|pct| super::eta_left_secs(rate, pct, unit)),
+        });
+    }
 }
 
 /// The dead-credential verdicts a profile carries on disk, most actionable

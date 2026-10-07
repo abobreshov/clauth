@@ -13,11 +13,11 @@ fn login_expired_shares_one_head_across_line_and_toast() {
     let m = login_expired(&crate::profile::ProfileName::from("work"));
     assert_eq!(
         m.line(),
-        "login for 'work' has expired: refresh token revoked or invalid: run tollgate login work"
+        "login for 'work' has expired: refresh token revoked or invalid: run `tollgate login work`"
     );
     assert_eq!(
         m.toast(),
-        "login for 'work' has expired\nrefresh token revoked or invalid: run tollgate login work"
+        "login for 'work' has expired\nrefresh token revoked or invalid: run `tollgate login work`"
     );
     // The bold toast head is exactly the line() prefix before the separator.
     assert_eq!(
@@ -266,7 +266,7 @@ fn every_transient_cause_renders_its_own_copy() {
             (Retry::Connection, ": check your connection and retry"),
             (
                 Retry::Restart,
-                ": run tollgate login again for a fresh code",
+                ": run `tollgate login` again for a fresh code",
             ),
         ] {
             let retry_name = format!("{retry:?}");
@@ -320,7 +320,7 @@ fn only_the_relogin_causes_read_as_permanent() {
 fn detail_returns_the_next_step_alone_and_falls_back_to_the_head() {
     assert_eq!(
         login_expired(&crate::profile::ProfileName::from("work")).detail(),
-        "refresh token revoked or invalid: run tollgate login work"
+        "refresh token revoked or invalid: run `tollgate login work`"
     );
     let bare = Message {
         head: "done".to_string(),
@@ -354,6 +354,17 @@ fn format_pct_drops_trailing_zero_on_whole_numbers() {
 #[test]
 fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
+}
+
+#[test]
+fn format_pct_rounds_to_two_decimals_without_trailing_zeros() {
+    assert_eq!(format_pct(1.0000000000000009), "1%");
+    assert_eq!(format_pct(1.001), "1%");
+    assert_eq!(format_pct(1.234), "1.23%");
+    assert_eq!(format_pct(1.236), "1.24%");
+    assert_eq!(format_pct(0.001), "0%");
+    assert_eq!(format_pct(-0.0), "0%");
+    assert_eq!(format_pct(99.999), "100%");
 }
 
 /// The one threshold spelling, pinned per branch so a drift on one branch

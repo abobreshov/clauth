@@ -145,16 +145,20 @@ fn bare_app() -> App {
     })
 }
 
-/// Seed CC's plugin registry with one tollgate install record at `scope`.
-fn write_plugin_install(scope: &str) {
+/// Seed CC's plugin registry with one tollgate install record at `scope`; the
+/// record carries `version` only when one is given, since the registry's
+/// version field is optional.
+fn write_plugin_install(scope: &str, version: Option<&str>) {
     let path = crate::profile::claude_dir()
         .expect("claude dir")
         .join("plugins")
         .join("installed_plugins.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    let body = serde_json::json!({
-        "plugins": { "tollgate@tollgate": [{ "scope": scope, "version": "0.1.0" }] }
-    });
+    let mut record = serde_json::json!({ "scope": scope });
+    if let Some(version) = version {
+        record["version"] = serde_json::Value::from(version);
+    }
+    let body = serde_json::json!({ "plugins": { "tollgate@tollgate": [record] } });
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 }
 
@@ -267,7 +271,7 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
 #[test]
 fn plugin_check_ok_when_installed_globally() {
     let _home = crate::testutil::HomeSandbox::new();
-    write_plugin_install("user");
+    write_plugin_install("user", Some(env!("CARGO_PKG_VERSION")));
     let mut app = bare_app();
     super::recompute_plugin_checks(&mut app, false);
     let check = plugin_check(&app);
@@ -285,7 +289,7 @@ fn plugin_check_ok_when_installed_globally() {
 #[test]
 fn plugin_check_warns_and_offers_global_install_when_project_local() {
     let _home = crate::testutil::HomeSandbox::new();
-    write_plugin_install("local");
+    write_plugin_install("local", Some("0.1.0"));
     let mut app = bare_app();
     super::recompute_plugin_checks(&mut app, false);
     let check = plugin_check(&app);
@@ -350,7 +354,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
     let body = serde_json::json!({
         "plugins": { "tollgate@tollgate": [
             { "scope": "local", "version": "0.14.1" },
-            { "scope": "user", "version": "0.15.0" }
+            { "scope": "user", "version": env!("CARGO_PKG_VERSION") }
         ] }
     });
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
@@ -376,7 +380,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
         check
             .detail
             .iter()
-            .any(|line| line.starts_with("version: 0.15.0")),
+            .any(|line| *line == format!("version: {}", env!("CARGO_PKG_VERSION"))),
         "the live user row's version must win: {:?}",
         check.detail
     );
@@ -421,6 +425,18 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
     assert!(
         matches!(state.on_confirm, super::ConfirmAction::InstallPlugin),
         "the modal must run the install on confirm"
+    );
+    // The install re-enables a disabled plugin, and the outdated-install warn
+    // reaches a disabled one too, so the confirm says where the plugin ends up.
+    assert_eq!(
+        (state.message.as_str(), state.detail.as_deref()),
+        (
+            "install the tollgate plugin into claude code?",
+            Some(
+                "runs claude's own plugin installer at user scope and turns the plugin on; your other plugins and settings are untouched."
+            ),
+        ),
+        "the install confirm's copy, by equality"
     );
     assert!(app.toasts.is_empty(), "arming the fix must run nothing yet");
     assert!(
@@ -584,7 +600,7 @@ fn mcp_check_warns_project_only_for_local_plugin() {
     let _home = crate::testutil::HomeSandbox::new();
     // A project-scope plugin advertises the server for one repo only, and no
     // global `~/.claude.json` entry exists in the sandbox to make it global.
-    write_plugin_install("local");
+    write_plugin_install("local", Some("0.1.0"));
     let mut app = bare_app();
     super::recompute_plugin_checks(&mut app, false);
     let check = mcp_check(&app);
@@ -976,6 +992,73 @@ fn api_relogin_chain_walks_base_url_then_api_key() {
     let d = app.config_draft.as_ref().expect("draft");
     assert!(!d.relogin_chain, "⎋ abandons the chain");
     assert_eq!(d.active, None, "⎋ ends editing");
+}
+
+/// The re-login chain opens fields away from the row it starts on: the cursor
+/// moves with each field it opens, so the highlight and the caret stay on one
+/// row from the first ⏎ to the last.
+#[test]
+fn api_relogin_chain_keeps_the_cursor_on_the_field_being_typed() {
+    use super::{ConfigRow, config_rows, enter_config_detail, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let api = Profile::new(
+        "api".to_string(),
+        Some("https://old.example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["api".into()],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("api account shows a login row");
+    let on_cursor = |app: &App| config_rows(app).get(app.config_action_cursor).copied();
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        on_cursor(&app),
+        Some(ConfigRow::BaseUrl),
+        "re-login opens base url"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+    assert_eq!(
+        on_cursor(&app),
+        Some(ConfigRow::BaseUrl),
+        "typing stays on base url"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(ConfigRow::ApiKey),
+        "precondition: ⏎ advanced the chain"
+    );
+    assert_eq!(
+        on_cursor(&app),
+        Some(ConfigRow::ApiKey),
+        "⏎ moves to api key"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        None,
+        "precondition: the chain ended"
+    );
+    assert_eq!(
+        on_cursor(&app),
+        Some(ConfigRow::ApiKey),
+        "the last field keeps it"
+    );
 }
 
 /// F1: a Setup re-key persists the new credential but the live key-rejected set
@@ -3987,6 +4070,64 @@ fn daemon_control_outcomes_toast_and_rearm_the_verb() {
     }
 }
 
+/// A daemon started elsewhere while the start confirm sat open meets no second
+/// spawn: `start` reads the held singleton, says so, and re-probes the chip.
+#[test]
+fn the_daemon_start_action_spawns_nothing_once_a_daemon_runs() {
+    use super::ToastKind;
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+
+    assert_eq!(app.daemon_health, DaemonHealth::Absent);
+
+    let _held = crate::daemon::hold_daemon_lock();
+    super::dispatch_action_menu_action(&mut app, super::ActionMenuAction::StartDaemon);
+    let toasts: Vec<(ToastKind, &str)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(toasts, vec![(ToastKind::Info, "daemon already running")]);
+    assert!(
+        !app.daemon_control_busy,
+        "no start runs, so the verb stays armed"
+    );
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Stale,
+        "the chip re-probes at once: a held lock with no feed reads stale"
+    );
+}
+
+/// A lock file `start` cannot read is no "no daemon": it refuses, naming the
+/// file, and spawns nothing.
+#[test]
+fn the_daemon_start_action_refuses_an_unreadable_lock() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let lock = crate::daemon::daemon_lock_path();
+    std::fs::create_dir_all(&lock).unwrap();
+
+    super::dispatch_action_menu_action(&mut app, super::ActionMenuAction::StartDaemon);
+    let [toast] = app.toasts.iter().collect::<Vec<_>>()[..] else {
+        panic!("one toast, got {:?}", app.toasts);
+    };
+    assert_eq!(toast.kind, ToastKind::Danger);
+    // Opening a directory for writing: EISDIR on unix, ERROR_ACCESS_DENIED on
+    // Windows.
+    let cause = std::io::Error::from_raw_os_error(if cfg!(windows) { 5 } else { 21 });
+    assert_eq!(
+        toast.body,
+        format!(
+            "daemon start failed\nfailed to open the tollgate daemon lock file {}: {cause}",
+            lock.display()
+        )
+    );
+    assert!(!app.daemon_control_busy);
+}
+
 /// The menu's verbs reach their workers and the tick lands their outcome. A
 /// test build refuses to start a daemon, since its binary is the test harness,
 /// and says so; the stop runs the real termination, which finds no daemon in
@@ -5907,7 +6048,10 @@ fn divergence_renders_through_the_system_banner() {
     assert_eq!(banner.severity, BannerSeverity::Warning);
     assert_eq!(
         banner.message,
-        "live login is 'play' · not the active 'work' · press d to resolve",
+        format!(
+            "live login is 'play' · not the active 'work' · press {} to resolve",
+            crate::tui::render::prose::key("d")
+        ),
     );
 
     // Heal the link → the divergence clears and so does the banner.
@@ -7207,7 +7351,7 @@ fn context_nudge_esc_discards_editor() {
 // ── Setup tab: per-account custom env editor ───────────────────────────────
 
 mod env_editor {
-    use super::super::{App, ConfigFocus, ConfigRow, InputState, Modal, Tab, config_rows};
+    use super::super::{App, ConfigFocus, ConfigRow, InputState, KeyCode, Modal, Tab, config_rows};
     use crate::profile::{AppConfig, AppState, Profile};
     use crate::testutil::HomeSandbox;
     use std::collections::BTreeMap;
@@ -7398,6 +7542,181 @@ mod env_editor {
         assert!(
             !rows.contains(&ConfigRow::ModelOverrideAdd),
             "the chip is gone once expanded"
+        );
+    }
+
+    #[test]
+    fn expanded_overrides_list_fable_first_then_opus_sonnet_haiku_subagent() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_env(BTreeMap::new());
+        enter_detail(&mut app);
+        super::super::run_config_row(&mut app, ConfigRow::ModelOverrideAdd);
+        let overrides: Vec<ConfigRow> = config_rows(&app)
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    ConfigRow::OpusModel
+                        | ConfigRow::SonnetModel
+                        | ConfigRow::HaikuModel
+                        | ConfigRow::FableModel
+                        | ConfigRow::SubagentModel
+                )
+            })
+            .collect();
+        assert_eq!(
+            overrides,
+            vec![
+                ConfigRow::FableModel,
+                ConfigRow::OpusModel,
+                ConfigRow::SonnetModel,
+                ConfigRow::HaikuModel,
+                ConfigRow::SubagentModel,
+            ]
+        );
+    }
+
+    fn app_with_opus_override_editing() -> App {
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.models.opus = Some("claude-opus-4-8".to_string());
+        let mut app = app_with_profile(profile);
+        enter_detail(&mut app);
+        app.config_action_cursor = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::OpusModel)
+            .expect("a set override renders");
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            Some(ConfigRow::OpusModel),
+            "⏎ opens the opus field"
+        );
+        for _ in 0.."claude-opus-4-8".len() {
+            super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+        }
+        assert_eq!(
+            app.config_draft
+                .as_ref()
+                .map(|d| d.opus_model.value.as_str()),
+            Some(""),
+            "every character is gone"
+        );
+        app
+    }
+
+    /// Space on a saved account's `model` row walks default → fable → opus →
+    /// sonnet → haiku → opusplan → default, and each step lands on disk.
+    #[test]
+    fn space_on_a_saved_accounts_model_row_cycles_fable_first_and_persists() {
+        let _home = HomeSandbox::new();
+        let profile = Profile::new("acct".to_string(), None, None);
+        crate::profile::save_app_state(&AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        })
+        .expect("save state");
+        crate::profile::save_profile(&profile).expect("save profile");
+        let mut app = app_with_profile(profile);
+        enter_detail(&mut app);
+        app.config_action_cursor = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::Model)
+            .expect("a saved account carries the model row");
+
+        for expected in [
+            Some("fable"),
+            Some("opus"),
+            Some("sonnet"),
+            Some("haiku"),
+            Some("opusplan"),
+            None,
+        ] {
+            super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+            let on_disk = crate::profile::load_config()
+                .expect("reload")
+                .profiles
+                .into_iter()
+                .find(|p| p.name == "acct")
+                .expect("the account is on disk")
+                .models
+                .default;
+            assert_eq!(on_disk.as_deref(), expected);
+            assert_eq!(
+                app.config_draft.as_ref().map(|d| d.model.value.as_str()),
+                Some(expected.unwrap_or("")),
+                "the row's buffer follows the saved value"
+            );
+        }
+    }
+
+    /// Typing into an OAuth account's empty base url turns it into an api
+    /// account mid-edit: `auto-start` above the field drops out and `api key`
+    /// joins below it. The cursor stays on the field being typed into, and on
+    /// it again once ⎋ reverts the buffer and the rows flip back.
+    #[test]
+    fn the_cursor_follows_the_base_url_field_while_its_rows_reshape() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_env(BTreeMap::new());
+        enter_detail(&mut app);
+        let before = config_rows(&app);
+        app.config_action_cursor = before
+            .iter()
+            .position(|r| *r == ConfigRow::BaseUrl)
+            .expect("base url row");
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('h')));
+        let typed = config_rows(&app);
+        assert!(
+            !typed.contains(&ConfigRow::AutoStart) && typed.contains(&ConfigRow::ApiKey),
+            "precondition: the typed base url flipped the account to api rows"
+        );
+        assert_eq!(
+            typed.get(app.config_action_cursor),
+            Some(&ConfigRow::BaseUrl)
+        );
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+        assert_eq!(config_rows(&app), before, "⎋ restores the oauth rows");
+        assert_eq!(
+            before.get(app.config_action_cursor),
+            Some(&ConfigRow::BaseUrl)
+        );
+    }
+
+    #[test]
+    fn an_override_emptied_mid_edit_keeps_its_row_and_the_cursor() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let app = app_with_opus_override_editing();
+        let rows = config_rows(&app);
+        assert_eq!(
+            rows.get(app.config_action_cursor),
+            Some(&ConfigRow::OpusModel),
+            "the emptied field stays under the cursor"
+        );
+    }
+
+    #[test]
+    fn an_override_committed_empty_stays_until_the_detail_pane_closes() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_opus_override_editing();
+        super::super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.config()
+                .find(&crate::profile::ProfileName::from("acct"))
+                .and_then(|p| p.models.opus.clone()),
+            None,
+            "an emptied override unsets the alias"
+        );
+        assert_eq!(
+            config_rows(&app).get(app.config_action_cursor),
+            Some(&ConfigRow::OpusModel),
+            "the emptied field stays where it was"
+        );
+        super::super::leave_config_detail(&mut app);
+        enter_detail(&mut app);
+        let rows = config_rows(&app);
+        assert!(
+            !rows.contains(&ConfigRow::OpusModel) && rows.contains(&ConfigRow::ModelOverrideAdd),
+            "a fresh draft tucks the now-unset override behind the chip"
         );
     }
 
@@ -8745,6 +9064,327 @@ fn fallback_usage_gate_toggles_persist() {
     assert!(!reloaded.check_scoped);
 }
 
+#[test]
+fn usage_roster_reload_with_no_accounts_returns_to_selector() {
+    use super::{StatusFocus, Tab, handle_key, on_tick};
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("alpha"),
+    )]);
+    app.tab = Tab::Usage;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.usage_detail_focus, StatusFocus::Detail);
+    app.usage_detail_scroll = 7;
+    let mut state = crate::profile::load_app_state().expect("read roster before external removal");
+    state.profiles.clear();
+    state.fallback_chain.clear();
+    crate::profile::save_app_state(&state).expect("external removal saves roster");
+    let path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
+        .join("profiles.toml");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000),
+    );
+    on_tick(&mut app);
+    assert_eq!(
+        app.profile_count(),
+        0,
+        "the reload removed the last account"
+    );
+    assert_eq!(app.tab, Tab::Usage, "the tab remains Usage");
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::List,
+        "empty roster returns to selector"
+    );
+    assert_eq!(
+        app.usage_detail_scroll, 0,
+        "the old detail scroll does not survive"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains("no accounts yet")),
+        "empty Usage selector is visible"
+    );
+    assert!(
+        rows[13].contains("q quit"),
+        "footer no longer advertises descended focus"
+    );
+}
+
+#[test]
+fn usage_read_only_detail_keys_keep_account_and_return_to_selector() {
+    use super::{StatusFocus, Tab, handle_key};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let first = crate::testutil::blank_profile(&ProfileName::from("alpha"));
+    let second = crate::testutil::blank_profile(&ProfileName::from("beta"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![first.name.clone(), second.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![first, second],
+    });
+    app.tab = Tab::Usage;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.profile_cursor, 1, "at rest ↓ changes account");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.usage_detail_focus, StatusFocus::Detail);
+    app.usage_detail_max_scroll.set(20);
+    app.usage_detail_viewport.set(8);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.usage_detail_scroll, 8,
+        "page moves by the current viewport"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_detail_scroll, 9, "↓ scrolls one real detail line");
+    assert_eq!(
+        app.profile_cursor, 1,
+        "detail scroll does not change account"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.usage_detail_focus, StatusFocus::List);
+    assert_eq!(app.tab, Tab::Usage, "← ascends rather than switching tabs");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.profile_cursor, 0, "↑ once again selects accounts");
+}
+
+#[test]
+fn tokens_models_detail_keys_keep_model_and_return_to_selector() {
+    use super::{StatusFocus, Tab, TokenView, handle_key};
+    use crate::tokens::{ModelTokens, TokenStats};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_view = TokenView::Models;
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-alpha".into(),
+                input: 10_000_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "claude-beta".into(),
+                input: 5_000_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.token_model_cursor, 1, "at rest ↓ changes model");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.model_detail_focus, StatusFocus::Detail);
+    app.model_detail_max_scroll.set(15);
+    app.model_detail_viewport.set(6);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.model_detail_scroll, 6, "page moves by current viewport");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.model_detail_scroll, 7);
+    assert_eq!(app.token_model_cursor, 1, "detail scroll retains model");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.model_detail_focus, StatusFocus::List);
+    assert_eq!(
+        app.token_view,
+        TokenView::Models,
+        "esc ascends only one level"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.token_model_cursor, 0, "↑ once again selects models");
+}
+
+#[test]
+fn models_detail_resets_scroll_when_period_or_filter_changes() {
+    use super::{Tab, TokenFilter, TokenPeriod, TokenView, set_token_filter, set_token_period};
+    use crate::tokens::{ModelTokens, TokenStats};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_view = TokenView::Models;
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-alpha".into(),
+                input: 10_000_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "other-beta".into(),
+                input: 5_000_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app.model_detail_scroll = 9;
+    set_token_filter(&mut app, TokenFilter::Others);
+    assert_eq!(
+        app.model_detail_scroll, 0,
+        "a changed filtered model starts at the top"
+    );
+    app.model_detail_scroll = 8;
+    set_token_period(&mut app, TokenPeriod::Daily);
+    assert_eq!(
+        app.model_detail_scroll, 0,
+        "a new period starts at its first detail row"
+    );
+}
+
+#[test]
+fn empty_model_list_returns_detail_focus_on_filter_period_and_load() {
+    use super::{
+        ActionMenuAction, StatusFocus, Tab, TokenFilter, TokenPeriod, TokenView,
+        dispatch_action_menu_action, drain_tokens_events, handle_key,
+    };
+    use crate::tokens::{ModelTokens, TokenStats, TokensEvent};
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_stats = Some(TokenStats {
+        models: vec![ModelTokens {
+            model: "claude-opus-4-8".into(),
+            input: 10_000_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tokens_events = rx;
+
+    for producer in ["filter", "period key", "period menu", "loaded"] {
+        app.token_view = TokenView::Dashboard;
+        app.token_filter = TokenFilter::All;
+        app.token_period = TokenPeriod::Lifetime;
+        app.model_detail_focus = StatusFocus::List;
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.token_view,
+            TokenView::Models,
+            "{producer}: model rows are enterable"
+        );
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.model_detail_focus,
+            StatusFocus::Detail,
+            "{producer}: detail is focused"
+        );
+        app.model_detail_scroll = 7;
+        match producer {
+            "filter" => dispatch_action_menu_action(&mut app, ActionMenuAction::TokensShowOthers),
+            "period key" => handle_key(&mut app, crate::testutil::key(KeyCode::Char('t'))),
+            "period menu" => {
+                dispatch_action_menu_action(&mut app, ActionMenuAction::TokensPeriodWeekly)
+            }
+            "loaded" => {
+                tx.send(TokensEvent::Loaded(Box::<TokenStats>::default()))
+                    .unwrap();
+                drain_tokens_events(&mut app);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            super::token_model_count(&app),
+            0,
+            "{producer}: no model remains"
+        );
+        assert_eq!(
+            app.token_view,
+            TokenView::Models,
+            "{producer}: keep the models screen"
+        );
+        assert_eq!(
+            app.model_detail_focus,
+            StatusFocus::List,
+            "{producer}: return to selector"
+        );
+        assert_eq!(
+            app.model_detail_scroll, 0,
+            "{producer}: reset the missing detail's scroll"
+        );
+        app.token_stats = Some(TokenStats {
+            models: vec![ModelTokens {
+                model: "claude-opus-4-8".into(),
+                input: 10_000_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+}
+
+#[test]
+fn calendar_rollover_reconciles_empty_model_detail_on_tick() {
+    use super::{StatusFocus, Tab, TokenPeriod, TokenView, on_tick};
+    use crate::tokens::{DayModelTokens, ModelTokens, TokenStats};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 40 * 24 * 60 * 60);
+    let prior = prior[..10].to_owned();
+    for period in [TokenPeriod::Weekly, TokenPeriod::Monthly] {
+        let mut app = bare_app();
+        app.tab = Tab::Tokens;
+        app.token_view = TokenView::Models;
+        app.token_period = period;
+        app.token_stats = Some(TokenStats {
+            daily_models: vec![DayModelTokens {
+                date: prior.clone(),
+                model: "claude-opus-4-8".into(),
+                in_out: 20,
+                split: Some(ModelTokens {
+                    model: "claude-opus-4-8".into(),
+                    input: 12,
+                    output: 8,
+                    ..Default::default()
+                }),
+                hours: None,
+            }],
+            ..Default::default()
+        });
+        let bucket = period.bucket().expect("scoped lens");
+        let (from, to) = crate::tokens::current_bucket_bounds(&prior, bucket);
+        assert_eq!(
+            crate::tokens::period_models(
+                &app.token_stats.as_ref().expect("stats").daily_models,
+                &from,
+                &to
+            )
+            .len(),
+            1,
+            "this model was selectable in its previous calendar bucket"
+        );
+        app.model_detail_focus = StatusFocus::Detail;
+        app.model_detail_scroll = 7;
+        assert_eq!(
+            super::token_model_count(&app),
+            0,
+            "the new calendar bucket has no models"
+        );
+        on_tick(&mut app);
+        assert_eq!(app.token_view, TokenView::Models);
+        assert_eq!(
+            app.model_detail_focus,
+            StatusFocus::List,
+            "{period:?}: empty detail ascends at the next tick"
+        );
+        assert_eq!(
+            app.model_detail_scroll, 0,
+            "{period:?}: stale detail scroll clears"
+        );
+    }
+}
+
 // ── tokens tab: model filter via the action menu ─────────────────────────────
 
 #[test]
@@ -9081,7 +9721,7 @@ mod new_account_model_row {
         let mut app = empty_app();
         enter_new_account_form(&mut app);
 
-        for expected in ["opus", "sonnet", "haiku", "opusplan"] {
+        for expected in ["fable", "opus", "sonnet", "haiku", "opusplan"] {
             cycle_model(&mut app);
             assert_eq!(app.config_draft.as_ref().unwrap().model.value, expected);
         }
@@ -9101,7 +9741,7 @@ mod new_account_model_row {
         if let Some(d) = app.config_draft.as_mut() {
             d.name = InputState::new("fresh");
         }
-        cycle_model(&mut app); // "" -> "opus"
+        cycle_model(&mut app); // "" -> "fable"
 
         commit_new_account(&mut app);
 
@@ -9109,7 +9749,7 @@ mod new_account_model_row {
             app.config()
                 .find(&crate::profile::ProfileName::from("fresh"))
                 .and_then(|p| p.models.default.clone()),
-            Some("opus".to_string()),
+            Some("fable".to_string()),
             "the model picked on the create form persists to the new profile"
         );
     }
@@ -11392,6 +12032,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     );
     target.models.default = Some("keep-me".to_string());
     target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
     crate::profile::save_profile(&target).expect("save target");
 
     let mut app = app_with(vec![target]);
@@ -11407,8 +12048,8 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     assert_eq!(state.message, "apply 'DeepSeek' over 'target'?");
     assert_eq!(
         state.detail.as_deref(),
-        Some("replaces base url, model, opus."),
-        "the warning names the fields, not just that there are some",
+        Some("replaces base url, model, fable, opus."),
+        "the warning names the fields in the Setup rows' order",
     );
     assert!(!state.choice, "the warning defaults to cancel");
 
@@ -11437,6 +12078,49 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
         applied.models.opus, None,
         "the apply replaces the model block whole, it does not merge into it",
     );
+}
+
+/// A preset applied while the account's detail pane is open reshapes the row
+/// list above the cursor (the endpoint and override rows); the cursor stays on
+/// the row it was on.
+#[test]
+fn a_preset_applied_from_the_open_detail_pane_keeps_the_cursor_on_its_row() {
+    use super::{
+        ActionMenuAction, ConfigRow, Modal, Tab, config_rows, dispatch_action_menu_action,
+        handle_key, run_confirm_action,
+    };
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut target = Profile::new("target".to_string(), None, None);
+    target.models.opus = Some("old-opus".to_string());
+    crate::profile::save_profile(&target).expect("save target");
+
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::enter_config_detail(&mut app);
+    let before = config_rows(&app);
+    app.config_action_cursor = before
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("login row");
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("the set opus override raises the overwrite warning");
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+
+    let after = config_rows(&app);
+    assert_ne!(
+        after.iter().position(|r| *r == ConfigRow::Login),
+        before.iter().position(|r| *r == ConfigRow::Login),
+        "precondition: the apply moved the login row",
+    );
+    assert_eq!(after.get(app.config_action_cursor), Some(&ConfigRow::Login));
 }
 
 /// `save as preset` onto a name a custom preset already holds asks first, and
@@ -11978,7 +12662,11 @@ fn herdr_check_warns_without_fix_when_not_installed() {
     );
     assert_eq!(check.health, super::Health::Warn);
     assert!(check.detail.iter().any(|l| l == "plugin: not installed"));
-    assert!(check.detail.iter().any(|l| l == "  tollgate herdr install"));
+    assert!(check.detail.iter().any(|l| *l
+        == format!(
+            "  {}",
+            crate::tui::render::prose::cmd("tollgate herdr install")
+        )));
     assert!(check.fix.is_none());
 }
 
@@ -12787,7 +13475,11 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     let about = &app.plugin.checks[0];
     assert_eq!(about.label, "about");
     assert!(
-        about.detail.iter().any(|l| l == "claude: press r to probe"),
+        about.detail.iter().any(|l| *l
+            == format!(
+                "claude: press {} to probe",
+                crate::tui::render::prose::key("r")
+            )),
         "the about row invites the `r` probe: {:?}",
         about.detail
     );
@@ -13546,109 +14238,182 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
     assert_eq!(app.config().state.count_cache, count_cache);
 }
 
-// ── the codex-only view disarms every key bound to the claude selection ──────
+// ── Overview selection across harnesses ─────────────────────────────────────
 
-/// With the claude rows hidden, reorder, cursor, switch and the action menu's
-/// account group would act on a row the screen does not show. The keys are
-/// inert with a toast saying why, the menu opens with its tab-global actions
-/// alone, and every filter that shows the claude rows (`All` and `Claude`
-/// alike) re-arms all four.
 #[test]
-fn the_codex_only_view_disarms_the_claude_selection_keys() {
-    use super::{HarnessFilter, KeyEvent, KeyModifiers, Modal, handle_key};
+fn leaving_overview_does_not_restore_an_old_claude_selection() {
+    use super::{Tab, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with_unlinked_profiles(vec![
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
-    app.tab = Tab::Overview;
-    app.harness_filter = HarnessFilter::Codex;
-    let order = |app: &App| -> Vec<String> {
-        app.config()
-            .profiles
-            .iter()
-            .map(|p| p.name.to_string())
-            .collect()
-    };
-    let state_order = |app: &App| -> Vec<String> {
-        app.config()
-            .state
-            .profiles
-            .iter()
-            .map(|n| n.to_string())
-            .collect()
-    };
-    let shift_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
-
-    handle_key(&mut app, shift_down);
-    assert_eq!(
-        order(&app),
-        ["a", "b"],
-        "reorder is inert while claude rows are hidden"
-    );
-    assert_eq!(state_order(&app), ["a", "b"]);
-    assert_eq!(
-        app.toasts.back().map(|t| t.body.as_str()),
-        Some("claude rows are hidden, press c"),
-        "the inert key says why"
-    );
-
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_eq!(app.tab, Tab::Usage);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.profile_cursor, 0, "the cursor does not step");
+    assert_eq!(app.profile_cursor, 1);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "the Usage selection survives leaving that tab"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "returning to Usage keeps the selected account"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(
+        app.overview_cursor, 1,
+        "Overview follows the account selected in Usage"
+    );
+}
 
+#[test]
+fn removing_the_selected_codex_account_targets_the_visible_claude_fallback() {
+    use super::{MainItemKind, Modal, handle_key, poll_codex_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(matches!(
+        app.current_main_item(),
+        Some(MainItemKind::Codex(0))
+    ));
+    assert_eq!(app.profile_cursor, 1);
+    crate::testutil::write_codex_roster(&[]);
+    app.last_codex_rows_refresh = None;
+    poll_codex_rows(&mut app);
+    assert!(matches!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(1))
+    ));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.context.as_deref() == Some("b"))
+    );
+    assert_eq!(app.profile_cursor, 1);
+}
+
+#[test]
+fn filtering_a_codex_selection_back_to_claude_targets_the_visible_account() {
+    use super::{MainItemKind, Modal, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(matches!(
+        app.current_main_item(),
+        Some(MainItemKind::Codex(0))
+    ));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "b was the last selected Claude account"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert!(matches!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(1))
+    ));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.context.as_deref() == Some("b"))
+    );
+    assert_eq!(
+        app.profile_cursor, 1,
+        "account actions follow the visible caret"
+    );
+}
+
+#[test]
+fn codex_rows_can_be_selected_without_acting_on_a_claude_account() {
+    use super::{HarnessFilter, KeyEvent, KeyModifiers, MainItemKind, Modal, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    assert_eq!(app.codex_rows.len(), 3, "fixture loaded every codex row");
+    assert_eq!(app.main_items().len(), 5, "all five accounts are reachable");
+
+    for _ in 0..4 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.overview_cursor, 4);
+    assert_eq!(
+        app.current_main_item().map(|item| format!("{item:?}")),
+        Some("Codex(2)".to_string())
+    );
+    let before = app.config().state.profiles.clone();
+    handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(
-        app.config().state.active_profile,
-        None,
-        "enter switches nothing"
+        app.config().state.profiles,
+        before,
+        "codex does not reorder claude"
     );
-    assert!(app.modals.is_empty(), "enter pushes no confirm");
-
+    assert!(app.modals.is_empty(), "codex does not open a claude switch");
+    assert!(
+        app.toasts.is_empty(),
+        "an inert action raises no false filter toast"
+    );
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
-    let Some(Modal::ActionMenu(menu)) = app.modals.last() else {
-        panic!("`a` opens the tab-global actions");
-    };
-    assert_eq!(
-        (menu.scoped_len, menu.context.as_deref()),
-        (0, None),
-        "no entry acts on the hidden row"
-    );
-    assert_eq!(
-        menu.items.iter().map(|i| i.label).collect::<Vec<_>>(),
-        ["refresh all accounts", "new account", "start daemon"]
-    );
+    assert!(matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.scoped_len == 0));
     app.modals.clear();
 
-    // Every filter showing the claude rows re-arms all four keys; each pass
-    // reorders from cursor 0, so the order flips back and forth.
-    let re_armed = |app: &mut App, filter: HarnessFilter, reordered: [&str; 2]| {
-        app.harness_filter = filter;
-        handle_key(app, shift_down);
-        assert_eq!(order(app), reordered, "{filter:?}: reorder re-armed");
-        assert_eq!(
-            app.profile_cursor, 1,
-            "{filter:?}: the reorder carried the cursor with the row"
-        );
-
-        handle_key(app, crate::testutil::key(KeyCode::Up));
-        assert_eq!(app.profile_cursor, 0, "{filter:?}: cursor re-armed");
-
-        handle_key(app, crate::testutil::key(KeyCode::Enter));
-        assert!(
-            matches!(app.modals.last(), Some(Modal::Confirm(_))),
-            "{filter:?}: enter re-armed: the switch confirm is up"
-        );
-        app.modals.clear();
-
-        handle_key(app, crate::testutil::key(KeyCode::Char('a')));
-        assert!(
-            matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.scoped_len == 3),
-            "{filter:?}: `a` re-armed: the menu carries the account's group"
-        );
-        app.modals.clear();
-    };
-    re_armed(&mut app, HarnessFilter::All, ["b", "a"]);
-    re_armed(&mut app, HarnessFilter::Claude, ["a", "b"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Codex);
+    assert_eq!(
+        app.overview_cursor, 0,
+        "a hidden selection lands on the first visible row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.overview_cursor, 2,
+        "codex-only navigation wraps to the last row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.overview_cursor, 0,
+        "codex-only navigation wraps to the first row"
+    );
+    assert_eq!(
+        app.current_main_item().map(|item| format!("{item:?}")),
+        Some("Codex(0)".to_string())
+    );
+    assert!(app.toasts.is_empty());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(
+        app.overview_cursor, 1,
+        "returning through Hermes restores the last Claude account"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.overview_cursor, 1,
+        "claude cursor reaches the second row"
+    );
+    assert!(matches!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(1))
+    ));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(matches!(app.modals.last(), Some(Modal::Confirm(_))));
 }
 
 // ── the day-list collision warning ───────────────────────────
@@ -14806,6 +15571,232 @@ fn a_failed_day_list_save_keeps_memory_on_the_disk_value_and_names_the_error() {
     );
 }
 
+// ── Note editor ───────────────────────────────────────────────────────────────
+
+fn notes_app(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    App::new(AppConfig {
+        state: AppState::default(),
+        profiles,
+    })
+}
+
+/// `n` on the usage tab opens the account's note editor; an empty roster keeps
+/// the empty state's `n to create one` promise; every other tab keeps the
+/// global new-account flow.
+#[test]
+fn n_on_usage_opens_the_note_editor() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // With an account, n opens the note editor for the selected account.
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(
+        app.note_editor.is_some(),
+        "usage tab: n opens the note editor"
+    );
+    assert_eq!(app.note_editor.as_ref().unwrap().profile.as_str(), "alice");
+    assert!(app.config_draft.is_none(), "new-account never started");
+
+    // An empty roster keeps the empty state's `n to create one` promise.
+    let mut app = notes_app(vec![]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_none(), "no account, no editor");
+    assert!(
+        app.config_draft.is_some(),
+        "the empty state keeps n = new account"
+    );
+
+    // Every other tab keeps the global new-account flow.
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Overview;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_none());
+    assert!(app.config_draft.is_some());
+}
+
+/// ⏎ saves the draft into the profile dir and toasts; esc discards the draft.
+#[test]
+fn enter_saves_the_note_and_esc_discards_it() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_some(), "editor open");
+    for ch in "hello".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    );
+    for ch in "world".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let name = crate::profile::ProfileName::from("alice");
+    assert_eq!(
+        crate::profile_notes::load_note(&name).as_deref(),
+        Some("hello\nworld"),
+        "the draft landed on disk verbatim"
+    );
+    assert_eq!(app.note_text.as_deref(), Some("hello\nworld"));
+    assert!(app.note_editor.is_none(), "a save closes the editor");
+    assert_eq!(app.toasts[0].body, "note saved");
+
+    // Reopen: seeded from the saved text.
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.note_editor.as_ref().unwrap().buf.text(), "hello\nworld");
+
+    // esc discards: the typed extra stays out of the stored note.
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.note_editor.is_none());
+    assert_eq!(
+        crate::profile_notes::load_note(&name).as_deref(),
+        Some("hello\nworld"),
+        "esc never wrote"
+    );
+}
+
+/// ⌃j splits the draft, backspace at a line start joins it, ⌃w deletes the
+/// previous word.
+#[test]
+fn the_note_editor_keymap_edits_the_draft() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    let press = |app: &mut App, code| {
+        super::handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    };
+    for ch in "foo bar baz".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(draft(&app), "foo bar ", "⌃w removes the last word");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(draft(&app), "foo bar \n", "⌃j splits at the caret");
+    for ch in "ab".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(draft(&app), "foo bar ", "backspace joins at a line start");
+}
+
+/// A save for an account the roster dropped fails and keeps the editor open —
+/// the draft is the only copy.
+#[test]
+fn a_failed_save_keeps_the_editor_open() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    for ch in "boo".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.note_editor.is_some(),
+        "the draft survives a failed save"
+    );
+    assert!(
+        app.toasts[0].body.starts_with("couldn't save the note"),
+        "the failure names itself, got {:?}",
+        app.toasts[0].body
+    );
+}
+
+fn draft(app: &App) -> String {
+    app.note_editor.as_ref().unwrap().buf.text()
+}
+
+/// ↓ on the usage tab re-reads the note: the `notes:` row must never show the
+/// previous account's note under the newly selected header.
+#[test]
+fn stepping_the_cursor_reloads_the_note() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let alice = mini_profile("alice", None);
+    let bob = mini_profile("bob", None);
+    crate::profile::save_profile(&alice).unwrap();
+    crate::profile::save_profile(&bob).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into(), "bob".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let alice_name = crate::profile::ProfileName::from("alice");
+    let bob_name = crate::profile::ProfileName::from("bob");
+    crate::profile_notes::save_note(&alice_name, "A note").unwrap();
+    crate::profile_notes::save_note(&bob_name, "B note").unwrap();
+
+    let mut app = notes_app(vec![alice, bob]);
+    app.tab = Tab::Usage;
+    assert_eq!(app.note_text.as_deref(), Some("A note"));
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        app.note_text.as_deref(),
+        Some("B note"),
+        "a cursor step re-reads the note for the new selection"
+    );
+}
+
 /// `--tab usage` (the herdr `tollgate.usage` action's entrypoint) opens the
 /// Usage tab, over the home tab and over the first herdr landing alike; no
 /// `--tab` leaves the landing alone.
@@ -15053,6 +16044,7 @@ fn m_moves_a_live_session_through_the_request_core() {
         .expect("tm-b is on the roster");
     let mut app = super::App::new(config);
     app.profile_cursor = target_idx;
+    app.overview_cursor = target_idx;
     let last_toast = |app: &super::App| {
         app.toasts
             .back()
@@ -15355,4 +16347,386 @@ fn m_moves_a_committed_but_unserved_session_back_to_the_served_member() {
         .map(|t| t.body.clone())
         .unwrap_or_default();
     assert_eq!(toast, "session 4242-0: swapping… onto tb-a");
+}
+
+/// Toast lifetimes per the cloudy-tui contract: a red toast lingers 6 s, every
+/// other kind 5 s, each pinned on both sides of its edge.
+#[test]
+fn toasts_live_five_seconds_and_red_ones_six() {
+    use super::ToastKind as K;
+    use std::time::{Duration, Instant};
+    let _home = crate::testutil::HomeSandbox::new();
+    for (kind, ttl_ms) in [
+        (K::Info, 5_000),
+        (K::Success, 5_000),
+        (K::Warning, 5_000),
+        (K::Danger, 6_000),
+    ] {
+        for (age_ms, kept) in [(ttl_ms - 100, true), (ttl_ms, false)] {
+            let mut app = bare_app();
+            app.toasts.clear();
+            app.toast(kind, "a toast");
+            app.toasts.back_mut().expect("the toast").born =
+                Instant::now() - Duration::from_millis(age_ms);
+            app.prune_toasts();
+            assert_eq!(
+                app.toasts.len(),
+                usize::from(kept),
+                "{kind:?} at {age_ms} ms: kept = {kept}"
+            );
+        }
+    }
+}
+
+/// Each toast expires on its own clock: a live red toast at the front of the
+/// stack never holds an expired one behind it on screen.
+#[test]
+fn an_expired_toast_behind_a_live_red_one_still_expires() {
+    use super::ToastKind as K;
+    use std::time::{Duration, Instant};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.toasts.clear();
+    for (kind, age_ms) in [(K::Danger, 5_500), (K::Info, 5_200), (K::Warning, 1_000)] {
+        app.toast(kind, format!("{kind:?}"));
+        app.toasts.back_mut().expect("the toast").born =
+            Instant::now() - Duration::from_millis(age_ms);
+    }
+    app.prune_toasts();
+    let kinds: Vec<K> = app.toasts.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![K::Danger, K::Warning],
+        "the 5.2 s info toast goes, the 5.5 s red and 1 s warning ones stay, in order"
+    );
+}
+
+#[test]
+fn plugin_install_warns_only_when_its_user_manifest_is_older() {
+    for (version, outdated) in [
+        (Some("0.0.0"), true),
+        (Some(env!("CARGO_PKG_VERSION")), false),
+        (Some("999.0.0"), false),
+        (Some("dev"), false),
+        (None, false),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        write_plugin_install("user", version);
+        let mut app = bare_app();
+        super::recompute_plugin_checks(&mut app, false);
+        let check = plugin_check(&app);
+        assert_eq!(
+            check.health,
+            if outdated {
+                super::Health::Warn
+            } else {
+                super::Health::Ok
+            }
+        );
+        assert_eq!(
+            check.fix,
+            outdated.then_some(super::PluginFix::InstallPlugin)
+        );
+        assert_eq!(
+            check
+                .detail
+                .iter()
+                .any(|line| line.contains(super::OUTDATED_PLUGIN_MARK)),
+            outdated
+        );
+        if outdated {
+            assert_eq!(
+                check.detail[1],
+                format!(
+                    "version: 0.0.0 (outdated; this tollgate is {})",
+                    env!("CARGO_PKG_VERSION")
+                )
+            );
+        }
+    }
+    assert!(super::plugin_version_older("0.9.0", "0.17.0"));
+    assert!(!super::plugin_version_older("0.100.0", "0.17.0"));
+    assert!(super::plugin_version_older("v0.17.0", "v0.17.1"));
+}
+
+#[test]
+fn note_editor_keeps_its_account_when_the_roster_selection_changes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let alice = mini_profile("alice", None);
+    let bob = mini_profile("bob", None);
+    crate::profile::save_profile(&alice).unwrap();
+    crate::profile::save_profile(&bob).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into(), "bob".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut app = notes_app(vec![alice, bob]);
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('A')));
+    app.profile_cursor = 1;
+    app.clamp_profile_cursor();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        crate::profile_notes::load_note(&"alice".into()).as_deref(),
+        Some("A")
+    );
+    assert_eq!(crate::profile_notes::load_note(&"bob".into()), None);
+    assert_eq!(
+        app.note_text, None,
+        "the visible note follows Bob, the save remains Alice's"
+    );
+}
+
+#[test]
+fn monitor_usage_detail_scrolls_and_never_edits_a_local_accounts_note() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    app.usage_extras = vec![overview_monitor_extra()];
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_extra_cursor, Some(0));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.usage_detail_focus, super::StatusFocus::Detail);
+    app.usage_detail_max_scroll.set(20);
+    app.usage_detail_viewport.set(5);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.usage_detail_scroll, 5);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(app.note_editor.is_none());
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "notes belong to local accounts"
+    );
+    let menu = super::build_action_menu(&app);
+    assert_eq!(
+        (menu.scoped_len, menu.context),
+        (0, None),
+        "a monitor offers no local account actions"
+    );
+    let before = app.toasts.len();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert_eq!(
+        app.toasts.len(),
+        before,
+        "refresh cannot target the last local account"
+    );
+}
+
+#[test]
+fn note_buffer_unicode_edits_and_cursor_width_follow_the_renderer() {
+    let mut buf = super::NoteBuffer::new("é界e\u{301}");
+    assert_eq!(
+        buf.cursor_pos(),
+        (0, 4),
+        "accent combining mark takes no extra cell"
+    );
+    buf.left();
+    buf.backspace();
+    assert_eq!(buf.text(), "é界\u{301}");
+    buf.home();
+    buf.delete();
+    assert_eq!(buf.text(), "界\u{301}");
+    buf.end();
+    buf.insert_newline();
+    buf.insert_char('🙂');
+    assert_eq!(buf.cursor_pos(), (1, 2));
+    buf.home();
+    buf.backspace();
+    assert_eq!(buf.text(), "界\u{301}🙂");
+}
+
+#[test]
+fn note_read_errors_block_the_editor_and_preserve_the_note() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_notes::NOTE_FILE).unwrap();
+    // EISDIR is deterministic even when tests run with elevated permissions.
+    std::fs::create_dir(&path).unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_none(),
+        "a read error must not seed an empty draft"
+    );
+    assert!(app.toasts.iter().any(
+        |t| t.kind == super::ToastKind::Danger && t.body.starts_with("couldn't read the note:")
+    ));
+    super::commit_note(&mut app);
+    assert!(path.is_dir());
+}
+
+#[test]
+fn invalid_utf8_notes_cannot_be_saved_as_replacement_characters() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_notes::NOTE_FILE).unwrap();
+    std::fs::write(&path, b"caf\xe9").unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    assert_eq!(
+        app.note_text.as_deref(),
+        Some("caf\u{fffd}"),
+        "the read-only view can show lossy text"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_none(),
+        "editing invalid UTF-8 would destroy the original bytes"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body.contains("UTF-8"))
+    );
+    super::commit_note(&mut app);
+    assert_eq!(std::fs::read(&path).unwrap(), b"caf\xe9");
+}
+
+#[test]
+fn note_editor_accepts_alt_text_and_ignores_control_chords() {
+    use super::{KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::open_note_editor(&mut app);
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ] {
+        for ch in ['a', 'e', 'u', 'x'] {
+            super::handle_key(&mut app, KeyEvent::new(KeyCode::Char(ch), modifiers));
+        }
+    }
+    for ch in ['j', 'w'] {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT),
+        );
+    }
+    assert_eq!(draft(&app), "", "Control chords are not text");
+    for ch in ['a', 'é', '@', 'j', 'w'] {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT),
+        );
+    }
+    assert_eq!(draft(&app), "aé@jw", "Alt/Option characters are text");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('É'), KeyModifiers::SHIFT),
+    );
+    assert_eq!(draft(&app), "aé@jwÉ", "shifted Unicode text is still data");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert!(app.quit, "Ctrl-C still owns quit before the editor");
+    assert_eq!(draft(&app), "aé@jwÉ");
+}
+
+#[test]
+fn codex_roster_refresh_keeps_the_selected_name_after_delete_and_reorder() {
+    use super::{HarnessFilter, MainItemKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Overview;
+    for filter in [HarnessFilter::All, HarnessFilter::Codex] {
+        app.harness_filter = filter;
+        app.overview_cursor = app
+            .main_items()
+            .iter()
+            .position(|r| *r == MainItemKind::Codex(1))
+            .unwrap();
+        crate::testutil::write_codex_roster(&["cx2", "cx3"]);
+        app.last_codex_rows_refresh = None;
+        super::poll_codex_rows(&mut app);
+        assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+        assert_eq!(app.codex_rows[0].name, "cx2");
+        crate::testutil::write_codex_roster(&["cx3", "cx2", "cx1"]);
+        app.last_codex_rows_refresh = None;
+        super::poll_codex_rows(&mut app);
+        assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(1)));
+        assert_eq!(app.codex_rows[1].name, "cx2");
+        crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+        app.last_codex_rows_refresh = None;
+        super::poll_codex_rows(&mut app);
+    }
+}
+
+#[test]
+fn overview_filter_cycle_and_tab_return_preserve_the_last_account() {
+    use super::{HarnessFilter, MainItemKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = notes_app(
+        (0..6)
+            .map(|i| mini_profile(&format!("a{i}"), None))
+            .collect(),
+    );
+    app.tab = Tab::Overview;
+    app.profile_cursor = 5;
+    app.overview_cursor = 5;
+    for _ in 0..4 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    }
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(5)));
+    assert_eq!(app.profile_cursor, 5);
+    app.harness_filter = HarnessFilter::Codex;
+    app.overview_cursor = 1;
+    super::switch_tab(&mut app, Tab::Usage);
+    super::switch_tab(&mut app, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(1)));
+    assert_eq!(app.profile_cursor, 5);
+}
+
+#[test]
+fn monitor_usage_cannot_toggle_local_profile_estimates_or_pace() {
+    use super::{ActionMenuAction, StatusFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    app.usage_extras = vec![overview_monitor_extra()];
+    app.usage_extra_cursor = Some(0);
+    let toggles = |app: &App| {
+        let config = app.config();
+        (config.state.show_estimates, config.state.show_pace)
+    };
+    let before = toggles(&app);
+    for focus in [StatusFocus::List, StatusFocus::Detail] {
+        app.usage_detail_focus = focus;
+        for ch in ['e', 'p'] {
+            super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
+        }
+        assert_eq!(toggles(&app), before);
+        assert!(
+            !super::build_action_menu(&app)
+                .items
+                .iter()
+                .any(|i| matches!(
+                    i.action,
+                    ActionMenuAction::ToggleEstimates | ActionMenuAction::TogglePace
+                ))
+        );
+    }
+    app.usage_extra_cursor = None;
+    super::handle_usage_key(&mut app, crate::testutil::key(KeyCode::Char('e')));
+    super::handle_usage_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    assert_eq!(toggles(&app), (!before.0, !before.1));
+    assert!(
+        super::build_action_menu(&app)
+            .items
+            .iter()
+            .any(|i| matches!(i.action, ActionMenuAction::ToggleEstimates))
+    );
 }

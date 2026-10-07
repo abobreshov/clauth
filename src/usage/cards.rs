@@ -130,9 +130,9 @@ fn indented(segs: Vec<Seg>) -> CardLine {
     out
 }
 
-/// A whole percent: `42%`. Rounded; the exact figure is in `--json`.
+/// A percentage with at most two decimals; measurements stay exact in JSON.
 fn pct_text(pct: f64) -> String {
-    format!("{:.0}%", pct)
+    crate::format::format_pct(pct)
 }
 
 /// Bar cells: `used_pct` filled (`█`, `fill` ink) over the `░` track, with the
@@ -176,8 +176,9 @@ fn bar_row(
     value: Vec<Seg>,
     width: usize,
 ) -> CardLine {
-    let bar_w = width.saturating_sub(INDENT + 1 + VALUE_W).max(8);
-    let pad = VALUE_W.saturating_sub(line_width(&value));
+    let value_w = VALUE_W.max(line_width(&value));
+    let bar_w = width.saturating_sub(INDENT + 1 + value_w).max(8);
+    let pad = value_w.saturating_sub(line_width(&value));
     let mut line = indented(bar_segs(used_pct, marker_pct, bar_w, fill));
     line.push(Seg::new(" ".repeat(1 + pad), Ink::Text));
     line.extend(value);
@@ -276,7 +277,7 @@ pub(crate) fn window_card(w: &QuotaWindow, ctx: &CardCtx) -> Vec<CardLine> {
     if let Some(p) = pace {
         sep(&mut foot);
         foot.push(Seg::new(
-            format!("{:.0}% elapsed · {}", p.elapsed_pct.floor(), p.label()),
+            format!("{} elapsed · {}", pct_text(p.elapsed_pct), p.label()),
             Ink::Faint,
         ));
     }
@@ -292,6 +293,9 @@ pub(crate) fn window_card(w: &QuotaWindow, ctx: &CardCtx) -> Vec<CardLine> {
     }
     if !foot.is_empty() {
         rows.push(indented(foot));
+    }
+    if let Some(rate) = &w.running_rate {
+        rows.push(indented(vec![Seg::new(rate.display(), Ink::Dim)]));
     }
     rows
 }

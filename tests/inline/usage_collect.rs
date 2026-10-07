@@ -100,6 +100,231 @@ fn ids(obs: &[AccountObservation]) -> Vec<&str> {
     obs.iter().map(|o| o.id.as_str()).collect()
 }
 
+fn usage_at(five_h: f64, weekly: f64, now_secs: i64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: five_h,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 7200)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: weekly,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 86_400)),
+        }),
+        ..Default::default()
+    }
+}
+
+fn canned_history(name: &str, now_ms: u64, samples: &[(u64, f64, f64)]) {
+    crate::testutil::register_names(&[name]);
+    let lines = samples
+        .iter()
+        .map(|&(age, five_h, weekly)| {
+            serde_json::json!({
+                "ts": now_ms - age, "name": name,
+                "usage": usage_at(five_h, weekly, (now_ms / 1000) as i64),
+            })
+            .to_string()
+                + "\n"
+        })
+        .collect::<String>();
+    let path = crate::profile::profile_history_path(&ProfileName::from(name)).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, lines).unwrap();
+}
+
+#[test]
+fn canned_running_rate_reaches_cards_waybar_and_additive_json() {
+    let _home = HomeSandbox::new();
+    let now_ms = 1_790_676_000_000;
+    let now_secs = (now_ms / 1000) as i64;
+    for name in ["work", "home"] {
+        canned_history(
+            name,
+            now_ms,
+            &[(600_000, 31.5, 40.25), (300_000, 36.5, 40.75)],
+        );
+        write_profile_cache(
+            &ProfileName::from(name),
+            USAGE_CACHE_FILE,
+            &usage_at(41.5, 41.25, now_secs),
+        );
+    }
+    let config = config(vec![oauth("work"), oauth("home")], "work");
+    let codex = CodexState::default();
+    let got = collect_with(
+        &ctx(&config, &codex, now_ms),
+        &CollectOpts::default(),
+        &[],
+        &[],
+    );
+    for account in &got {
+        let session = account.window(WINDOW_SESSION).unwrap();
+        let rate = session.running_rate.as_ref().unwrap();
+        assert!((rate.pct_per_unit - 60.0).abs() < 0.00001);
+        assert_eq!(rate.unit, "h");
+        assert!((rate.time_left_secs.unwrap() - 3510).abs() <= 1);
+        let weekly = account
+            .window(super::super::observation::WINDOW_WEEKLY)
+            .unwrap();
+        let rate = weekly.running_rate.as_ref().unwrap();
+        assert!((rate.pct_per_unit - 144.0).abs() < 0.00001);
+        assert_eq!(rate.unit, "d");
+        assert!((rate.time_left_secs.unwrap() - 35_250).abs() <= 1);
+    }
+    let card_ctx = super::super::cards::CardCtx {
+        width: 80,
+        now_secs,
+        offset_secs: 0,
+        guest_mode: false,
+    };
+    let text =
+        super::super::pretty::render_text(&got, &card_ctx, super::super::pretty::TextMode::Plain);
+    assert_eq!(text.matches("60%/h · 58m left").count(), 2, "{text}");
+    assert_eq!(text.matches("144%/d · 9h 47m left").count(), 2, "{text}");
+    let bar = super::super::pretty::waybar(&got, now_secs, 0);
+    assert_eq!(bar.tooltip.matches("60%/h · 58m left").count(), 2);
+    assert!(bar.tooltip.contains("144%/d · 9h 47m left"));
+    let report = super::super::report::UsageReport::new(got, now_secs, false);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json["schema_version"],
+        super::super::observation::SCHEMA_VERSION
+    );
+    assert_eq!(
+        json["accounts"][0]["windows"][0]["running_rate"]["unit"],
+        "h"
+    );
+    assert_eq!(
+        json["accounts"][0]["windows"][1]["running_rate"]["unit"],
+        "d"
+    );
+    assert!(!json.to_string().contains("usage_history"));
+}
+
+#[test]
+fn running_rate_omits_thin_old_idle_and_pre_reset_history() {
+    let _home = HomeSandbox::new();
+    let now_ms = 1_790_676_000_000;
+    type Samples = [(u64, f64, f64)];
+    let cases: &[(&str, &Samples)] = &[
+        ("absent", &[]),
+        ("thin", &[(300_000, 35.0, 40.5)]),
+        ("old", &[(4_200_000, 30.0, 40.0), (3_900_000, 35.0, 40.5)]),
+        ("idle", &[(1_200_000, 30.0, 40.0), (900_000, 40.0, 41.0)]),
+        ("reset", &[(600_000, 90.0, 90.0), (300_000, 95.0, 95.0)]),
+    ];
+    for &(name, samples) in cases {
+        canned_history(name, now_ms, samples);
+        write_profile_cache(
+            &ProfileName::from(name),
+            USAGE_CACHE_FILE,
+            &usage_at(40.0, 41.0, (now_ms / 1000) as i64),
+        );
+    }
+    let config = config(
+        cases.iter().map(|(name, _)| oauth(name)).collect(),
+        "absent",
+    );
+    let codex = CodexState::default();
+    let got = collect_with(
+        &ctx(&config, &codex, now_ms),
+        &CollectOpts::default(),
+        &[],
+        &[],
+    );
+    assert!(
+        got.iter()
+            .flat_map(|o| &o.windows)
+            .all(|w| w.running_rate.is_none())
+    );
+    assert!(
+        !serde_json::to_string(&got)
+            .unwrap()
+            .contains("running_rate")
+    );
+}
+
+#[test]
+fn show_estimates_hides_running_rate_on_all_report_surfaces() {
+    let _home = HomeSandbox::new();
+    let now_ms = 1_790_676_000_000;
+    let now_secs = (now_ms / 1000) as i64;
+    canned_history(
+        "work",
+        now_ms,
+        &[(600_000, 30.0, 40.0), (300_000, 35.0, 40.5)],
+    );
+    write_profile_cache(
+        &ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+        &usage_at(40.0, 41.0, now_secs),
+    );
+    let mut config = config(vec![oauth("work")], "work");
+    config.state.show_estimates = false;
+    let codex = CodexState::default();
+    let got = collect_with(
+        &ctx(&config, &codex, now_ms),
+        &CollectOpts::default(),
+        &[],
+        &[],
+    );
+    assert!(got[0].windows.iter().all(|w| w.running_rate.is_none()));
+    assert!(
+        !serde_json::to_string(&got)
+            .unwrap()
+            .contains("running_rate")
+    );
+    assert!(
+        !super::super::pretty::waybar(&got, now_secs, 0)
+            .tooltip
+            .contains("%/")
+    );
+    let card_ctx = super::super::cards::CardCtx {
+        width: 80,
+        now_secs,
+        offset_secs: 0,
+        guest_mode: false,
+    };
+    assert!(
+        !super::super::pretty::render_text(&got, &card_ctx, super::super::pretty::TextMode::Plain)
+            .contains("%/")
+    );
+}
+
+#[test]
+fn running_rate_never_revives_a_window_past_its_reset() {
+    let _home = HomeSandbox::new();
+    let now_ms = 1_790_676_000_000;
+    let now_secs = (now_ms / 1000) as i64;
+    canned_history(
+        "work",
+        now_ms,
+        &[(600_000, 30.0, 40.0), (300_000, 35.0, 40.5)],
+    );
+    let mut usage = usage_at(40.0, 41.0, now_secs);
+    for window in [&mut usage.five_hour, &mut usage.seven_day]
+        .into_iter()
+        .flatten()
+    {
+        window.resets_at = Some(crate::usage::epoch_secs_to_iso(now_secs));
+    }
+    write_profile_cache(&ProfileName::from("work"), USAGE_CACHE_FILE, &usage);
+    let config = config(vec![oauth("work")], "work");
+    let codex = CodexState::default();
+    let got = collect_with(
+        &ctx(&config, &codex, now_ms),
+        &CollectOpts::default(),
+        &[],
+        &[],
+    );
+    assert!(got[0].windows.is_empty());
+    assert!(
+        !serde_json::to_string(&got)
+            .unwrap()
+            .contains("running_rate")
+    );
+}
+
 #[test]
 fn claude_oauth_profile_projects_from_its_usage_cache() {
     let _home = HomeSandbox::new();

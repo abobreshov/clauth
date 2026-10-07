@@ -128,6 +128,17 @@ fn list_rows_say_whether_a_variable_is_set_without_its_value() {
 }
 
 #[test]
+fn monitor_list_rounds_alert_percentages_for_display_only() {
+    let _home = HomeSandbox::new();
+    let now_ms = crate::usage::now_ms();
+    let mut config = MonitorConfig::new("nous", MonitorKind::Nous);
+    config.alert_pct = Some(42.4567);
+    let rows = list_rows(vec![config], now_ms, &|_| None);
+    assert!(list_line(&rows[0], (now_ms / 1000) as i64).contains("alert at 42.46%"));
+    assert_eq!(rows[0].config.alert_pct, Some(42.4567));
+}
+
+#[test]
 fn add_then_remove_through_the_dispatch() {
     let _home = HomeSandbox::new();
     run(MonitorCommand::Add(add_args(&["nous", "--kind", "nous"]))).unwrap();

@@ -11,10 +11,11 @@ use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
     HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, PluginFocus, StatusFocus, Tab,
     TokenView, build_action_menu, config_rows, fallback_hint, has_sub_focus, herdr_config_writable,
-    keyboard_owner,
+    keyboard_owner, token_model_count,
 };
 use super::super::theme;
 use super::format::spinner_frame;
+use super::prose;
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
@@ -29,6 +30,15 @@ const TYPED_FIELD: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("e
 /// The `+ new` form's typed field: ⏎ and esc both end the edit and keep the
 /// typed value; nothing saves until the form's own `create account` row.
 const NEW_ACCOUNT_FIELD: &[(&str, &str)] = &[("↵", "done"), ("←→", "caret"), ("esc", "done")];
+
+/// The note editor's grammar: ⏎ saves the draft, ⌃j inserts a newline, esc
+/// cancels. ←→ move the caret inside the draft (never switch tabs).
+const NOTE_EDITOR_FIELD: &[(&str, &str)] = &[
+    ("↵", "save"),
+    ("⌃j", "newline"),
+    ("←→", "caret"),
+    ("esc", "cancel"),
+];
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // 1-col breathing room on each side; the alert row (which replaces this in
@@ -81,7 +91,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         None => owner
             .is_none()
-            .then_some(TAB_NAV)
+            .then_some(
+                if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+                    || (app.tab == Tab::Tokens
+                        && app.token_view == TokenView::Models
+                        && app.model_detail_focus == StatusFocus::Detail)
+                {
+                    ("←", "back")
+                } else {
+                    TAB_NAV
+                },
+            )
             .into_iter()
             .chain(tab_hints(app))
             .collect(),
@@ -135,6 +155,7 @@ fn owner_hints(owner: KeyOwner) -> Option<&'static [(&'static str, &'static str)
         | KeyOwner::WeeklyThreshold
         | KeyOwner::HerdrTag => Some(TYPED_FIELD),
         KeyOwner::NewAccountField => Some(NEW_ACCOUNT_FIELD),
+        KeyOwner::NoteEditor => Some(NOTE_EDITOR_FIELD),
         // `←→` walk the chips and each space saves, so nothing reads as a
         // commit; `q` leaves the picker. ⏎ leaves it too, so it takes no group
         // of its own beside `q back`: three screen-specific groups at most.
@@ -172,13 +193,45 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("c", "harness"),
             ("?", "help"),
         ],
-        Tab::Usage => &[
+        // The hint derives from the key's behavior on this frame: with no
+        // accounts, `n` still starts a new account (the empty state's promise)
+        // and the note editor does not exist yet.
+        Tab::Usage
+            if app.usage_extra_cursor.is_some()
+                && app.usage_detail_focus == StatusFocus::Detail =>
+        {
+            &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")]
+        }
+        Tab::Usage if app.usage_extra_cursor.is_some() => &[
             ("↑↓", "account"),
-            ("r", "refresh account"),
+            ("↵", "detail"),
             ("a", "actions"),
             ("?", "help"),
         ],
+        Tab::Usage if app.usage_detail_focus == StatusFocus::Detail => &[
+            ("↑↓", "scroll"),
+            ("r", "refresh account"),
+            ("n", "note"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        Tab::Usage if app.profile_count() > 0 => &[
+            ("↑↓", "account"),
+            ("↵", "detail"),
+            ("r", "refresh account"),
+            ("n", "note"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        Tab::Usage => &[("↑↓", "account"), ("a", "actions"), ("?", "help")],
         Tab::Tokens => match app.token_view {
+            TokenView::Dashboard if token_model_count(app) == 0 => &[
+                ("r", "reload"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             TokenView::Dashboard => &[
                 ("↵", "models"),
                 ("r", "reload"),
@@ -187,8 +240,23 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("a", "actions"),
                 ("?", "help"),
             ],
+            TokenView::Models if app.model_detail_focus == StatusFocus::Detail => &[
+                ("↑↓", "scroll"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
+            TokenView::Models if token_model_count(app) == 0 => &[
+                ("↑↓", "model"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             TokenView::Models => &[
                 ("↑↓", "model"),
+                ("↵", "detail"),
                 ("c", "count cache"),
                 ("t", "period"),
                 ("a", "actions"),
@@ -553,10 +621,11 @@ fn inset_x(area: Rect, pad: u16) -> Rect {
 /// `! <message>` — glyph in `WARNING`, message in `TEXT_DIM`.
 fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
     let FooterAlert::Warn(msg) = alert;
-    let spans = vec![
-        Span::styled("! ", Style::default().fg(theme::warning_color())),
-        Span::styled(msg.as_str(), theme::dim()),
-    ];
+    let mut spans = vec![Span::styled(
+        "! ",
+        Style::default().fg(theme::warning_color()),
+    )];
+    spans.extend(prose::spans(msg, theme::dim()));
     frame.render_widget(
         Paragraph::new(Line::from(spans))
             .style(theme::base())
@@ -619,3 +688,7 @@ fn draw_login(
         area,
     );
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_footer.rs"]
+mod tests;

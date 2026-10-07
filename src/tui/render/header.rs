@@ -4,8 +4,8 @@
 //!
 //! Row 0 reads `tollgate vX.Y.Z` on the left with the herdr tag between them,
 //! and the `[ daemon ]` health chip on the right edge; it sheds the tag first,
-//! then the chip. Row 1 carries the active-profile usage gauge and the status
-//! indicator, nothing else: the account counts and the harness filter live on
+//! then the chip. Row 1 carries the fleet live-session counter, active-profile
+//! usage gauge and status indicator: account counts and the harness filter live on
 //! the accounts panel's title row, as meta slots beside the bare `ACCOUNTS`
 //! title. The collapse ladder drops the usage bar before the name.
 
@@ -15,7 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Tab};
+use super::super::app::{App, Tab, live_count_text};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 
@@ -144,11 +144,14 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
                 style,
             ));
             spans.push(Span::styled("]", theme::dim()));
-            spans.push(Span::styled(format!(" {pct:.0}%"), style));
+            spans.push(Span::styled(
+                format!(" {}", crate::format::format_pct(pct)),
+                style,
+            ));
         }
         Some(pct) => {
             spans.push(Span::styled(
-                format!("{pct:.0}%"),
+                crate::format::format_pct(pct),
                 Style::default().fg(theme::util_color(pct)),
             ));
         }
@@ -277,13 +280,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rows[0],
     );
 
-    // ── Row 1: [gauge] ...... ● feed ─────────────────────────────────────
+    // ── Row 1: [live chip] · [gauge] ...... ● feed ─────────────────────────────────────
     // The active profile's gauge, left-aligned, and the status indicator, the
     // only thing right-aligned, across an elastic gap. The account counts and
     // the harness filter left this row for the accounts panel's title row,
     // whose meta slots carry them beside the bare `ACCOUNTS` title (the filter
-    // name left, the roster counts right): this row stays counts-free at every
-    // width. The indicator drops whole, head and feed together, since a dot
+    // name left, the roster counts right): roster counts stay off this row. The indicator drops whole, head and feed together, since a dot
     // left to render clips the feed mid-word and a half-spelled source says
     // less than none. Its gate is charged the gauge as rendered, so the gauge's
     // own ladder gives way before the indicator does.
@@ -296,11 +298,26 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // before it would render closer than that, never at a 1-2 cell squeeze.
     let mut left_spans: Vec<Span<'static>> = Vec::new();
     if let Some(ref g) = gauge {
-        let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP);
+        let pct_extra = g.pct.map_or(0, |pct| {
+            (crate::format::format_pct(pct).len() + 1).saturating_sub(GAUGE_PCT_W)
+        });
+        let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP + pct_extra);
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
+    }
+    // Keep zero visible and the widest read count padded, so sessions starting
+    // or ending do not move the gauge. Shed the complete chip first.
+    let mut prefix = live_chip_spans(app);
+    if !left_spans.is_empty() {
+        prefix.push(Span::styled(" · ", theme::dim()));
+    }
+    let prefix_w: usize = prefix.iter().map(Span::width).sum();
+    let gauge_w: usize = left_spans.iter().map(Span::width).sum();
+    if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
+        prefix.append(&mut left_spans);
+        left_spans = prefix;
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
     let mut row1_spans = left_spans;
@@ -321,6 +338,29 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // ── Row 2: tabs ──────────────────────────────────────────────────────
     super::tabs::draw(frame, rows[2], app);
+}
+
+/// `[ N live ]`: brackets and unit dim, the number `TEXT` + bold, dim at zero
+/// and as the `—` of a tally that could not read. Blank cells after the closing
+/// bracket pad it to the widest count the app has read, so a count losing a
+/// digit moves nothing right of the chip.
+fn live_chip_spans(app: &App) -> Vec<Span<'static>> {
+    let total = app.live_sessions.total();
+    let number = live_count_text(total);
+    let number_style = match total {
+        Some(n) if n > 0 => Style::default().fg(theme::text_color()).bold(),
+        Some(_) | None => theme::dim(),
+    };
+    let pad = app.live_count_width.saturating_sub(number.chars().count());
+    let mut spans = vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(number, number_style),
+        Span::styled(" live ]", theme::dim()),
+    ];
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
 }
 
 fn status_dot_color(app: &App) -> ratatui::style::Color {

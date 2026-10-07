@@ -45,6 +45,7 @@ mod pricing;
 mod profile;
 mod profile_cache;
 mod profile_json;
+mod profile_notes;
 mod providers;
 mod relaunch;
 mod runtime;

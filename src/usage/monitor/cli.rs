@@ -350,7 +350,7 @@ pub(crate) fn list_line(row: &ListRow, now_secs: i64) -> String {
         parts.push(format!("budget ${b}/mo"));
     }
     if let Some(p) = m.alert_pct {
-        parts.push(format!("alert at {p}%"));
+        parts.push(format!("alert at {}", crate::format::format_pct(p)));
     }
     if let Some(sev) = monitor_severity(&row.observation, now_secs) {
         parts.push(format!("monitor {}", sev.word(SeverityBasis::Usage)));

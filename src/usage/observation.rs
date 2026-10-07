@@ -891,6 +891,9 @@ pub(crate) struct QuotaWindow {
     pub(crate) breakdown: Vec<ModelCount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) attribution: Vec<Share>,
+    /// Measured utilization slope and exhaustion estimate, when history is sufficient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) running_rate: Option<RunningRate>,
 }
 
 impl QuotaWindow {
@@ -909,7 +912,31 @@ impl QuotaWindow {
             limit: None,
             breakdown: Vec::new(),
             attribution: Vec::new(),
+            running_rate: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub(crate) struct RunningRate {
+    pub(crate) pct_per_unit: f64,
+    /// `h` for the session window, `d` for weekly windows.
+    pub(crate) unit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) time_left_secs: Option<i64>,
+}
+
+impl RunningRate {
+    pub(crate) fn display(&self) -> String {
+        let rate = crate::format::format_pct(self.pct_per_unit);
+        let mut text = format!("{rate}/{}", self.unit);
+        if let Some(secs) = self.time_left_secs {
+            text.push_str(&format!(
+                " · {} left",
+                crate::usage::humanize_duration(secs)
+            ));
+        }
+        text
     }
 }
 

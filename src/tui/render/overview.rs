@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph};
+use ratatui::widgets::{ListItem, Paragraph};
 use std::collections::HashSet;
 
 use super::super::app::{App, CodexRow, HarnessFilter, HermesRow, MainItemKind};
@@ -17,9 +17,10 @@ use super::format::{
 };
 use super::header::pulse_name_spans;
 use super::panes::{
-    bold_when, draw_scrollbar, empty_state, name_color, section_box, section_box_meta, select_line,
-    wrap_words,
+    bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
+    select_line, wrap_words,
 };
+use super::prose::{self, cmd_lit};
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
@@ -142,7 +143,7 @@ fn extras_hint_line(app: &App) -> Line<'static> {
     }
     Line::from(vec![
         Span::styled("  no tollgate accounts yet · ", theme::dim()),
-        Span::styled("n", theme::accent()),
+        Span::styled("n", theme::accent().bold()),
         Span::styled(
             format!(" to add one · showing {} read-only", shown.join(" + ")),
             theme::dim(),
@@ -177,6 +178,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let extras = shown_extras(app);
     let no_own = app.config().profiles.is_empty() && codex.is_empty() && hermes.is_empty();
     if no_own && extras.is_empty() {
+        app.overview_selector_offset.set(0);
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -205,45 +207,41 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
-    let items = if app.harness_filter.shows_claude() {
-        app.main_items()
-    } else {
-        Vec::new()
-    };
-    // A selection resting on a read-only row highlights no profile.
+    let items = app.main_items();
     let selected_extra = if extras.is_empty() {
         None
     } else {
         app.overview_selected_extra()
     };
-    let sel = app.profile_cursor.min(items.len().saturating_sub(1));
+    let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
-    let mut rows: Vec<ListItem<'_>> = items
-        .iter()
-        .enumerate()
-        .map(|(row, item)| match item {
+    let mut rows: Vec<ListItem<'_>> = Vec::new();
+    let mut selected_row = 0;
+    let mut codex_heading = false;
+    for (index, item) in items.iter().enumerate() {
+        let selected = index == sel && selected_extra.is_none();
+        let line = match item {
             MainItemKind::Profile(idx) => {
-                let selected = row == sel && selected_extra.is_none();
-                let line = render_overview_row(app, *idx, &widths, selected, focused);
-                ListItem::new(select_line(line, selected, focused, width))
+                render_overview_row(app, *idx, &widths, selected, focused)
             }
-        })
-        .collect();
-    // The codex section, after the claude rows and never selectable: the cursor
-    // and every action are bound to `config.profiles`, and a codex account has
-    // no record there for them to act on. Rendering it read-only is what keeps
-    // "what the cursor can reach" and "what the screen shows" from diverging.
-    if !codex.is_empty() {
-        if !rows.is_empty() {
-            rows.push(ListItem::new(Line::from("")));
+            MainItemKind::Codex(idx) => {
+                if !codex_heading {
+                    if !rows.is_empty() {
+                        rows.push(ListItem::new(Line::from("")));
+                    }
+                    rows.push(ListItem::new(Line::from(prose::spans(
+                        concat!("  codex — switch with ", cmd_lit!("tollgate <name>")),
+                        theme::dim(),
+                    ))));
+                    codex_heading = true;
+                }
+                render_codex_row(&app.codex_rows[*idx], &widths, selected)
+            }
+        };
+        if selected {
+            selected_row = rows.len();
         }
-        rows.push(ListItem::new(Line::from(vec![Span::styled(
-            "  codex — switch with `tollgate <name>`",
-            theme::dim(),
-        )])));
-        for row in codex {
-            rows.push(ListItem::new(render_codex_row(row, &widths)));
-        }
+        rows.push(ListItem::new(select_line(line, selected, focused, width)));
     }
     // The Hermes section: read-only like codex. Only the `Hermes` view
     // selects a row (Enter and `s` there toast the relaunch hint), so the
@@ -253,10 +251,13 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if !rows.is_empty() {
             rows.push(ListItem::new(Line::from("")));
         }
-        rows.push(ListItem::new(Line::from(vec![Span::styled(
-            "  hermes — relaunch with `tollgate start <name>`",
+        rows.push(ListItem::new(Line::from(prose::spans(
+            concat!(
+                "  hermes — relaunch with ",
+                cmd_lit!("tollgate start <name>")
+            ),
             theme::dim(),
-        )])));
+        ))));
         let selectable = app.harness_filter == HarnessFilter::Hermes;
         for (i, row) in hermes.iter().enumerate() {
             let selected = selectable && i == app.hermes_cursor.min(hermes.len() - 1);
@@ -270,7 +271,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The read-only rows: upstream clauth's accounts, then monitors, each
     // group under its own caption. The cursor lands on them (⏎ opens the Usage
     // tab there) but no account action does — see `read_only_hint`.
-    let mut list_sel = sel;
+    let mut list_sel = selected_row;
     let now = now_epoch_secs();
     let reset_fmt = ResetFmt::from_state(&app.config().state);
     for (caption, upstream) in [("clauth (read-only)", true), ("monitors", false)] {
@@ -306,14 +307,13 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
-    let total = rows.len();
-    let list = List::new(rows).style(theme::base());
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(list_sel_hermes.unwrap_or(list_sel)));
-    frame.render_stateful_widget(list, list_area, &mut state);
-
-    let viewport = list_area.height as usize;
-    draw_scrollbar(frame, list_area, total, state.offset(), viewport);
+    draw_following_list(
+        frame,
+        list_area,
+        rows,
+        list_sel_hermes.unwrap_or(list_sel),
+        &app.overview_selector_offset,
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -575,20 +575,23 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
 
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
 /// `↺ N` chip while the account holds a banked usage-limit reset (what
-/// `tollgate limit-reset` spends). The cursor and timer slots are kept blank and
-/// no live cell is drawn — this section is read-only, and a timer would
-/// promise a countdown the Overview cannot act on.
-fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
+/// `tollgate limit-reset` spends). The timer slot stays blank and no live cell
+/// is drawn: the Overview cannot refresh or switch a Codex account.
+fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
+    } else if selected {
+        theme::base().bold()
     } else {
         theme::base()
     };
-    // The same slots every list row carries — the 2-cell cursor prefix (blank:
-    // a codex row is never selected), the marker cell and its gap — so the
-    // `×` and the name sit in the claude rows' columns under the header.
+    // The cursor and marker slots align with the Claude columns.
     let mut spans = vec![
-        Span::raw("  "),
+        if selected {
+            Span::styled("❯ ", theme::accent().bold())
+        } else {
+            Span::raw("  ")
+        },
         if row.broken {
             Span::styled(theme::dead_credential_glyph(), theme::danger())
         } else {
@@ -606,7 +609,10 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     // timer slot) and its left alignment, and the 7d cell drops with its
     // column, so a codex reading sits under `5h`/`7d` and never under `live`.
     let cell = |window: Option<&crate::usage::UsageWindow>, w: usize| match window {
-        Some(win) => Span::styled(fixed(&format!("{:.0}%", win.utilization), w), theme::base()),
+        Some(win) => Span::styled(
+            fixed(&crate::format::format_pct(win.utilization), w),
+            theme::base(),
+        ),
         None => Span::styled(fixed(NO_DATA, w), theme::faint()),
     };
     spans.push(narrow_gap(widths));
@@ -1204,7 +1210,11 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let thr_w = chain
         .iter()
         .filter_map(|n| cfg.find(n))
-        .map(|p| format!("{:.0}", threshold_for(p)).len())
+        .map(|p| {
+            crate::format::format_pct(threshold_for(p))
+                .len()
+                .saturating_sub(1)
+        })
         .max()
         .unwrap_or(3);
     let last = chain.len() - 1;
@@ -1214,8 +1224,22 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         // Trailers (hint/marker) only render when the base leaves room, so a
         // narrow line keeps its figures on one row instead of hard-wrapping.
         let idx_w = (last + 1).to_string().chars().count() + 1;
+        let figure_w = chain
+            .iter()
+            .filter_map(|name| cfg.find(name))
+            .filter_map(|profile| profile.usage.as_ref()?.five_hour.as_ref())
+            .map(|window| {
+                crate::format::format_pct(window.utilization)
+                    .len()
+                    .saturating_sub(1)
+            })
+            .max()
+            .unwrap_or(3)
+            .max(3)
+            + 2;
+        let threshold_w = (thr_w + 4).max(7);
         width
-            .saturating_sub(3 + idx_w + name_w + 2 + 5 + 7)
+            .saturating_sub(3 + idx_w + name_w + 2 + figure_w + threshold_w)
             .clamp(4, GAUGE_W)
     } else {
         GAUGE_W
@@ -1483,14 +1507,21 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
                 Some(v) => (
-                    format!("  {v:>3.0}"),
+                    format!(
+                        "  {:>3}",
+                        crate::format::format_pct(v).trim_end_matches('%')
+                    ),
                     Style::default().fg(theme::util_color(v)),
                 ),
                 None => ("    —".to_string(), theme::faint()),
             };
             spans.push(Span::styled(figure, figure_style));
             spans.push(Span::styled(
-                format!(" / {threshold:>thr_w$.0}%"),
+                format!(
+                    " / {:>width$}",
+                    crate::format::format_pct(threshold),
+                    width = thr_w + 1
+                ),
                 theme::faint(),
             ));
         }

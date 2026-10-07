@@ -148,3 +148,44 @@ fn observation_lines_put_the_header_first_and_fit_the_pane() {
     assert_eq!(first, "oll-main · Ollama Cloud · pro (monitor)");
     assert!(lines.iter().all(|l| l.width() <= 60));
 }
+
+#[test]
+fn monitor_detail_scroll_reaches_the_last_window_without_local_account_hints() {
+    use crate::testutil::key;
+    use crate::tui::app::{StatusFocus, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(Tier::Full);
+    let mut obs = monitor();
+    let template = obs.windows[0].clone();
+    obs.windows = (0..20)
+        .map(|i| {
+            let mut window = template.clone();
+            window.label = format!("window-{i:02}");
+            window
+        })
+        .collect();
+    obs.money.clear();
+    let mut app = app_with_extras(vec![obs]);
+    app.tab = Tab::Usage;
+    app.usage_extra_cursor = Some(0);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    let before = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(!before.contains("window-19"), "the tail starts off-screen");
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.usage_detail_focus, StatusFocus::Detail);
+    for _ in 0..40 {
+        handle_key(&mut app, key(KeyCode::PageDown));
+    }
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    let after = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(
+        after.contains("window-19"),
+        "last monitor window is reachable: {after}"
+    );
+    assert!(!after.contains("n note") && !after.contains("r refresh account"));
+    assert_eq!(app.usage_extra_cursor, Some(0));
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(app.usage_detail_focus, StatusFocus::List);
+}

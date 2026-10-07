@@ -5,10 +5,12 @@
 //! agreement with what `monitor` reports for the same record, its overflow
 //! marker, and its empty state.
 
+use super::{detail_line, option_row, value_tone};
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
 use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
 use crate::profile::{AppConfig, AppState};
-use crate::tui::app::{App, Check, Health, herdr_check};
+use crate::tui::app::{App, Check, Health, HerdrOption, herdr_check};
+use crate::tui::theme;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::PathBuf;
@@ -942,4 +944,57 @@ fn herdr_tag_refresh_editor_renders_the_edit_state() {
         screen.contains("min is 1 s"),
         "the range sub-line renders while typing:\n{screen}"
     );
+}
+
+#[test]
+fn an_outdated_plugin_version_has_a_warning_word_and_tone() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let text = format!(
+        "version: 0.0.0 (outdated; {} {})",
+        super::super::super::app::OUTDATED_PLUGIN_MARK,
+        env!("CARGO_PKG_VERSION")
+    );
+    let row = detail_line(&text, 7, 80);
+    assert!(row.spans.iter().any(|s| s.content.contains("outdated")));
+    assert!(
+        row.spans
+            .iter()
+            .skip(1)
+            .all(|s| s.style == theme::warning())
+    );
+    assert_eq!(
+        value_tone("version", env!("CARGO_PKG_VERSION")),
+        theme::body()
+    );
+}
+
+#[test]
+fn plugin_popup_cycle_wraps_at_the_value_column_without_reflowing_on_focus() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let settings = crate::profile::HerdrSettings::default();
+    let render = |selected| {
+        option_row(
+            HerdrOption::PopupWidth,
+            &settings,
+            selected,
+            None,
+            false,
+            34,
+        )
+    };
+    let blurred = render(false);
+    let focused = render(true);
+    assert!(blurred.len() > 1);
+    assert_eq!(blurred.len(), focused.len());
+    for rows in [&blurred, &focused] {
+        assert!(rows.iter().all(|r| r.width() <= 34));
+        let text: String = rows
+            .iter()
+            .flat_map(|r| &r.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        for option in ["fit", "half", "split-right", "split-top"] {
+            assert!(text.contains(option));
+        }
+    }
 }

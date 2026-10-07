@@ -66,6 +66,8 @@ tokio = { version = "1.53.1", features = ["rt", "io-std", "time"] }
 # signatures. No default features: `sync` is unconditional.
 tokio-util = { version = "0.7.19", default-features = false }
 regex = "1.13.1"
+# Keep terminal truncation and note scrolling on grapheme boundaries.
+unicode-segmentation = "1.13.3"
 # CLI grammar + generated help. `wrap_help` is what keeps the command table and
 # the per-subcommand prose wrapping to the real terminal width instead of the
 # hand-padded block it replaced; it adds only `terminal_size` (rustix is already

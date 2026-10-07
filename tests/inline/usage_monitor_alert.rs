@@ -73,6 +73,29 @@ fn alert_pct_notifies_once_per_window() {
 }
 
 #[test]
+fn notifications_round_percentages_without_changing_threshold_comparisons() {
+    let mut config = cfg();
+    config.alert_pct = Some(80.4567);
+    let below = obs(80.4566, 3600);
+    let (notifications, _) = evaluate(&config, &below, &AlertState::default(), NOW);
+    assert_eq!(
+        notifications.len(),
+        1,
+        "severity only, below the exact threshold"
+    );
+    assert!(
+        notifications[0]
+            .body
+            .starts_with("Monthly credits 80.46% used")
+    );
+    let (notifications, _) = evaluate(&config, &obs(80.4568, 3600), &AlertState::default(), NOW);
+    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications[1].summary, "tollgate: Nous past 80.46%");
+    assert_eq!(notifications[1].body, "Monthly credits 80.46% used");
+    assert!(notifications[1].key.starts_with("alert_pct:80.4567:"));
+}
+
+#[test]
 fn the_sent_keys_are_bounded() {
     let mut s = AlertState::default();
     for i in 0..(MAX_SENT_KEYS as i64 + 10) {

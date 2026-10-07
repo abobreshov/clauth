@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### TUI and usage reporting
+
+- Usage and Tokens model details now scroll with arrows and page keys after Enter; long account lists, settings and cycle rows keep their selection visible. Model presets include fable first, and clearing a Setup field keeps that field selected.
+- Overview selects Codex accounts; switch a Codex account with `tollgate <name>`. The header shows the fleet's live session count in a counter chip while keeping the gauge still when the first session starts.
+- Usage supports private per-profile notes (`n`, Enter saves, Ctrl+j adds a newline, Esc cancels), including Alt/Option characters as text. Unreadable or invalid UTF-8 notes are protected from edits, and saves are serialized with account deletion. Notes stay under `~/.tollgate` at 0600 and outside status and agent APIs.
+- Ordinary toasts last five seconds, wrap by terminal cells and keep at most three rows with a final ellipsis. Severity words remain visible; keys and commands in prose use the palette accent.
+- Daemon start rechecks the singleton at activation, avoiding a second spawn from a stale menu. The Plugin tab warns about an older installed tollgate plugin, including disabled installs; installing enables it.
+- Displayed percentages round to at most two decimals. Claude OAuth usage cards, Waybar tooltips and additive JSON window fields now expose measured running rates and time left from the existing history fit, respecting `show_estimates`; Waybar's percentage remains integer and the JSON schema version is unchanged.
+
 ### Import
 
 - A profile's `throughput_cache.json` (upstream 0.16.0 keeps its per-model throughput samples in each profile) is copied as a profile cache instead of blocking the import as an unknown entry.

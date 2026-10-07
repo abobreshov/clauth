@@ -12,7 +12,8 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, MoveSessionForm, NamePromptForm, PresetPickerForm, Tab,
+    LoginStage, Modal, MoveSessionForm, NamePromptForm, PresetPickerForm, StatusFocus, Tab,
+    TokenView, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -23,6 +24,7 @@ use super::panes::{
     DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines,
     head_cols, key_cell, meta_line,
 };
+use super::prose::{self, key_lit};
 use crate::fallback::BlockedReason;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
@@ -208,7 +210,7 @@ fn draw_modal_scrolled(
         lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16
     };
     let scroll = scroll.min(max_scroll) as usize;
-    draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport));
+    draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport), None);
     if let (Some((_, cell)), Some(row)) = (caret, caret_row) {
         // A caret right after a row's last cell stays on that row, in the
         // right padding, rather than folding onto a row the chunking never
@@ -348,7 +350,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         theme::body(),
     ))];
     if let Some(detail) = &state.detail {
-        lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
+        lines.push(Line::from(prose::spans(detail, theme::dim())));
     }
     lines.push(Line::from(""));
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
@@ -660,8 +662,8 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
     }
     // `d` reaches nothing else from here, so the picker has to teach it.
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "d deletes a saved preset",
+    lines.push(Line::from(prose::spans(
+        concat!(key_lit!("d"), " deletes a saved preset"),
         theme::dim(),
     )));
 
@@ -672,8 +674,8 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
 /// `every_sub_focus_tab_documents_esc_in_help`.
-fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
-    match tab {
+fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
+    match app.tab {
         Tab::Overview => vec![(
             "accounts",
             &[
@@ -683,27 +685,127 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("m", "move a live session onto this account"),
             ][..],
         )],
-        Tab::Usage => vec![(
+        Tab::Usage
+            if app.usage_extra_cursor.is_some()
+                && app.usage_detail_focus == StatusFocus::Detail =>
+        {
+            vec![(
+                "usage",
+                &[
+                    ("↑ ↓", "scroll account detail"),
+                    ("page up", "scroll account detail up a viewport"),
+                    ("page down", "scroll account detail down a viewport"),
+                    ("esc", "return to account selector"),
+                    ("←", "return to account selector"),
+                ][..],
+            )]
+        }
+        Tab::Usage if app.usage_extra_cursor.is_some() => vec![(
             "usage",
             &[
-                ("\u{2191} \u{2193}", "pick account to inspect"),
+                ("↑ ↓", "pick account to inspect"),
+                ("↵", "open account detail"),
+            ][..],
+        )],
+        Tab::Usage if app.usage_detail_focus == StatusFocus::Detail => vec![(
+            "usage",
+            &[
+                ("↑ ↓", "scroll account detail"),
+                ("page up", "scroll account detail up a viewport"),
+                ("page down", "scroll account detail down a viewport"),
+                ("esc", "return to account selector"),
+                ("←", "return to account selector"),
                 ("r", "refresh account"),
+                ("n", "edit the account's note"),
                 ("e", "toggle estimates"),
                 ("p", "toggle pace marker"),
             ][..],
         )],
-        Tab::Tokens => vec![(
+        Tab::Usage if app.profile_count() > 0 => vec![(
+            "usage",
+            &[
+                ("↑ ↓", "pick account to inspect"),
+                ("↵", "open account detail"),
+                ("r", "refresh account"),
+                ("n", "edit the account's note"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ][..],
+        )],
+        Tab::Usage => vec![(
+            "usage",
+            &[
+                ("↑ ↓", "pick account to inspect"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ][..],
+        )],
+        Tab::Tokens if app.token_view == TokenView::Dashboard && token_model_count(app) == 0 => {
+            vec![(
+                "tokens",
+                &[
+                    ("c", "count cache in token figures"),
+                    (
+                        "t",
+                        "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                    ),
+                    ("r", "reload on-disk stats"),
+                ][..],
+            )]
+        }
+        Tab::Tokens if app.token_view == TokenView::Dashboard => vec![(
             "tokens",
             &[
                 ("\u{21b5}", "open per-model breakdown"),
-                ("\u{2191} \u{2193}", "pick model (in breakdown)"),
                 ("c", "count cache in token figures"),
                 (
                     "t",
                     "cycle period \u{b7} lifetime / daily / weekly / monthly",
                 ),
                 ("r", "reload on-disk stats"),
+            ][..],
+        )],
+        Tab::Tokens if app.model_detail_focus == StatusFocus::Detail => vec![(
+            "tokens",
+            &[
+                ("\u{2191} \u{2193}", "scroll model detail"),
+                ("page up", "scroll model detail up a viewport"),
+                ("page down", "scroll model detail down a viewport"),
+                ("esc", "return to model selector"),
+                ("\u{2190}", "return to model selector"),
+                ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
+                ("r", "reload on-disk stats"),
+            ][..],
+        )],
+        Tab::Tokens if token_model_count(app) == 0 => vec![(
+            "tokens",
+            &[
+                ("\u{2191} \u{2193}", "pick model"),
                 ("esc", "back to dashboard"),
+                ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
+                ("r", "reload on-disk stats"),
+            ][..],
+        )],
+        Tab::Tokens => vec![(
+            "tokens",
+            &[
+                ("\u{2191} \u{2193}", "pick model"),
+                ("\u{21b5}", "open model detail"),
+                ("esc", "back to dashboard"),
+                ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
+                ("r", "reload on-disk stats"),
             ][..],
         )],
         Tab::Setup => vec![(
@@ -711,18 +813,30 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             &[
                 ("\u{2191} \u{2193}", "pick account / + new, then a row"),
                 ("\u{21b5}", "open settings · edit field · flip toggle"),
-                ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
+                (
+                    "\u{21b5} on a field",
+                    concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+                ),
                 ("space", "cycle the model preset (model row)"),
-                ("env", "+ add env · \u{21b5} edits a value"),
+                (
+                    "env",
+                    concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+                ),
                 (
                     "a",
                     "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
                 ),
                 (
                     "disable / enable",
-                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                    concat!(
+                        key_lit!("\u{21b5}"),
+                        " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                    ),
                 ),
-                ("delete", "\u{21b5} once to arm, again to confirm"),
+                (
+                    "delete",
+                    concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+                ),
                 ("esc", "stop editing / back to account list"),
             ][..],
         )],
@@ -733,7 +847,11 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("space", "cycle the focused setting"),
                 (
                     "\u{21b5}",
-                    "same as space · type a value on refresh or weekly limit",
+                    concat!(
+                        "same as ",
+                        key_lit!("space"),
+                        " · type a value on refresh or weekly limit",
+                    ),
                 ),
             ][..],
         )],
@@ -771,7 +889,10 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                     "open \u{00b7} edit threshold \u{00b7} edit weekly at \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step rotate at / weekly at by 5"),
-                ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
+                (
+                    "\u{21b5} on rotate at",
+                    concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+                ),
                 ("\u{21b5} on weekly at", "type a %, empty clears"),
                 (
                     "space on preferred days",
@@ -779,7 +900,17 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ),
                 (
                     "\u{21b5} on preferred days",
-                    "pick days: \u{2190} \u{2192} walk \u{00b7} space toggles and saves \u{00b7} \u{21b5} esc q leave \u{00b7} \u{2191} \u{2193} leave and move",
+                    concat!(
+                        "pick days: ",
+                        key_lit!("\u{2190} \u{2192}"),
+                        " walk \u{00b7} ",
+                        key_lit!("space"),
+                        " toggles and saves \u{00b7} ",
+                        key_lit!("\u{21b5} esc q"),
+                        " leave \u{00b7} ",
+                        key_lit!("\u{2191} \u{2193}"),
+                        " leave and move",
+                    ),
                 ),
                 ("esc", "back / cancel edit"),
             ][..],
@@ -790,12 +921,31 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = "KEYS";
 
-    let tab_specific = tab_specific_rows(app.tab);
+    let tab_specific = tab_specific_rows(app);
 
-    let nav: &[(&str, &str)] = &[(
-        "\u{2190} \u{2192} \u{00b7} tab",
-        "previous / next tab (shift tab: previous)",
-    )];
+    // In a descended read-only pane, arrows do not switch tabs; Tab/BackTab still do.
+    let nav: &[(&str, &str)] = if (app.tab == Tab::Usage
+        && app.usage_detail_focus == StatusFocus::Detail)
+        || (app.tab == Tab::Tokens
+            && app.token_view == TokenView::Models
+            && app.model_detail_focus == StatusFocus::Detail)
+    {
+        &[
+            ("\u{2190}", "return to selector"),
+            ("\u{2192}", "stays on detail"),
+            ("tab", "next tab"),
+            ("shift tab", "previous tab"),
+        ]
+    } else {
+        &[(
+            "\u{2190} \u{2192} \u{00b7} tab",
+            concat!(
+                "previous / next tab (",
+                key_lit!("shift tab"),
+                ": previous)"
+            ),
+        )]
+    };
 
     // The modal's own keys, in their own section. Not folded into `global`
     // below: every tab binds ↑↓ for its own list, so the shadow filter there
@@ -941,13 +1091,12 @@ const HELP_KEY_W: usize = 18;
 const HELP_KEY_GUTTER: usize = 2;
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
-            Style::default().fg(theme::accent_color()).bold(),
-        ),
-        Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
-    ])
+    let mut spans = vec![Span::styled(
+        format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
+        Style::default().fg(theme::accent_color()).bold(),
+    )];
+    spans.extend(prose::spans(desc, Style::default().fg(theme::text_color())));
+    Line::from(spans)
 }
 
 /// A legend row, aligned to the same description column the key rows open at.

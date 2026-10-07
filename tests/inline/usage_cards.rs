@@ -81,6 +81,23 @@ fn a_bar_is_exact_width_with_the_elapsed_marker_in_place() {
 }
 
 #[test]
+fn card_percentages_round_to_two_decimals_without_changing_measurements() {
+    let mut window = sample_accounts().remove(0).windows.remove(0);
+    window.used_pct = Some(42.4567);
+    let rows = window_card(&window, &ctx(80));
+    assert!(plain_text(&rows[1]).contains("42.46%"));
+    assert_eq!(window.used_pct, Some(42.4567));
+    assert_eq!(pct_text(1.0000000000000009), "1%");
+    assert_eq!(pct_text(-0.0), "0%");
+    window.used_pct = Some(99.876);
+    for width in [MIN_WIDTH, 80] {
+        let rows = window_card(&window, &ctx(width));
+        assert_eq!(line_width(&rows[1]), width);
+        assert!(plain_text(&rows[1]).ends_with("99.88% ↑ CRITICAL"));
+    }
+}
+
+#[test]
 fn a_window_card_carries_countdown_local_time_pace_and_severity_word() {
     let accounts = sample_accounts();
     let weekly = accounts[0].window("weekly").unwrap();
@@ -93,7 +110,7 @@ fn a_window_card_carries_countdown_local_time_pace_and_severity_word() {
     // 4d 1h from 10:00Z is 11:00Z, 13:00 at UTC+2.
     assert!(rows[0].ends_with("resets in 4d 1h (13:00)"), "{rows:?}");
     assert!(rows[1].ends_with("81% ↑ HIGH"), "{rows:?}");
-    assert_eq!(rows[2], "  42% elapsed · 38 pts ahead");
+    assert_eq!(rows[2], "  42.26% elapsed · 38 pts ahead");
     // The severity word is coloured by its rung, and bold.
     let word = window_card(weekly, &ctx(80))[1]
         .iter()

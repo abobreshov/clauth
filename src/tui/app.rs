@@ -1,8 +1,8 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - Overview: read-only account list; `profile_cursor` is shared with Usage
-//!     and Config so the highlight follows across tab switches.
+//!   - Overview: selectable Claude and Codex rows; `overview_cursor` maps onto
+//!     the visible filter, while Claude selections sync `profile_cursor` with Usage and Setup.
 //!   - Config: master-detail — account list + `+ new` row + inline editor
 //!     (`config_draft`). No popups for create / edit / rename / delete.
 //!   - Fallback: master-detail — ordered chain + `+ add` on the left; inline
@@ -56,6 +56,7 @@ use crate::profile::{
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
+use crate::tui::render::prose::{self, cmd_lit};
 use crate::tui::theme;
 use crate::update;
 use crate::usage::{
@@ -169,6 +170,187 @@ impl InputState {
     }
 }
 
+// ── Note editor ───────────────────────────────────────────────────────────────
+
+/// The note editor's multi-line draft. The stored text is `lines` joined by
+/// `\n`; the caret is `(row, col)` in char columns, converted to display cells
+/// at render (a wide char takes two cells).
+#[derive(Debug, Clone)]
+pub(crate) struct NoteBuffer {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+impl NoteBuffer {
+    pub(crate) fn new(text: &str) -> Self {
+        let lines: Vec<String> = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(str::to_string).collect()
+        };
+        let row = lines.len() - 1;
+        let col = lines[row].chars().count();
+        Self { lines, row, col }
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(crate) fn line(&self, index: usize) -> &str {
+        &self.lines[index]
+    }
+
+    /// Caret row and DISPLAY column (wide chars count two cells), for the
+    /// native cursor position.
+    pub(crate) fn cursor_pos(&self) -> (usize, usize) {
+        (self.row, display_col(&self.lines[self.row], self.col))
+    }
+
+    fn line_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    fn clamp_col(&mut self) {
+        self.col = self.col.min(self.line_len());
+    }
+
+    fn cursor_byte(&self) -> usize {
+        let line = &self.lines[self.row];
+        line.char_indices()
+            .nth(self.col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len())
+    }
+
+    pub(crate) fn insert_char(&mut self, ch: char) {
+        let at = self.cursor_byte();
+        self.lines[self.row].insert(at, ch);
+        self.col += 1;
+    }
+
+    pub(crate) fn insert_newline(&mut self) {
+        let at = self.cursor_byte();
+        let rest = self.lines[self.row].split_off(at);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.col > 0 {
+            let prev = self.lines[self.row]
+                .char_indices()
+                .nth(self.col - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let at = self.cursor_byte();
+            self.lines[self.row].replace_range(prev..at, "");
+            self.col -= 1;
+        } else if self.row > 0 {
+            let line = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.line_len();
+            self.lines[self.row].push_str(&line);
+        }
+    }
+
+    pub(crate) fn delete(&mut self) {
+        if self.col < self.line_len() {
+            let at = self.cursor_byte();
+            let line = &self.lines[self.row];
+            let next = line[at..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| at + i)
+                .unwrap_or(line.len());
+            self.lines[self.row].replace_range(at..next, "");
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+        }
+    }
+
+    pub(crate) fn left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.line_len();
+        }
+    }
+
+    pub(crate) fn right(&mut self) {
+        if self.col < self.line_len() {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    pub(crate) fn up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            self.clamp_col();
+        }
+    }
+
+    pub(crate) fn down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.clamp_col();
+        }
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.col = 0;
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.col = self.line_len();
+    }
+
+    /// Delete the word (run of non-spaces, plus any preceding spaces) left of
+    /// the caret within the line; at a line start, joins the line up.
+    pub(crate) fn delete_word(&mut self) {
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let mut start = self.col;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let from_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
+        let at = self.cursor_byte();
+        self.lines[self.row].replace_range(from_byte..at, "");
+        self.col = start;
+    }
+}
+
+/// Display column of a char-indexed caret, using the renderer's Unicode width.
+fn display_col(line: &str, cols: usize) -> usize {
+    ratatui::text::Span::raw(line.chars().take(cols).collect::<String>()).width()
+}
+
+/// The usage tab's note editor state. The account is captured at open, so a
+/// config reload mid-edit can never retarget the draft.
+#[derive(Debug, Clone)]
+pub(crate) struct NoteEditor {
+    pub(crate) profile: crate::profile::ProfileName,
+    pub(crate) buf: NoteBuffer,
+}
+
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
@@ -230,18 +412,18 @@ pub(crate) enum ConfigRow {
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
     Model,
+    /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
+    FableModel,
     /// `ANTHROPIC_DEFAULT_OPUS_MODEL` — full id, free text.
     OpusModel,
     /// `ANTHROPIC_DEFAULT_SONNET_MODEL` — full id, free text.
     SonnetModel,
     /// `ANTHROPIC_DEFAULT_HAIKU_MODEL` — full id, free text.
     HaikuModel,
-    /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
-    FableModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
     /// The `+ model override` reveal row. Shown only while the unset alias
-    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/fable/subagent inline.
+    /// overrides are collapsed; ⏎ expands fable/opus/sonnet/haiku/subagent inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
     /// snapshot. ⏎ edits its VALUE. An emptied value REMOVES the key — the
@@ -303,7 +485,16 @@ impl ConfigRow {
 
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
 /// (no `model` key); a custom id set via ⏎ is outside this list.
-pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
+pub(crate) const MODEL_PRESETS: [&str; 5] = ["fable", "opus", "sonnet", "haiku", "opusplan"];
+
+/// The alias-override rows, in the order Setup lists them.
+const OVERRIDE_ROWS: [ConfigRow; 5] = [
+    ConfigRow::FableModel,
+    ConfigRow::OpusModel,
+    ConfigRow::SonnetModel,
+    ConfigRow::HaikuModel,
+    ConfigRow::SubagentModel,
+];
 
 /// The weekly-line preset ladder: one source for the Config row's segmented
 /// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
@@ -495,6 +686,10 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
+    /// The override rows this draft opened with a value. They stay listed for
+    /// the draft's life, so emptying one never pulls the row out from under
+    /// the cursor; a fresh draft tucks an unset one behind the chip again.
+    pub(crate) overrides_shown: Vec<ConfigRow>,
     /// A `+ new`-form login stash, held in memory until `create account`
     /// consumes it (capture-then-commit): the browser mint `+ login` produced,
     /// or the live login `+ capture current login` snapshotted. Carries the
@@ -762,12 +957,14 @@ impl DivergenceNotice {
     pub(crate) fn banner_message(&self) -> String {
         match &self.sibling {
             Some(owner) => format!(
-                "live login is '{owner}' · not the active '{}' · press d to resolve",
-                self.active
+                "live login is '{owner}' · not the active '{}' · press {} to resolve",
+                self.active,
+                prose::key("d")
             ),
             None => format!(
-                "live login no longer matches '{}' · press d to resolve",
-                self.active
+                "live login no longer matches '{}' · press {} to resolve",
+                self.active,
+                prose::key("d")
             ),
         }
     }
@@ -1135,7 +1332,7 @@ const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where tollgate ca
 const DISABLE_DETAIL: &str =
     "it drops out of auto-switch, usage polling, and status until re-enabled.";
 const TOAST_CAPACITY: usize = 3;
-const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
+const TOAST_TTL_NORMAL: Duration = Duration::from_secs(5);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -1365,6 +1562,7 @@ pub(crate) struct StatusState {
     /// Selected incident index in `incidents`.
     pub(crate) cursor: usize,
     pub(crate) focus: StatusFocus,
+    pub(crate) selector_offset: std::cell::Cell<usize>,
     /// Scroll offset (lines) into the detail timeline.
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last detail render (`total - viewport`).
@@ -1387,6 +1585,7 @@ impl Default for StatusState {
             fetching: false,
             cursor: 0,
             focus: StatusFocus::List,
+            selector_offset: std::cell::Cell::new(0),
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
             seen_latest: None,
@@ -1478,6 +1677,8 @@ pub(crate) struct PluginState {
     pub(crate) focus: PluginFocus,
     /// Cursor over the integration checks (`0..checks.len()`).
     pub(crate) cursor: usize,
+    pub(crate) selector_offset: std::cell::Cell<usize>,
+    pub(crate) form_offset: std::cell::Cell<usize>,
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
     /// clamped by the key handler — same pattern as `StatusState`).
@@ -1549,6 +1750,8 @@ impl Default for PluginState {
         Self {
             focus: PluginFocus::List,
             cursor: 0,
+            selector_offset: std::cell::Cell::new(0),
+            form_offset: std::cell::Cell::new(0),
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
             fetching: false,
@@ -1652,18 +1855,13 @@ pub(crate) struct Banner {
 
 // ── Overview list items ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MainItemKind {
     Profile(usize),
+    Codex(usize),
 }
 
-/// Which harness the Overview shows. A VIEW filter only: selection and every
-/// action stay bound to the claude list, because a codex account has no
-/// `Profile` record for them to act on and tollgate switches it through its own
-/// CLI verb. So the codex section renders READ-ONLY, and while the claude rows
-/// are hidden every key bound to the selection is inert
-/// ([`claude_rows_hidden`]) rather than acting on a row the screen does not
-/// show.
+/// The Overview's visible harness filter; selection maps onto the rows it shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HarnessFilter {
     #[default]
@@ -1976,6 +2174,19 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    pub(crate) overview_cursor: usize,
+    pub(crate) overview_selector_offset: std::cell::Cell<usize>,
+    pub(crate) usage_selector_offset: std::cell::Cell<usize>,
+    pub(crate) setup_selector_offset: std::cell::Cell<usize>,
+    pub(crate) chain_selector_offset: std::cell::Cell<usize>,
+    pub(crate) models_selector_offset: std::cell::Cell<usize>,
+    pub(crate) setup_detail_offset: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_offset: std::cell::Cell<usize>,
+    pub(crate) global_config_offset: std::cell::Cell<usize>,
+    pub(crate) usage_detail_focus: StatusFocus,
+    pub(crate) usage_detail_scroll: usize,
+    pub(crate) usage_detail_max_scroll: std::cell::Cell<usize>,
+    pub(crate) usage_detail_viewport: std::cell::Cell<usize>,
     /// Monitoring-only and upstream-clauth accounts (`monitor:` / `upstream:`
     /// observations from the collect hooks), listed below the profiles on the
     /// Usage tab's rail. Re-read from caches every
@@ -2025,6 +2236,12 @@ pub(crate) struct App {
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
     pub(crate) weekly_threshold_draft: Option<InputState>,
+    /// The selected account's note (the usage tab's `notes:` row). Loaded on
+    /// cursor moves, tab switches with a clamped cursor, and saves — never per
+    /// frame.
+    pub(crate) note_text: Option<String>,
+    /// The open note editor, while `n` has one open on the usage tab.
+    pub(crate) note_editor: Option<NoteEditor>,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -2102,6 +2319,10 @@ pub(crate) struct App {
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
+    pub(crate) model_detail_focus: StatusFocus,
+    pub(crate) model_detail_scroll: u16,
+    pub(crate) model_detail_max_scroll: std::cell::Cell<u16>,
+    pub(crate) model_detail_viewport: std::cell::Cell<u16>,
     /// Model filter over the Tokens tab's model surfaces (action-menu driven).
     pub(crate) token_filter: TokenFilter,
     pub(crate) token_period: TokenPeriod,
@@ -2229,6 +2450,9 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
+    /// chip renders at least this wide for the TUI's lifetime.
+    pub(crate) live_count_width: usize,
     /// The codex roster as the Overview lists it and the header counts it.
     /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
     /// small files per account, the header draws on every tab every frame, and
@@ -2489,6 +2713,10 @@ impl App {
                 .map(|p| p.name.to_string())
                 .collect::<Vec<_>>(),
         );
+        let initial_note = config
+            .profiles
+            .first()
+            .and_then(|p| crate::profile_notes::load_note(&p.name));
 
         let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
@@ -2525,6 +2753,19 @@ impl App {
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
             profile_cursor: 0,
+            overview_cursor: 0,
+            overview_selector_offset: std::cell::Cell::new(0),
+            usage_selector_offset: std::cell::Cell::new(0),
+            setup_selector_offset: std::cell::Cell::new(0),
+            chain_selector_offset: std::cell::Cell::new(0),
+            models_selector_offset: std::cell::Cell::new(0),
+            setup_detail_offset: std::cell::Cell::new(0),
+            fallback_detail_offset: std::cell::Cell::new(0),
+            global_config_offset: std::cell::Cell::new(0),
+            usage_detail_focus: StatusFocus::List,
+            usage_detail_scroll: 0,
+            usage_detail_max_scroll: std::cell::Cell::new(0),
+            usage_detail_viewport: std::cell::Cell::new(0),
             usage_extras: Vec::new(),
             usage_extra_cursor: None,
             usage_extras_polled: None,
@@ -2539,6 +2780,8 @@ impl App {
             refresh_interval_draft: None,
             context_nudge_draft: None,
             weekly_threshold_draft: None,
+            note_text: initial_note,
+            note_editor: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -2569,6 +2812,10 @@ impl App {
             tokens_progress: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
+            model_detail_focus: StatusFocus::List,
+            model_detail_scroll: 0,
+            model_detail_max_scroll: std::cell::Cell::new(0),
+            model_detail_viewport: std::cell::Cell::new(0),
             token_filter: TokenFilter::default(),
             token_period: TokenPeriod::default(),
             tokens_events,
@@ -2603,6 +2850,7 @@ impl App {
             wallet_cache,
             wallet_fp,
             session_tokens,
+            live_count_width: live_count_text(live_sessions.total()).chars().count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
@@ -2718,6 +2966,16 @@ impl App {
             self.tab = tab.into();
         }
         self
+    }
+
+    /// The production write path for the tally after construction: it also widens
+    /// the header chip's held count width, so a count shrinking by a digit
+    /// moves nothing right of the chip.
+    pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
+        self.live_count_width = self
+            .live_count_width
+            .max(live_count_text(tally.total()).chars().count());
+        self.live_sessions = tally;
     }
 
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
@@ -3300,7 +3558,7 @@ impl App {
         }
         self.toasts.push_back(Toast {
             kind,
-            body: body.into(),
+            body: prose::mark_commands(&body.into()),
             born: Instant::now(),
         });
     }
@@ -3315,18 +3573,14 @@ impl App {
     }
 
     pub(crate) fn prune_toasts(&mut self) {
-        while let Some(front) = self.toasts.front() {
-            let ttl = if front.kind == ToastKind::Danger {
+        self.toasts.retain(|toast| {
+            let ttl = if toast.kind == ToastKind::Danger {
                 TOAST_TTL_DANGER
             } else {
                 TOAST_TTL_NORMAL
             };
-            if front.born.elapsed() >= ttl {
-                self.toasts.pop_front();
-            } else {
-                break;
-            }
-        }
+            toast.born.elapsed() < ttl
+        });
     }
 
     /// Called each frame with the current terminal height. Tracks compact
@@ -3359,9 +3613,14 @@ impl App {
     // ── Main list ────────────────────────────────────────────────────────────
 
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        (0..self.config().profiles.len())
-            .map(MainItemKind::Profile)
-            .collect()
+        let mut rows = Vec::new();
+        if self.harness_filter.shows_claude() {
+            rows.extend((0..self.profile_count()).map(MainItemKind::Profile));
+        }
+        if self.harness_filter.shows_codex() {
+            rows.extend((0..self.codex_rows.len()).map(MainItemKind::Codex));
+        }
+        rows
     }
 
     pub(crate) fn profile_count(&self) -> usize {
@@ -3376,10 +3635,37 @@ impl App {
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
+        self.clamp_overview_cursor();
+        if self.tab == Tab::Overview {
+            self.sync_overview_profile_selection();
+        }
+        // Every reload path lands here (a roster change can move or remove the
+        // selected account), so the note tracks the selection for free.
+        self.reload_selected_note();
+    }
+
+    /// Re-read the selected account's note from disk.
+    pub(crate) fn reload_selected_note(&mut self) {
+        self.note_text = self
+            .profile_name_at(self.profile_cursor)
+            .and_then(|name| crate::profile_notes::load_note(&name));
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
-        self.main_items().get(self.profile_cursor).copied()
+        self.main_items().get(self.overview_cursor).copied()
+    }
+
+    fn clamp_overview_cursor(&mut self) {
+        self.overview_cursor = self
+            .overview_cursor
+            .min(self.main_items().len().saturating_sub(1));
+    }
+
+    fn sync_overview_profile_selection(&mut self) {
+        if let Some(MainItemKind::Profile(idx)) = self.current_main_item() {
+            self.profile_cursor = idx;
+            self.reload_selected_note();
+        }
     }
 
     /// The Overview's read-only rows in display order, as indices into
@@ -3406,9 +3692,12 @@ impl App {
     /// [`App::usage_extra_cursor`], else — with no profile to rest on — the
     /// first read-only row, the same fallback the Usage rail applies.
     pub(crate) fn overview_selected_extra(&self) -> Option<usize> {
+        if !self.harness_filter.shows_claude() {
+            return None;
+        }
         match self.usage_extra_cursor {
             Some(i) if i < self.usage_extras.len() => Some(i),
-            _ if self.profile_count() == 0 => self.overview_extras().first().copied(),
+            _ if self.main_items().is_empty() => self.overview_extras().first().copied(),
             _ => None,
         }
     }
@@ -3482,7 +3771,8 @@ pub(super) fn reconcile_startup(app: &mut App) {
 /// `q back` / `q quit` label; the help-modal esc-row test iterates it too, so
 /// a new sub-focus tab without an `esc` help row fails CI.
 pub(crate) fn has_sub_focus(app: &App) -> bool {
-    (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
+    (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+        || (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
         || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
         || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
@@ -3513,6 +3803,9 @@ pub(crate) enum KeyOwner {
     WeeklyThreshold,
     /// The Plugin tab's herdr tag-refresh field.
     HerdrTag,
+    /// The usage tab's note editor (the `n`-opened draft on the selected
+    /// account).
+    NoteEditor,
 }
 
 impl KeyOwner {
@@ -3555,6 +3848,7 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
         Tab::Config if app.context_nudge_draft.is_some() => Some(KeyOwner::ContextNudge),
         Tab::Config if app.weekly_threshold_draft.is_some() => Some(KeyOwner::WeeklyThreshold),
         Tab::Plugin if app.plugin.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
+        Tab::Usage if app.note_editor.is_some() => Some(KeyOwner::NoteEditor),
         Tab::Overview
         | Tab::Usage
         | Tab::Tokens
@@ -3589,6 +3883,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             KeyOwner::ContextNudge => handle_context_nudge_edit_key(app, key),
             KeyOwner::WeeklyThreshold => handle_weekly_threshold_edit_key(app, key),
             KeyOwner::HerdrTag => handle_herdr_tag_edit_key(app, key),
+            KeyOwner::NoteEditor => handle_note_editor_key(app, key),
         }
         return;
     }
@@ -3606,6 +3901,26 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
+        KeyCode::Left if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail => {
+            app.usage_detail_focus = StatusFocus::List;
+            return;
+        }
+        KeyCode::Left
+            if app.tab == Tab::Tokens
+                && app.token_view == TokenView::Models
+                && app.model_detail_focus == StatusFocus::Detail =>
+        {
+            app.model_detail_focus = StatusFocus::List;
+            return;
+        }
+        KeyCode::Right
+            if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+                || (app.tab == Tab::Tokens
+                    && app.token_view == TokenView::Models
+                    && app.model_detail_focus == StatusFocus::Detail) =>
+        {
+            return;
+        }
         KeyCode::Right | KeyCode::Tab => {
             app.disarm_quit();
             switch_tab(app, app.tab.next());
@@ -3636,7 +3951,21 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
         KeyCode::Char('c') if app.tab == Tab::Overview => {
             app.disarm_quit();
+            let selected = app.current_main_item();
             app.harness_filter = app.harness_filter.next();
+            if !app.harness_filter.shows_claude() {
+                app.usage_extra_cursor = None;
+            }
+            app.overview_cursor = selected
+                .and_then(|item| app.main_items().iter().position(|row| *row == item))
+                .or_else(|| {
+                    app.main_items()
+                        .iter()
+                        .position(|row| *row == MainItemKind::Profile(app.profile_cursor))
+                })
+                .unwrap_or(0);
+            app.sync_overview_profile_selection();
+            app.overview_selector_offset.set(0);
             return;
         }
         KeyCode::Char('a') => {
@@ -3694,13 +4023,27 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('n') => {
             app.disarm_quit();
-            start_new_account(app);
+            // The usage tab claims `n` for the account's note editor (footer +
+            // help modal advertise it there); the empty roster keeps the empty
+            // state's `n to create one` promise. Everywhere else: new account.
+            if app.tab == Tab::Usage && app.profile_count() > 0 {
+                open_note_editor(app);
+            } else {
+                start_new_account(app);
+            }
             return;
         }
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
             app.disarm_quit();
-            if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
+            if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail {
+                app.usage_detail_focus = StatusFocus::List;
+            } else if app.tab == Tab::Tokens
+                && app.token_view == TokenView::Models
+                && app.model_detail_focus == StatusFocus::Detail
+            {
+                app.model_detail_focus = StatusFocus::List;
+            } else if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
                 leave_config_detail(app);
             } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
                 leave_fallback_detail(app);
@@ -3719,7 +4062,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') => {
             if has_sub_focus(app) {
                 app.disarm_quit();
-                if app.tab == Tab::Setup {
+                if app.tab == Tab::Usage {
+                    app.usage_detail_focus = StatusFocus::List;
+                } else if app.tab == Tab::Tokens && app.model_detail_focus == StatusFocus::Detail {
+                    app.model_detail_focus = StatusFocus::List;
+                } else if app.tab == Tab::Setup {
                     leave_config_detail(app);
                 } else if app.tab == Tab::Fallback {
                     leave_fallback_detail(app);
@@ -3735,7 +4082,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 app.shutting_down.store(true, Ordering::SeqCst);
             } else {
                 app.armed_quit = true;
-                app.footer_alert = Some(FooterAlert::Warn("press q again to quit".to_string()));
+                app.footer_alert = Some(FooterAlert::Warn(format!(
+                    "press {} again to quit",
+                    prose::key("q")
+                )));
             }
             return;
         }
@@ -3827,8 +4177,20 @@ pub(crate) fn token_period_models(app: &App) -> Vec<crate::tokens::PeriodModel> 
 
 /// Number of rows in the Tokens `Models` master list under the active
 /// period + filter lenses.
-fn token_model_count(app: &App) -> usize {
+pub(crate) fn token_model_count(app: &App) -> usize {
     token_period_models(app).len()
+}
+
+/// Keep detail focus on a model only while the active list can select one.
+fn clamp_token_model_cursor(app: &mut App) {
+    let len = token_model_count(app);
+    if len == 0 {
+        app.model_detail_focus = StatusFocus::List;
+        app.model_detail_scroll = 0;
+    }
+    if app.token_model_cursor >= len {
+        app.token_model_cursor = len.saturating_sub(1);
+    }
 }
 
 /// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
@@ -3843,10 +4205,8 @@ fn reload_token_stats(app: &mut App) {
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
-/// Tokens tab: `c` toggles cache-counting (persisted) on either view (`t`'s
-/// period cycle is claimed by the global key arm); Dashboard descends to
-/// Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled by the
-/// global esc/q).
+/// Tokens tab: `c` toggles cache-counting on either view; Dashboard enters
+/// Models on ⏎. From Models, ⏎ descends into the read-only detail.
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') {
         toggle_count_cache(app);
@@ -3857,19 +4217,55 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
             // Dashboard is a fixed grid (no scroll); ⏎ descends into Models.
             if key.code == KeyCode::Enter && token_model_count(app) > 0 {
                 app.token_view = TokenView::Models;
+                app.model_detail_focus = StatusFocus::List;
+                app.model_detail_scroll = 0;
                 app.token_model_cursor = 0;
             }
         }
         TokenView::Models => {
-            let len = token_model_count(app);
-            match key.code {
-                KeyCode::Up if len > 0 => {
-                    app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+            if app.model_detail_focus == StatusFocus::Detail {
+                let max = app.model_detail_max_scroll.get();
+                let viewport = app.model_detail_viewport.get();
+                match key.code {
+                    KeyCode::Up => {
+                        app.model_detail_scroll = app.model_detail_scroll.min(max).saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        app.model_detail_scroll =
+                            app.model_detail_scroll.min(max).saturating_add(1).min(max)
+                    }
+                    KeyCode::PageUp => {
+                        app.model_detail_scroll = app
+                            .model_detail_scroll
+                            .min(max)
+                            .saturating_sub(viewport.max(1))
+                    }
+                    KeyCode::PageDown => {
+                        app.model_detail_scroll = app
+                            .model_detail_scroll
+                            .min(max)
+                            .saturating_add(viewport.max(1))
+                            .min(max)
+                    }
+                    _ => {}
                 }
-                KeyCode::Down if len > 0 => {
-                    app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+            } else {
+                let len = token_model_count(app);
+                match key.code {
+                    KeyCode::Up if len > 0 => {
+                        app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::Down if len > 0 => {
+                        app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::Enter if len > 0 => {
+                        app.model_detail_focus = StatusFocus::Detail;
+                        app.model_detail_scroll = 0;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -3877,16 +4273,29 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
+    if tab == Tab::Overview && app.tab != Tab::Overview && app.harness_filter.shows_claude() {
+        app.overview_cursor = app
+            .main_items()
+            .iter()
+            .position(|row| *row == MainItemKind::Profile(app.profile_cursor))
+            .unwrap_or(0);
+    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
-        Tab::Overview | Tab::Usage => {}
+        Tab::Overview => {}
+        Tab::Usage => {
+            app.usage_detail_focus = StatusFocus::List;
+            app.usage_detail_scroll = 0;
+        }
         Tab::Tokens => {
             // Land on the dashboard; keep the model cursor reset for descend.
             app.token_view = TokenView::Dashboard;
+            app.model_detail_focus = StatusFocus::List;
+            app.model_detail_scroll = 0;
             app.token_model_cursor = 0;
         }
         Tab::Setup => {
@@ -3947,6 +4356,8 @@ pub(crate) fn step_usage_cursor(app: &mut App, delta: i32) {
     } else {
         app.usage_extra_cursor = Some(next - profiles);
     }
+    app.usage_detail_scroll = 0;
+    app.reload_selected_note();
 }
 
 /// How often the TUI re-reads the monitoring / upstream observations.
@@ -4025,29 +4436,19 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
         return;
     }
     app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
-}
-
-/// True, with a toast saying so, while the Overview's `Codex` filter hides the
-/// claude rows the cursor is bound to. Every key that reorders, steps or acts
-/// on the selection asks here first, so nothing acts on a row the screen does
-/// not show.
-fn claude_rows_hidden(app: &mut App) -> bool {
-    if app.harness_filter.shows_claude() {
-        return false;
-    }
-    app.toast(ToastKind::Info, "claude rows are hidden, press c");
-    true
+    // The note belongs to the selection: the row must never show the previous
+    // account's note under the newly selected header.
+    app.reload_selected_note();
 }
 
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
-    if app.harness_filter == HarnessFilter::Hermes && handle_hermes_rows_key(app, key) {
+    if app.harness_filter == HarnessFilter::Hermes {
+        handle_hermes_rows_key(app, key);
         return;
     }
     let extra = app.overview_selected_extra();
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Char('m')
-            if claude_rows_hidden(app) => {}
         KeyCode::Up | KeyCode::Down if shift && extra.is_some() => refuse_read_only(app),
         KeyCode::Char('m') if extra.is_some() => refuse_read_only(app),
         KeyCode::Char('m') => open_move_session(app),
@@ -4250,24 +4651,28 @@ fn handle_hermes_rows_key(app: &mut App, key: KeyEvent) -> bool {
 /// rows in display order ([`App::overview_extras`]), wrapping. With no extras
 /// this is the plain profile step, unchanged.
 fn step_overview_cursor(app: &mut App, delta: i32) {
-    let count = app.profile_count();
-    let order = app.overview_extras();
-    if order.is_empty() {
-        step_profile_cursor(app, delta, count);
+    let count = app.main_items().len();
+    let order = if app.harness_filter.shows_claude() {
+        app.overview_extras()
+    } else {
+        Vec::new()
+    };
+    let len = count + order.len();
+    if len == 0 {
         return;
     }
-    let len = count + order.len();
     let at = match app
         .overview_selected_extra()
         .and_then(|i| order.iter().position(|&o| o == i))
     {
         Some(pos) => count + pos,
-        None => app.profile_cursor.min(count.saturating_sub(1)),
+        None => app.overview_cursor.min(count.saturating_sub(1)),
     };
     let next = (at as i32 + delta).rem_euclid(len as i32) as usize;
     if next < count {
-        app.profile_cursor = next;
+        app.overview_cursor = next;
         app.usage_extra_cursor = None;
+        app.sync_overview_profile_selection();
     } else {
         app.usage_extra_cursor = Some(order[next - count]);
     }
@@ -4289,12 +4694,165 @@ fn refuse_read_only(app: &mut App) {
 /// Usage tab: up/down picks the account — the profiles, then the
 /// monitoring / upstream extras below them. Read-only pane.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
+    if app.usage_detail_focus == StatusFocus::Detail {
+        let max = app.usage_detail_max_scroll.get();
+        let viewport = app.usage_detail_viewport.get();
+        match key.code {
+            KeyCode::Up => {
+                app.usage_detail_scroll = app.usage_detail_scroll.min(max).saturating_sub(1)
+            }
+            KeyCode::Down => {
+                app.usage_detail_scroll =
+                    app.usage_detail_scroll.min(max).saturating_add(1).min(max)
+            }
+            KeyCode::PageUp => {
+                app.usage_detail_scroll = app
+                    .usage_detail_scroll
+                    .min(max)
+                    .saturating_sub(viewport.max(1))
+            }
+            KeyCode::PageDown => {
+                app.usage_detail_scroll = app
+                    .usage_detail_scroll
+                    .min(max)
+                    .saturating_add(viewport.max(1))
+                    .min(max)
+            }
+            KeyCode::Char('e') if app.usage_extra_cursor.is_none() => toggle_show_estimates(app),
+            KeyCode::Char('p') if app.usage_extra_cursor.is_none() => toggle_show_pace(app),
+            _ => {}
+        }
+        return;
+    }
+    let count = app.profile_count() + app.usage_extras.len();
     match key.code {
-        KeyCode::Up => step_usage_cursor(app, -1),
-        KeyCode::Down => step_usage_cursor(app, 1),
-        KeyCode::Char('e') => toggle_show_estimates(app),
-        KeyCode::Char('p') => toggle_show_pace(app),
+        KeyCode::Up => {
+            step_usage_cursor(app, -1);
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::Down => {
+            step_usage_cursor(app, 1);
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::Enter if count > 0 => {
+            app.usage_detail_focus = StatusFocus::Detail;
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::Char('e') if app.usage_extra_cursor.is_none() => toggle_show_estimates(app),
+        KeyCode::Char('p') if app.usage_extra_cursor.is_none() => toggle_show_pace(app),
         _ => {}
+    }
+}
+
+/// Open the note editor on the selected account, seeded from disk.
+fn open_note_editor(app: &mut App) {
+    if app.usage_extra_cursor.is_some() {
+        app.toast(ToastKind::Info, "notes belong to local accounts");
+        return;
+    }
+    let Some(name) = app.profile_name_at(app.profile_cursor) else {
+        return;
+    };
+    let text = match crate::profile_notes::load_note_for_edit(&name) {
+        Ok(text) => text.unwrap_or_default(),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("couldn't read the note: {e}"));
+            return;
+        }
+    };
+    app.note_editor = Some(NoteEditor {
+        profile: name,
+        buf: NoteBuffer::new(&text),
+    });
+}
+
+/// `⏎` in the note editor: persist the draft (an empty draft clears the note).
+/// A failed save keeps the editor open — the draft is the only copy.
+fn commit_note(app: &mut App) {
+    let Some(editor) = app.note_editor.take() else {
+        return;
+    };
+    let text = editor.buf.text();
+    match crate::profile_notes::save_note(&editor.profile, &text) {
+        Ok(()) => {
+            app.reload_selected_note();
+            app.toast(ToastKind::Success, "note saved");
+        }
+        Err(e) => {
+            app.note_editor = Some(editor);
+            app.toast(ToastKind::Danger, format!("couldn't save the note: {e}"));
+        }
+    }
+}
+
+/// The note editor's keymap: text edits, ⌃j newline, ⏎ save, esc cancel. Every
+/// printable is data (a note may contain `q`, `?`, `x`), so the owner claims
+/// all keys bar ctrl+c.
+fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
+    enum NoteKey {
+        Commit,
+        Cancel,
+        Char(char),
+        Newline,
+        Word,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+    }
+    let action = match key.code {
+        KeyCode::Enter => NoteKey::Commit,
+        KeyCode::Esc => NoteKey::Cancel,
+        KeyCode::Char('j')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            NoteKey::Newline
+        }
+        KeyCode::Char('w')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            NoteKey::Word
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Char(ch),
+        KeyCode::Backspace => NoteKey::Backspace,
+        KeyCode::Delete => NoteKey::Delete,
+        KeyCode::Left => NoteKey::Left,
+        KeyCode::Right => NoteKey::Right,
+        KeyCode::Up => NoteKey::Up,
+        KeyCode::Down => NoteKey::Down,
+        KeyCode::Home => NoteKey::Home,
+        KeyCode::End => NoteKey::End,
+        _ => return,
+    };
+    match action {
+        NoteKey::Commit => commit_note(app),
+        NoteKey::Cancel => app.note_editor = None,
+        _ => {
+            let Some(editor) = app.note_editor.as_mut() else {
+                return;
+            };
+            let buf = &mut editor.buf;
+            match action {
+                NoteKey::Char(ch) => buf.insert_char(ch),
+                NoteKey::Newline => buf.insert_newline(),
+                NoteKey::Word => buf.delete_word(),
+                NoteKey::Backspace => buf.backspace(),
+                NoteKey::Delete => buf.delete(),
+                NoteKey::Left => buf.left(),
+                NoteKey::Right => buf.right(),
+                NoteKey::Up => buf.up(),
+                NoteKey::Down => buf.down(),
+                NoteKey::Home => buf.home(),
+                NoteKey::End => buf.end(),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -4441,7 +4999,12 @@ fn apply_plugin_fix(app: &mut App) {
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: "add the keybinding and sidebar row to herdr's config?".to_string(),
                 detail: Some(
-                    "writes them into herdr's config.toml and validates the result with `herdr config check`.".to_string(),
+                    concat!(
+                        "writes them into herdr's config.toml and validates the result with ",
+                        cmd_lit!("herdr config check"),
+                        "."
+                    )
+                    .to_string(),
                 ),
                 choice: false,
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
@@ -4452,7 +5015,7 @@ fn apply_plugin_fix(app: &mut App) {
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: "install the tollgate plugin into claude code?".to_string(),
                 detail: Some(
-                    "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
+                    "runs claude's own plugin installer at user scope and turns the plugin on; your other plugins and settings are untouched."
                         .to_string(),
                 ),
                 choice: false,
@@ -4700,11 +5263,19 @@ fn open_herdr_row_text_confirm(app: &mut App) {
             "drop the delegate token from herdr's sidebar row?".to_string()
         },
         detail: Some(if turning_on {
-            "writes $tollgate_delegate into the row tollgate added in herdr's config.toml, validated by `herdr config check`; a hand-owned row is left alone with a note."
-                .to_string()
+            concat!(
+                "writes $tollgate_delegate into the row tollgate added in herdr's config.toml, validated by ",
+                cmd_lit!("herdr config check"),
+                "; a hand-owned row is left alone with a note."
+            )
+            .to_string()
         } else {
-            "rewrites the row tollgate added in herdr's config.toml without $tollgate_delegate, validated by `herdr config check`; a hand-owned row is left alone with a note."
-                .to_string()
+            concat!(
+                "rewrites the row tollgate added in herdr's config.toml without $tollgate_delegate, validated by ",
+                cmd_lit!("herdr config check"),
+                "; a hand-owned row is left alone with a note."
+            )
+            .to_string()
         }),
         choice: false,
         on_confirm: ConfirmAction::HerdrDelegateRowText(path),
@@ -4825,7 +5396,7 @@ pub(crate) fn herdr_check(
         warn = true;
         detail.push("plugin: not installed".to_string());
         detail.push(String::new());
-        detail.push("  tollgate herdr install".to_string());
+        detail.push(format!("  {}", prose::cmd("tollgate herdr install")));
     }
 
     let health = if danger {
@@ -4841,6 +5412,26 @@ pub(crate) fn herdr_check(
         health,
         detail,
         fix,
+    }
+}
+
+/// Marker shared with the plugin renderer for an outdated install.
+pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this tollgate is";
+
+/// Compare plugin manifest versions numerically; unknown versions prove no drift.
+fn plugin_version_older(installed: &str, current: &str) -> bool {
+    let parse = |version: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = version.trim_start_matches('v').split('.');
+        let parsed = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        parts.next().is_none().then_some(parsed)
+    };
+    match (parse(installed), parse(current)) {
+        (Some(installed), Some(current)) => installed < current,
+        _ => false,
     }
 }
 
@@ -4899,7 +5490,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         // Unprobed is not missing: the probe is `r`-gated, so before the first
         // `r` the row names the key that fills the line in instead of claiming
         // a binary is absent.
-        None => about_detail.push("claude: press r to probe".to_string()),
+        None => about_detail.push(format!("claude: press {} to probe", prose::key("r"))),
     }
     checks.push(Check {
         label: "about",
@@ -5019,9 +5610,19 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         .or_else(|| records.first());
     let plugin_check = if let Some(record) = record_for_check {
         let scope = record.scope.as_deref();
+        let this_version = env!("CARGO_PKG_VERSION");
+        let outdated = plugin_global
+            && record
+                .version
+                .as_deref()
+                .is_some_and(|installed| plugin_version_older(installed, this_version));
         let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
         if let Some(version) = &record.version {
-            detail.push(format!("version: {version}"));
+            detail.push(if outdated {
+                format!("version: {version} (outdated; {OUTDATED_PLUGIN_MARK} {this_version})")
+            } else {
+                format!("version: {version}")
+            });
         }
         if let Some(sha) = &record.git_commit_sha {
             detail.push(format!(
@@ -5041,7 +5642,16 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
-        if plugin_global {
+        if outdated {
+            detail.push(String::new());
+            detail.push("[f] update plugin (user scope)".to_string());
+            Check {
+                label: "plugin",
+                health: Health::Warn,
+                detail,
+                fix: Some(PluginFix::InstallPlugin),
+            }
+        } else if plugin_global {
             Check {
                 label: "plugin",
                 health: Health::Ok,
@@ -5361,6 +5971,7 @@ fn activate_main_item(app: &mut App) {
     };
     match item {
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
+        MainItemKind::Codex(_) => {}
     }
 }
 
@@ -5381,11 +5992,8 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         app.toast(ToastKind::Danger, format!("reorder failed\n{e}"));
         return;
     }
-    if delta < 0 && app.profile_cursor > 0 {
-        app.profile_cursor -= 1;
-    } else if delta > 0 {
-        app.profile_cursor += 1;
-    }
+    app.profile_cursor = new_idx;
+    app.overview_cursor = new_idx;
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
@@ -7530,7 +8138,9 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             // The codex filter hides the claude rows the cursor is bound to,
             // so nothing may act on the row under it; a read-only row has no
             // profile for the account group to act on either.
-            if app.harness_filter.shows_claude() && app.overview_selected_extra().is_none() {
+            if matches!(app.current_main_item(), Some(MainItemKind::Profile(_)))
+                && app.overview_selected_extra().is_none()
+            {
                 context = push_account_scope(app, &mut scoped);
             }
             actions.push(RefreshAll);
@@ -7539,8 +8149,10 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         Tab::Usage => {
             context = push_account_scope(app, &mut scoped);
             actions.push(RefreshAll);
-            actions.push(ToggleEstimates);
-            actions.push(TogglePace);
+            if app.usage_extra_cursor.is_none() {
+                actions.push(ToggleEstimates);
+                actions.push(TogglePace);
+            }
         }
         // Tokens: the period + model-filter lenses (minus the ones already
         // active) plus the page keys (`c` cache basis, `r` reload) for
@@ -7741,6 +8353,9 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 /// third-party leg fetches generic api-key endpoints too — `is_third_party`
 /// would refuse a litellm row the scheduler refreshes every cadence.
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
+    if app.tab == Tab::Usage && app.usage_extra_cursor.is_some() {
+        return None;
+    }
     let cfg = app.config();
     cfg.profiles.get(app.profile_cursor).map(|p| {
         (
@@ -7836,6 +8451,18 @@ const DAEMON_LOG_HINT: &str = "see ~/.tollgate/daemon.log";
 /// to reap the child, so a daemon this TUI started and stops never lingers as
 /// a zombie while the TUI runs.
 fn start_daemon(app: &mut App) {
+    match crate::daemon::singleton_held() {
+        Ok(false) => {}
+        Ok(true) => {
+            app.toast(ToastKind::Info, "daemon already running");
+            reprobe_daemon(app);
+            return;
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("daemon start failed\n{e:#}"));
+            return;
+        }
+    }
     let exe = match daemon_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -7887,8 +8514,8 @@ fn stop_daemon(app: &mut App) {
 /// How often the start worker re-checks its child.
 const DAEMON_CONTROL_POLL: Duration = Duration::from_millis(50);
 
-/// Toast each daemon start/stop outcome, re-arm the menu's verb, and re-probe
-/// the header chip at once rather than at the next throttled probe.
+/// Toast each daemon start/stop outcome, re-arm the menu's verb, and
+/// [`reprobe_daemon`].
 fn drain_daemon_control(app: &mut App) {
     use crate::daemon::{DaemonStop, StartOutcome};
     while let Ok(result) = app.daemon_control_rx.try_recv() {
@@ -7927,29 +8554,30 @@ fn drain_daemon_control(app: &mut App) {
                 app.toast(ToastKind::Danger, format!("daemon stop failed\n{e}"));
             }
         }
-        app.daemon_health = crate::daemon::daemon_health();
-        app.last_daemon_probe = Instant::now();
+        reprobe_daemon(app);
     }
+}
+
+/// Re-probe the daemon chip and menu verb immediately after a control action.
+fn reprobe_daemon(app: &mut App) {
+    app.daemon_health = crate::daemon::daemon_health();
+    app.last_daemon_probe = Instant::now();
 }
 
 /// Swap the Tokens model filter and re-clamp the Models cursor — the filtered
 /// list can be shorter than where the cursor sat.
 fn set_token_filter(app: &mut App, filter: TokenFilter) {
     app.token_filter = filter;
-    let len = token_model_count(app);
-    if app.token_model_cursor >= len {
-        app.token_model_cursor = len.saturating_sub(1);
-    }
+    app.model_detail_scroll = 0;
+    clamp_token_model_cursor(app);
 }
 
 /// Swap the Tokens period lens and re-clamp the Models cursor — the scoped
 /// list can be shorter than where the cursor sat.
 fn set_token_period(app: &mut App, period: TokenPeriod) {
     app.token_period = period;
-    let len = token_model_count(app);
-    if app.token_model_cursor >= len {
-        app.token_model_cursor = len.saturating_sub(1);
-    }
+    app.model_detail_scroll = 0;
+    clamp_token_model_cursor(app);
 }
 
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
@@ -8054,11 +8682,11 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     }
     rows.push(ConfigRow::Model);
 
-    // Alias overrides collapse: render the ones already set, tuck the rest behind
-    // a single `+ model override` reveal until ⏎ expands them (draft-scoped).
+    // Alias overrides collapse: render the ones set when the draft opened, tuck
+    // the rest behind a single `+ model override` reveal until ⏎ expands them.
     let expanded = draft.is_some_and(|d| d.overrides_expanded);
     let override_set = |row: ConfigRow| match draft {
-        Some(d) => d.field(row).is_some_and(|i| !i.value.trim().is_empty()),
+        Some(d) => d.overrides_shown.contains(&row),
         None => {
             let v = match row {
                 ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
@@ -8072,13 +8700,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         }
     };
     let mut any_collapsed = false;
-    for row in [
-        ConfigRow::OpusModel,
-        ConfigRow::SonnetModel,
-        ConfigRow::HaikuModel,
-        ConfigRow::FableModel,
-        ConfigRow::SubagentModel,
-    ] {
+    for row in OVERRIDE_ROWS {
         if expanded || override_set(row) {
             rows.push(row);
         } else {
@@ -8175,6 +8797,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
+        overrides_shown: Vec::new(),
         captured_login: None,
         preset_env: std::collections::BTreeMap::new(),
     }
@@ -8184,7 +8807,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     let cfg = app.config();
     let profile = cfg.find(name);
     let m = profile.map(|p| p.models.clone()).unwrap_or_default();
-    ConfigDraft {
+    let mut draft = ConfigDraft {
         editing_name: Some(name.to_string()),
         name: InputState::new(name),
         base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
@@ -8202,9 +8825,15 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
+        overrides_shown: Vec::new(),
         captured_login: None,
         preset_env: std::collections::BTreeMap::new(),
-    }
+    };
+    draft.overrides_shown = OVERRIDE_ROWS
+        .into_iter()
+        .filter(|&row| draft.field(row).is_some_and(|i| !i.value.trim().is_empty()))
+        .collect();
+    draft
 }
 
 /// Back out of the Setup detail pane, dropping the draft. A `+ new` draft
@@ -8356,7 +8985,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 app.toast(
                     ToastKind::Danger,
                     format!(
-                        "these credentials already belong to '{owner}'\nswitch to it with:  tollgate {owner}"
+                        "these credentials already belong to '{owner}'\nswitch to it with:  {}",
+                        prose::cmd(&format!("tollgate {owner}"))
                     ),
                 );
                 app.refresh_unsaved_live_login();
@@ -8660,6 +9290,9 @@ fn start_api_relogin(app: &mut App) {
         d.relogin_chain = true;
         d.active = Some(ConfigRow::BaseUrl);
     }
+    if let Some(pos) = config_row_index(app, ConfigRow::BaseUrl) {
+        app.config_action_cursor = pos;
+    }
 }
 
 /// Kick an OAuth login: mint it on this thread (no network), open the browser
@@ -8934,6 +9567,16 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
                 apply_input_edit(input, key);
             }
         }
+    }
+    // A keystroke, commit or revert can add or drop rows above the field (a
+    // typed base url flips the account's rows), and the cursor is an index.
+    let edited = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.active)
+        .unwrap_or(active);
+    if let Some(pos) = config_row_index(app, edited) {
+        app.config_action_cursor = pos;
     }
 }
 
@@ -9233,8 +9876,9 @@ fn cycle_model(app: &mut App) {
     }
 }
 
-/// Advance the `model` alias cycle: default → opus → sonnet → haiku → opusplan →
-/// default. A value outside [`MODEL_PRESETS`] (a custom id) collapses to default.
+/// Advance the `model` alias cycle: default → fable → opus → sonnet → haiku →
+/// opusplan → default. A value outside [`MODEL_PRESETS`] (a custom id)
+/// collapses to default.
 fn next_model_preset(current: Option<&str>) -> Option<String> {
     match current {
         None => Some(MODEL_PRESETS[0].to_string()),
@@ -9443,17 +10087,15 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
     let Some(idx) = idx else {
         return;
     };
-    if let Some(row_pos) = env_entry_row_index(app, idx) {
+    if let Some(row_pos) = config_row_index(app, ConfigRow::EnvEntry(idx)) {
         app.config_action_cursor = row_pos;
     }
     enter_env_value_edit(app, idx);
 }
 
-/// Position of `EnvEntry(sorted_idx)` in the current detail-row list, if present.
-fn env_entry_row_index(app: &App, sorted_idx: usize) -> Option<usize> {
-    config_rows(app)
-        .iter()
-        .position(|r| *r == ConfigRow::EnvEntry(sorted_idx))
+/// Position of `row` in the current detail-row list, if present.
+fn config_row_index(app: &App, row: ConfigRow) -> Option<usize> {
+    config_rows(app).iter().position(|r| *r == row)
 }
 
 /// Build the collision prompt for a candidate key against its colliding source.
@@ -9529,7 +10171,7 @@ fn run_env_collision_choice(
         EnvCollisionChoice::KeepExisting => {
             // For an own-field clash, jump to the existing entry; else just dismiss.
             if let Some(idx) = existing_idx
-                && let Some(row_pos) = env_entry_row_index(app, idx)
+                && let Some(row_pos) = config_row_index(app, ConfigRow::EnvEntry(idx))
             {
                 app.config_action_cursor = row_pos;
             }
@@ -10060,10 +10702,10 @@ fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
     let m = &profile.models;
     for (label, set) in [
         ("model", m.default.is_some()),
+        ("fable", m.fable.is_some()),
         ("opus", m.opus.is_some()),
         ("sonnet", m.sonnet.is_some()),
         ("haiku", m.haiku.is_some()),
-        ("fable", m.fable.is_some()),
         ("subagent", m.subagent.is_some()),
     ] {
         if set {
@@ -10115,7 +10757,11 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
             clear_profile_status_chrome(app, &target);
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
+                let selected = config_rows(app).get(app.config_action_cursor).copied();
                 app.config_draft = Some(build_draft_existing(app, &target));
+                if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
+                    app.config_action_cursor = pos;
+                }
             }
             app.toast(
                 ToastKind::Success,
@@ -11074,11 +11720,8 @@ fn drain_tokens_events(app: &mut App) {
                 app.tokens_topping_up = false;
                 app.tokens_progress = None;
                 app.token_stats = Some(*stats);
-                // Re-clamp the model cursor in case the grouped list shrank.
-                let len = token_model_count(app);
-                if len > 0 && app.token_model_cursor >= len {
-                    app.token_model_cursor = len - 1;
-                }
+                // Re-clamp after the loader replaces the grouped list.
+                clamp_token_model_cursor(app);
             }
             // Surface failure only when there is nothing to show — a transient
             // read error mid-session keeps the last good snapshot.
@@ -11329,11 +11972,21 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_op_results(app);
     drain_status_events(app);
     drain_tokens_events(app);
+    if app.tab == Tab::Tokens
+        && app.token_view == TokenView::Models
+        && app.token_period.bucket().is_some()
+    {
+        clamp_token_model_cursor(app);
+    }
     drain_pricing_events(app);
     drain_login_events(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
+        if app.profile_count() + app.usage_extras.len() == 0 {
+            app.usage_detail_focus = StatusFocus::List;
+            app.usage_detail_scroll = 0;
+        }
     }
     app.apply_usage();
 
@@ -11448,7 +12101,25 @@ fn poll_codex_rows(app: &mut App) {
         return;
     }
     app.last_codex_rows_refresh = Some(Instant::now());
+    let selected = app.current_main_item();
+    let selected_codex = match selected {
+        Some(MainItemKind::Codex(i)) => app.codex_rows.get(i).map(|row| row.name.clone()),
+        _ => None,
+    };
     app.codex_rows = codex_rows();
+    if let Some(name) = selected_codex
+        && let Some(i) = app.codex_rows.iter().position(|row| row.name == name)
+        && let Some(pos) = app
+            .main_items()
+            .iter()
+            .position(|item| *item == MainItemKind::Codex(i))
+    {
+        app.overview_cursor = pos;
+    }
+    app.clamp_overview_cursor();
+    if app.tab == Tab::Overview && selected != app.current_main_item() {
+        app.sync_overview_profile_selection();
+    }
     app.hermes_rows = hermes_rows();
     app.hermes_cursor = app
         .hermes_cursor
@@ -11483,7 +12154,13 @@ fn poll_live_sessions(app: &mut App) {
     }
     app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
-    app.live_sessions = tally;
+    app.set_live_sessions(tally);
+}
+
+/// The header chip's number: the fleet total, or `—` for a tally that could
+/// not read the registry or the bare-session markers.
+pub(crate) fn live_count_text(total: Option<usize>) -> String {
+    total.map_or_else(|| "—".to_owned(), |n| n.to_string())
 }
 
 /// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`

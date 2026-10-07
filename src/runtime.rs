@@ -908,7 +908,7 @@ pub(crate) fn register_bare_session() -> Result<File> {
 
 /// How many marker holders are running. `None` when the probe could not tell,
 /// exactly as [`live_sessions_at`] defines it; the caller picks the direction,
-/// and the one caller that exists picks zero (see
+/// and the fleet tally leaves an unreadable total unknown (see
 /// [`crate::live_sessions::LiveTally::collect`]).
 ///
 /// This is a `tollgate mcp` count STANDING IN for a bare `claude` count, and the

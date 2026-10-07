@@ -34,6 +34,7 @@ use super::panes::{
     name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
     wrap_words,
 };
+use super::prose::{cmd, key};
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
     soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
@@ -69,93 +70,101 @@ fn draw_chain_selector(
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
     let sel = app.chain_cursor.min(items.len().saturating_sub(1));
-    draw_selector_list(frame, area, "chain", focused, sel, |w| {
-        items
-            .iter()
-            .enumerate()
-            .map(|(row, item)| {
-                let selected = row == sel;
-                let line = match item {
-                    ChainItemKind::Member(i) => {
-                        let name = cfg
-                            .state
-                            .fallback_chain
-                            .get(*i)
-                            .cloned()
-                            .unwrap_or_default();
-                        // `#n` right-aligned in a fixed 3 cells, so `#1` and
-                        // `#10` start their names on the same column. The
-                        // trailing gap absorbs the `#`, keeping the rail the
-                        // same total width it had as a bare number — nothing
-                        // downstream shifts.
-                        let ord = format!("#{}", i + 1);
-                        let rail = if selected && focused {
-                            Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
-                        } else {
-                            Span::styled(format!("  {ord:>3} "), theme::faint())
-                        };
-                        // A member still sits in `fallback_chain` on disk while
-                        // disabled (only the walk skips it), so it renders as a
-                        // normal row with a dim name; the exclusion itself
-                        // arrives through `blocked_reason`'s `Disabled` arm like
-                        // any other block. It can never be `is_active`, so dim
-                        // always wins over `name_color`.
-                        let disabled = cfg.find(&name).is_some_and(|p| p.is_disabled());
-                        let ns = if disabled {
-                            bold_when(theme::dim(), selected && focused)
-                        } else {
-                            bold_when(name_color(cfg.is_active(&name)), selected && focused)
-                        };
-                        let reason = cfg.find(&name).and_then(|p| {
-                            blocked_reason(
-                                &cfg,
-                                p,
-                                kick_lifts.get(name.as_str()).copied(),
-                                key_rejected,
-                            )
-                        });
-                        let rail_w = rail.width();
-                        let mut spans = vec![rail];
-                        match &reason {
-                            // The 1-cell marker is right-aligned at the row's last
-                            // content column (the scrollbar owns the padding cell
-                            // beyond it, so they never collide), and the name is
-                            // clamped to whatever that leaves. Unclamped, a long
-                            // enough name pushed the marker past the pane and
-                            // ratatui dropped it, so a blocked account rendered
-                            // identically to a healthy one. Only a row that
-                            // actually carries a marker pays the clamp — the name
-                            // column's width therefore tracks blocked state.
-                            Some(reason) => {
-                                let name_w = (w as usize).saturating_sub(rail_w + 2);
-                                let (text, pad) = fixed_split(&name, name_w);
-                                spans.push(Span::styled(text, ns));
-                                spans.push(Span::raw(format!("{pad} ")));
-                                spans.push(reason_marker(reason));
+    draw_selector_list(
+        frame,
+        area,
+        "chain",
+        focused,
+        sel,
+        &app.chain_selector_offset,
+        |w| {
+            items
+                .iter()
+                .enumerate()
+                .map(|(row, item)| {
+                    let selected = row == sel;
+                    let line = match item {
+                        ChainItemKind::Member(i) => {
+                            let name = cfg
+                                .state
+                                .fallback_chain
+                                .get(*i)
+                                .cloned()
+                                .unwrap_or_default();
+                            // `#n` right-aligned in a fixed 3 cells, so `#1` and
+                            // `#10` start their names on the same column. The
+                            // trailing gap absorbs the `#`, keeping the rail the
+                            // same total width it had as a bare number — nothing
+                            // downstream shifts.
+                            let ord = format!("#{}", i + 1);
+                            let rail = if selected && focused {
+                                Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
+                            } else {
+                                Span::styled(format!("  {ord:>3} "), theme::faint())
+                            };
+                            // A member still sits in `fallback_chain` on disk while
+                            // disabled (only the walk skips it), so it renders as a
+                            // normal row with a dim name; the exclusion itself
+                            // arrives through `blocked_reason`'s `Disabled` arm like
+                            // any other block. It can never be `is_active`, so dim
+                            // always wins over `name_color`.
+                            let disabled = cfg.find(&name).is_some_and(|p| p.is_disabled());
+                            let ns = if disabled {
+                                bold_when(theme::dim(), selected && focused)
+                            } else {
+                                bold_when(name_color(cfg.is_active(&name)), selected && focused)
+                            };
+                            let reason = cfg.find(&name).and_then(|p| {
+                                blocked_reason(
+                                    &cfg,
+                                    p,
+                                    kick_lifts.get(name.as_str()).copied(),
+                                    key_rejected,
+                                )
+                            });
+                            let rail_w = rail.width();
+                            let mut spans = vec![rail];
+                            match &reason {
+                                // The 1-cell marker is right-aligned at the row's last
+                                // content column (the scrollbar owns the padding cell
+                                // beyond it, so they never collide), and the name is
+                                // clamped to whatever that leaves. Unclamped, a long
+                                // enough name pushed the marker past the pane and
+                                // ratatui dropped it, so a blocked account rendered
+                                // identically to a healthy one. Only a row that
+                                // actually carries a marker pays the clamp — the name
+                                // column's width therefore tracks blocked state.
+                                Some(reason) => {
+                                    let name_w = (w as usize).saturating_sub(rail_w + 2);
+                                    let (text, pad) = fixed_split(&name, name_w);
+                                    spans.push(Span::styled(text, ns));
+                                    spans.push(Span::raw(format!("{pad} ")));
+                                    spans.push(reason_marker(reason));
+                                }
+                                None => spans.push(Span::styled(name.to_string(), ns)),
                             }
-                            None => spans.push(Span::styled(name.to_string(), ns)),
+                            Line::from(spans)
                         }
-                        Line::from(spans)
-                    }
-                    ChainItemKind::Add => {
-                        let arrow = if selected && focused {
-                            Span::styled("❯ ", theme::accent().bold())
-                        } else {
-                            Span::raw("  ")
-                        };
-                        Line::from(vec![
-                            arrow,
-                            Span::styled(
-                                "    + add",
-                                bold_when(theme::accent(), selected && focused),
-                            ),
-                        ])
-                    }
-                };
-                select_line(line, selected, focused, w)
-            })
-            .collect()
-    });
+                        ChainItemKind::Add => {
+                            let arrow = if selected && focused {
+                                Span::styled("❯ ", theme::accent().bold())
+                            } else {
+                                Span::raw("  ")
+                            };
+                            Line::from(vec![
+                                arrow,
+                                Span::styled(
+                                    "    + add",
+                                    bold_when(theme::accent(), selected && focused),
+                                ),
+                            ])
+                        }
+                    };
+                    select_line(line, selected, focused, w)
+                })
+                .collect()
+        },
+    );
 }
 
 fn draw_chain_detail(
@@ -294,7 +303,13 @@ fn draw_chain_detail(
         Some(ChainItemKind::Add) => add_focus,
         Some(ChainItemKind::Member(_)) | None => (0, 0),
     };
-    let scroll = draw_scrolled_lines(frame, inner, lines, focus);
+    let scroll = draw_scrolled_lines(
+        frame,
+        inner,
+        lines,
+        focus,
+        Some(&app.fallback_detail_offset),
+    );
 
     // Position the native terminal cursor for whichever field is being typed,
     // matching the post-draw cursor path the other edit screens use. This is not
@@ -394,17 +409,17 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             (DIAG_BUDGET_SPENT.to_string(), theme::warning().bold(), None)
         }
         BlockedReason::FiveHour { pct, resets_in } => (
-            format!("5h {pct:.0}%"),
+            format!("5h {}", crate::format::format_pct(*pct)),
             theme::warning().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
         BlockedReason::ScopedSpent { label, pct } => (
-            format!("{label} {pct:.0}%"),
+            format!("{label} {}", crate::format::format_pct(*pct)),
             theme::warning().bold(),
             Some("other models ok".to_string()),
         ),
         BlockedReason::WeeklySoft { pct } => (
-            format!("weekly {pct:.0}%"),
+            format!("weekly {}", crate::format::format_pct(*pct)),
             theme::warning().bold(),
             Some("still serving".to_string()),
         ),
@@ -427,7 +442,9 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
-        BlockedReason::AuthBroken => format!("re-login with tollgate login {name}"),
+        BlockedReason::AuthBroken => {
+            format!("re-login with {}", cmd(&format!("tollgate login {name}")))
+        }
         BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
         BlockedReason::WeeklySpent { .. } => "weekly limit is spent".to_string(),
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
@@ -652,7 +669,10 @@ fn member_detail(
     // key and the figure leave, up to `GAUGE_W`, so on a narrow pane the bar
     // gives and the figure reads whole.
     let (figure, figure_style) = match pct {
-        Some(v) => (format!("  {v:.0}% used"), theme::util(v)),
+        Some(v) => (
+            format!("  {} used", crate::format::format_pct(v)),
+            theme::util(v),
+        ),
         None => ("  no data yet".to_string(), theme::faint()),
     };
     let gauge_w = width
@@ -672,7 +692,10 @@ fn member_detail(
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(DETAIL_KEY_W + DETAIL_KEY_GUTTER)),
             Span::styled(
-                format!("{:.0}% until rotate", (threshold - v).max(0.0)),
+                format!(
+                    "{} until rotate",
+                    crate::format::format_pct((threshold - v).max(0.0))
+                ),
                 theme::faint(),
             ),
         ]));
@@ -802,21 +825,27 @@ fn member_detail(
                 picking,
                 crate::fallback::day_claim_blocker(cfg, name, key_rejected),
             ) {
-                (Some(_), _) => {
-                    "← → walk · space toggles and saves · ↵ esc done · ↑ ↓ leave".to_string()
-                }
+                (Some(_), _) => format!(
+                    "{} walk · {} toggles and saves · {} done · {} leave",
+                    key("← →"),
+                    key("space"),
+                    key("↵ esc"),
+                    key("↑ ↓")
+                ),
                 (None, Some(reason)) => format!(
-                    "a day list here would claim nothing: {reason} · ↵ picks days one by one"
+                    "a day list here would claim nothing: {reason} · {} picks days one by one",
+                    key("↵")
                 ),
                 (None, None) if !shared.is_empty() => format!(
                     "another list also names {}: work returns to whichever account reads clear \
-                     first · ↵ picks days one by one",
-                    day_list_label(&shared)
+                     first · {} picks days one by one",
+                    day_list_label(&shared),
+                    key("↵")
                 ),
-                (None, None) => {
-                    "work returns to this account on the days set here · ↵ picks days one by one"
-                        .to_string()
-                }
+                (None, None) => format!(
+                    "work returns to this account on the days set here · {} picks days one by one",
+                    key("↵")
+                ),
             };
             lines.extend(help_tooltip_lines(&hint, width));
         }
@@ -1085,10 +1114,16 @@ fn detail_row(
                     spans.push(Span::styled(" %", pct_style));
                 }
                 None => {
-                    spans.push(Span::styled(format!("{threshold:.0}%"), theme::accent()));
+                    spans.push(Span::styled(
+                        crate::format::format_pct(threshold),
+                        theme::accent(),
+                    ));
                     if (threshold - DEFAULT_THRESHOLD).abs() > f64::EPSILON {
                         spans.push(Span::styled(
-                            format!("   default: {DEFAULT_THRESHOLD:.0}%"),
+                            format!(
+                                "   default: {}",
+                                crate::format::format_pct(DEFAULT_THRESHOLD)
+                            ),
                             theme::faint(),
                         ));
                     }
@@ -1136,18 +1171,18 @@ fn detail_row(
                         } else {
                             theme::accent()
                         };
-                        spans.push(Span::styled(format!("{v:.0}%"), value_style));
+                        spans.push(Span::styled(crate::format::format_pct(v), value_style));
                         // Mirrors `rotate at`: only remind of the default once the
                         // value actually differs from it (else it's noise).
                         if (v - weekly_default).abs() > f64::EPSILON {
-                            spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                            spans.push(default_reminder(crate::format::format_pct(weekly_default)));
                         }
                     }
                     // Unset follows the chain-wide line — show that value, but
                     // faint, so a member-set figure stays visually distinct.
                     None => {
                         spans.push(Span::styled(
-                            format!("{weekly_default:.0}%"),
+                            crate::format::format_pct(weekly_default),
                             theme::faint(),
                         ));
                     }
@@ -1325,6 +1360,7 @@ fn day_list_lines(
         custom
             .as_ref()
             .map(|(value, active)| (value.as_str(), *active)),
+        None,
         selected,
         width,
     )

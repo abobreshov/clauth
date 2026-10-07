@@ -32,10 +32,11 @@ use super::super::app::{
 use super::super::theme;
 use super::format::spinner_frame;
 use super::panes::{
-    cycle_option, draw_scrollbar, draw_scrolled_lines, empty_state, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
-    value_caret,
+    cycle_row_lines, draw_scrollbar, draw_scrolled_lines, empty_state, follow_scroll_offset,
+    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, section_box, value_caret,
 };
+use super::prose;
 use crate::format::truncate;
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
@@ -65,6 +66,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.plugin.row_count() == 0 {
+        app.plugin.selector_offset.set(0);
         let widget = if app.plugin.error.is_some() {
             empty_state("check failed", "r", "to retry")
         } else {
@@ -101,25 +103,18 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let viewport = inner.height as usize;
-    let start = window_start(cursor_line, viewport, rows.len());
+    let start = follow_scroll_offset(
+        rows.len(),
+        viewport,
+        (cursor_line, cursor_line + 1),
+        app.plugin.selector_offset.get(),
+    );
+    app.plugin.selector_offset.set(start);
     let shown = rows.len().saturating_sub(start).min(viewport.max(1));
     let window: Vec<Line<'static>> = rows.iter().skip(start).take(shown).cloned().collect();
 
     frame.render_widget(Paragraph::new(window).style(theme::base()), inner);
     draw_scrollbar(frame, inner, rows.len(), start, viewport);
-}
-
-/// Keep `focus` near the center of a `viewport`-tall window over `total` rows.
-fn window_start(focus: usize, viewport: usize, total: usize) -> usize {
-    if total <= viewport || viewport == 0 {
-        return 0;
-    }
-    let half = viewport / 2;
-    if focus < half {
-        0
-    } else {
-        focus.saturating_sub(half).min(total - viewport)
-    }
 }
 
 /// The display context for one selector row — label styling, value, alignment
@@ -296,7 +291,10 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .max()
         .unwrap_or(0)
         .min(18);
-    let lines: Vec<Line<'static>> = detail.iter().map(|line| detail_line(line, key_w)).collect();
+    let lines: Vec<Line<'static>> = detail
+        .iter()
+        .map(|line| detail_line(line, key_w, inner.width as usize))
+        .collect();
 
     // The herdr detail appends its options section and takes per-row focus;
     // every other detail keeps the scroll-only path below.
@@ -361,7 +359,14 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
         if selected {
             focus.0 = lines.len();
         }
-        let line = option_row(*row, &settings, selected, row_editing, inert);
+        let row_lines = option_row(
+            *row,
+            &settings,
+            selected,
+            row_editing,
+            inert,
+            inner.width as usize,
+        );
         match row_editing {
             Some(input) => {
                 // The edit row renders plain (no highlight) with the edit
@@ -371,15 +376,17 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
                     (2 + row.label().chars().count() + 2 + head_cols(input)) as u16,
                 );
                 caret = Some((cx, lines.len()));
-                lines.push(line);
+                lines.extend(row_lines);
                 lines.extend(tag_refresh_range_tooltip(input, inner.width as usize));
             }
             None => {
-                lines.push(if selected {
-                    highlight_row(line, inner.width as usize)
-                } else {
-                    line
-                });
+                for line in row_lines {
+                    lines.push(if selected {
+                        highlight_row(line, inner.width as usize)
+                    } else {
+                        line
+                    });
+                }
                 if selected && inert {
                     lines.extend(help_tooltip_lines(
                         herdr_row_text_tooltip(app),
@@ -393,7 +400,7 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
         }
     }
 
-    let offset = draw_scrolled_lines(frame, inner, lines, focus);
+    let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.plugin.form_offset));
     // A caret scrolled off the top has no cell to sit in; leaving the cursor
     // unset is better than parking it on an unrelated row.
     if let Some((cx, row)) = caret
@@ -418,7 +425,8 @@ fn option_row(
     selected: bool,
     editing: Option<&InputState>,
     inert: bool,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected && inert {
@@ -436,21 +444,14 @@ fn option_row(
     let mut spans = vec![arrow, Span::styled(format!("{}  ", row.label()), key_style)];
     match row {
         HerdrOption::PopupWidth => {
-            let width = settings.popup_width;
-            for (i, (label, active)) in [
-                ("fit", width == PopupWidth::Fit),
-                ("half", width == PopupWidth::Half),
-                ("split-right", width == PopupWidth::SplitRight),
-                ("split-top", width == PopupWidth::SplitTop),
-            ]
-            .iter()
-            .enumerate()
-            {
-                if i > 0 {
-                    spans.push(Span::raw("  "));
-                }
-                spans.push(cycle_option(label, *active, selected));
-            }
+            let popup = settings.popup_width;
+            let options = [
+                ("fit", popup == PopupWidth::Fit),
+                ("half", popup == PopupWidth::Half),
+                ("split-right", popup == PopupWidth::SplitRight),
+                ("split-top", popup == PopupWidth::SplitTop),
+            ];
+            return cycle_row_lines(spans, &options, None, None, selected, width);
         }
         HerdrOption::PaneTag => spans.push(toggle_value(settings.pane_tag, inert)),
         HerdrOption::TagRefresh => match editing {
@@ -473,7 +474,7 @@ fn option_row(
         HerdrOption::DelegateDot => spans.push(toggle_value(settings.delegate_dot, inert)),
         HerdrOption::DelegateRowText => spans.push(toggle_value(settings.delegate_row_text, inert)),
     }
-    Line::from(spans)
+    vec![Line::from(spans)]
 }
 
 /// A toggle row's value: the tier-dependent glyph, ACCENT when on, faint when
@@ -522,29 +523,34 @@ fn herdr_row_text_tooltip(app: &App) -> &'static str {
 /// tool list, copyable commands) dim, `key: value` source rows as a label key
 /// column + tone-colored value (colon dropped, gap-aligned to `key_w`), everything
 /// else body text.
-fn detail_line(text: &str, key_w: usize) -> Line<'static> {
+fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
     if text.is_empty() {
         return Line::from("");
     }
     if let Some(rest) = text.strip_prefix("[f]") {
         let label = rest.trim_start();
-        return Line::from(vec![
-            Span::styled("[f]", theme::accent().add_modifier(Modifier::BOLD)),
-            Span::raw(" "),
-            Span::styled(label.to_string(), theme::dim()),
-        ]);
+        return Line::from(prose::spans(
+            &format!("{} {label}", prose::key("[f]")),
+            theme::dim(),
+        ));
     }
     if text.starts_with("  ") {
-        return Line::from(Span::styled(text.to_string(), theme::dim()));
+        return Line::from(prose::fit(text, width, theme::dim()));
     }
     if let Some((key, value)) = text.split_once(": ") {
         let pad = key_w.saturating_sub(key.chars().count()) + 2;
-        return Line::from(vec![
-            Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label()),
-            Span::styled(value.to_string(), value_tone(key, value)),
-        ]);
+        let mut spans = vec![Span::styled(
+            format!("{key}{}", " ".repeat(pad)),
+            theme::label(),
+        )];
+        spans.extend(prose::fit(
+            value,
+            width.saturating_sub(key_w + 2),
+            value_tone(key, value),
+        ));
+        return Line::from(spans);
     }
-    Line::from(Span::styled(text.to_string(), theme::body()))
+    Line::from(prose::fit(text, width, theme::body()))
 }
 
 /// Tone the value of a `key: value` row by health-bearing (key, value-head) pairs.
@@ -571,6 +577,9 @@ fn value_tone(key: &str, value: &str) -> Style {
         ("key", "not") => theme::warning(),
         ("sidebar", "templated") => theme::success(),
         ("sidebar", "not") => theme::warning(),
+        ("version", _) if value.contains(super::super::app::OUTDATED_PLUGIN_MARK) => {
+            theme::warning()
+        }
         _ => theme::body(),
     }
 }

@@ -958,6 +958,14 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         body.contains("not logged in"),
         "the body takes the OAuth arm's empty message, got {body:?}"
     );
+    // Notes close the pane (cloudy's placement): after the usage blocks, never
+    // between header and body.
+    let at_notes = body.find("notes:").expect("notes row present");
+    let at_empty = body.find("not logged in").expect("empty message present");
+    assert!(
+        at_notes > at_empty,
+        "notes render below the usage blocks, got {body:?}"
+    );
 }
 
 /// The `account_tier` fallback is gated to OAuth profiles: an api-key profile
@@ -2192,7 +2200,7 @@ fn kick_hint_diverges_on_auto_start() {
 #[test]
 fn auth_broken_hint_names_the_profile() {
     assert_eq!(
-        diag_fix(UsageDiag::AuthBroken, "kerry"),
+        prose::plain(&diag_fix(UsageDiag::AuthBroken, "kerry")),
         "re-login with tollgate login kerry"
     );
 }
@@ -2997,5 +3005,158 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
         rows.iter()
             .any(|r| r.starts_with("│ looks wrong? report at")),
         "the wrapped head keeps the report invite: {rows:?}"
+    );
+}
+
+/// The `notes:` row: accent key + faint hint while the account has none; the
+/// full note wrapped to the value column, continuation lines aligned under it.
+#[test]
+fn the_notes_row_hints_when_empty_and_renders_the_full_note() {
+    // No note: the hint line, key in accent, hint in faint.
+    let lines = notes_lines(None, 60);
+    let all: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+        .collect();
+    assert!(all.contains("notes:"), "lowercase key copy, got {all:?}");
+    assert!(all.contains("press n to add notes"));
+    assert_eq!(lines[0].spans[0].style.fg, Some(theme::accent_color()));
+    assert_eq!(lines[0].spans[1].style.fg, Some(theme::text_faint_color()));
+
+    // A note renders IN FULL: every line, wrapped to the value column, with
+    // continuation lines padded to the value column.
+    let note = "first line\nsecond line that is quite long and keeps going well past the column";
+    let lines = notes_lines(Some(note), 40);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert_eq!(lines[0].spans[0].content, "notes:    ");
+    assert_eq!(lines[0].spans[1].content, "first line");
+    assert_eq!(lines[1].spans[0].content, " ".repeat(NOTES_VALUE_LEAD));
+    assert_eq!(lines[1].spans[1].content, "second line that is quite long");
+    // value column width = 40 - 10 = 30; the 74-char line wraps greedily to 3.
+    assert_eq!(lines.len(), 4, "full note, wrapped: {texts:?}");
+    assert_eq!(lines[0].spans[1].style.fg, Some(theme::text_color()));
+    assert_eq!(lines[1].spans[1].style.fg, Some(theme::text_color()));
+}
+
+/// The note slot renders the `✎` mark, the draft rows and the native caret on
+/// the draft row the caret sits in.
+#[test]
+fn the_note_slot_renders_the_draft_and_parks_the_caret_on_it() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let buf = NoteBuffer::new("ab\ncd");
+    let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let screen = rows.concat();
+    assert!(screen.contains("✎"), "the edit mark rides the title break");
+    assert!(screen.contains("ab"), "draft row one, got {screen:?}");
+    assert!(screen.contains("cd"), "draft row two");
+    let caret = term.get_cursor_position().unwrap();
+    assert_eq!(caret.x, 4, "border + padding + caret display col 2");
+    assert_eq!(caret.y, 2, "border + draft row one");
+}
+
+/// Past 8 draft rows (or a short slot) the draft scrolls cursor-first.
+#[test]
+fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let draft = (0..12)
+        .map(|i| format!("row{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buf = NoteBuffer::new(&draft);
+    let mut term = Terminal::new(TestBackend::new(30, 6)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let screen = rows.concat();
+    assert!(
+        screen.contains("row11"),
+        "the caret row stays visible, got {screen:?}"
+    );
+    let caret = term.get_cursor_position().unwrap();
+    assert_eq!(caret.y, 4, "the caret parks on the inner bottom row");
+}
+
+#[test]
+fn note_slot_horizontal_scroll_keeps_the_end_of_a_long_draft_visible() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let buf = NoteBuffer::new("abcdefghijklmnopqrstuvwxyz END");
+    let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    assert!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .concat()
+            .contains("END")
+    );
+    assert_eq!(term.get_cursor_position().unwrap().x, 17);
+}
+
+#[test]
+fn note_slot_horizontal_scroll_passes_the_u16_cell_limit() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let buf = NoteBuffer::new(&format!("{} END", "a".repeat(70_000)));
+    let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    assert!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .concat()
+            .contains("END"),
+        "the actual caret's text stays visible beyond column 65535"
+    );
+    assert_eq!(term.get_cursor_position().unwrap().x, 17);
+}
+
+#[test]
+fn note_slot_scrolls_large_wide_drafts_without_splitting_graphemes() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let draft = format!("{}e\u{301}👩‍💻 END", "界".repeat(35_000));
+    let buf = NoteBuffer::new(&draft);
+    let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    let screen = term.backend().buffer();
+    assert_eq!(screen[(10, 1)].symbol(), "e\u{301}");
+    assert_eq!(screen[(11, 1)].symbol(), "👩‍💻");
+    assert_eq!(screen[(14, 1)].symbol(), "E");
+    assert_eq!(screen[(16, 1)].symbol(), "D");
+    assert_eq!(term.get_cursor_position().unwrap().x, 17);
+}
+
+#[test]
+fn note_cell_slice_keeps_wide_boundaries_and_combining_clusters_aligned() {
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 1), " e\u{301}👩‍💻 END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 2), "e\u{301}👩‍💻 END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 3), "👩‍💻 END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 4), "  END");
+    assert_eq!(note_after_cells("界e\u{301}👩‍💻 END", 5), " END");
+    assert_eq!(note_after_cells("界", 10), "");
+    let large = format!("{}e\u{301}👩‍💻 END", "界".repeat(32_769));
+    assert_eq!(note_after_cells(&large, 65_537), " e\u{301}👩‍💻 END");
+}
+
+#[test]
+fn usage_detail_can_scroll_past_u16_rows_of_saved_notes() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&"notes".into());
+    let mut app = App::new(crate::profile::AppConfig {
+        state: Default::default(),
+        profiles: vec![profile],
+    });
+    app.note_text = Some(format!("{}last note row", "note row\n".repeat(66_000)));
+    app.usage_detail_scroll = 66_000;
+    let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+    term.draw(|f| draw_usage_detail(f, f.area(), &app)).unwrap();
+    app.usage_detail_scroll = app.usage_detail_max_scroll.get();
+    term.draw(|f| draw_usage_detail(f, f.area(), &app)).unwrap();
+    assert!(app.usage_detail_scroll > usize::from(u16::MAX));
+    assert!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .concat()
+            .contains("last note row")
     );
 }
