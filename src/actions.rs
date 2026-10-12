@@ -775,6 +775,10 @@ pub(crate) fn edit_profile_endpoint(
 ) -> Result<()> {
     with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
+        // A failed save must leave the in-memory profile matching disk: the
+        // next write would otherwise persist a change the error said did not
+        // happen.
+        let snapshot = profile.clone();
         let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
         profile.api_key = api_key;
@@ -786,20 +790,10 @@ pub(crate) fn edit_profile_endpoint(
             .base_url
             .as_deref()
             .and_then(crate::providers::Provider::from_base_url);
-        if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
+        let drop_cache =
+            provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key);
+        if drop_cache {
             profile.third_party_usage = None;
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
-            // a daemon boot/standby promotion, or the stood-down TUI's
-            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory mirror entry survives
-            // until the profile's next fetch (≤ one interval; until restart
-            // if the edit left it no fetch leg) — no cross-process clear
-            // exists.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            );
         }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
@@ -812,7 +806,25 @@ pub(crate) fn edit_profile_endpoint(
             profile.console = None;
         }
         profile.provider = provider;
-        save_profile_config(profile)?;
+        if let Err(e) = save_profile_config(profile) {
+            *profile = snapshot;
+            return Err(e);
+        }
+        if drop_cache {
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
+            // a daemon boot/standby promotion, or the stood-down TUI's
+            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
+            // the reseed; a LIVE process's in-memory mirror entry survives
+            // until the profile's next fetch (≤ one interval; until restart
+            // if the edit left it no fetch leg) — no cross-process clear
+            // exists. Only after the save lands: a failed save restores the
+            // in-memory profile, so it must leave the cache as it was too.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
+        }
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;

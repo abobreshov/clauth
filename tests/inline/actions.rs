@@ -5986,6 +5986,101 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     );
 }
 
+/// A failed endpoint save restores the in-memory profile to exactly its
+/// pre-call value: the save mutates the profile first, so without the restore
+/// the TUI's roster would hold the new endpoint/key while disk kept the old,
+/// and the next write would persist the change the error said did not happen.
+#[cfg(unix)]
+#[test]
+fn a_failed_endpoint_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let mut p = Profile::new(
+        "alice".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    p.third_party_usage = Some(crate::testutil::stats_with_bars(vec![
+        crate::testutil::bar("5h", 80.0),
+    ]));
+    crate::profile::save_profile(&p).expect("save the profile");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice"))
+        .expect("profile dir");
+    let mut config = inactive_config(p);
+    let before = config
+        .find(&crate::profile::ProfileName::from("alice"))
+        .expect("alice in the roster")
+        .clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("alice"),
+        Some("http://127.0.0.1:3001".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&crate::profile::ProfileName::from("alice"))
+        .expect("alice still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// A failed endpoint save leaves the third-party DISK cache as it was: the
+/// removal runs only after `save_profile_config` landed. `config.toml` is made a
+/// directory so the save fails while the profile dir stays writable — a
+/// read-only dir would also block the removal, hiding the ordering.
+#[test]
+fn a_failed_endpoint_save_keeps_the_third_party_cache() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new(
+        "alice".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["alice"]);
+    let name = crate::profile::ProfileName::from("alice");
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]),
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    assert!(cache.exists(), "the fixture wrote the cache file");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    std::fs::remove_file(&config_toml).expect("remove config.toml");
+    std::fs::create_dir_all(&config_toml).expect("replace config.toml with a directory");
+    let mut config = inactive_config(p);
+    let err = edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("http://127.0.0.1:3001".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect_err("the save must fail");
+    assert!(
+        cache.exists(),
+        "a failed save keeps the third-party cache file: {err:#}"
+    );
+}
+
 // ── codex login capture (`tollgate login <name> --codex`) ────────────────────
 
 fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&str>) {
