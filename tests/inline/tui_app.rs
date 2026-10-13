@@ -92,7 +92,7 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
@@ -108,7 +108,7 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
@@ -123,13 +123,151 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
     assert!(
         !crate::usage::is_idle(&app.activity, &name),
         "a pending switch outlives an unrelated rotation result"
+    );
+}
+
+/// Run a manual rotate of `name` whose token endpoint runs `change` before it
+/// answers, so the change lands between the refresh and its persist. The app
+/// shares the rotated config handle, so its token list shows what the drain
+/// rebuilt.
+fn rotate_across_a_login_change(
+    name: &'static str,
+    change: impl Fn() + Send + 'static,
+) -> (App, crate::testutil::HomeSandbox) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        change();
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut app = bare_app();
+    app.config = config;
+    app.refresh_tokens();
+
+    crate::oauth::rotate_one(
+        &app.config,
+        &crate::profile::ProfileName::from(name),
+        &app.refetch_queue,
+        &app.activity,
+        &app.op_sender,
+    );
+    super::drain_op_results(&mut app);
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the rotate spent the old login once"
+    );
+    (app, home)
+}
+
+fn token_pairs(app: &App) -> Vec<(String, String, Option<String>)> {
+    app.usage_tokens
+        .lock()
+        .expect("usage_tokens")
+        .iter()
+        .map(|t| {
+            (
+                t.name.to_string(),
+                t.access_token.clone(),
+                t.refresh_token.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A re-login landing while a manual rotate refreshes the old login is kept,
+/// and the toast says so: nothing failed, so it is neither the Danger
+/// "refresh failed" toast nor the "rotated token" one. The token list follows
+/// the kept login.
+#[test]
+fn a_relogin_during_a_manual_rotate_toasts_the_kept_login() {
+    let (app, _home) = rotate_across_a_login_change("rotate-relogin", || {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &crate::profile::ProfileName::from("rotate-relogin"),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at-relogin".to_string(),
+                        refresh_token: Some("rt-relogin".to_string()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login mid-refresh");
+    });
+
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            super::ToastKind::Info,
+            "'rotate-relogin' login changed during the refresh · kept the change"
+        )]
+    );
+    assert_eq!(
+        token_pairs(&app),
+        vec![(
+            "rotate-relogin".to_string(),
+            "at-relogin".to_string(),
+            Some("rt-relogin".to_string())
+        )],
+        "the token list follows the kept login"
+    );
+}
+
+/// A log out landing while a manual rotate refreshes reads the same way, and
+/// the token list drops the logged-out account.
+#[test]
+fn a_logout_during_a_manual_rotate_toasts_the_kept_change() {
+    let (app, _home) = rotate_across_a_login_change("rotate-logout", || {
+        let store =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("rotate-logout"))
+                .expect("profile dir")
+                .join("credentials.json");
+        std::fs::remove_file(store).expect("log out mid-refresh");
+    });
+
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            super::ToastKind::Info,
+            "'rotate-logout' login changed during the refresh · kept the change"
+        )]
+    );
+    assert_eq!(
+        token_pairs(&app),
+        Vec::new(),
+        "the logged-out account leaves the token list"
     );
 }
 
@@ -10040,6 +10178,70 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
             .iter()
             .any(|t| t.kind == ToastKind::Danger && t.body.contains("could not refresh 'flaky'")),
         "the refusal says retry, not re-login"
+    );
+}
+
+/// A re-login landing while the switch gate refreshes, into a login that is
+/// itself expiring: nothing failed, so the refusal is the login-change sentence
+/// alone, as a warning, under no "could not refresh" head.
+#[test]
+fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![stored_oauth_profile("moved", already_expired())]);
+
+    super::spawn_switch_gate(
+        &mut app,
+        crate::profile::ProfileName::from("moved".to_string()),
+        |_, _| {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::overwrite_captured_profile(
+                &mut cfg,
+                &crate::profile::ProfileName::from("moved"),
+                crate::actions::CaptureSnapshot {
+                    credentials: Some(crate::profile::ClaudeCredentials {
+                        claude_ai_oauth: Some(crate::profile::OAuthToken {
+                            access_token: "at-relogin".to_string(),
+                            refresh_token: Some("rt-relogin".to_string()),
+                            expires_at: Some(already_expired()),
+                            scopes: None,
+                            subscription_type: None,
+                            ..crate::profile::OAuthToken::default_extra()
+                        }),
+                    }),
+                    base_url: None,
+                    api_key: None,
+                    anchor: crate::actions::AnchorAction::Unproven,
+                },
+            )
+            .expect("install the re-login mid-refresh");
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+        },
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        !app.config()
+            .is_active(&crate::profile::ProfileName::from("moved")),
+        "the expiring re-login waits for a retry"
+    );
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            ToastKind::Warning,
+            "'moved' login changed during its refresh and the new login expires soon · retry in a moment"
+        )]
     );
 }
 

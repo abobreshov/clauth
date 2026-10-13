@@ -59,7 +59,7 @@ pub(crate) use fetch::{
 pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,
     NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
-    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
+    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, RotateDone,
     StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch,

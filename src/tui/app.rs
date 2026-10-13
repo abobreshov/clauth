@@ -12534,9 +12534,17 @@ fn drain_op_results(app: &mut App) {
         // its worker returned, so the OAuth leg may already belong to a refetch.
         crate::usage::end_rotation(&app.activity, &ProfileName::from(name.clone()));
         match outcome {
-            Ok(()) => {
+            Ok(crate::usage::RotateDone::Rotated) => {
                 needs_token_snapshot_rebuild = true;
                 app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+                app.set_tab_activity(Tab::Usage, ToastKind::Info);
+            }
+            Ok(crate::usage::RotateDone::LoginChanged) => {
+                needs_token_snapshot_rebuild = true;
+                app.toast(
+                    ToastKind::Info,
+                    format!("'{name}' login changed during the refresh · kept the change"),
+                );
                 app.set_tab_activity(Tab::Usage, ToastKind::Info);
             }
             Err(e) => {
@@ -12575,7 +12583,11 @@ fn drain_switch_gates(app: &mut App) {
                 crate::format::login_expired(&name).toast(),
             ),
             oauth::AuthGate::Transient(e) => app.toast(
-                ToastKind::Danger,
+                if e.is_login_change() {
+                    ToastKind::Warning
+                } else {
+                    ToastKind::Danger
+                },
                 crate::format::refresh_transient(&name, &e).toast(),
             ),
         }
