@@ -44,6 +44,7 @@ pub(crate) mod openrouter;
 mod zai;
 
 pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
+pub(crate) use deepseek::alias_serves as deepseek_alias_serves;
 
 /// Whether a `StatRow` label names the account's spendable balance, in either
 /// spelling a cache on disk can carry: the current [`DEEPSEEK_BALANCE_ROW_LABEL`],

@@ -1042,6 +1042,10 @@ pub(crate) struct ModelDayAcc {
 
 struct FileContrib {
     mtime: SystemTime,
+    /// The owner verdict at parse time: an owner re-stamp with the file's mtime
+    /// unchanged must invalidate the cached records, or the old mapped models
+    /// keep merging.
+    maps: bool,
     recs: Vec<LineRec>,
 }
 
@@ -1082,6 +1086,7 @@ fn refresh_topup_cache(
     cache.files.retain(|p, _| present.contains(p));
 
     let total = paths.len();
+    let mut ctx = MapCtx::new();
     for (done, path) in paths.into_iter().enumerate() {
         progress(done + 1, total);
         let mtime = match std::fs::metadata(&path)
@@ -1101,11 +1106,13 @@ fn refresh_topup_cache(
             cache.files.remove(&path);
             continue;
         }
+        let conv = conv_id_for(&path);
+        let maps = ctx.maps(conv.as_deref());
         match cache.files.get(&path) {
-            Some(fc) if fc.mtime == mtime => {} // unchanged — keep cached records
+            Some(fc) if fc.mtime == mtime && fc.maps == maps => {} // unchanged — keep cached records
             _ => {
-                let recs = parse_file(&path);
-                cache.files.insert(path, FileContrib { mtime, recs });
+                let recs = parse_file(&path, conv.as_deref(), &mut ctx);
+                cache.files.insert(path, FileContrib { mtime, maps, recs });
             }
         }
     }
@@ -1370,18 +1377,81 @@ pub(crate) fn is_placeholder_model(model: &str) -> bool {
     model.contains(['<', '>'])
 }
 
+/// The conversation id a transcript attributes under: the filename stem for a
+/// main transcript, and for a nested subagent file (`<conv>/subagents/…`) the
+/// conversation dir's name — the layout [`collect_jsonl`]'s deeper walk adds.
+fn conv_id_for(path: &Path) -> Option<String> {
+    let mut conv: Option<String> = None;
+    for component in path.components() {
+        if component.as_os_str() == "subagents" {
+            return conv;
+        }
+        conv = component.as_os_str().to_str().map(str::to_owned);
+    }
+    path.file_stem()?.to_str().map(str::to_owned)
+}
+
+/// Per-sweep context for the requested→served model map: one owner-store load
+/// and one provider memo per owner, so a sweep pays neither per file.
+pub(crate) struct MapCtx {
+    owners: crate::sessions::OwnerLookup,
+    deepseek_owner: HashMap<String, bool>,
+}
+
+impl MapCtx {
+    pub(crate) fn new() -> Self {
+        Self {
+            owners: crate::sessions::OwnerLookup::new(),
+            deepseek_owner: HashMap::new(),
+        }
+    }
+
+    /// Whether rows in a transcript this conversation owns map: only a
+    /// typed-deepseek owner maps, and the alias table then answers `None` for
+    /// everything that is not a requested `claude-*` id. `false` for an
+    /// unattributed conversation — absent and contested owners never map.
+    fn maps(&mut self, conv: Option<&str>) -> bool {
+        let Some(conv) = conv else {
+            return false;
+        };
+        let Some(owner) = self.owners.owner(conv) else {
+            return false;
+        };
+        *self.deepseek_owner.entry(owner.clone()).or_insert_with(|| {
+            crate::profile::load_profile(&owner.clone().into())
+                .map(|p| p.provider == Some(crate::providers::Provider::DeepSeek))
+                .unwrap_or(false)
+        })
+    }
+
+    /// One requested model id, rewritten through the deepseek alias when this
+    /// file's owner maps.
+    fn map_model(maps: bool, model: String) -> String {
+        if !maps {
+            return model;
+        }
+        match crate::providers::deepseek_alias_serves(&model) {
+            Some(served) => served.to_owned(),
+            None => model,
+        }
+    }
+}
+
 /// Parse one JSONL transcript into per-line contribution records, collapsing
 /// each turn's streaming deltas into its completed line (see
-/// [`collapse_streamed_turns`]) and classifying + correcting the per-model
-/// usage shapes (see [`apply_usage_shapes`]). The cutoff/today split happens
+/// [`collapse_streamed_turns`]), classifying + correcting the per-model usage
+/// shapes (see [`apply_usage_shapes`]) and rewriting requested `claude-*` ids
+/// to the model the deepseek alias served, on transcripts attributed to a
+/// typed-deepseek profile (see [`MapCtx`]). The cutoff/today split happens
 /// later in [`merge_topup`], so an advancing `last_computed_date` never forces
 /// a re-read. Silently skips parse errors.
-fn parse_file(path: &Path) -> Vec<LineRec> {
+fn parse_file(path: &Path, conv: Option<&str>, ctx: &mut MapCtx) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
     let reader = std::io::BufReader::new(file);
+    let maps = ctx.maps(conv);
     let mut out = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
@@ -1421,7 +1491,9 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
                 // Dedup by `message.id` (present on every usage line); fall back to
                 // a content-derived composite when absent so an id-less line still
                 // dedups instead of bypassing the guard (the old over-count bug,
-                // hit by usage lines that carry no `requestId`).
+                // hit by usage lines that carry no `requestId`). The composite keys
+                // on the RAW model: the same physical line copied into a fork
+                // under a differently-typed owner must still dedup to one.
                 let key = match msg.id.as_deref() {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => format!(
@@ -1432,6 +1504,7 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
                         u.cache_creation_input_tokens
                     ),
                 };
+                let model = MapCtx::map_model(maps, model);
                 (
                     true,
                     key,
@@ -1523,8 +1596,9 @@ fn collapse_streamed_turns(recs: Vec<LineRec>) -> Vec<LineRec> {
 /// response within the file, so each token-bearing line here is one distinct
 /// response and can be summed directly. Fail-soft: an unreadable file yields
 /// `[]`.
-pub(crate) fn file_hourly_model_tokens(path: &Path) -> Vec<HourlyDayModel> {
-    let recs = parse_file(path);
+pub(crate) fn file_hourly_model_tokens(path: &Path, ctx: &mut MapCtx) -> Vec<HourlyDayModel> {
+    let conv = conv_id_for(path);
+    let recs = parse_file(path, conv.as_deref(), ctx);
     let mut by_key: HashMap<(&str, &str), HourlyDayModel> = HashMap::new();
     for r in &recs {
         if !r.has_usage {
@@ -1601,6 +1675,7 @@ fn backfill_corpus(
     paths.sort_unstable();
 
     let total = paths.len();
+    let mut ctx = MapCtx::new();
     // Owned keys only: the dedup set spans the WHOLE pass (cross-file
     // first-seen wins, matching merge_topup) and must not borrow from
     // per-file records that drop immediately after their file. With 78% of
@@ -1618,7 +1693,8 @@ fn backfill_corpus(
         if mtime > cutoff {
             continue; // the live top-up owns this file
         }
-        for r in parse_file(&path) {
+        let conv = conv_id_for(&path);
+        for r in parse_file(&path, conv.as_deref(), &mut ctx) {
             if !r.has_usage || r.date.as_str() > recorded_through {
                 continue; // post-watermark lines belong to the top-up
             }

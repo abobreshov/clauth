@@ -27,6 +27,21 @@ pub(super) fn matches_base_url(url: &str) -> bool {
     url_matches_host(url, ORIGIN)
 }
 
+/// The alias's served model for a REQUESTED `claude-*` id, or `None` for any
+/// other id. `opus` binds to `deepseek-v4-pro`, every other `claude-*` id to
+/// `deepseek-v4-flash` (user-attested 2026-08-14). A served deepseek id passes
+/// through untouched, so a pre-flip transcript that already records it is a
+/// no-op by construction.
+pub(crate) fn alias_serves(requested: &str) -> Option<&'static str> {
+    if requested.starts_with("claude-opus") {
+        Some("deepseek-v4-pro")
+    } else if requested.starts_with("claude-") {
+        Some("deepseek-v4-flash")
+    } else {
+        None
+    }
+}
+
 pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
     let text = super::get_json(BALANCE_URL, api_key)?;
     let raw: DeepSeekResponse = serde_json::from_str(&text).map_err(|_| ThirdPartyError::Parse)?;
