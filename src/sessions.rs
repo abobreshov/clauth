@@ -929,12 +929,8 @@ fn isolated_holds(depth: usize) -> Vec<IsolatedHold> {
 /// unpriced. The priced/unpriced boundary is read from the rate table directly,
 /// not from `usd > 0`, so a priced but genuinely zero-cost session is
 /// `Some(0.0)` — distinct from an unpriced `None`.
-pub(crate) fn annotate(
-    info: &mut SessionInfo,
-    price: Option<&PriceTable>,
-    ctx: &mut crate::tokens::MapCtx,
-) {
-    let days = crate::tokens::file_hourly_model_tokens(&info.path, ctx);
+pub(crate) fn annotate(info: &mut SessionInfo, price: Option<&PriceTable>) {
+    let days = crate::tokens::file_hourly_model_tokens(&info.path);
     // >= 1 token-bearing row ⇒ a real total (possibly 0); no rows ⇒ blank.
     info.tokens = (!days.is_empty()).then(|| {
         days.iter()
@@ -962,13 +958,11 @@ pub(crate) fn annotate(
 }
 
 /// Annotate every session across all groups (the CLI's eager pass; the TUI may
-/// instead call [`annotate`] lazily per visible row). One shared [`MapCtx`]
-/// amortizes the owner-store load across the pass.
+/// instead call [`annotate`] lazily per visible row).
 pub(crate) fn annotate_all(groups: &mut [WorkspaceGroup], price: Option<&PriceTable>) {
-    let mut ctx = crate::tokens::MapCtx::new();
     for group in groups.iter_mut() {
         for session in group.sessions.iter_mut() {
-            annotate(session, price, &mut ctx);
+            annotate(session, price);
         }
     }
 }
@@ -1312,42 +1306,6 @@ fn owner_in(store: &SessionProfiles, session_id: &str) -> Option<String> {
 pub(crate) fn owner_of(session_id: &str) -> Option<String> {
     crate::hook_note::resolved_account(session_id)
         .or_else(|| owner_in(&load_store(&store_path()?), session_id))
-}
-
-/// A per-sweep owner resolver: the owner store loaded once (on first use) plus
-/// a memo of the live per-conversation record reads, so a transcript sweep
-/// pays one store load rather than one per file, and a caller that never asks
-/// resolves no home at all. Same precedence as [`owner_of`]: the exact
-/// per-conversation record wins, the store answers the ids it never saw.
-pub(crate) struct OwnerLookup {
-    store: Option<SessionProfiles>,
-    records: HashMap<String, Option<String>>,
-}
-
-impl OwnerLookup {
-    pub(crate) fn new() -> Self {
-        Self {
-            store: None,
-            records: HashMap::new(),
-        }
-    }
-
-    /// The profile one conversation last ran under, or `None` when unknown —
-    /// absent and `Contested` both read back as "unknown".
-    pub(crate) fn owner(&mut self, id: &str) -> Option<String> {
-        let record = self
-            .records
-            .entry(id.to_owned())
-            .or_insert_with(|| crate::hook_note::resolved_account(id))
-            .clone();
-        if record.is_some() {
-            return record;
-        }
-        let store = self
-            .store
-            .get_or_insert_with(|| store_path().map(|p| load_store(&p)).unwrap_or_default());
-        owner_in(store, id)
-    }
 }
 
 /// Annotate each session's `last_ran_profile`. The exact per-conversation

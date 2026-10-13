@@ -169,7 +169,7 @@ fn transcript_usage_without_a_model_keeps_unknown_bucket() {
         r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#,
     )
     .expect("write transcript");
-    let records = parse_file(&path, None, &mut MapCtx::new());
+    let records = parse_file(&path);
     assert_eq!(records.len(), 1);
     assert!(records[0].has_usage);
     assert_eq!(records[0].model, "unknown");
@@ -743,7 +743,7 @@ fn top_up_counts_nested_subagent_transcripts() {
     assert_eq!(opus.output, 250); // 50 + 200
 }
 
-// ── 7. session attribution + deepseek alias mapping ───────────────────────────
+// ── 7. deepseek served-model mapping ──────────────────────────────────────────
 
 fn write_owner_store(home: &std::path::Path, json: &str) {
     let dir = home.join(".clauth");
@@ -757,10 +757,11 @@ fn save_base_url_profile(name: &str, base_url: &str) {
     crate::profile::save_profile(&profile).expect("save profile");
 }
 
-#[test]
-fn deepseek_owned_post_flip_file_maps_requested_opus_to_v4_pro() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
+/// A stats-cache, a deepseek-owned conversation `sess` and its transcript
+/// holding `lines`: the attribution the map must ignore, set up so a mapping
+/// keyed on the owner would fire.
+fn deepseek_owned_transcript(sb: &HomeSandbox, lines: &[String]) -> PathBuf {
+    let claude_dir = make_claude_dir(sb);
     write_stats_cache(
         &claude_dir,
         r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
@@ -769,296 +770,188 @@ fn deepseek_owned_post_flip_file_maps_requested_opus_to_v4_pro() {
     save_base_url_profile("D1", "https://api.deepseek.com");
     let proj_dir = claude_dir.join("projects").join("p1");
     std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    // 2.1.296 shape: message.model holds the REQUESTED wire id.
+    std::fs::write(proj_dir.join("sess.jsonl"), lines.join("\n")).expect("write transcript");
+    claude_dir
+}
+
+fn model_splits(stats: &TokenStats) -> Vec<(&str, u64, u64)> {
+    let mut rows: Vec<_> = stats
+        .models
+        .iter()
+        .map(|m| (m.model.as_str(), m.input, m.output))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+#[test]
+fn a_uuid_message_id_maps_requested_claude_ids_to_the_served_deepseek_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    // A contested conversation and one an anthropic profile owns: the ids
+    // alone decide, whatever the owner.
+    write_owner_store(
+        sb.home(),
+        r#"{"sessions":{"sess":"contested","sess2":{"known":"cld"}}}"#,
+    );
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    std::fs::write(
+        proj_dir.join("sess2.jsonl"),
+        jsonl_line_with_ids(
+            "2026-06-11T10:03:00+00:00",
+            "r4",
+            "3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "claude-opus-5-5",
+            5,
+            2,
+        ),
+    )
+    .expect("write transcript");
     std::fs::write(
         proj_dir.join("sess.jsonl"),
         [
-            jsonl_line(
+            jsonl_line_with_ids(
                 "2026-06-11T10:00:00+00:00",
+                "r1",
+                "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
                 "claude-opus-5-5",
                 100,
                 50,
-                10,
-                0,
             ),
-            // A requested NON-opus claude id exercises the alias's flash arm.
-            jsonl_line(
+            jsonl_line_with_ids(
                 "2026-06-11T10:01:00+00:00",
+                "r2",
+                "1a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
                 "claude-sonnet-5-5",
                 40,
                 20,
-                0,
-                0,
             ),
-            // A served deepseek id passes the alias untouched.
-            jsonl_line(
+            // A served deepseek id passes untouched.
+            jsonl_line_with_ids(
                 "2026-06-11T10:02:00+00:00",
+                "r3",
+                "2a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
                 "deepseek-v4-flash",
                 30,
                 10,
-                0,
-                0,
             ),
         ]
         .join("\n"),
     )
     .expect("write transcript");
     let stats = load(&claude_dir).expect("load stats");
-    let mut models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    models.sort_unstable();
-    assert_eq!(models, vec!["deepseek-v4-flash", "deepseek-v4-pro"]);
-    let pro = stats
-        .models
-        .iter()
-        .find(|m| m.model == "deepseek-v4-pro")
-        .expect("v4-pro");
-    assert_eq!((pro.input, pro.output, pro.cache_read), (100, 50, 10));
-    // Sonnet maps onto the flash bucket; the served flash row joins it.
-    let flash = stats
-        .models
-        .iter()
-        .find(|m| m.model == "deepseek-v4-flash")
-        .expect("v4-flash");
-    assert_eq!((flash.input, flash.output, flash.cache_read), (70, 30, 0));
-}
-
-#[test]
-fn deepseek_owned_pre_flip_served_ids_stay() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
-    );
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"D1"}}}"#);
-    save_base_url_profile("D1", "https://api.deepseek.com");
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    // 2.1.294/2.1.295 shape: message.model holds the SERVED deepseek id.
-    std::fs::write(
-        proj_dir.join("sess.jsonl"),
-        jsonl_line(
-            "2026-06-11T10:00:00+00:00",
-            "deepseek-v4-pro",
-            100,
-            50,
-            10,
-            0,
-        ),
-    )
-    .expect("write transcript");
-    let stats = load(&claude_dir).expect("load stats");
-    let models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    assert_eq!(models, vec!["deepseek-v4-pro"]);
-}
-
-#[test]
-fn anthropic_owned_requested_claude_ids_stay() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
-    );
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"cld"}}}"#);
-    // cld has no config.toml: an OAuth profile, provider None — never mapped.
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    std::fs::write(
-        proj_dir.join("sess.jsonl"),
-        jsonl_line(
-            "2026-06-11T10:00:00+00:00",
-            "claude-opus-5-5",
-            100,
-            50,
-            10,
-            0,
-        ),
-    )
-    .expect("write transcript");
-    let stats = load(&claude_dir).expect("load stats");
-    let models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    assert_eq!(models, vec!["claude-opus-5-5"]);
-}
-
-#[test]
-fn contested_file_stays_raw() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
-    );
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":"contested"}}"#);
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    std::fs::write(
-        proj_dir.join("sess.jsonl"),
-        jsonl_line(
-            "2026-06-11T10:00:00+00:00",
-            "claude-opus-5-5",
-            100,
-            50,
-            10,
-            0,
-        ),
-    )
-    .expect("write transcript");
-    let stats = load(&claude_dir).expect("load stats");
-    let models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    assert_eq!(models, vec!["claude-opus-5-5"]);
-}
-
-#[test]
-fn glm_owned_requested_claude_ids_stay() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
-    );
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"glm1"}}}"#);
-    save_base_url_profile("glm1", "https://api.z.ai");
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    std::fs::write(
-        proj_dir.join("sess.jsonl"),
-        [
-            jsonl_line("2026-06-11T10:00:00+00:00", "glm-5.3-flash", 100, 50, 10, 0),
-            jsonl_line("2026-06-11T10:01:00+00:00", "claude-opus-5-5", 30, 10, 0, 0),
+    assert_eq!(
+        model_splits(&stats),
+        vec![
+            ("deepseek-flash", 40, 20),
+            ("deepseek-v4-flash", 30, 10),
+            ("deepseek-v4-pro", 105, 52)
         ]
-        .join("\n"),
-    )
-    .expect("write transcript");
-    let stats = load(&claude_dir).expect("load stats");
-    let mut models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    models.sort_unstable();
-    assert_eq!(models, vec!["claude-opus-5-5", "glm-5.3-flash"]);
+    );
 }
 
 #[test]
-fn unowned_file_stays_raw() {
+fn an_anthropic_message_id_keeps_its_claude_id_in_a_deepseek_owned_conversation() {
     let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    let claude_dir = deepseek_owned_transcript(
+        &sb,
+        &[
+            jsonl_line_with_ids(
+                "2026-06-11T10:00:00+00:00",
+                "r1",
+                "msg_01AbCdEfGhIjKlMnOpQrStUv",
+                "claude-opus-5-5",
+                100,
+                50,
+            ),
+            jsonl_line_with_ids(
+                "2026-06-11T10:01:00+00:00",
+                "r2",
+                "3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                7,
+                3,
+            ),
+        ],
     );
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    std::fs::write(
-        proj_dir.join("sess.jsonl"),
-        jsonl_line(
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(
+        model_splits(&stats),
+        vec![("claude-opus-5-5", 100, 50), ("deepseek-v4-pro", 7, 3)]
+    );
+}
+
+#[test]
+fn an_id_less_line_never_maps() {
+    let sb = HomeSandbox::new();
+    let claude_dir = deepseek_owned_transcript(
+        &sb,
+        &[jsonl_line(
             "2026-06-11T10:00:00+00:00",
             "claude-opus-5-5",
             100,
             50,
             10,
             0,
-        ),
-    )
-    .expect("write transcript");
-    let stats = load(&claude_dir).expect("load stats");
-    let models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    assert_eq!(models, vec!["claude-opus-5-5"]);
-}
-
-#[test]
-fn nested_subagent_file_attributes_via_parent_conversation() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+        )],
     );
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"D1"}}}"#);
-    save_base_url_profile("D1", "https://api.deepseek.com");
-    let sub_dir = claude_dir
-        .join("projects")
-        .join("p1")
-        .join("sess")
-        .join("subagents");
-    std::fs::create_dir_all(&sub_dir).expect("create subagents dir");
-    std::fs::write(
-        sub_dir.join("agent-x.jsonl"),
-        jsonl_line(
-            "2026-06-11T10:05:00+00:00",
-            "claude-opus-5-5",
-            300,
-            200,
-            0,
-            0,
-        ),
-    )
-    .expect("write subagent");
     let stats = load(&claude_dir).expect("load stats");
-    let models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    assert_eq!(models, vec!["deepseek-v4-pro"]);
+    assert_eq!(model_splits(&stats), vec![("claude-opus-5-5", 100, 50)]);
 }
 
 #[test]
-fn hook_record_outranks_the_owner_store_for_mapping() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_stats_cache(
-        &claude_dir,
-        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
-    );
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"D1"}}}"#);
-    save_base_url_profile("D1", "https://api.deepseek.com");
-    // The exact per-conversation record wins over the owner store: the record
-    // names cld (anthropic), so the row must stay raw despite the D1 stamp.
-    let rec_dir = sb.home().join(".clauth").join("conversations");
-    std::fs::create_dir_all(&rec_dir).expect("create conversations dir");
-    std::fs::write(rec_dir.join("sess.json"), r#"{"resolved":"cld"}"#).expect("write record");
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    std::fs::write(
-        proj_dir.join("sess.jsonl"),
-        jsonl_line(
-            "2026-06-11T10:00:00+00:00",
-            "claude-opus-5-5",
-            100,
-            50,
-            10,
-            0,
+fn only_a_lowercase_hyphenated_uuid_reads_as_a_deepseek_message_id() {
+    let cases = [
+        (
+            "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            Some("deepseek-v4-pro"),
         ),
-    )
-    .expect("write transcript");
-    let stats = load(&claude_dir).expect("load stats");
-    let models: Vec<_> = stats.models.iter().map(|m| m.model.as_str()).collect();
-    assert_eq!(models, vec!["claude-opus-5-5"]);
+        ("0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D", None),
+        ("0a1b2c3d4e5f4a6b8c7d9e0f1a2b3c4d", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4de", None),
+        ("0a1b2c3d4-e5f-4a6b-8c7d-9e0f1a2b3c4d", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4g", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c-d", None),
+        ("msg_01AbCdEfGhIjKlMnOpQrStUv", None),
+        ("msg_20261009abcdef0123456789abcd", None),
+        ("", None),
+    ];
+    for (id, want) in cases {
+        assert_eq!(
+            crate::providers::deepseek_served_model("claude-opus-5-5", id),
+            want,
+            "{id:?}"
+        );
+    }
 }
 
 #[test]
-fn owner_restamp_invalidates_the_cached_mapping() {
-    let sb = HomeSandbox::new();
-    let claude_dir = make_claude_dir(&sb);
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"D1"}}}"#);
-    save_base_url_profile("D1", "https://api.deepseek.com");
-    let proj_dir = claude_dir.join("projects").join("p1");
-    std::fs::create_dir_all(&proj_dir).expect("create project dir");
-    let path = proj_dir.join("sess.jsonl");
-    std::fs::write(
-        &path,
-        jsonl_line(
-            "2026-06-11T10:00:00+00:00",
-            "claude-opus-5-5",
-            100,
-            50,
-            10,
-            0,
-        ),
-    )
-    .expect("write transcript");
-    let mut cache = TopUpCache::default();
-    refresh_topup_cache(&claude_dir, Some("2026-06-10"), &mut cache, |_, _| {});
-    assert_eq!(cache.files[&path].recs[0].model, "deepseek-v4-pro");
-    // Re-stamp the conversation to an anthropic profile without touching the
-    // transcript: the cached mapping must not survive the owner change.
-    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"cld"}}}"#);
-    refresh_topup_cache(&claude_dir, Some("2026-06-10"), &mut cache, |_, _| {});
-    assert_eq!(cache.files[&path].recs[0].model, "claude-opus-5-5");
+fn a_deepseek_message_id_maps_only_requested_claude_ids() {
+    let id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    let cases = [
+        ("claude-opus-5-5", Some("deepseek-v4-pro")),
+        ("claude-opus-5", Some("deepseek-v4-pro")),
+        ("claude-sonnet-5-5", Some("deepseek-flash")),
+        ("claude-haiku-5-5", Some("deepseek-flash")),
+        ("claude-foo-1", Some("deepseek-flash")),
+        ("deepseek-v4-pro", None),
+        ("deepseek-flash", None),
+        ("<synthetic>", None),
+        ("glm-5.3-flash", None),
+    ];
+    for (requested, want) in cases {
+        assert_eq!(
+            crate::providers::deepseek_served_model(requested, id),
+            want,
+            "{requested:?}"
+        );
+    }
 }
 
 #[test]
@@ -1976,7 +1869,7 @@ fn file_hourly_model_tokens_splits_by_model_and_day() {
     std::fs::write(&p, lines.join("\n")).expect("write");
     set_mtime(&p, SystemTime::now());
 
-    let rows = file_hourly_model_tokens(&p, &mut MapCtx::new());
+    let rows = file_hourly_model_tokens(&p);
     assert_eq!(rows.len(), 3, "one row per (model, day) pair");
     let opus_11 = rows
         .iter()
@@ -2554,7 +2447,7 @@ fn shape_fixture(name: &str) -> std::path::PathBuf {
 }
 
 fn fixture_totals(path: &std::path::Path) -> (u64, u64, u64, u64, UsageShape, usize) {
-    let recs = super::parse_file(path, None, &mut MapCtx::new());
+    let recs = super::parse_file(path);
     let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
     assert_eq!(usage.len(), 12, "fixture holds 12 usage rows");
     let input: u64 = usage.iter().map(|r| r.input).sum();
@@ -2667,7 +2560,7 @@ fn ladder_pins_whole_prompt_vs_anthropic() {
     }
     let p_below = proj.join("below.jsonl");
     std::fs::write(&p_below, below).expect("write");
-    let recs = super::parse_file(&p_below, None, &mut MapCtx::new());
+    let recs = super::parse_file(&p_below);
     assert_eq!(
         recs.iter()
             .filter(|r| r.has_usage)
@@ -2694,7 +2587,7 @@ fn ladder_pins_whole_prompt_vs_anthropic() {
     }
     let p_above = proj.join("above.jsonl");
     std::fs::write(&p_above, above).expect("write");
-    let recs = super::parse_file(&p_above, None, &mut MapCtx::new());
+    let recs = super::parse_file(&p_above);
     assert_eq!(
         recs.iter()
             .filter(|r| r.has_usage)
@@ -2716,7 +2609,7 @@ fn c_fixture_low_ratio_rows_below_cache_read_stay_anthropic() {
     let path = shape_fixture("tokens-shape-c.jsonl");
     let (raw_in, _, raw_cr, raw_cc) = raw_sums(&path);
     assert!(raw_cr < 2 * raw_in, "fixture sits in the old subtract zone");
-    let recs = super::parse_file(&path, None, &mut MapCtx::new());
+    let recs = super::parse_file(&path);
     let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
     assert!(
         usage.iter().any(|r| r.input < r.cache_read),
@@ -2778,7 +2671,7 @@ fn d_inline_tails_above_cache_chain_accumulates() {
     }
     let p = proj.join("d.jsonl");
     std::fs::write(&p, s).expect("write");
-    let recs = super::parse_file(&p, None, &mut MapCtx::new());
+    let recs = super::parse_file(&p);
     let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
     assert_eq!(usage.len(), 12);
     let raw_in: u64 = usage.iter().map(|r| r.input).sum();
@@ -2859,7 +2752,7 @@ fn dip_fraction_boundary_is_inclusive_half() {
         }
         let p = proj.join(format!("{name}.jsonl"));
         std::fs::write(&p, s).expect("write");
-        let recs = super::parse_file(&p, None, &mut MapCtx::new());
+        let recs = super::parse_file(&p);
         assert_eq!(
             recs.iter()
                 .filter(|r| r.has_usage)
@@ -2907,7 +2800,7 @@ fn fully_cached_signature_decides_below_row_floor() {
     }
     let p = proj.join("eq.jsonl");
     std::fs::write(&p, s).expect("write");
-    let recs = super::parse_file(&p, None, &mut MapCtx::new());
+    let recs = super::parse_file(&p);
     let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
     assert_eq!(usage.len(), 4);
     assert!(
@@ -2970,7 +2863,7 @@ fn collapse_keeps_first_occurrence_order() {
     s.push('\n');
     let p = proj.join("order.jsonl");
     std::fs::write(&p, s).expect("write");
-    let recs = super::parse_file(&p, None, &mut MapCtx::new());
+    let recs = super::parse_file(&p);
     let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
     assert_eq!(usage.len(), 3);
     assert_eq!(
@@ -3061,7 +2954,7 @@ fn thin_evidence_classifies_healthy() {
     }
     let p = proj.join("thin.jsonl");
     std::fs::write(&p, s).expect("write");
-    let recs = super::parse_file(&p, None, &mut MapCtx::new());
+    let recs = super::parse_file(&p);
     let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
     assert_eq!(usage.len(), 7);
     assert_eq!(usage[0].shape, UsageShape::Healthy);
@@ -3111,7 +3004,7 @@ fn same_model_two_files_two_shapes() {
     }
     std::fs::write(proj.join("healthy.jsonl"), healthy).expect("write");
 
-    let a1_recs = super::parse_file(&proj.join("a1.jsonl"), None, &mut MapCtx::new());
+    let a1_recs = super::parse_file(&proj.join("a1.jsonl"));
     assert_eq!(
         a1_recs
             .iter()
@@ -3121,7 +3014,7 @@ fn same_model_two_files_two_shapes() {
             .unwrap(),
         UsageShape::WholePromptInput
     );
-    let h_recs = super::parse_file(&proj.join("healthy.jsonl"), None, &mut MapCtx::new());
+    let h_recs = super::parse_file(&proj.join("healthy.jsonl"));
     assert_eq!(
         h_recs
             .iter()
