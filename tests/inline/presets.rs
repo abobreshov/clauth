@@ -30,56 +30,87 @@ fn names(presets: &[super::Preset]) -> Vec<&str> {
     presets.iter().map(|p| p.name.as_str()).collect()
 }
 
+/// A built-in's whole model block: `default` is the `opus` alias, so the main
+/// model follows the opus bind; `subagent` stays unset, so each subagent's own
+/// tier pick lands on that tier's bind.
+fn binds(opus: &str, sonnet: &str, haiku: &str, fable: &str) -> ModelSettings {
+    ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some(opus.to_string()),
+        sonnet: Some(sonnet.to_string()),
+        haiku: Some(haiku.to_string()),
+        fable: Some(fable.to_string()),
+        subagent: None,
+    }
+}
+
 /// With nothing on disk the list is exactly the built-ins, in menu order, each
-/// carrying the endpoint + base model that makes it worth picking.
+/// carrying its endpoint and a bind on every tier.
 #[test]
-fn the_builtins_ship_with_their_endpoint_and_base_model() {
+fn the_builtins_ship_with_their_endpoint_and_every_tier_bound() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let listed = list_presets();
     assert_eq!(names(&listed), BUILTIN_NAMES);
     assert!(listed.iter().all(|p| p.builtin));
 
-    let deepseek = &listed[0];
-    assert_eq!(
-        deepseek.base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic")
-    );
-    assert_eq!(deepseek.models.default.as_deref(), Some("deepseek-chat"));
-    // Only the base model: the per-tier rows stay free for the operator, and
-    // `ANTHROPIC_MODEL`'s stand-in (the top-level `model` setting) already
-    // covers every alias no override pins.
-    assert_eq!(deepseek.models.opus, None);
-    assert_eq!(deepseek.models.subagent, None);
-
-    let zai = &listed[1];
-    assert_eq!(
-        zai.base_url.as_deref(),
-        Some("https://api.z.ai/api/anthropic")
-    );
-    assert_eq!(zai.models.default.as_deref(), Some("glm-5.2"));
-
-    // OpenRouter's v2 contents are pinned in their own test below.
-    let openrouter = &listed[2];
-    assert_eq!(
-        openrouter.base_url.as_deref(),
-        Some("https://openrouter.ai/api")
-    );
-
-    let minimax = &listed[3];
-    assert_eq!(
-        minimax.base_url.as_deref(),
-        Some("https://api.minimax.io/anthropic")
-    );
-    assert_eq!(minimax.models.default.as_deref(), Some("MiniMax-M3"));
-    assert_eq!(minimax.models.opus, None);
+    for (preset, base_url, models) in [
+        (
+            &listed[0],
+            "https://api.deepseek.com/anthropic",
+            binds(
+                "deepseek-v4-pro[1m]",
+                "deepseek-flash[1m]",
+                "deepseek-flash[1m]",
+                "deepseek-v4-pro[1m]",
+            ),
+        ),
+        (
+            &listed[1],
+            "https://api.z.ai/api/anthropic",
+            binds(
+                "glm-5.3[1m]",
+                "glm-5.3-flash[1m]",
+                "glm-5.3-flash[1m]",
+                "glm-5.3[1m]",
+            ),
+        ),
+        (
+            &listed[2],
+            "https://openrouter.ai/api",
+            binds(
+                "~anthropic/claude-opus-latest[1m]",
+                "~anthropic/claude-sonnet-latest[1m]",
+                "~anthropic/claude-haiku-latest",
+                "~anthropic/claude-fable-latest[1m]",
+            ),
+        ),
+        (
+            &listed[3],
+            "https://api.minimax.io/anthropic",
+            binds(
+                "MiniMax-M3[1m]",
+                "MiniMax-M3.1-Flash-Preview[1m]",
+                "MiniMax-M3.1-Flash-Preview[1m]",
+                "MiniMax-M3[1m]",
+            ),
+        ),
+    ] {
+        assert_eq!(
+            preset.base_url.as_deref(),
+            Some(base_url),
+            "{}",
+            preset.name
+        );
+        assert_eq!(preset.models, models, "{}", preset.name);
+    }
 }
 
 /// Alibaba's endpoints answer `400 "Model not exist."` for any Claude model id,
 /// so the alias an uncovered tier resolves to is a hard failure there rather
-/// than a degraded route. Every alibaba preset therefore pins each alias AND the
-/// subagent row, not just `models.default` — the deliberate deviation from the
-/// presets above.
+/// than a degraded route. Every alibaba preset therefore writes its one model to
+/// `default`, each alias AND the subagent row, where the presets above leave the
+/// subagent row unset.
 #[test]
 fn an_alibaba_preset_pins_every_alias_and_the_subagent_row() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -413,12 +444,12 @@ fn the_openrouter_preset_pins_anthropic_latest_tiers_and_skips_the_org_check() {
     assert_eq!(
         p.models,
         ModelSettings {
-            default: None,
+            default: Some("opus".to_string()),
             opus: Some("~anthropic/claude-opus-latest[1m]".to_string()),
             sonnet: Some("~anthropic/claude-sonnet-latest[1m]".to_string()),
             haiku: Some("~anthropic/claude-haiku-latest".to_string()),
-            fable: None,
-            subagent: Some("~anthropic/claude-opus-latest[1m]".to_string()),
+            fable: Some("~anthropic/claude-fable-latest[1m]".to_string()),
+            subagent: None,
         }
     );
     assert_eq!(

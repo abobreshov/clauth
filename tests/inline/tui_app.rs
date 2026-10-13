@@ -12083,7 +12083,24 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
 
     let draft = app.config_draft.as_ref().expect("draft still mounted");
     assert_eq!(draft.base_url.value, "https://api.deepseek.com/anthropic");
-    assert_eq!(draft.model.value, "deepseek-chat");
+    assert_eq!(
+        [
+            draft.model.value.as_str(),
+            draft.opus_model.value.as_str(),
+            draft.sonnet_model.value.as_str(),
+            draft.haiku_model.value.as_str(),
+            draft.fable_model.value.as_str(),
+            draft.subagent_model.value.as_str(),
+        ],
+        [
+            "opus",
+            "deepseek-v4-pro[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-v4-pro[1m]",
+            "",
+        ],
+    );
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("acct"))
@@ -12311,6 +12328,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     target.models.default = Some("keep-me".to_string());
     target.models.opus = Some("old-opus".to_string());
     target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
     crate::profile::save_profile(&target).expect("save target");
 
     let mut app = app_with(vec![target]);
@@ -12326,7 +12344,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     assert_eq!(state.message, "apply 'DeepSeek' over 'target'?");
     assert_eq!(
         state.detail.as_deref(),
-        Some("replaces base url, model, fable, opus."),
+        Some("replaces base url, model, fable, opus, subagent."),
         "the warning names the fields in the Setup rows' order",
     );
     assert!(!state.choice, "the warning defaults to cancel");
@@ -12351,9 +12369,16 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
         applied.base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic")
     );
-    assert_eq!(applied.models.default.as_deref(), Some("deepseek-chat"));
     assert_eq!(
-        applied.models.opus, None,
+        applied.models,
+        crate::profile::ModelSettings {
+            default: Some("opus".to_string()),
+            opus: Some("deepseek-v4-pro[1m]".to_string()),
+            sonnet: Some("deepseek-flash[1m]".to_string()),
+            haiku: Some("deepseek-flash[1m]".to_string()),
+            fable: Some("deepseek-v4-pro[1m]".to_string()),
+            subagent: None,
+        },
         "the apply replaces the model block whole, it does not merge into it",
     );
 }
