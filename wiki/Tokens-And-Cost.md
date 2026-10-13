@@ -12,6 +12,8 @@ The Tokens tab is a dashboard over Claude Code's own token history on this machi
 
 Claude Code prunes old transcripts and its rollup freezes at a date, so tollgate keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable. Transcript model ids containing `<` or `>` do not contribute token totals or model rows, but their messages still count; previously recorded placeholder model rows are dropped when the ledger loads.
 
+DeepSeek's endpoint answers a Claude model id with its own model and names only the id you asked for in the transcript. tollgate recognizes DeepSeek's replies by their message ids and counts each under the model that served it: `deepseek-v4-pro` for an opus request, `deepseek-flash` for any other Claude id. Ledger days recorded before tollgate did this are re-keyed once, on the first refresh after the upgrade, wherever the transcripts still hold all of that day's Claude, `deepseek-v4-pro` and `deepseek-flash` usage; any other day keeps its recorded rows.
+
 The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `tollgate start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 
 The tab is Claude Code only. A codex session ([Codex](Codex)) writes no transcript into Claude Code's store, so its spend is absent from every figure here rather than folded in silently; a codex account's usage shows as its 5h and 7d percentages on the Overview and in `status.json`, and nowhere on this tab.
