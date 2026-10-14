@@ -684,3 +684,205 @@ fn cli_bare_official_oauth_url_on_stderr_is_usage_auth_required() {
     ));
     assert!(!sign_in_flow("https://accounts.google.com/help/login"));
 }
+
+#[test]
+fn agy_usage_adopts_one_official_keyring_login_and_skips_locked_or_multiple() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut http = super::super::source::FakeHttp::offline();
+    http.send_reply = Box::new(|_, req| {
+        let body = if req.url.ends_with("loadCodeAssist") {
+            json!({"response":{"paidTier":{"name":"Google AI Pro"}}}).to_string()
+        } else if req.url.ends_with("retrieveUserQuotaSummary") {
+            include_str!("../fixtures/monitors/agy-summary.json").to_string()
+        } else {
+            panic!("unexpected {}", req.url);
+        };
+        Ok(HttpReply {
+            retry_after_secs: None,
+            status: 200,
+            body,
+            headers: vec![],
+        })
+    });
+    let opts = crate::usage::collect::CollectOpts::default();
+    for (owner, locked, unlocked) in [(false, 0, 0), (true, 1, 0), (true, 0, 2)] {
+        let probe = std::rc::Rc::new(Fake {
+            owner,
+            locked,
+            unlocked,
+            blob: json!({"access_token":"ACCESS","expiry":2000000000})
+                .to_string()
+                .into_bytes(),
+        });
+        let accounts = with_test_keyring(probe, || crate::usage::report::accounts(&opts, &http));
+        assert!(accounts.iter().all(|a| a.id != "monitor:agy"));
+        assert!(http.calls().is_empty());
+    }
+    let probe = std::rc::Rc::new(Fake {
+        owner: true,
+        locked: 0,
+        unlocked: 1,
+        blob: json!({"access_token":"ACCESS","expiry":2000000000})
+            .to_string()
+            .into_bytes(),
+    });
+    with_test_keyring(probe, || {
+        let first = crate::usage::report::accounts(&opts, &http);
+        let account = first
+            .iter()
+            .find(|a| a.id == "monitor:agy")
+            .expect("expected monitor:agy observation");
+        assert_eq!(account.plan.as_deref(), Some("Google AI Pro"));
+        assert_eq!(account.windows[0].used_pct, Some(75.));
+        let monitors = super::super::config::load().unwrap();
+        let agy: Vec<_> = monitors
+            .iter()
+            .filter(|m| m.kind == MonitorKind::Antigravity)
+            .collect();
+        assert_eq!(agy.len(), 1);
+        assert_eq!(agy[0].id, "agy");
+        assert_eq!(agy[0].via.as_deref(), Some("keyring"));
+        assert_eq!(agy[0].ttl_secs, Some(600));
+        let calls = http.calls().len();
+        assert!(calls >= 2);
+        let second = crate::usage::report::accounts(&opts, &http);
+        assert!(second.iter().any(|a| a.id == "monitor:agy"));
+        assert_eq!(
+            http.calls().len(),
+            calls,
+            "a second usage read must use the cache"
+        );
+    });
+}
+
+#[test]
+fn agy_load_code_assist_extracts_plan_from_allowed_tiers_and_g1_tier() {
+    let home = crate::testutil::HomeSandbox::new();
+    let fake = Fake {
+        owner: true,
+        locked: 0,
+        unlocked: 1,
+        blob: json!({"access_token":"ACCESS","expiry":2000000000})
+            .to_string()
+            .into_bytes(),
+    };
+    for (assist_body, expected_plan) in [
+        (
+            json!({"allowedTiers":[{"id":"free-tier","name":"Free","isDefault":false},{"id":"standard-tier","name":"Standard","isDefault":true}]}),
+            "Standard",
+        ),
+        (
+            json!({"allowedTiers":[{"id":"standard-tier","name":"Standard"}]}),
+            "Standard",
+        ),
+        (
+            json!({"g1Tier":"Google One AI Premium"}),
+            "Google One AI Premium",
+        ),
+        (
+            json!({"response":{"g1Tier":{"name":"Google One AI Premium"}}}),
+            "Google One AI Premium",
+        ),
+    ] {
+        let mut http = super::super::source::FakeHttp::offline();
+        http.send_reply = Box::new(move |_, req| {
+            let body = if req.url.ends_with("loadCodeAssist") {
+                assist_body.to_string()
+            } else {
+                include_str!("../fixtures/monitors/agy-summary.json").to_string()
+            };
+            Ok(HttpReply {
+                retry_after_secs: None,
+                status: 200,
+                body,
+                headers: vec![],
+            })
+        });
+        let reading = fetch_with(&target(home.home()), &http, &fake).unwrap();
+        assert_eq!(reading.plan.as_deref(), Some(expected_plan));
+    }
+}
+
+#[test]
+fn agy_map_summary_orders_5h_before_7d_within_each_group() {
+    let body = json!({
+        "response": {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.4,
+                            "resetTime": "2033-05-24T03:33:20Z"
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "remainingFraction": 0.8325939,
+                            "resetTime": "2033-05-18T03:33:20Z"
+                        }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {
+                            "bucketId": "3p-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.5,
+                            "resetTime": "2033-05-24T03:33:20Z"
+                        },
+                        {
+                            "bucketId": "3p-5h",
+                            "window": "5h",
+                            "remainingFraction": 0.8,
+                            "resetTime": "2033-05-18T03:33:20Z"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    let reading = map_summary(&body).unwrap();
+    let labels: Vec<&str> = reading.windows.iter().map(|w| w.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "5h Gemini Models",
+            "7d Gemini Models",
+            "5h Claude and GPT models",
+            "7d Claude and GPT models",
+        ]
+    );
+    assert_eq!(reading.windows[0].used_pct, Some(17.0));
+
+    let hourly_body = json!({
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "remainingFraction": 0.6,
+                        "resetTime": "2033-05-24T03:33:20Z"
+                    },
+                    {
+                        "bucketId": "gemini-1h",
+                        "window": "1h",
+                        "remainingFraction": 0.75,
+                        "resetTime": "2033-05-18T03:33:20Z"
+                    }
+                ]
+            }
+        ]
+    });
+    let hourly = map_summary(&hourly_body).unwrap();
+    assert_eq!(hourly.windows[0].label, "1h Gemini Models");
+    assert_eq!(hourly.windows[0].window_secs, Some(3600));
+    assert_eq!(hourly.windows[1].label, "7d Gemini Models");
+    assert_eq!(hourly.windows[1].window_secs, Some(604800));
+}
+

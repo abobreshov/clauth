@@ -3863,3 +3863,137 @@ fn codex_percentages_round_to_two_decimals() {
         .collect();
     assert!(text.contains("42.13%"), "{text}");
 }
+
+#[test]
+fn overview_extra_row_renders_5h_and_7d_columns_for_model_scoped_monitor_windows() {
+    use crate::usage::observation::{
+        AccountObservation, AuthKind, Origin, QuotaWindow, SourceId, Timestamp, WindowScope,
+        account_id,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(vec![], None, vec![]));
+    let widths = OverviewWidths::new(140, &app);
+    let now = 1_790_000_000_i64;
+
+    let mut obs = AccountObservation::new(
+        account_id(Origin::Monitor, "agy"),
+        SourceId::Antigravity,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Antigravity (agy login)",
+    );
+    obs.plan = Some("Standard".into());
+    let mut five = QuotaWindow::new(
+        "agy.gemini-5h",
+        "5h Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    five.window_secs = Some(18_000);
+    five.used_pct = Some(25.0);
+    five.resets_at = Some(Timestamp(now + 3600));
+    let mut seven = QuotaWindow::new(
+        "agy.gemini-weekly",
+        "7d Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    seven.window_secs = Some(604_800);
+    seven.used_pct = Some(60.0);
+    seven.resets_at = Some(Timestamp(now + 86400));
+    obs.windows = vec![five, seven];
+
+    let text = line_text(&render_extra_row(
+        &obs,
+        &widths,
+        false,
+        false,
+        ResetFmt::default(),
+        now,
+    ));
+    assert!(text.contains("25%"), "expected 5h share in row: {text}");
+    assert!(text.contains("(1h 0m)"), "expected 5h countdown in row: {text}");
+    assert!(text.contains("60%"), "expected 7d share in row: {text}");
+    assert!(text.contains("(1d 0h)"), "expected 7d countdown in row: {text}");
+    assert!(
+        !text.contains("(5h Gemini Models)"),
+        "5h lead must not render fallback label in 7d column: {text}"
+    );
+
+    let mut hourly_obs = AccountObservation::new(
+        account_id(Origin::Monitor, "agy-1h"),
+        SourceId::Antigravity,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Antigravity (1h)",
+    );
+    let mut one_hour = QuotaWindow::new(
+        "agy.gemini-1h",
+        "1h Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    one_hour.window_secs = Some(3_600);
+    one_hour.used_pct = Some(35.0);
+    one_hour.resets_at = Some(Timestamp(now + 1800));
+    let mut weekly = QuotaWindow::new(
+        "agy.gemini-weekly",
+        "7d Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    weekly.window_secs = Some(604_800);
+    weekly.used_pct = Some(50.0);
+    weekly.resets_at = Some(Timestamp(now + 86400));
+    hourly_obs.windows = vec![one_hour, weekly];
+    let hourly_text = line_text(&render_extra_row(
+        &hourly_obs,
+        &widths,
+        false,
+        false,
+        ResetFmt::default(),
+        now,
+    ));
+    assert!(hourly_text.contains("35%"), "{hourly_text}");
+    assert!(hourly_text.contains("1h"), "{hourly_text}");
+    assert!(hourly_text.contains("50%"), "{hourly_text}");
+
+    hourly_obs.windows[0].resets_at = None;
+    let hourly_no_reset = line_text(&render_extra_row(
+        &hourly_obs,
+        &widths,
+        false,
+        false,
+        ResetFmt::default(),
+        now,
+    ));
+    assert!(hourly_no_reset.contains("(1h)"), "{hourly_no_reset}");
+
+    let mut monthly_obs = AccountObservation::new(
+        account_id(Origin::Monitor, "oll"),
+        SourceId::OllamaCloud,
+        AuthKind::ApiKey,
+        Origin::Monitor,
+        "oll",
+    );
+    let mut month = QuotaWindow::new("month", "30d", WindowScope::Shared);
+    month.window_secs = Some(2_592_000);
+    month.used_pct = Some(40.0);
+    monthly_obs.windows = vec![month];
+    let monthly_text = line_text(&render_extra_row(
+        &monthly_obs,
+        &widths,
+        false,
+        false,
+        ResetFmt::default(),
+        now,
+    ));
+    assert!(monthly_text.contains("40%"), "{monthly_text}");
+    assert!(monthly_text.contains("(30d)"), "{monthly_text}");
+}
+
+
