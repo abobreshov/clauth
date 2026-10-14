@@ -711,9 +711,25 @@ fn render_extra_row(
     spans.push(narrow_gap(widths));
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
 
-    let session = obs.window(WINDOW_SESSION);
-    let lead = session.or_else(|| lead_window(&obs.windows, now));
-    let weekly = session.and(obs.window(WINDOW_WEEKLY));
+    let short_windows: Vec<QuotaWindow> = obs
+        .windows
+        .iter()
+        .filter(|w| matches!(w.window_secs, Some(3_600 | 18_000)))
+        .cloned()
+        .collect();
+    let short = obs.window(WINDOW_SESSION).or_else(|| {
+        lead_window(&short_windows, now).and_then(|l| obs.windows.iter().find(|w| w.id == l.id))
+    });
+    let lead = short.or_else(|| lead_window(&obs.windows, now));
+    let weekly = short.and_then(|s| {
+        obs.window(WINDOW_WEEKLY)
+            .or_else(|| {
+                obs.windows
+                    .iter()
+                    .find(|w| w.window_secs == Some(604_800) && w.scope == s.scope)
+            })
+            .or_else(|| obs.windows.iter().find(|w| w.window_secs == Some(604_800)))
+    });
     let cell = |window: Option<&QuotaWindow>, w: usize, include_bar: bool| {
         let usage = window.and_then(extra_usage_window);
         let past = usage
@@ -731,7 +747,20 @@ fn render_extra_row(
         ))
     };
     let five_spans = match lead {
-        Some(_) => cell(lead, widths.five_hour, true),
+        Some(w) => {
+            let mut cells = cell(Some(w), widths.five_hour, true);
+            if w.window_secs == Some(3_600) {
+                let len: usize = cells.iter().map(|s| s.content.chars().count()).sum();
+                if let Some(span) = cells.iter_mut().find(|s| s.content.starts_with(" (")) {
+                    if len + 3 <= widths.five_hour {
+                        span.content = span.content.replacen(" (", " (1h ", 1).into();
+                    }
+                } else if len + 5 <= widths.five_hour {
+                    cells.push(Span::styled(" (1h)", theme::dim()));
+                }
+            }
+            cells
+        }
         None => match extra_lead_money(obs) {
             Some(money) => vec![Span::styled(
                 fixed(&format!("[{money}]"), widths.five_hour),
@@ -746,12 +775,12 @@ fn render_extra_row(
         spans.push(Span::raw(" ".repeat(w.saturating_sub(len))));
     };
     pad_to(&mut spans, five_spans, widths.five_hour);
-    // A lead that is not the 5h window names itself in the 7d cell it leaves
+    // A lead that is not the 5h/1h window names itself in the 7d cell it leaves
     // empty, so a monthly pool never reads as a 5h reading. (After the columns
     // would be clipped: the gaps already widen to the row's full width.)
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        let seven = match (weekly, lead.filter(|w| w.id != WINDOW_SESSION)) {
+        let seven = match (weekly, lead.filter(|_| short.is_none())) {
             (Some(_), _) => cell(weekly, widths.seven_day, widths.seven_day >= 18),
             (None, Some(w)) => vec![Span::styled(
                 fixed(&format!("({})", w.label), widths.seven_day),

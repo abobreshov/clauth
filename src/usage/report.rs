@@ -47,7 +47,9 @@ impl UsageReport {
 /// time this runs, and its allowance is fetched once into that monitor's
 /// cache. Later calls, including the MCP `usage` tool, read the cache.
 pub(crate) fn accounts(opts: &CollectOpts, http: &dyn MonitorHttp) -> Vec<AccountObservation> {
-    super::monitor::grok::ensure_official_grok(http, crate::usage::now_ms());
+    let now_ms = crate::usage::now_ms();
+    super::monitor::grok::ensure_official_grok(http, now_ms);
+    super::monitor::antigravity::ensure_official_antigravity(http, now_ms);
     collect(opts)
 }
 

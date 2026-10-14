@@ -382,10 +382,7 @@ pub(crate) fn fetch_with(
             Failure::new(FailureKind::Unavailable, "agy plan response unrecognized")
         })?;
         let plan = plan.get("response").unwrap_or(&plan);
-        reading.plan = plan["paidTier"]["name"]
-            .as_str()
-            .or_else(|| plan["currentTier"]["name"].as_str())
-            .map(str::to_string);
+        reading.plan = extract_plan(plan);
         reading.plan_checked_at = Some(target.now_secs);
     }
     Ok(reading)
@@ -397,6 +394,36 @@ pub(crate) fn fetch_with(
     _: &dyn KeyringProbe,
 ) -> Result<Reading, Failure> {
     Err(Failure::new(FailureKind::Unavailable, "Linux only in 0.1"))
+}
+fn extract_plan(root: &Value) -> Option<String> {
+    root["paidTier"]["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            root["currentTier"]["name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            root["g1Tier"]["name"]
+                .as_str()
+                .or_else(|| root["g1Tier"].as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            let tiers = root["allowedTiers"].as_array()?;
+            tiers
+                .iter()
+                .find(|t| t["isDefault"].as_bool() == Some(true))
+                .and_then(|t| t["name"].as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    tiers
+                        .iter()
+                        .find_map(|t| t["name"].as_str().filter(|s| !s.is_empty()))
+                })
+        })
+        .map(str::to_string)
 }
 impl UsageSource for AntigravitySource {
     fn source_id(&self, _: &MonitorTarget) -> SourceId {
@@ -427,11 +454,13 @@ pub(crate) fn map_summary(value: &Value) -> Result<Reading, Failure> {
     let mut reading = Reading::default();
     for group in groups {
         let label = group["displayName"].as_str().unwrap_or("Antigravity");
+        let mut group_windows = Vec::new();
         for bucket in group["buckets"].as_array().into_iter().flatten() {
             let Some(id) = bucket["bucketId"].as_str() else {
                 continue;
             };
             let (duration, secs) = match bucket["window"].as_str() {
+                Some("1h" | "hourly") => ("1h", Some(3600)),
                 Some("5h") => ("5h", Some(18000)),
                 Some("weekly" | "7d") => ("7d", Some(604800)),
                 _ => ("quota", None),
@@ -447,11 +476,13 @@ pub(crate) fn map_summary(value: &Value) -> Result<Reading, Failure> {
             window.used_pct = bucket["remainingFraction"]
                 .as_f64()
                 .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-                .map(|v| (1. - v) * 100.);
+                .map(|v| ((1. - v) * 100.).round());
             window.exhausted = window.used_pct.is_some_and(|v| v >= 100.);
             window.resets_at = super::nous::value_timestamp(&bucket["resetTime"]);
-            reading.windows.push(window);
+            group_windows.push(window);
         }
+        group_windows.sort_by_key(|w| w.window_secs.unwrap_or(u64::MAX));
+        reading.windows.extend(group_windows);
     }
     if reading.windows.is_empty() {
         return Err(Failure::new(
@@ -820,12 +851,86 @@ fn fetch_cli(runner: &dyn CliRunner, now: i64) -> Result<Reading, Failure> {
     })?;
     let mut reading = map_summary(&value)?;
     let root = value.get("response").unwrap_or(&value);
-    reading.plan = root["paidTier"]["name"]
-        .as_str()
-        .or_else(|| root["currentTier"]["name"].as_str())
-        .map(str::to_string);
+    reading.plan = extract_plan(root);
     reading.plan_checked_at = Some(now);
     Ok(reading)
+}
+
+/// The monitor row an official keyring login gets when nobody has added one.
+/// Same non-secret fields as `tollgate monitor add agy`.
+fn official_monitor() -> super::config::MonitorConfig {
+    super::config::MonitorConfig {
+        id: "agy".into(),
+        kind: MonitorKind::Antigravity,
+        provider: None,
+        label: Some("Antigravity (agy login)".into()),
+        api_key_env: None,
+        billing_key_env: None,
+        hermes_home: None,
+        tool_home: None,
+        auth_entry: None,
+        via: Some("keyring".into()),
+        probe_model: None,
+        probe: false,
+        budget_usd_month: None,
+        alert_pct: None,
+        ttl_secs: Some(600),
+        enabled: true,
+    }
+}
+
+fn single_official_login(now_secs: i64) -> bool {
+    #[cfg(test)]
+    if let Some(probe) = TEST_KEYRING.with(|p| p.borrow().clone()) {
+        return read_token(probe.as_ref(), now_secs).is_ok();
+    }
+    read_token(&LiveKeyring, now_secs).is_ok()
+}
+
+fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now_ms: u64) {
+    if let Some(cache) = super::cache::load(&cfg.id)
+        && cache.matches(cfg)
+        && (cache.reading.is_some() || cache.checked_at_ms.is_some())
+    {
+        return;
+    }
+    let deps = super::cache::RefreshDeps {
+        http,
+        notifier: None,
+        env: &super::source::process_env,
+        now_ms,
+    };
+    let _ = super::cache::refresh_one(cfg, &deps, true);
+}
+
+/// Make one unlocked official Antigravity keyring login visible to the normal
+/// monitor collector without starting or unlocking a Secret Service wallet.
+pub(crate) fn ensure_official_antigravity(http: &dyn MonitorHttp, now_ms: u64) {
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+    if !single_official_login(now_secs) {
+        return;
+    }
+    let Ok(monitors) = super::config::load() else {
+        return;
+    };
+    if let Some(existing) = monitors.iter().find(|m| m.kind == MonitorKind::Antigravity) {
+        if existing.enabled {
+            fill_if_empty(existing, http, now_ms);
+        }
+        return;
+    }
+    let cfg = official_monitor();
+    if super::config::add(&cfg).is_err() {
+        if let Ok(monitors) = super::config::load()
+            && let Some(existing) = monitors
+                .iter()
+                .find(|m| m.kind == MonitorKind::Antigravity && m.enabled)
+        {
+            fill_if_empty(existing, http, now_ms);
+        }
+        return;
+    }
+    fill_if_empty(&cfg, http, now_ms);
 }
 
 #[cfg(test)]
