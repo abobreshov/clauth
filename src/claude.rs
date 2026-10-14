@@ -709,7 +709,7 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
     // is a filesystem or permissions problem under `~/.tollgate`, not contention:
     // the ordinary interleaving is that we WAIT here while the daemon's
     // rotation lands, and only then proceed.
-    let _guard = match crate::runtime::RotationGuard::acquire(name) {
+    let guard = match crate::runtime::RotationGuard::acquire(name) {
         Ok(guard) => guard,
         Err(e) => {
             // `acquire` BLOCKS, so failing is a filesystem or permissions
@@ -722,6 +722,14 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
             return;
         }
     };
+    // The stamp below reads the stored chain: a staged pair lands first.
+    if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
+        crate::logline::logline!(
+            "tollgate: start-time rolling-token arming for '{name}' skipped ({})",
+            refused.text_with_status()
+        );
+        return;
+    }
     // So the token above is now potentially the one that rotation just
     // superseded. Re-read under the guard and stamp from THAT — the same rule
     // `oauth.rs` states for the refresher: a pre-guard snapshot can go stale
@@ -1485,6 +1493,9 @@ fn carry_session_blob_into(
             }
             return Ok(());
         }
+        if !session_item_carry_gate(store, &parsed)? {
+            return Ok(());
+        }
         let store_creds = store_bytes
             .as_deref()
             .and_then(|sb| serde_json::from_slice::<ClaudeCredentials>(sb).ok());
@@ -1500,6 +1511,33 @@ fn carry_session_blob_into(
         }
         Ok(())
     })
+}
+
+/// The spent-token gate of [`carry_session_item_into`]: `Ok(true)` lets the
+/// item's login be written over `store`, `Ok(false)` keeps the store (an item
+/// still holding a token the server consumed is a rewind, the rule the file
+/// drain keeps), and `Err` refuses the carry when the record beside the store
+/// cannot be read: the swap then stays inert instead of writing the incoming
+/// member's pair over an item that may hold the account's only live refresh
+/// token. PURE of the Keychain so it is pinned on every platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS session-item carry; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn session_item_carry_gate(store: &Path, item: &ClaudeCredentials) -> Result<bool> {
+    match crate::oauth::session_login_copy(store, item) {
+        crate::oauth::SessionLoginCopy::Copyable => Ok(true),
+        crate::oauth::SessionLoginCopy::Spent => Ok(false),
+        crate::oauth::SessionLoginCopy::Unknown => anyhow::bail!(
+            "cannot read the spent-token record beside {}, so whether the per-session Keychain \
+             item's refresh token was already consumed is unknown: the item is left as it is; \
+             check permissions on ~/.tollgate",
+            store.display()
+        ),
+    }
 }
 
 /// Whether the per-session Keychain item's login outranks the store's for the
@@ -3568,6 +3606,7 @@ fn snapshot_active_credentials_unchecked(
                 active,
                 crate::profile_cache::ACCOUNT_IDENTITY_FILE,
             );
+            crate::oauth::retire_unreadable_spent_record(active);
         }
         profile.set_credentials(Some(credentials), held);
         save_profile(profile)?;

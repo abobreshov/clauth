@@ -51,7 +51,7 @@ use crate::profile::{
     MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
     MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
     PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, WalkOrder,
-    load_config, reload_fingerprint, save_app_state, save_profile,
+    load_config, reload_fingerprint, save_app_state, save_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -7443,7 +7443,7 @@ fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) 
         match cfg.find_mut(name) {
             Some(profile) => {
                 profile.weekly_threshold = value;
-                save_profile(profile).err()
+                save_profile_config(profile).err()
             }
             None => None,
         }
@@ -7480,7 +7480,7 @@ fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) {
         match cfg.find_mut(name) {
             Some(profile) => {
                 profile.max_auto_spend = Some(value);
-                save_profile(profile).err()
+                save_profile_config(profile).err()
             }
             None => None,
         }
@@ -7796,7 +7796,7 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
             }
         }
         *field(profile, flag) = !*field(profile, flag);
-        match save_profile(profile) {
+        match save_profile_config(profile) {
             Ok(()) => None,
             Err(e) => {
                 *field(profile, flag) = !*field(profile, flag);
@@ -7837,7 +7837,7 @@ fn toggle_last_resort(app: &mut App) {
                 if now_on {
                     profile.preferred = false;
                 }
-                match save_profile(profile) {
+                match save_profile_config(profile) {
                     Ok(()) => {
                         let mut moved_from = None;
                         if now_on {
@@ -7847,7 +7847,7 @@ fn toggle_last_resort(app: &mut App) {
                                 .filter(|p| p.last_resort && p.name != name)
                             {
                                 p.last_resort = false;
-                                match save_profile(p) {
+                                match save_profile_config(p) {
                                     Ok(()) => {
                                         moved_from.get_or_insert_with(|| p.name.to_string());
                                     }
@@ -7912,7 +7912,7 @@ fn toggle_preferred(app: &mut App) {
                 if now_on {
                     profile.last_resort = false;
                 }
-                match save_profile(profile) {
+                match save_profile_config(profile) {
                     Ok(()) => {
                         let mut moved_from = None;
                         if now_on {
@@ -7922,7 +7922,7 @@ fn toggle_preferred(app: &mut App) {
                                 .filter(|p| p.preferred && p.name != name)
                             {
                                 p.preferred = false;
-                                match save_profile(p) {
+                                match save_profile_config(p) {
                                     Ok(()) => {
                                         moved_from.get_or_insert_with(|| p.name.to_string());
                                     }
@@ -7964,7 +7964,7 @@ fn add_chain_candidate(app: &mut App, name: &ProfileName) {
         && profile.fallback_threshold.is_none()
     {
         profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-        let _ = save_profile(profile);
+        let _ = save_profile_config(profile);
     }
     cfg.state.fallback_chain.push(name.clone());
     let _ = save_app_state(&cfg.state);
@@ -9271,7 +9271,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
 /// local `remove` below only spares that marker one tick of staleness.
 fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
-    let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
+    let guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             // Rendered from the shared cause, not spelled here: one condition
@@ -9292,6 +9292,15 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             return;
         }
     };
+    // The relink below puts the store in front of Claude Code: a staged pair
+    // lands first.
+    if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
+        app.toast(
+            ToastKind::Danger,
+            format!("clear failed\n{}", refused.text()),
+        );
+        return;
+    }
     // Everything the ACTIONS key off is re-read under the guard — the CLI's
     // own rule, and stricter here: the TUI's config is a tick-stale snapshot,
     // and `reload_fingerprint` does not stat `credentials.json` at all, so an
@@ -9317,16 +9326,16 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         // The PERSIST is written from the same under-guard disk read, never
-        // the in-memory snapshot — an external daemon's rotation may have
-        // landed since the last reload, and `save_profile` writes the whole
-        // profile back. The renderer's in-memory flag flips only AFTER that
+        // the in-memory snapshot — another process's config edit may have
+        // landed since the last reload, and `save_profile_config` writes the
+        // whole config back. The renderer's in-memory flag flips only AFTER that
         // write lands: flipped first, a failed save leaves the config lying
         // (`reload_fingerprint` never corrects it — config mtime did not move)
         // until an unrelated save makes the lie durable, and the end state is
         // a live rolling sidecar nothing re-stamps.
         let mut disarmed = on_disk.clone();
         disarmed.rolling_token = false;
-        if let Err(e) = save_profile(&disarmed) {
+        if let Err(e) = save_profile_config(&disarmed) {
             app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
             return;
         }
@@ -11070,7 +11079,7 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
             Some(profile) => {
                 profile.auto_start = !profile.auto_start;
                 let now_on = profile.auto_start;
-                match save_profile(profile) {
+                match save_profile_config(profile) {
                     Ok(()) => Outcome::Saved(now_on),
                     Err(e) => {
                         if let Some(p) = cfg.find_mut(name) {
