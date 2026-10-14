@@ -1024,7 +1024,7 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
     let gauge_cells = |line: &str| line.chars().filter(|c| *c == '▰' || *c == '▱').count();
     assert_eq!(
         gauge_cells(row),
-        10,
+        11,
         "narrow gauge sized from leftover width"
     );
     let wide = dump(&app, 90, 24);
@@ -1173,6 +1173,7 @@ fn narrow_modal_body_wraps_instead_of_clipping() {
     use crate::tui::app::{ConfirmAction, ConfirmState, Modal};
     let mut app = narrow_app();
     app.modals.push(Modal::Confirm(ConfirmState {
+        scroll: crate::tui::app::ConfirmScroll::default(),
         message: "switch every profile to a freshly rotated credential set immediately".into(),
         detail: None,
         choice: false,
@@ -1602,8 +1603,8 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     use super::panes::scroll_offset;
 
     // Block 18..22 in a 20-row viewport. Scrolling to the ROW alone yields 1
-    // (18 + 3 pad - 20) and clips the block's tail at 21.
-    assert_eq!(scroll_offset(30, 20, (18, 22)), 5);
+    // (18 + 2 pad - 20) and clips the block's tail at 21.
+    assert_eq!(scroll_offset(30, 20, (18, 22)), 4);
     // A block taller than the viewport caps at its first line, so the row it
     // explains survives even though its hint cannot.
     assert_eq!(scroll_offset(40, 10, (5, 30)), 5);
@@ -3314,7 +3315,7 @@ fn the_setup_model_row_wraps_between_options_at_80_columns() {
         [
             "❯ model           default  [fable]  opus  sonnet",
             "                  haiku  opusplan",
-            "  + login",
+            "  + model override",
         ],
         "{out}"
     );
@@ -3517,12 +3518,12 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     app.tab = Tab::Setup;
     term.draw(|f| super::draw(f, &app)).unwrap();
-    let setup_offset = app.setup_selector_offset.get();
+    let setup_offset = app.setup_selector.offset.get();
     assert!(setup_offset > 0, "setup scrolled to selected account");
     app.tab = Tab::Usage;
     term.draw(|f| super::draw(f, &app)).unwrap();
     assert!(
-        app.usage_selector_offset.get() > 0,
+        app.usage_selector.offset.get() > 0,
         "usage has its own viewport"
     );
     app.profile_cursor = 0;
@@ -3530,7 +3531,7 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
     app.tab = Tab::Overview;
     term.draw(|f| super::draw(f, &app)).unwrap();
     assert_eq!(
-        app.overview_selector_offset.get(),
+        app.overview_selector.offset.get(),
         0,
         "overview begins at its first row"
     );
@@ -3539,13 +3540,13 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
     term.autoresize().unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     assert_eq!(
-        app.setup_selector_offset.get(),
+        app.setup_selector.offset.get(),
         0,
         "resize and selection clamp the old viewport"
     );
     assert_eq!(
         setup_offset,
-        app.usage_selector_offset.get(),
+        app.usage_selector.offset.get(),
         "inactive usage offset persists"
     );
 }
@@ -3609,12 +3610,12 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
         "both rows move inside the persistent viewport"
     );
     app.status.cursor = 11;
-    app.status.selector_offset.set(16);
+    app.status.selector.offset.set(16);
     term.backend_mut().resize(80, 19);
     term.autoresize().unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     assert_eq!(
-        app.status.selector_offset.get(),
+        app.status.selector.offset.get(),
         12,
         "13-line viewport starts at a title, not an orphan phase"
     );
@@ -3706,7 +3707,7 @@ fn a_three_line_status_viewport_shows_only_whole_incidents() {
     assert!(rows[4].contains("incident-11"), "selected title is visible");
     assert!(rows[5].contains("[ minor ]"), "selected phase is visible");
     assert!(!rows[6].contains("incident-"), "no orphan title at bottom");
-    assert_eq!(app.status.selector_offset.get(), 22);
+    assert_eq!(app.status.selector.offset.get(), 22);
     assert_eq!(
         term.backend().buffer().cell((22, 6)).unwrap().symbol(),
         "┃",
@@ -3747,7 +3748,7 @@ fn a_shrunk_selector_restores_its_first_row_and_removes_its_bar() {
     app.profile_cursor = 24;
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
-    assert!(app.usage_selector_offset.get() > 0);
+    assert!(app.usage_selector.offset.get() > 0);
     app.config().profiles.truncate(5);
     app.profile_cursor = 4;
     term.draw(|f| super::draw(f, &app)).unwrap();
@@ -3757,7 +3758,7 @@ fn a_shrunk_selector_restores_its_first_row_and_removes_its_bar() {
         "first row returns"
     );
     assert_eq!(
-        app.usage_selector_offset.get(),
+        app.usage_selector.offset.get(),
         0,
         "fitting list has no offset"
     );
@@ -3782,8 +3783,8 @@ fn form_scroll_follows_without_repinning_and_clamps_wrapped_blocks() {
     use super::panes::follow_scroll_offset;
     assert_eq!(follow_scroll_offset(30, 10, (15, 16), 10), 10);
     assert_eq!(follow_scroll_offset(30, 10, (16, 17), 10), 10);
-    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 4);
-    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 15);
+    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 5);
+    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 14);
     assert_eq!(follow_scroll_offset(40, 10, (5, 30), 0), 5);
     assert_eq!(follow_scroll_offset(8, 10, (7, 8), 20), 0);
 }

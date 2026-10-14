@@ -19,6 +19,8 @@ mod header;
 mod modals;
 mod overview;
 mod panes;
+pub(crate) use format::truncate;
+pub(crate) use panes::{ListView, follow_scroll_offset};
 mod plugin;
 pub(super) mod prose;
 mod status;

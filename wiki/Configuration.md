@@ -124,7 +124,7 @@ A preset is a named `base_url` + `[models]` pair, plus a few non-secret env swit
 { "base_url": "https://api.example/anthropic", "models": { "default": "my-model" } }
 ```
 
-`apply preset` opens the picker, built-ins first. Applying replaces the account's endpoint and its whole `[models]` block, so a tier the preset leaves unset is cleared rather than kept; the picker warns and names the fields first when the account already carries any. A preset's env is merged into the account's `[env]` only where the account has no value of its own. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
+`apply preset` opens the picker, built-ins first. Applying writes each field the preset sets and keeps each field it leaves unset; the picker warns and names the fields first when the account already carries any. A preset's env is merged into the account's `[env]` only where the account has no value of its own. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
 
 **The env allowlist.** A preset may set only these keys, and the list is applied on every load, so a hand-edited preset file cannot smuggle `ANTHROPIC_AUTH_TOKEN` or any other credential onto an account: `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK`, `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`, `CLAUDE_CODE_ATTRIBUTION_HEADER`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY`, `DISABLE_ERROR_REPORTING`. Any other key in a file's `env` object is dropped. `save as preset` writes endpoint and models only.
 
@@ -152,9 +152,11 @@ Ollama Cloud serves an Anthropic-compatible `/v1/messages` at its root, so Claud
    subagent = "<id>"   # usually the sonnet one
    ```
 
-Applying the `Ollama-Cloud` preset from the Setup tab sets the endpoint and adds three switches to the account's `[env]` that `ollama launch claude` also sets, without replacing a value you already have: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `DISABLE_ERROR_REPORTING=1` and `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`. Like every preset it clears the `[models]` block, so pick the models after applying it. The preset writes no env when stamped onto a `+ new` draft; apply it again once the account is saved.
+Applying the `Ollama-Cloud` preset from the Setup tab sets the endpoint and adds three switches to the account's `[env]` that `ollama launch claude` also sets, without replacing a value you already have: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `DISABLE_ERROR_REPORTING=1` and `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`. It keeps existing model fields unless you choose `clear them` in the confirmation. The preset writes no env when stamped onto a `+ new` draft; apply it again once the account is saved.
 
 The plan label (`pro-legacy`, `pro`, `max`, `team`) is not in the usage response, so an Ollama account shows no tier unless you name one. Personal and team keys are separate Ollama accounts, so give each its own profile.
+
+When an account or `+ new` draft carries a value the preset leaves unset, the confirmation names those fields and offers `keep them` (the default) or `clear them`. The account’s API key stays unchanged.
 
 ## Auto-start the 5-hour window
 
@@ -284,7 +286,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `preferred` | bool | `false` | the home account tollgate returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
-| `bell_threshold` | float | none | 5h % that fires a bell toast |
+| `bell_threshold` | float | none | 5h % that fires an alert toast |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `tollgate rolling-token`, cleared by `tollgate static-token` (bare or `--clear`) |
 | `billing_key_env` | string | none | the NAME of an environment variable holding a monitoring-only key (an OpenRouter management key today). Only the name is stored. The daemon reads the value from its own environment at fetch time and sends it to `GET /api/v1/credits` and nowhere else; it is never written, printed or handed to a session, and every named variable is scrubbed from each `claude` / `codex` spawn. Process variables (`PATH`, `HOME`, `XDG_*`, …) are refused as names. Set it by hand; no TUI row writes it |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |

@@ -1543,3 +1543,22 @@ fn model_detail_marks_nothing_on_incomplete_split() {
         "incomplete split renders no marker, got: {out}"
     );
 }
+
+/// A narrow TOTAL card drops the `cache hit` badge to its own line instead of
+/// clipping its tail off the card edge.
+#[test]
+fn the_total_cache_hit_badge_drops_to_its_own_line_when_narrow() {
+    let stats = populated_stats();
+    let (lines, _) = total_lines(&stats, 24, true, None);
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    assert_eq!(
+        texts,
+        [
+            "tokens    170M",
+            "  0% cache hit",
+            "cost      —",
+            "sessions  1,000",
+            "msgs      200K"
+        ]
+    );
+}

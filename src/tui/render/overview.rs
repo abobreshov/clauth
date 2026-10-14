@@ -12,8 +12,8 @@ use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
     NO_DATA, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split,
-    is_past_reset, reset_in_secs_at, reset_resume, spinner_frame, spinner_style,
-    window_summary_spans_bracketed, window_summary_spans_bracketed_at,
+    grapheme_cells, is_past_reset, reset_in_secs_at, reset_resume, spinner_frame, spinner_style,
+    truncate, window_summary_spans_bracketed, window_summary_spans_bracketed_at,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -22,9 +22,7 @@ use super::panes::{
 };
 use super::prose::{self, cmd_lit};
 use super::usage::{eta_left_secs, window_rate_unit};
-use crate::fallback::{
-    BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
-};
+use crate::fallback::{BlockedReason, SwitchAction, blocked_reason, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::derive::{format_money, lead_window};
@@ -45,11 +43,18 @@ const ACCOUNTS_MIN: u16 = 7;
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The chain panel's inner width is independent of the vertical split (both
     // panels span the full body width), so build its lines first and size the
-    // panel to fit them — no clipped members, no wasted rows.
+    // panel to fit them, capped; members that do not fit collapse into
+    // `truncate_chain`'s `+N more` line.
     let probe = Rect { height: 3, ..area };
-    let chain_inner_w = section_box("", false, false).inner(probe).width as usize;
-    let chain_lines = fallback_flow_lines(app, chain_inner_w);
-    let chain_height = chain_panel_height(chain_lines.len(), area.height);
+    let chain_inner_w = section_box("", false, false, probe.width)
+        .inner(probe)
+        .width as usize;
+    let (full_lines, member_ends) = fallback_flow_blocks(app, chain_inner_w);
+    let chain_height = chain_panel_height(full_lines.len(), area.height);
+    // The panel is capped, so its inner height is the budget the member list
+    // must fit: when members are hidden, the last row names how many.
+    let inner_height = chain_height.saturating_sub(2) as usize;
+    let chain_lines = truncate_chain(full_lines, &member_ends, inner_height);
 
     let [accounts_area, chain_area] = Layout::vertical([
         Constraint::Min(ACCOUNTS_MIN),
@@ -70,6 +75,63 @@ fn chain_panel_height(content_rows: usize, area_height: u16) -> u16 {
     let desired = (content_rows as u16).saturating_add(2);
     let max_chain = area_height.saturating_sub(ACCOUNTS_MIN);
     desired.min(max_chain).max(3)
+}
+
+/// [`fallback_flow_lines`]'s full output cut to `inner_height` content rows.
+/// Members first: when every member fits, draw them all plus the captions that
+/// still fit, with no `+N more` line. Only when a member is hidden does the
+/// last row become `+N more · → fallback tab` (N = hidden members), captions
+/// keeping their rows while the members shrink.
+fn truncate_chain(
+    full: Vec<Line<'static>>,
+    member_ends: &[usize],
+    inner_height: usize,
+) -> Vec<Line<'static>> {
+    // The empty-chain prose is not a member list — never truncate it.
+    if member_ends.is_empty() || full.len() <= inner_height {
+        return full;
+    }
+    if inner_height == 0 {
+        return Vec::new();
+    }
+    // A narrow member can occupy both its name/gauge row and a figure row.
+    // Cut only at complete member blocks; captions start after the final block.
+    let Some(&member_rows) = member_ends.last() else {
+        return full;
+    };
+    let caption_count = full.len() - member_rows;
+    if member_rows <= inner_height {
+        return full.into_iter().take(inner_height).collect();
+    }
+    let room = inner_height - 1;
+    let captions_kept = caption_count.min(room);
+    let member_budget = room - captions_kept;
+    let members_drawn = member_ends
+        .iter()
+        .take_while(|&&end| end <= member_budget)
+        .count();
+    let rows_drawn = members_drawn.checked_sub(1).map_or(0, |i| member_ends[i]);
+    let hidden = member_ends.len() - members_drawn;
+    let mut out = Vec::with_capacity(rows_drawn + captions_kept + 1);
+    out.extend(full[..rows_drawn].iter().cloned());
+    out.extend(
+        full[member_rows..member_rows + captions_kept]
+            .iter()
+            .cloned(),
+    );
+    out.push(more_members_line(hidden));
+    out
+}
+
+/// The `+N more · → fallback tab` line: prose faint, the arrow a running-copy
+/// key (`ACCENT + bold`) through the shared tokenizer, like every caption.
+fn more_members_line(hidden: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(prose::spans(
+        &format!("+{hidden} more · {} fallback tab", prose::key("\u{2192}")),
+        theme::faint(),
+    ));
+    Line::from(spans)
 }
 
 /// The accounts panel's title-right meta: one count per harness — both
@@ -178,7 +240,11 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let extras = shown_extras(app);
     let no_own = app.config().profiles.is_empty() && codex.is_empty() && hermes.is_empty();
     if no_own && extras.is_empty() {
-        app.overview_selector_offset.set(0);
+        app.overview_selector.offset.set(0);
+        app.overview_selector.viewport.set(0);
+        app.overview_selector.starts.replace(Vec::new());
+        app.overview_selector.block_ends.replace(Vec::new());
+        app.overview_selector.total.set(0);
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -217,6 +283,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = list_area.width;
     let mut rows: Vec<ListItem<'_>> = Vec::new();
     let mut selected_row = 0;
+    let mut starts = Vec::new();
     let mut codex_heading = false;
     for (index, item) in items.iter().enumerate() {
         let selected = index == sel && selected_extra.is_none();
@@ -238,6 +305,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 render_codex_row(&app.codex_rows[*idx], &widths, selected)
             }
         };
+        starts.push(rows.len());
         if selected {
             selected_row = rows.len();
         }
@@ -261,6 +329,9 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let selectable = app.harness_filter == HarnessFilter::Hermes;
         for (i, row) in hermes.iter().enumerate() {
             let selected = selectable && i == app.hermes_cursor.min(hermes.len() - 1);
+            if selectable {
+                starts.push(rows.len());
+            }
             if selected {
                 list_sel_hermes = Some(rows.len());
             }
@@ -291,6 +362,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             theme::dim(),
         )])));
         for i in group {
+            starts.push(rows.len());
             let selected = selected_extra == Some(i);
             if selected {
                 list_sel = rows.len();
@@ -312,8 +384,13 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         list_area,
         rows,
         list_sel_hermes.unwrap_or(list_sel),
-        &app.overview_selector_offset,
+        &app.overview_selector,
     );
+    app.overview_selector
+        .block_ends
+        .replace(starts.iter().map(|s| s + 1).collect());
+    app.overview_selector.tips.replace(vec![0; starts.len()]);
+    app.overview_selector.starts.replace(starts);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -342,6 +419,9 @@ const NAME_MAX: usize = 22;
 const KIND_MAX: usize = 16;
 /// Widest the 5h column reaches before the wall-clock stamp bonus.
 const FIVE_HOUR_MAX: usize = 26;
+/// Narrowest the 5h column ever reaches: `{:>3.0}%` alone (` 49%`), the bar
+/// (brackets included) shed rather than clipping the figure.
+const FIVE_HOUR_MIN: usize = 4;
 /// Widest the 7d column reaches before the wall-clock stamp bonus.
 const SEVEN_DAY_MAX: usize = 27;
 /// `total` at which the name clamp lets a name reach [`NAME_MAX`].
@@ -365,7 +445,7 @@ impl OverviewWidths {
             .config()
             .profiles
             .iter()
-            .map(|p| p.name.chars().count())
+            .map(|p| grapheme_cells(p.name.as_str()))
             .chain(
                 extras
                     .iter()
@@ -374,7 +454,7 @@ impl OverviewWidths {
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
-        let (name, kind, mut five_hour, mut seven_day) = overview_tiers(max_name, total);
+        let (mut name, kind, mut five_hour, mut seven_day) = overview_tiers(max_name, total);
         let live = live_column_width(max_name, total);
 
         if shows_clock {
@@ -410,6 +490,16 @@ impl OverviewWidths {
         // narrow widths and clips the tail of the 5h column. Widen from the
         // real leftover instead.
         let gap = (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
+
+        // The name column is the one flexible text column (the only column that
+        // truncates with `…`; kind/5h/7d/live are fixed-width). Once the gap is
+        // at its ceiling and the clock bonus has taken what it wants, spare
+        // width goes to the name instead of stranding at the row end.
+        if gap == 8 {
+            name += total.saturating_sub(
+                fixed_overview_width(name, kind, five_hour, seven_day, live, gap) + TIMER_SLOT,
+            );
+        }
 
         let deepseek_amount_w = app
             .config()
@@ -467,8 +557,15 @@ fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize)
     } else {
         0
     };
-    while fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) > total {
-        if seven_day > 0 {
+    while fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) + TIMER_SLOT > total {
+        if seven_day > 26 {
+            // Shed the 7d reset stamp's spare cell first (bar + `%` stay whole),
+            // then the stamp itself, then the column — the transient signal
+            // gives way before the persistent one, mirroring the 5h ladder.
+            seven_day = 26;
+        } else if seven_day > 18 {
+            seven_day = 18;
+        } else if seven_day > 0 {
             seven_day = 0;
         } else if five_hour > 17 {
             five_hour = 17;
@@ -478,6 +575,11 @@ fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize)
             kind = 6;
         } else if name > 8 {
             name -= 1;
+        } else if five_hour > FIVE_HOUR_MIN {
+            // Shed the bracketed bar (keep the `%` figure whole) before the
+            // figure itself is ever clipped: `window_summary_spans_bracketed`
+            // renders `{:>3.0}%` alone below 12 cells.
+            five_hour = FIVE_HOUR_MIN;
         } else {
             break;
         }
@@ -1121,15 +1223,26 @@ fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Ve
         })
         .collect::<Vec<_>>()
         .join(", ");
-    // 2 cells reserved for brackets; truncate inner if it would overflow.
-    let inner_w = width.saturating_sub(2);
-    let inner: String = inner.chars().take(inner_w).collect();
-    let used = inner.chars().count() + 2;
-    let pad = width.saturating_sub(used);
-    vec![
-        Span::styled(format!("[{inner}]"), theme::dim()),
-        Span::raw(" ".repeat(pad)),
-    ]
+    let inner_cells = grapheme_cells(&inner);
+    // A fabricated figure is never acceptable (spec: never show a usage figure
+    // tollgate did not read). The whole balance stays bracketed while it fits;
+    // the brackets shed before the figure is cut; only then does it end in `…`,
+    // never a closed bracket around a cut figure.
+    if inner_cells + 2 <= width {
+        let pad = width.saturating_sub(inner_cells + 2);
+        return vec![
+            Span::styled(format!("[{inner}]"), theme::dim()),
+            Span::raw(" ".repeat(pad)),
+        ];
+    }
+    if inner_cells <= width {
+        let pad = width.saturating_sub(inner_cells);
+        return vec![
+            Span::styled(inner, theme::dim()),
+            Span::raw(" ".repeat(pad)),
+        ];
+    }
+    vec![Span::styled(truncate(&inner, width), theme::dim())]
 }
 
 /// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
@@ -1165,7 +1278,7 @@ fn narrow_gap(widths: &OverviewWidths) -> Span<'static> {
 
 fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'static>>) {
     // Read-only detail pane — focus never descends here from the overview screen.
-    let block = section_box("fallback chain", false, false);
+    let block = section_box("fallback chain", false, false, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // No `Wrap`: an over-wide row truncates rather than folding onto a second
@@ -1175,7 +1288,13 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
 
 const GAUGE_W: usize = 12;
 
-fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+#[cfg(test)]
+fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
+    let (lines, member_ends) = fallback_flow_blocks(app, width);
+    (lines, member_ends.len())
+}
+
+fn fallback_flow_blocks(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
@@ -1183,6 +1302,10 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // (both stores rank below it) — never a durable read under the guard.
     let key_rejected = app.key_rejected_names();
     let narrow = super::panes::narrow(width as u16);
+    // The projected switch, computed BEFORE the Config lock: the caption's
+    // decision reads the stores (which rank below `Config`), so it must not run
+    // under the guard below. `projected_switch` reads the config itself.
+    let projection = projected_switch(app, &key_rejected);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
         let mut lines = vec![Line::from(Span::styled(
@@ -1198,18 +1321,14 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             .into_iter()
             .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
         );
-        return lines;
+        return (lines, Vec::new());
     }
 
     let chain = &cfg.state.fallback_chain;
     // Narrow: tighter name clamp + a gauge sized from what's left, so a chain
     // row fits a phone line instead of hard-wrapping its trailing figures.
-    let name_w = chain
-        .iter()
-        .map(|n| n.chars().count())
-        .max()
-        .unwrap_or(8)
-        .clamp(6, if narrow { 12 } else { 18 });
+    let last = chain.len() - 1;
+    let idx_w = (last + 1).to_string().chars().count() + 1;
     // Threshold digits vary across members (`95%` vs `100%`), so left-pad them to
     // the widest so the `%` signs line up.
     // It also makes every row's content the same width, which is what lets the
@@ -1217,45 +1336,49 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let thr_w = chain
         .iter()
         .filter_map(|n| cfg.find(n))
-        .map(|p| {
-            crate::format::format_pct(threshold_for(p))
-                .len()
-                .saturating_sub(1)
-        })
+        .map(|p| format!("{:.0}", threshold_for(p)).len())
         .max()
         .unwrap_or(3);
-    let last = chain.len() - 1;
-    let gauge_w = if narrow {
-        // Exact-fit budget against chain_row's spans: ` ╭ `(3) + `N `(digits+1)
-        // + name(name_w+2) + figure `  100`(5) + ` / 100%`(7, 3-digit worst).
-        // Trailers (hint/marker) only render when the base leaves room, so a
-        // narrow line keeps its figures on one row instead of hard-wrapping.
-        let idx_w = (last + 1).to_string().chars().count() + 1;
-        let figure_w = chain
-            .iter()
-            .filter_map(|name| cfg.find(name))
-            .filter_map(|profile| profile.usage.as_ref()?.five_hour.as_ref())
-            .map(|window| {
-                crate::format::format_pct(window.utilization)
-                    .len()
-                    .saturating_sub(1)
-            })
-            .max()
-            .unwrap_or(3)
-            .max(3)
-            + 2;
-        let threshold_w = (thr_w + 4).max(7);
-        width
-            .saturating_sub(3 + idx_w + name_w + 2 + figure_w + threshold_w)
-            .clamp(4, GAUGE_W)
+    let figure_w = thr_w + 9;
+    // The name reaches its full width where the row has the room — a long
+    // email-style member name must not gain a `…` with free cells left. It
+    // clamps only to what the row leaves after the rail (` ╭ `), the index,
+    // the gauge and the inline figure; narrow reserves the gauge floor (4) so
+    // the clamp bites only once the gauge + figure need the room.
+    let widest_name = chain
+        .iter()
+        .map(|n| Span::raw(n.as_str()).width())
+        .max()
+        .unwrap_or(8);
+    let name_w = if narrow {
+        widest_name.clamp(6, width.saturating_sub(3 + idx_w + 2 + 4 + figure_w).max(6))
     } else {
+        widest_name.clamp(
+            6,
+            width
+                .saturating_sub(3 + idx_w + 2 + GAUGE_W + figure_w)
+                .max(6),
+        )
+    };
+    // Exact-fit budget against chain_row's spans: ` ╭ `(3) + `N `(digits+1)
+    // + name(name_w+2), then the gauge, then the figure `  100`(5) + ` / 100%`
+    // (thr_w+4, 3-digit worst = 7). The gauge shrinks first; once even its
+    // 4-cell floor leaves no room, the figure drops to its own line instead of
+    // hard-wrapping an orphan `63 /`.
+    let head = 3 + idx_w + name_w + 2;
+    let figure_inline = !narrow || width >= head + 4 + figure_w;
+    let gauge_w = if !narrow {
         GAUGE_W
+    } else if figure_inline {
+        width.saturating_sub(head + figure_w).clamp(4, GAUGE_W)
+    } else {
+        width.saturating_sub(head).clamp(4, GAUGE_W)
     };
 
     // Project the active profile's next switch once, up front: a `To(target)`
     // renders inline on the target member's row (right side); `Off` has no
-    // single target row, so it stays a caption below.
-    let projection = projected_switch(app, &cfg, &key_rejected);
+    // single target row, so it stays a caption below. `projection` was computed
+    // before the Config lock (the stores rank below it).
     let switch_to = match &projection {
         Some((SwitchAction::To(target), secs)) => Some((target.clone(), *secs)),
         _ => None,
@@ -1289,6 +1412,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     name_w,
                     gauge_w,
                     thr_w,
+                    figure_inline,
                     reason,
                     switch_eta,
                 },
@@ -1297,30 +1421,62 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .collect();
     let trailer_col = rows.iter().map(ChainRow::base_width).max().unwrap_or(0) + TRAILER_GAP;
 
-    let mut lines: Vec<Line<'static>> = rows
-        .into_iter()
-        .map(|row| row.into_line(trailer_col, width))
-        .collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut member_ends = Vec::with_capacity(chain.len());
+    for row in rows {
+        let ChainRow {
+            base,
+            figure,
+            hint,
+            marker,
+        } = row;
+        lines.push(
+            ChainRow {
+                base,
+                figure: None,
+                hint,
+                marker,
+            }
+            .into_line(trailer_col, width),
+        );
+        if let Some(figure) = figure {
+            lines.push(figure);
+        }
+        member_ends.push(lines.len());
+    }
 
-    // All-spent caption: wrap-off `stop` vs wrap-mode `stay`.
-    let caption = if cfg.state.switch_off_when_spent {
-        vec![
-            Span::raw("  "),
-            Span::styled("[ ", theme::dim()),
-            Span::styled("stop", theme::danger().bold()),
-            Span::styled(" ]", theme::dim()),
-            Span::styled(" when all spent", theme::faint()),
-        ]
+    // All-spent caption: wrap-off `stop` vs wrap-mode `stay`. The chip and its
+    // tail wrap together so a narrow pane never clips the caption's tail.
+    let (chip_style, chip_word, tail) = if cfg.state.switch_off_when_spent {
+        (theme::danger().bold(), "stop", "when all spent")
     } else {
-        vec![
-            Span::raw("  "),
-            Span::styled("[ ", theme::dim()),
-            Span::styled("stay", theme::dim().bold()),
-            Span::styled(" ]", theme::dim()),
-            Span::styled(" on the active account when all spent", theme::faint()),
-        ]
+        (
+            theme::dim().bold(),
+            "stay",
+            "on the active account when all spent",
+        )
     };
-    lines.push(Line::from(caption));
+    let chip = vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(chip_word, chip_style),
+        Span::styled(" ]", theme::dim()),
+        Span::raw(" "),
+    ];
+    let chip_w: usize = chip.iter().map(Span::width).sum();
+    // The first line also carries the 2-cell lead before the chip, so the tail
+    // wraps to `width - chip - 2` — else the caption's first line overruns the
+    // pane by exactly those two cells and clips without a mark.
+    for (i, seg) in wrap_words(tail, width.saturating_sub(chip_w + 2))
+        .into_iter()
+        .enumerate()
+    {
+        let mut spans = vec![Span::raw("  ")];
+        if i == 0 {
+            spans.extend(chip.clone());
+        }
+        spans.push(Span::styled(seg, theme::faint()));
+        lines.push(Line::from(spans));
+    }
 
     // A wallet-bearing active's runway: its funded balance and burn rate, and
     // how long the two hold — the wallet sibling of the projection above. No
@@ -1375,41 +1531,39 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ),
         ]));
     }
-    lines
+    (lines, member_ends)
 }
 
 /// The active profile's projected next switch (action + eta secs), or `None`
-/// when none is imminent. Guards the projection the same way the old inline line
-/// did: only when the active crosses its threshold BEFORE its 5h window resets
-/// (past the reset the window refills and no switch fires). Shared by the inline
-/// `To` hint (on the target's row) and the `Off` caption.
-fn projected_switch(
-    app: &App,
-    cfg: &AppConfig,
-    key_rejected: &HashSet<ProfileName>,
-) -> Option<(SwitchAction, i64)> {
-    if cfg.state.fallback_chain.len() <= 1 {
-        return None;
-    }
-    let active_name = cfg.state.active_profile.as_ref()?;
-    let profile = cfg.find(active_name)?;
-    let usage_info = profile.usage.as_ref()?;
-    let usage = usage_info.five_hour.as_ref()?;
-    let threshold = threshold_for(profile);
-    // In-memory rate (`app.history_cache`) — no disk read while `cfg` is held.
-    let active_rate = app.active_burn_rate(active_name, usage_info);
-    let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold)?;
+/// when none is imminent. The action is the scheduler walk's answer to "where
+/// does the chain land when the active crosses its threshold"
+/// ([`App::auto_switch_projection`]); the eta guards the projection the same
+/// way the old inline line did: only when the active crosses its threshold
+/// BEFORE its 5h window resets (past the reset the window refills and no switch
+/// fires). Shared by the inline `To` hint (on the target's row) and the `Off`
+/// caption.
+fn projected_switch(app: &App, key_rejected: &HashSet<ProfileName>) -> Option<(SwitchAction, i64)> {
+    let projection = app.auto_switch_projection(key_rejected);
+    let action = projection.action?;
+    let usage = projection.active_usage.as_ref()?.five_hour.as_ref()?;
+    // In-memory rate (`history_cache`) — no disk read under any guard. A
+    // third-party member has no burn history to pair with its provider window
+    // (maintainer ruling 2026-09-10), so no rate and no projection.
+    let eta_secs = burn_rate_eta(
+        projection.active_rate,
+        usage.utilization,
+        projection.active_threshold,
+    )?;
     let reset_secs = super::format::reset_in_secs(usage);
     if reset_secs.is_some_and(|reset| eta_secs >= reset) {
         return None;
     }
-    next_target(cfg, active_rate, key_rejected).map(|action| (action, eta_secs))
+    Some((action, eta_secs))
 }
 
-/// Cells between the widest chain row's content and the shared trailer column.
-/// Matches the row's own internal 2-space gaps, so a trailer reads as part of
-/// its row instead of a right-edge rail.
-const TRAILER_GAP: usize = 2;
+/// Cells between the widest chain row's content and the shared trailer column
+/// (the contract's 3-cell right-aligned gap).
+const TRAILER_GAP: usize = 3;
 
 /// A chain row before its trailer lands. Split from the assembled `Line` so the
 /// panel can measure every row's content and start every trailer at one column.
@@ -1417,6 +1571,9 @@ const TRAILER_GAP: usize = 2;
 /// target), so at most that row's marker sits further right than its siblings'.
 struct ChainRow {
     base: Vec<Span<'static>>,
+    /// The `63 / 90%` figure when it drops to its own line (the row was too
+    /// narrow to hold it beside the gauge); `None` when it rides the base.
+    figure: Option<Line<'static>>,
     hint: Option<Span<'static>>,
     marker: Option<Span<'static>>,
 }
@@ -1429,9 +1586,9 @@ impl ChainRow {
     /// Pad the content out to `col`, then append whichever trailers fit inside
     /// `width` (the panel's inner width). A projected-switch target carries the
     /// `↲ ~eta` hint; a blocked member carries its 1-cell reason marker. BOTH can
-    /// apply to one row: `next_target`'s headroom walk only prefers a fresh
-    /// member and falls through to a stale-but-unexhausted one (`is_exhausted`
-    /// ignores `fetch_status`), so a `To` target can also be `Stale`. Render both
+    /// apply to one row: the walk's headroom pass only prefers a fresh
+    /// member and falls through to a stale-but-unexhausted one, so a `To`
+    /// target can also be `Stale`. Render both
     /// then (hint, then marker outermost) instead of dropping the imminent-switch
     /// projection. Too narrow for the pair → keep the marker (the persistent
     /// signal) and drop the hint; too narrow for even that → drop both.
@@ -1464,6 +1621,9 @@ struct ChainRowCtx {
     name_w: usize,
     gauge_w: usize,
     thr_w: usize,
+    /// Whether the figure rides the base line; when false it drops to its own
+    /// line so the `%` stays whole instead of hard-wrapping off the edge.
+    figure_inline: bool,
     reason: Option<BlockedReason>,
     switch_eta: Option<i64>,
 }
@@ -1475,6 +1635,7 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
         name_w,
         gauge_w,
         thr_w,
+        figure_inline,
         reason,
         switch_eta,
     } = ctx;
@@ -1494,13 +1655,14 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
     } else {
         theme::dim()
     };
-    let name_pad = name_w.saturating_sub(name.chars().count());
+    let (name_text, name_pad) = fixed_split(name.as_str(), name_w);
 
     let mut spans = vec![
         Span::styled(format!(" {rail} "), theme::faint()),
         Span::styled(format!("{} ", index + 1), theme::faint()),
-        Span::styled(format!("{name}{}  ", " ".repeat(name_pad)), name_style),
+        Span::styled(format!("{name_text}{name_pad}  "), name_style),
     ];
+    let mut figure_line = None;
 
     match cfg.find(name) {
         None => spans.push(Span::styled("missing", theme::danger())),
@@ -1514,28 +1676,29 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
                 Some(v) => (
-                    format!(
-                        "  {:>3}",
-                        crate::format::format_pct(v).trim_end_matches('%')
-                    ),
+                    format!("  {v:>3.0}"),
                     Style::default().fg(theme::util_color(v)),
                 ),
                 None => ("    —".to_string(), theme::faint()),
             };
-            spans.push(Span::styled(figure, figure_style));
-            spans.push(Span::styled(
-                format!(
-                    " / {:>width$}",
-                    crate::format::format_pct(threshold),
-                    width = thr_w + 1
-                ),
-                theme::faint(),
-            ));
+            if figure_inline {
+                spans.push(Span::styled(figure, figure_style));
+                spans.push(Span::styled(
+                    format!(" / {threshold:>thr_w$.0}%"),
+                    theme::faint(),
+                ));
+            } else {
+                figure_line = Some(Line::from(vec![
+                    Span::styled(figure, figure_style),
+                    Span::styled(format!(" / {threshold:>thr_w$.0}%"), theme::faint()),
+                ]));
+            }
         }
     }
 
     ChainRow {
         base: spans,
+        figure: figure_line,
         hint: switch_eta.map(|secs| {
             // `projected_switch` only ever fires off `burn_rate_eta`, so this
             // hint is always an EXHAUSTION projection — a genuine event-driven

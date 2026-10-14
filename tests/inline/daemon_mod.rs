@@ -599,11 +599,29 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         }),
         ..Default::default()
     };
+    let window = spent.five_hour.expect("spent provider window");
     daemon
-        .usage_store
+        .third_party_usage_store
         .lock()
-        .expect("usage")
-        .insert("tp".to_string(), spent);
+        .expect("provider usage")
+        .insert(
+            "tp".to_string(),
+            crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: Vec::new(),
+                bars: vec![crate::providers::UsageBar {
+                    label: "5h".to_string(),
+                    pct: window.utilization,
+                    resets_at: window.resets_at,
+                    used: None,
+                    total: None,
+                }],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+                observed: None,
+            },
+        );
     daemon
         .usage_store
         .lock()
@@ -620,6 +638,7 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,
@@ -729,6 +748,7 @@ fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,
@@ -2395,6 +2415,7 @@ fn a_scan_after_a_dropped_proactive_move_executes_same_target_exhaustion() {
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,

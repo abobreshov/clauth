@@ -57,6 +57,7 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::render::prose::{self, cmd_lit};
+use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update;
 use crate::usage::{
@@ -408,6 +409,9 @@ pub(crate) enum ConfigRow {
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
     AutoStart,
+    /// `Profile::bell_threshold`, labelled `alert at`: the 5h % the bell rings
+    /// at. ⏎ types a value (empty turns it off), `+`/`-` step it by 5.
+    BellThreshold,
     BaseUrl,
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
@@ -467,7 +471,8 @@ impl ConfigRow {
     /// Text rows capture keystrokes and commit on ⏎; the rest act on ⏎. The
     /// `Model` row is hybrid (space cycles, ⏎ opens a custom field), and the env
     /// rows seed their buffer before editing, so all three are driven out of band
-    /// and are deliberately not text rows here.
+    /// and are deliberately not text rows here. `BellThreshold` is a text row
+    /// whose `+`/`-` at rest step it without opening the editor.
     pub(crate) fn is_text(self) -> bool {
         matches!(
             self,
@@ -479,6 +484,7 @@ impl ConfigRow {
                 | ConfigRow::HaikuModel
                 | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
+                | ConfigRow::BellThreshold
         )
     }
 }
@@ -670,6 +676,7 @@ pub(crate) struct ConfigDraft {
     pub(crate) haiku_model: InputState,
     pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
+    pub(crate) bell_threshold: InputState,
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
     pub(crate) env_value: InputState,
@@ -694,9 +701,10 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
-    /// The override rows this draft opened with a value. They stay listed for
-    /// the draft's life, so emptying one never pulls the row out from under
-    /// the cursor; a fresh draft tucks an unset one behind the chip again.
+    /// The override rows this draft opened with a value, or the last preset
+    /// stamp filled. They stay listed until the next stamp or the draft's end,
+    /// so emptying one never pulls the row out from under the cursor; a fresh
+    /// draft tucks an unset one behind the chip again.
     pub(crate) overrides_shown: Vec<ConfigRow>,
     /// A `+ new`-form login stash, held in memory until `create account`
     /// consumes it (capture-then-commit): the browser mint `+ login` produced,
@@ -714,6 +722,27 @@ pub(crate) struct ConfigDraft {
 }
 
 impl ConfigDraft {
+    /// The model block the six model buffers spell, each trimmed, a blank
+    /// one unset.
+    fn typed_models(&self) -> ModelSettings {
+        ModelSettings {
+            default: self.model.trimmed_some(),
+            opus: self.opus_model.trimmed_some(),
+            sonnet: self.sonnet_model.trimmed_some(),
+            haiku: self.haiku_model.trimmed_some(),
+            fable: self.fable_model.trimmed_some(),
+            subagent: self.subagent_model.trimmed_some(),
+        }
+    }
+
+    /// The alias-override rows whose buffer holds a value, in row order.
+    fn filled_overrides(&self) -> Vec<ConfigRow> {
+        OVERRIDE_ROWS
+            .into_iter()
+            .filter(|&row| self.field(row).is_some_and(|i| !i.value.trim().is_empty()))
+            .collect()
+    }
+
     /// The edit buffer behind a text, `Model`, or actively-edited env row; `None`
     /// for toggle/action rows. The env buffers resolve only while their row is the
     /// active one — an idle `EnvEntry` renders from the read-only snapshot instead.
@@ -728,6 +757,7 @@ impl ConfigDraft {
             ConfigRow::HaikuModel => &self.haiku_model,
             ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
+            ConfigRow::BellThreshold => &self.bell_threshold,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::AutoStart
@@ -755,6 +785,7 @@ impl ConfigDraft {
             ConfigRow::HaikuModel => &mut self.haiku_model,
             ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
+            ConfigRow::BellThreshold => &mut self.bell_threshold,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::AutoStart
@@ -788,7 +819,76 @@ pub(crate) struct ConfirmState {
     pub(crate) detail: Option<String>,
     /// Highlighted choice: false = cancel, true = confirm.
     pub(crate) choice: bool,
+    /// Body scroll state for an overflowing confirm body: `↑`/`↓` scroll one
+    /// line, `PageUp`/`PageDown` one page, while the buttons stay pinned. The
+    /// render publishes the bound and the viewport; the key handler clamps.
+    pub(crate) scroll: ConfirmScroll,
     pub(crate) on_confirm: ConfirmAction,
+}
+
+/// The scroll a confirm modal's body carries. `offset` is the key handler's
+/// own state; `max_scroll` and `viewport` are what the last render drew, so a
+/// resize changes the page step on the next press. `Default` keeps the many
+/// one-line confirms at the top of their (fitting) bodies.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfirmScroll {
+    pub(crate) offset: u16,
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) viewport: std::cell::Cell<u16>,
+}
+
+/// The three buttons of the apply-preset confirm, left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetApplyButton {
+    Cancel,
+    Keep,
+    Clear,
+}
+
+/// What `apply preset` stamps: the `+ new` draft, or a saved account. Fixed
+/// when the picker opens, so a reload moving the roster under an open picker
+/// or confirm never re-routes the apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PresetTarget {
+    NewAccount,
+    Account(String),
+}
+
+impl From<&str> for PresetTarget {
+    fn from(name: &str) -> Self {
+        Self::Account(name.to_string())
+    }
+}
+
+impl From<String> for PresetTarget {
+    fn from(name: String) -> Self {
+        Self::Account(name)
+    }
+}
+
+impl std::fmt::Display for PresetTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewAccount => f.write_str("the new account"),
+            Self::Account(name) => write!(f, "'{name}'"),
+        }
+    }
+}
+
+/// `apply preset` over an account (or the `+ new` draft) holding a value
+/// where the preset leaves the field unset: `keep them` or `clear them`.
+#[derive(Debug, Clone)]
+pub(crate) struct PresetApplyForm {
+    pub(crate) target: PresetTarget,
+    pub(crate) preset: String,
+    /// The confirm's first line, naming the preset and its target.
+    pub(crate) message: String,
+    /// Fields whose value the preset's own replaces, in Setup row order.
+    pub(crate) replaces: Vec<&'static str>,
+    /// Fields holding a value the preset leaves unset, in Setup row order.
+    pub(crate) leaves: Vec<&'static str>,
+    pub(crate) focus: PresetApplyButton,
+    pub(crate) scroll: ConfirmScroll,
 }
 
 #[derive(Debug, Clone)]
@@ -844,10 +944,10 @@ pub(crate) enum ConfirmAction {
     /// Setup menu `save as preset`: a custom preset already holds the typed
     /// name. `(preset name, source account)` — confirming re-saves over it.
     OverwritePreset(String, String),
-    /// Setup menu `apply preset`: the target account already carries a base url
-    /// or model settings the preset would replace. `(account, preset name)` —
-    /// the preset is re-read at apply, so what lands is what is on disk now.
-    ApplyPresetOver(String, String),
+    /// Setup menu `apply preset`: the target already carries values the preset
+    /// would replace. `(target, preset name, the fields the confirm names)` —
+    /// the preset is re-read at apply, and a diff that moved since asks again.
+    ApplyPresetOver(PresetTarget, String, Vec<&'static str>),
     /// Preset picker `d`: drop a custom preset from disk.
     DeletePreset(String),
     /// Info-only modal: an action the user asked for is refused for a reason
@@ -912,9 +1012,14 @@ impl NamePromptAction {
 #[derive(Debug, Clone)]
 pub(crate) struct PresetPickerForm {
     /// The account the pick is stamped onto.
-    pub(crate) target: String,
+    pub(crate) target: PresetTarget,
     pub(crate) presets: Vec<crate::presets::Preset>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -941,6 +1046,11 @@ pub(crate) struct DivergenceForm {
     /// known account, which the generic three options all get wrong.
     pub(crate) sibling: Option<ProfileName>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// The non-blocking divergence signal behind the accounts-pane banner: set by
@@ -1011,6 +1121,11 @@ impl DivergenceForm {
 pub(crate) struct DivergenceTargetForm {
     pub(crate) targets: Vec<String>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// A choice on the env-key collision prompt (3 vertical options).
@@ -1037,6 +1152,12 @@ pub(crate) struct EnvCollisionForm {
     /// Sorted `EnvEntry` index of the colliding own-field, for `keep existing`.
     pub(crate) existing_idx: Option<usize>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) reviewing_overwrite: bool,
+    pub(crate) confirm_overwrite: bool,
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) overwrite_needs_review: std::cell::Cell<bool>,
 }
 
 impl EnvCollisionForm {
@@ -1139,6 +1260,11 @@ pub(crate) struct MoveSessionForm {
     pub(crate) target: String,
     pub(crate) sessions: Vec<MoveCandidate>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// What a session-move worker reports, once: the session request core's
@@ -1164,6 +1290,14 @@ pub(crate) struct ActionMenuState {
     /// on a menu of tab-global actions would claim a scope that isn't there.
     pub(crate) context: Option<String>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// Visible menu rows from the last render (the page step).
+    pub(crate) viewport: std::cell::Cell<usize>,
+    /// Chunked row starts/ends per item and the total row count, published by
+    /// the render so the page step accounts for the group-rule line.
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 impl ActionMenuState {
@@ -1209,6 +1343,11 @@ impl ActionMenuState {
             scoped_len,
             context,
             cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
         }
     }
 }
@@ -1287,6 +1426,8 @@ pub(crate) enum Modal {
     NamePrompt(NamePromptForm),
     /// Setup menu `apply preset`: pick which preset stamps the account.
     PresetPicker(PresetPickerForm),
+    /// `apply preset` over set fields the preset leaves unset: keep or clear.
+    PresetApply(PresetApplyForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
     Help,
@@ -1447,6 +1588,19 @@ pub(crate) enum TokenView {
     Models,
 }
 
+/// One card of the Tokens dashboard. Focus is stored as this (not an index)
+/// so it keeps meaning across a resize that changes the layout's reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardKind {
+    First,
+    Total,
+    Trend,
+    Models,
+    Comp,
+    Hour,
+    Activity,
+}
+
 /// Display filter over the Tokens tab's grouped model list (top-models card +
 /// the Models view), set from the tab's action menu. Session-only — a lens,
 /// not a setting. The aggregate cards (today/total/daily/…) stay unfiltered:
@@ -1574,7 +1728,7 @@ pub(crate) struct StatusState {
     /// Selected incident index in `incidents`.
     pub(crate) cursor: usize,
     pub(crate) focus: StatusFocus,
-    pub(crate) selector_offset: std::cell::Cell<usize>,
+    pub(crate) selector: ListView,
     /// Scroll offset (lines) into the detail timeline.
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last detail render (`total - viewport`).
@@ -1582,6 +1736,8 @@ pub(crate) struct StatusState {
     /// `&App` interior mutability) and the key handler clamps against it — that
     /// stops a held ↓ from inflating `detail_scroll` toward `u16::MAX`.
     pub(crate) detail_max_scroll: std::cell::Cell<u16>,
+    /// Visible detail-timeline rows from the last render (the page step).
+    pub(crate) detail_viewport: std::cell::Cell<u16>,
     /// Newest incident id already signalled, so a refresh only toasts genuinely
     /// new incidents (not the initial load).
     pub(crate) seen_latest: Option<String>,
@@ -1597,9 +1753,10 @@ impl Default for StatusState {
             fetching: false,
             cursor: 0,
             focus: StatusFocus::List,
-            selector_offset: std::cell::Cell::new(0),
+            selector: ListView::default(),
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
+            detail_viewport: std::cell::Cell::new(0),
             seen_latest: None,
         }
     }
@@ -1689,9 +1846,12 @@ pub(crate) struct PluginState {
     pub(crate) focus: PluginFocus,
     /// Cursor over the integration checks (`0..checks.len()`).
     pub(crate) cursor: usize,
-    pub(crate) selector_offset: std::cell::Cell<usize>,
+    pub(crate) selector: ListView,
     pub(crate) form_offset: std::cell::Cell<usize>,
     pub(crate) detail_scroll: u16,
+    pub(crate) diagnostic_focus: bool,
+    pub(crate) displayed_scroll: std::cell::Cell<u16>,
+    pub(crate) detail_viewport: std::cell::Cell<u16>,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
     /// clamped by the key handler — same pattern as `StatusState`).
     pub(crate) detail_max_scroll: std::cell::Cell<u16>,
@@ -1762,9 +1922,12 @@ impl Default for PluginState {
         Self {
             focus: PluginFocus::List,
             cursor: 0,
-            selector_offset: std::cell::Cell::new(0),
+            selector: ListView::default(),
             form_offset: std::cell::Cell::new(0),
             detail_scroll: 0,
+            diagnostic_focus: false,
+            displayed_scroll: std::cell::Cell::new(0),
+            detail_viewport: std::cell::Cell::new(0),
             detail_max_scroll: std::cell::Cell::new(0),
             fetching: false,
             error: None,
@@ -1793,6 +1956,14 @@ impl PluginState {
 
     /// The fix offered by the row under the cursor, if any.
     pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
+        if self.focus == PluginFocus::Detail
+            && self.diagnostic_focus
+            && self
+                .selected_check()
+                .is_some_and(|check| check.label == "herdr")
+        {
+            return None;
+        }
         self.selected_check().and_then(|check| check.fix.as_ref())
     }
 }
@@ -2107,6 +2278,28 @@ pub(crate) enum LoginResult {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+/// The scheduler walk's answer to "where does the chain land when the active
+/// crosses its threshold", plus the ACTIVE's picked usage, resolved threshold
+/// and in-memory burn rate — the inputs the Overview projected-switch caption
+/// renders. See [`App::auto_switch_projection`].
+pub(crate) struct AutoSwitchProjection {
+    pub(crate) action: Option<SwitchAction>,
+    pub(crate) active_usage: Option<UsageInfo>,
+    pub(crate) active_threshold: f64,
+    pub(crate) active_rate: Option<f64>,
+}
+
+impl AutoSwitchProjection {
+    fn none() -> Self {
+        Self {
+            action: None,
+            active_usage: None,
+            active_threshold: crate::fallback::DEFAULT_THRESHOLD,
+            active_rate: None,
+        }
+    }
+}
+
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
     /// Release before HTTP to avoid stalling the UI.
@@ -2182,19 +2375,37 @@ pub(crate) struct App {
     /// Interior mutability because the render pass takes `&App`; clamping there
     /// stops a held ↓ from inflating `help_scroll` past the end.
     pub(crate) help_max_scroll: std::cell::Cell<u16>,
+    /// Visible help-modal rows from the last render — the key handler's page
+    /// step (`PageUp`/`PageDown`), published like `help_max_scroll`.
+    pub(crate) help_viewport: std::cell::Cell<u16>,
 
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
     pub(crate) overview_cursor: usize,
-    pub(crate) overview_selector_offset: std::cell::Cell<usize>,
-    pub(crate) usage_selector_offset: std::cell::Cell<usize>,
-    pub(crate) setup_selector_offset: std::cell::Cell<usize>,
-    pub(crate) chain_selector_offset: std::cell::Cell<usize>,
-    pub(crate) models_selector_offset: std::cell::Cell<usize>,
+    pub(crate) overview_selector: ListView,
+    pub(crate) usage_selector: ListView,
+    pub(crate) setup_selector: ListView,
+    pub(crate) chain_selector: ListView,
+    pub(crate) models_selector: ListView,
     pub(crate) setup_detail_offset: std::cell::Cell<usize>,
+    pub(crate) setup_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) setup_detail_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_total: std::cell::Cell<usize>,
     pub(crate) fallback_detail_offset: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_total: std::cell::Cell<usize>,
     pub(crate) global_config_offset: std::cell::Cell<usize>,
+    pub(crate) global_config_viewport: std::cell::Cell<usize>,
+    pub(crate) global_config_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_total: std::cell::Cell<usize>,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
     pub(crate) usage_detail_max_scroll: std::cell::Cell<usize>,
@@ -2259,6 +2470,10 @@ pub(crate) struct App {
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
     /// Tracked across frames so the "too small" toast fires only on the transition in.
     pub(crate) compact: bool,
+    /// Whether the terminal is below [`Self::WIDTH_FLOOR`] — the narrowest
+    /// width at which the Overview accounts row still reads whole (the binding
+    /// surface; the Fallback picker and blurb fit narrower).
+    pub(crate) below_width_floor: bool,
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
     pub(crate) update_handle: Option<JoinHandle<()>>,
 
@@ -2343,6 +2558,22 @@ pub(crate) struct App {
     /// Model filter over the Tokens tab's model surfaces (action-menu driven).
     pub(crate) token_filter: TokenFilter,
     pub(crate) token_period: TokenPeriod,
+    /// Focused card on the Tokens dashboard. Held across period/filter changes
+    /// and across a resize (it names the card, not a layout slot).
+    pub(crate) token_dash_focus: CardKind,
+    /// First fully-visible card (index into the published reading order),
+    /// reconciled each frame by [`follow_dash_focus`] and held in a `Cell` so
+    /// the render pass can publish its correction (precedent: `token_dash_viewport`).
+    pub(crate) token_dash_first: std::cell::Cell<usize>,
+    /// Dashboard card reading order, published by the render pass so the key
+    /// handler can walk `↑`/`↓` in the same order the frame drew.
+    pub(crate) token_dash_order: std::cell::Cell<[CardKind; 7]>,
+    /// Dashboard card `(top, bottom)` rows in reading order, published by the
+    /// render pass for the key handler's whole-card scroll; empty until the
+    /// first dashboard frame draws.
+    pub(crate) token_dash_rows: std::cell::RefCell<Vec<(u16, u16)>>,
+    /// Dashboard viewport height (body rows), published by the render pass.
+    pub(crate) token_dash_viewport: std::cell::Cell<u16>,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -2770,16 +3001,32 @@ impl App {
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            help_viewport: std::cell::Cell::new(0),
             profile_cursor: 0,
             overview_cursor: 0,
-            overview_selector_offset: std::cell::Cell::new(0),
-            usage_selector_offset: std::cell::Cell::new(0),
-            setup_selector_offset: std::cell::Cell::new(0),
-            chain_selector_offset: std::cell::Cell::new(0),
-            models_selector_offset: std::cell::Cell::new(0),
+            overview_selector: ListView::default(),
+            usage_selector: ListView::default(),
+            setup_selector: ListView::default(),
+            chain_selector: ListView::default(),
+            models_selector: ListView::default(),
             setup_detail_offset: std::cell::Cell::new(0),
+            setup_detail_viewport: std::cell::Cell::new(0),
+            setup_detail_row_starts: std::cell::RefCell::new(Vec::new()),
+            setup_detail_block_ends: std::cell::RefCell::new(Vec::new()),
+            setup_detail_tips: std::cell::RefCell::new(Vec::new()),
+            setup_detail_total: std::cell::Cell::new(0),
             fallback_detail_offset: std::cell::Cell::new(0),
+            fallback_detail_viewport: std::cell::Cell::new(0),
+            fallback_detail_row_starts: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_block_ends: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_tips: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_total: std::cell::Cell::new(0),
             global_config_offset: std::cell::Cell::new(0),
+            global_config_viewport: std::cell::Cell::new(0),
+            global_config_row_starts: std::cell::RefCell::new(Vec::new()),
+            global_config_block_ends: std::cell::RefCell::new(Vec::new()),
+            global_config_tips: std::cell::RefCell::new(Vec::new()),
+            global_config_total: std::cell::Cell::new(0),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
             usage_detail_max_scroll: std::cell::Cell::new(0),
@@ -2804,6 +3051,7 @@ impl App {
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
+            below_width_floor: false,
             update_handle,
             login: None,
             clipboard: crate::platform::copy_to_clipboard_osc52,
@@ -2839,6 +3087,19 @@ impl App {
             model_detail_viewport: std::cell::Cell::new(0),
             token_filter: TokenFilter::default(),
             token_period: TokenPeriod::default(),
+            token_dash_focus: CardKind::First,
+            token_dash_first: std::cell::Cell::new(0),
+            token_dash_order: std::cell::Cell::new([
+                CardKind::First,
+                CardKind::Total,
+                CardKind::Trend,
+                CardKind::Models,
+                CardKind::Comp,
+                CardKind::Hour,
+                CardKind::Activity,
+            ]),
+            token_dash_rows: std::cell::RefCell::new(Vec::new()),
+            token_dash_viewport: std::cell::Cell::new(0),
             tokens_events,
             tokens_refresh,
             price_table: None,
@@ -2930,6 +3191,10 @@ impl App {
     pub(crate) fn with_palette_watch(mut self, watch: super::theme::PaletteWatch) -> Self {
         self.palette_watch = Some(watch);
         self
+    }
+
+    pub(crate) fn open_modal(&mut self, modal: Modal) {
+        self.modals.push(modal);
     }
 
     /// Landing, applied at construction (before the first paint). The FIRST
@@ -3075,7 +3340,6 @@ impl App {
             );
             bootstrap_third_party(
                 &h.third_party_usage_store,
-                &h.usage_store,
                 &h.third_party_status,
                 &h.last_fetched,
                 &third_party,
@@ -3145,6 +3409,129 @@ impl App {
         .flatten()
     }
 
+    /// The startup one-shot's gate + burn rate, both off the stores (never
+    /// `Profile.usage`, never disk): `(active_fresh, rate)`. Freshness reads the
+    /// picker's status store via `decision_fresh_any` — the same verdict the
+    /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
+    /// `usage_store` paired with the in-memory `history_cache`; `None` for a
+    /// third-party-classified active, whose provider window never pairs with the
+    /// OAuth burn history (maintainer ruling 2026-09-10).
+    fn active_bootstrap_state(&self) -> (bool, Option<f64>) {
+        let (name, third_party) = {
+            let cfg = self.config();
+            let Some(name) = cfg.state.active_profile.as_ref().cloned() else {
+                return (false, None);
+            };
+            let third_party = cfg
+                .find(&name)
+                .is_some_and(|p| p.usage_cache_is_third_party());
+            (name, third_party)
+        };
+        let fresh = crate::usage::decision_fresh_any(
+            &self.usage_status,
+            &self.third_party_status,
+            third_party,
+            &name,
+        );
+        let rate = if third_party {
+            None
+        } else {
+            self.usage_store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(name.as_str()).cloned())
+                .and_then(|u| self.active_burn_rate(&name, &u))
+        };
+        (fresh, rate)
+    }
+
+    /// The projected next switch for the Overview caption: the scheduler walk's
+    /// answer over the ACTIVE's reading replaced by one that reads exhausted at
+    /// the crossing (its threshold), so the caption names where the walk lands
+    /// when the active crosses — never the walk's decision for the active as it
+    /// reads now (a healthy active below its threshold has none). Also carries
+    /// the ACTIVE's real picked usage, resolved threshold and in-memory burn
+    /// rate, which the caption's eta guard reads. Built in one config-then-stores
+    /// sequence (stores rank below `Config`), so the caller must not hold the
+    /// config guard. `key_rejected` is the caller's live set, computed once per
+    /// frame.
+    pub(crate) fn auto_switch_projection(
+        &self,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> AutoSwitchProjection {
+        let (mut snapshot, third_party_names) = {
+            let cfg = self.config();
+            let Some(snapshot) = crate::fallback::snapshot_chain(&cfg, key_rejected) else {
+                return AutoSwitchProjection::none();
+            };
+            if snapshot.chain.len() <= 1 {
+                return AutoSwitchProjection::none();
+            }
+            let third_party_names: HashSet<ProfileName> = cfg
+                .profiles
+                .iter()
+                .filter(|p| p.usage_cache_is_third_party())
+                .map(|p| p.name.clone())
+                .collect();
+            (snapshot, third_party_names)
+        };
+        let active = snapshot.active.clone();
+        let usage = crate::usage::fill_chain_snapshot_stores(
+            &mut snapshot,
+            &self.usage_store,
+            &self.third_party_usage_store,
+            &self.usage_status,
+            &self.third_party_status,
+            &self.poll_streaks,
+            &self.third_party_streaks,
+            &self.kick_blocks,
+            &third_party_names,
+        );
+        snapshot.broken.extend(key_rejected.iter().cloned());
+        let active_usage = usage.get(active.as_str()).cloned();
+        let active_threshold = snapshot
+            .chain
+            .iter()
+            .find(|m| m.name == active)
+            .map(|m| m.threshold)
+            .unwrap_or(crate::fallback::DEFAULT_THRESHOLD);
+        // A third-party-classified active has no burn history to pair with its
+        // provider window (maintainer ruling 2026-09-10), so no rate.
+        let active_rate = if third_party_names.contains(&active) {
+            None
+        } else {
+            active_usage
+                .as_ref()
+                .and_then(|u| self.active_burn_rate(&active, u))
+        };
+        // The caption projects "when the active crosses at ~eta, where does the
+        // walk land": re-run the SAME walk over a usage clone whose only change
+        // is the active's 5h utilization set to its threshold. The threshold
+        // reads exhausted in every mode — `util >= threshold` is the static
+        // disjunct in both arms of `is_exhausted_projected` (its `Some(rate)`
+        // arm ORs `projected_exhausted || util >= threshold`, its `None` arm is
+        // exactly that) and the direct check when burn-aware is off — so the
+        // floor, the rate and the mode never change the answer.
+        let mut projected = usage.clone();
+        if let Some(info) = projected.get_mut(active.as_str())
+            && let Some(window) = info.five_hour.as_mut()
+        {
+            window.utilization = active_threshold;
+        }
+        let action = crate::fallback::next_auto_switch_target_with_usage(
+            &snapshot,
+            &projected,
+            &third_party_names,
+            crate::fallback::ActiveBurnRate::Supplied(active_rate),
+        );
+        AutoSwitchProjection {
+            action,
+            active_usage,
+            active_threshold,
+            active_rate,
+        }
+    }
+
     /// The funded wallet's burn rate for `profile`, computed from the
     /// in-memory `wallet_cache` — never touches disk. The wallet twin of
     /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
@@ -3194,19 +3581,23 @@ impl App {
         // are due on the scheduler's first tick, which fetches then
         // auto-switches off the corrected numbers.
         let switched = {
-            let cfg = self.config();
-            let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
-            let active_fresh =
-                active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
+            let (active_fresh, rate) = self.active_bootstrap_state();
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
-                // while the config guard is held; see `active_burn_rate`.
-                let rate = active_profile.and_then(|p| {
-                    let usage = p.usage.as_ref()?;
-                    self.active_burn_rate(&p.name, usage)
-                });
-                drop(cfg);
-                auto_switch_if_needed(&self.config, rate).ok().flatten()
+                // under any guard; see `active_burn_rate`.
+                auto_switch_if_needed(
+                    &self.config,
+                    rate,
+                    &self.usage_store,
+                    &self.third_party_usage_store,
+                    &self.usage_status,
+                    &self.third_party_status,
+                    &self.poll_streaks,
+                    &self.third_party_streaks,
+                    &self.kick_blocks,
+                )
+                .ok()
+                .flatten()
             } else {
                 None
             }
@@ -3292,11 +3683,40 @@ impl App {
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             for p in &mut cfg.profiles {
-                if let Some(s) = info_map.as_ref() {
-                    p.usage = s.get(p.name.as_str()).cloned();
+                // The TUI's per-account reading is the picker's whole record,
+                // the same dichotomy the walk's picker and the disk readers
+                // key on (`usage_cache_is_third_party`): a third-party account
+                // (pure or hybrid) takes its provider stats' `to_usage_info()`
+                // — never the OAuth leg's entry, so a stale OAuth reading under
+                // a logged-out hybrid's name cannot survive, and no OAuth plan
+                // or spend reaches a hybrid's `Profile.usage`. Assign only when
+                // the store the classification needs is present — a poisoned
+                // lock keeps the prior reading.
+                let side_ok = if p.usage_cache_is_third_party() {
+                    third_party_map.is_some()
+                } else {
+                    info_map.is_some()
+                };
+                if side_ok {
+                    p.usage = crate::fallback::picked_usage(
+                        p.usage_cache_is_third_party(),
+                        info_map.as_ref().and_then(|s| s.get(p.name.as_str())),
+                        third_party_map
+                            .as_ref()
+                            .and_then(|s| s.get(p.name.as_str())),
+                    );
                 }
-                // OAuth fetch_status takes precedence; third-party only when no OAuth status.
-                if let Some(s) = status_map.as_ref()
+                // Fetch_status follows the picker's side too, so the TUI's
+                // freshness (the startup one-shot gate and the status pill)
+                // agrees with the scheduler's `decision_fresh_any`: a
+                // third-party-classified account reads its third-party status;
+                // every other account is OAuth-first with the third-party
+                // fallback.
+                if p.usage_cache_is_third_party() {
+                    if let Some(s) = third_party_status_map.as_ref() {
+                        p.fetch_status = s.get(p.name.as_str()).copied();
+                    }
+                } else if let Some(s) = status_map.as_ref()
                     && s.contains_key(p.name.as_str())
                 {
                     p.fetch_status = s.get(p.name.as_str()).copied();
@@ -3307,18 +3727,6 @@ impl App {
                     && s.contains_key(p.name.as_str())
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
-                }
-                // A third-party member's bars are its usage snapshot. The
-                // scheduler writes the snapshot and mirrors its derived window
-                // into the usage store as two separate acquisitions, so an
-                // apply landing between them still owes this account a figure:
-                // derive it off the snapshot. The `is_none` guard keeps that a
-                // fallback — the store's own entry, whichever leg wrote it,
-                // always wins.
-                if p.usage.is_none()
-                    && let Some(stats) = p.third_party_usage.as_ref()
-                {
-                    p.usage = stats.to_usage_info();
                 }
 
                 // #74 degraded cue: cache age past the derived threshold reads
@@ -3365,7 +3773,12 @@ impl App {
                         .and_then(|u| u.five_hour.as_ref())
                         .map(|u| u.utilization);
                     let fresh = p.fetch_status == Some(FetchStatus::Fresh);
-                    (p.name.to_string(), p.bell_threshold, util, fresh)
+                    (
+                        p.name.to_string(),
+                        p.five_hour_alert_threshold(),
+                        util,
+                        fresh,
+                    )
                 })
                 .collect::<Vec<_>>();
 
@@ -3399,7 +3812,7 @@ impl App {
                     if !self.bell_fired.contains_key(&name) {
                         self.toast(
                             ToastKind::Warning,
-                            format!("bell: {name} at {}", format_pct(u)),
+                            format!("alert: {name} at {}", format_pct(u)),
                         );
                         self.set_tab_activity(Tab::Overview, ToastKind::Warning);
                         self.bell_fired.insert(name, true);
@@ -3604,11 +4017,22 @@ impl App {
         });
     }
 
-    /// Called each frame with the current terminal height. Tracks compact
-    /// state; the matching warning banner is recomputed from this flag in
-    /// `update_banner` each tick, so it self-clears on resize (no toast).
-    pub(crate) fn update_compact(&mut self, terminal_height: u16) {
+    /// The narrowest terminal width every surface still reads at whole or
+    /// visibly ellipsized. Set by the Overview accounts row: with the 5h bar
+    /// shed to its `%` figure, the row's floor is cursor(2) + marker(2) +
+    /// name(8) + gap(2) + kind(6) + narrow(1) + timer(5) + `%`(4) = 30 cells
+    /// inside a 4-cell-chromed panel, so the terminal needs 34. The Fallback
+    /// card's `preferred days` picker only needs 28; the Overview row is the
+    /// binding surface.
+    const WIDTH_FLOOR: u16 = 34;
+
+    /// Called each frame with the current terminal size. Tracks compact
+    /// state and the width floor; the matching warning banner is recomputed
+    /// from these flags in `update_banner` each tick, so it self-clears on
+    /// resize (no toast).
+    pub(crate) fn update_compact(&mut self, terminal_height: u16, terminal_width: u16) {
         self.compact = terminal_height < 14;
+        self.below_width_floor = terminal_width < Self::WIDTH_FLOOR;
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -3981,7 +4405,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 })
                 .unwrap_or(0);
             app.sync_overview_profile_selection();
-            app.overview_selector_offset.set(0);
+            app.overview_selector.offset.set(0);
             return;
         }
         KeyCode::Char('a') => {
@@ -4033,6 +4457,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::RotateAll,
             }));
             return;
@@ -4221,23 +4646,28 @@ fn reload_token_stats(app: &mut App) {
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
-/// Tokens tab: `c` toggles cache-counting on either view; Dashboard enters
-/// Models on ⏎. From Models, ⏎ descends into the read-only detail.
+/// Tokens tab: `c` toggles cache-counting on either view; the Dashboard moves
+/// card focus with ↑/↓ (wrapping) and the page keys (stopping at the ends), and
+/// ⏎ descends into Models. From Models, ⏎ descends into the read-only detail.
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') {
         toggle_count_cache(app);
         return;
     }
     match app.token_view {
-        TokenView::Dashboard => {
-            // Dashboard is a fixed grid (no scroll); ⏎ descends into Models.
-            if key.code == KeyCode::Enter && token_model_count(app) > 0 {
+        TokenView::Dashboard => match key.code {
+            KeyCode::Enter if token_model_count(app) > 0 => {
                 app.token_view = TokenView::Models;
                 app.model_detail_focus = StatusFocus::List;
                 app.model_detail_scroll = 0;
                 app.token_model_cursor = 0;
             }
-        }
+            KeyCode::Up => dash_move_focus(app, DashDir::Prev),
+            KeyCode::Down => dash_move_focus(app, DashDir::Next),
+            KeyCode::PageUp => dash_move_focus(app, DashDir::PageUp),
+            KeyCode::PageDown => dash_move_focus(app, DashDir::PageDown),
+            _ => {}
+        },
         TokenView::Models => {
             if app.model_detail_focus == StatusFocus::Detail {
                 let max = app.model_detail_max_scroll.get();
@@ -4251,17 +4681,18 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
                             app.model_detail_scroll.min(max).saturating_add(1).min(max)
                     }
                     KeyCode::PageUp => {
-                        app.model_detail_scroll = app
-                            .model_detail_scroll
-                            .min(max)
-                            .saturating_sub(viewport.max(1))
+                        app.model_detail_scroll = page_up_scroll(
+                            app.model_detail_scroll as usize,
+                            max as usize,
+                            viewport as usize,
+                        ) as u16
                     }
                     KeyCode::PageDown => {
-                        app.model_detail_scroll = app
-                            .model_detail_scroll
-                            .min(max)
-                            .saturating_add(viewport.max(1))
-                            .min(max)
+                        app.model_detail_scroll = page_down_scroll(
+                            app.model_detail_scroll as usize,
+                            max as usize,
+                            viewport as usize,
+                        ) as u16
                     }
                     _ => {}
                 }
@@ -4274,6 +4705,16 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
                     }
                     KeyCode::Down if len > 0 => {
                         app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::PageUp if len > 0 => {
+                        app.token_model_cursor =
+                            selector_page_up(app.token_model_cursor, &app.models_selector);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::PageDown if len > 0 => {
+                        app.token_model_cursor =
+                            selector_page_down(app.token_model_cursor, &app.models_selector);
                         app.model_detail_scroll = 0;
                     }
                     KeyCode::Enter if len > 0 => {
@@ -4457,11 +4898,178 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     app.reload_selected_note();
 }
 
+/// One page = the current viewport minus one overlap line (minimum 1), so a
+/// page down keeps the old bottom line as the new top line. Every scrollable
+/// surface steps by this; `↑`/`↓` stay one row/line and keep their wrapping.
+pub(crate) fn page_step(viewport: usize) -> usize {
+    viewport.saturating_sub(1).max(1)
+}
+
+/// The page-down landing row: the last row whose start line is within one page
+/// below `cursor`'s start, at least one row forward, stopping at the last row.
+/// Shared by [`page_down_cursor_by_rows`] and the Tokens dashboard page keys.
+pub(crate) fn page_land_down(cursor: usize, starts: &[usize], viewport: usize) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let last = starts.len() - 1;
+    let cursor = cursor.min(last);
+    if cursor >= last {
+        return last;
+    }
+    let target = starts[cursor] + page_step(viewport);
+    let mut next = cursor + 1;
+    while next < last && starts[next + 1] <= target {
+        next += 1;
+    }
+    next
+}
+
+/// The page-up landing row: the first row whose start line is within one page
+/// above `cursor`'s start, at least one row back, stopping at the first row.
+/// Shared by [`page_up_cursor_by_rows`] and the Tokens dashboard page keys.
+pub(crate) fn page_land_up(cursor: usize, starts: &[usize], viewport: usize) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    if cursor == 0 {
+        return 0;
+    }
+    let target = starts[cursor].saturating_sub(page_step(viewport));
+    let mut prev = cursor - 1;
+    while prev > 0 && starts[prev - 1] >= target {
+        prev -= 1;
+    }
+    prev
+}
+
+/// Page down on a read-only scroll offset, clamped to the last render's bound.
+pub(crate) fn page_down_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
+    scroll.min(max).saturating_add(page_step(viewport)).min(max)
+}
+
+/// Page up on a read-only scroll offset, clamped to the last render's bound.
+pub(crate) fn page_up_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
+    scroll.min(max).saturating_sub(page_step(viewport))
+}
+
+/// Page down on a cursor list over its published row geometry: the cursor
+/// lands on the last row whose start line is within one page (`viewport - 1`
+/// lines) below the current row's start, at least one row forward, stopping at
+/// the last row — walking back if the follow that landing produces would push
+/// the old bottom line off the top (a focused row's tooltip moves with the
+/// cursor). `starts[i]` is the rendered line where row `i` begins; `block_ends`
+/// is the line its block reaches when focused; `offset`/`total` are the last
+/// render's scroll and line count.
+pub(crate) fn page_down_cursor_by_rows(
+    cursor: usize,
+    starts: &[usize],
+    block_ends: &[usize],
+    viewport: usize,
+    offset: usize,
+    total: usize,
+) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    let mut next = page_land_down(cursor, starts, viewport);
+    while next > cursor + 1 {
+        let end = block_ends
+            .get(next)
+            .copied()
+            .unwrap_or(starts[next] + 1)
+            .max(starts[next] + 1);
+        let predicted = follow_scroll_offset(total, viewport, (starts[next], end), offset);
+        if predicted <= offset + page_step(viewport) {
+            break;
+        }
+        next -= 1;
+    }
+    next
+}
+
+/// Page up mirror of [`page_down_cursor_by_rows`]: the cursor lands on the
+/// first row whose start line is within one page above the current row's
+/// start, at least one row back, stopping at the first row — walking forward
+/// if the follow would push the old top line off the bottom. The landing row's
+/// focused tooltip inserts `tips[prev]` lines above the old top line, so the
+/// continuity bound is `offset + tip - page_step`, not `offset - page_step`.
+pub(crate) fn page_up_cursor_by_rows(
+    cursor: usize,
+    starts: &[usize],
+    block_ends: &[usize],
+    tips: &[usize],
+    viewport: usize,
+    offset: usize,
+    total: usize,
+) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    if cursor == 0 {
+        return 0;
+    }
+    let mut prev = page_land_up(cursor, starts, viewport);
+    while prev < cursor - 1 {
+        let end = block_ends
+            .get(prev)
+            .copied()
+            .unwrap_or(starts[prev] + 1)
+            .max(starts[prev] + 1);
+        let predicted = follow_scroll_offset(total, viewport, (starts[prev], end), offset);
+        let tip = tips.get(prev).copied().unwrap_or(0);
+        if predicted
+            >= offset
+                .saturating_add(tip)
+                .saturating_sub(page_step(viewport))
+        {
+            break;
+        }
+        prev += 1;
+    }
+    prev
+}
+
+/// Page down on a [`ListView`] cursor (single-line selector rows), reading the
+/// geometry the render published.
+fn selector_page_down(cursor: usize, list: &ListView) -> usize {
+    let starts = list.starts.borrow();
+    let block_ends = list.block_ends.borrow();
+    page_down_cursor_by_rows(
+        cursor,
+        &starts,
+        &block_ends,
+        list.viewport.get(),
+        list.offset.get(),
+        list.total.get(),
+    )
+}
+
+/// Page up on a [`ListView`] cursor, the mirror of [`selector_page_down`].
+fn selector_page_up(cursor: usize, list: &ListView) -> usize {
+    let starts = list.starts.borrow();
+    let block_ends = list.block_ends.borrow();
+    let tips = list.tips.borrow();
+    page_up_cursor_by_rows(
+        cursor,
+        &starts,
+        &block_ends,
+        &tips,
+        list.viewport.get(),
+        list.offset.get(),
+        list.total.get(),
+    )
+}
+
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
     if app.harness_filter == HarnessFilter::Hermes {
         handle_hermes_rows_key(app, key);
         return;
     }
+    let count = app.main_items().len();
     let extra = app.overview_selected_extra();
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
@@ -4472,6 +5080,23 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down if shift => reorder_main_cursor(app, 1),
         KeyCode::Up => step_overview_cursor(app, -1),
         KeyCode::Down => step_overview_cursor(app, 1),
+        KeyCode::PageUp | KeyCode::PageDown => {
+            let extras = if app.harness_filter.shows_claude() {
+                app.overview_extras()
+            } else {
+                Vec::new()
+            };
+            let at = app
+                .overview_selected_extra()
+                .and_then(|i| extras.iter().position(|&e| e == i))
+                .map_or(app.overview_cursor, |i| count + i);
+            let next = if key.code == KeyCode::PageDown {
+                selector_page_down(at, &app.overview_selector)
+            } else {
+                selector_page_up(at, &app.overview_selector)
+            };
+            step_overview_cursor(app, next as i32 - at as i32);
+        }
         KeyCode::Enter => match extra {
             // A read-only row has nothing to switch to here: ⏎ shows its
             // numbers instead, on the Usage tab that already lists it.
@@ -4502,6 +5127,11 @@ fn open_move_session(app: &mut App) {
         return;
     }
     app.modals.push(Modal::MoveSession(MoveSessionForm {
+        scroll: Default::default(),
+        viewport: Default::default(),
+        starts: Default::default(),
+        block_ends: Default::default(),
+        total: Default::default(),
         target,
         sessions,
         cursor: 0,
@@ -4568,6 +5198,30 @@ fn handle_move_session_key(app: &mut App, key: KeyEvent) {
             } else {
                 form.cursor + 1
             }
+        }
+        KeyCode::PageUp | KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let ends = form.block_ends.borrow();
+            form.cursor = if key.code == KeyCode::PageDown {
+                page_down_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &ends,
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            } else {
+                page_up_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &ends,
+                    &[],
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
         }
         KeyCode::Enter => {
             let picked = form.sessions.get(form.cursor.min(last)).cloned();
@@ -4654,6 +5308,15 @@ fn handle_hermes_rows_key(app: &mut App, key: KeyEvent) -> bool {
                 (app.hermes_cursor.min(len - 1) as i32 + delta).rem_euclid(len as i32) as usize;
             true
         }
+        KeyCode::PageUp | KeyCode::PageDown if len > 0 => {
+            app.hermes_cursor = if key.code == KeyCode::PageDown {
+                selector_page_down(app.hermes_cursor, &app.overview_selector)
+            } else {
+                selector_page_up(app.hermes_cursor, &app.overview_selector)
+            }
+            .min(len - 1);
+            true
+        }
         KeyCode::Enter | KeyCode::Char('s') if len > 0 => {
             let name = app.hermes_rows[app.hermes_cursor.min(len - 1)].name.clone();
             app.toast(ToastKind::Info, hermes_switch_toast(&name));
@@ -4722,17 +5385,10 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
                     app.usage_detail_scroll.min(max).saturating_add(1).min(max)
             }
             KeyCode::PageUp => {
-                app.usage_detail_scroll = app
-                    .usage_detail_scroll
-                    .min(max)
-                    .saturating_sub(viewport.max(1))
+                app.usage_detail_scroll = page_up_scroll(app.usage_detail_scroll, max, viewport)
             }
             KeyCode::PageDown => {
-                app.usage_detail_scroll = app
-                    .usage_detail_scroll
-                    .min(max)
-                    .saturating_add(viewport.max(1))
-                    .min(max)
+                app.usage_detail_scroll = page_down_scroll(app.usage_detail_scroll, max, viewport)
             }
             KeyCode::Char('e') if app.usage_extra_cursor.is_none() => toggle_show_estimates(app),
             KeyCode::Char('p') if app.usage_extra_cursor.is_none() => toggle_show_pace(app),
@@ -4749,6 +5405,17 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down => {
             step_usage_cursor(app, 1);
             app.usage_detail_scroll = 0;
+        }
+        KeyCode::PageUp | KeyCode::PageDown => {
+            let at = app
+                .usage_extra_cursor
+                .map_or(app.profile_cursor, |i| app.profile_count() + i);
+            let next = if key.code == KeyCode::PageDown {
+                selector_page_down(at, &app.usage_selector)
+            } else {
+                selector_page_up(at, &app.usage_selector)
+            };
+            step_usage_cursor(app, next as i32 - at as i32);
         }
         KeyCode::Enter if count > 0 => {
             app.usage_detail_focus = StatusFocus::Detail;
@@ -4888,6 +5555,14 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                     app.status.cursor = (app.status.cursor + 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
+                KeyCode::PageUp if len > 0 => {
+                    app.status.cursor = selector_page_up(app.status.cursor, &app.status.selector);
+                    app.status.detail_scroll = 0;
+                }
+                KeyCode::PageDown if len > 0 => {
+                    app.status.cursor = selector_page_down(app.status.cursor, &app.status.selector);
+                    app.status.detail_scroll = 0;
+                }
                 KeyCode::Enter if len > 0 => {
                     app.status.focus = StatusFocus::Detail;
                     app.status.detail_scroll = 0;
@@ -4910,6 +5585,22 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                 // run the offset past the end (which would make ↑ look dead).
                 let max = app.status.detail_max_scroll.get();
                 app.status.detail_scroll = app.status.detail_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::PageUp => {
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = page_up_scroll(
+                    app.status.detail_scroll as usize,
+                    max as usize,
+                    app.status.detail_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = page_down_scroll(
+                    app.status.detail_scroll as usize,
+                    max as usize,
+                    app.status.detail_viewport.get() as usize,
+                ) as u16;
             }
             _ => {}
         },
@@ -4935,21 +5626,48 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Up if len > 0 => {
                     app.plugin.cursor = (app.plugin.cursor + len - 1) % len;
                     app.plugin.detail_scroll = 0;
+                    app.plugin.diagnostic_focus = false;
                 }
                 KeyCode::Down if len > 0 => {
                     app.plugin.cursor = (app.plugin.cursor + 1) % len;
                     app.plugin.detail_scroll = 0;
+                    app.plugin.diagnostic_focus = false;
+                }
+                KeyCode::PageUp if len > 0 => {
+                    app.plugin.cursor = selector_page_up(app.plugin.cursor, &app.plugin.selector);
+                    app.plugin.detail_scroll = 0;
+                    app.plugin.diagnostic_focus = false;
+                }
+                KeyCode::PageDown if len > 0 => {
+                    app.plugin.cursor = selector_page_down(app.plugin.cursor, &app.plugin.selector);
+                    app.plugin.detail_scroll = 0;
+                    app.plugin.diagnostic_focus = false;
                 }
                 KeyCode::Enter if len > 0 => {
                     app.plugin.focus = PluginFocus::Detail;
                     app.plugin.detail_scroll = 0;
+                    app.plugin.diagnostic_focus = false;
                 }
                 KeyCode::Char('f') => apply_plugin_fix(app),
                 _ => {}
             }
         }
         PluginFocus::Detail => {
-            if app
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                let max = app.plugin.detail_max_scroll.get();
+                let viewport = app.plugin.detail_viewport.get();
+                let origin = if app.plugin.diagnostic_focus {
+                    app.plugin.detail_scroll.min(max)
+                } else {
+                    app.plugin.displayed_scroll.get().min(max)
+                };
+                app.plugin.diagnostic_focus = true;
+                app.plugin.detail_scroll = if key.code == KeyCode::PageDown {
+                    page_down_scroll(origin as usize, max as usize, viewport as usize) as u16
+                } else {
+                    page_up_scroll(origin as usize, max as usize, viewport as usize) as u16
+                };
+            } else if app
                 .plugin
                 .selected_check()
                 .is_some_and(|c| c.label == "herdr")
@@ -4967,6 +5685,22 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
                         let max = app.plugin.detail_max_scroll.get();
                         app.plugin.detail_scroll =
                             app.plugin.detail_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        let max = app.plugin.detail_max_scroll.get();
+                        app.plugin.detail_scroll = page_up_scroll(
+                            app.plugin.detail_scroll as usize,
+                            max as usize,
+                            app.plugin.detail_viewport.get() as usize,
+                        ) as u16;
+                    }
+                    KeyCode::PageDown => {
+                        let max = app.plugin.detail_max_scroll.get();
+                        app.plugin.detail_scroll = page_down_scroll(
+                            app.plugin.detail_scroll as usize,
+                            max as usize,
+                            app.plugin.detail_viewport.get() as usize,
+                        ) as u16;
                     }
                     KeyCode::Char('f') => apply_plugin_fix(app),
                     _ => {}
@@ -4992,6 +5726,7 @@ fn apply_plugin_fix(app: &mut App) {
                         .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::WireMcpServers,
             }));
         }
@@ -5007,6 +5742,7 @@ fn apply_plugin_fix(app: &mut App) {
                     "re-points .credentials.json at the account's own stored tokens; spends nothing.".to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::RelinkCredentials(name),
             }));
         }
@@ -5023,6 +5759,7 @@ fn apply_plugin_fix(app: &mut App) {
                     .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
             }));
         }
@@ -5035,6 +5772,7 @@ fn apply_plugin_fix(app: &mut App) {
                         .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::InstallPlugin,
             }));
         }
@@ -5049,12 +5787,20 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
     let cursor = app.plugin.herdr_options_cursor;
     let rows = HERDR_OPTIONS.len();
     match key.code {
-        KeyCode::Up => app.plugin.herdr_options_cursor = (cursor + rows - 1) % rows,
-        KeyCode::Down => app.plugin.herdr_options_cursor = (cursor + 1) % rows,
+        KeyCode::Up => {
+            app.plugin.diagnostic_focus = false;
+            app.plugin.herdr_options_cursor = (cursor + rows - 1) % rows;
+        }
+        KeyCode::Down => {
+            app.plugin.diagnostic_focus = false;
+            app.plugin.herdr_options_cursor = (cursor + 1) % rows;
+        }
         KeyCode::Char('f') => apply_plugin_fix(app),
-        KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
-        KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
-        KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
+        KeyCode::Enter | KeyCode::Char(' ') if !app.plugin.diagnostic_focus => {
+            activate_herdr_option(app, HERDR_OPTIONS[cursor]);
+        }
+        KeyCode::Char('+') if !app.plugin.diagnostic_focus => step_herdr_tag_refresh(app, 1),
+        KeyCode::Char('-') if !app.plugin.diagnostic_focus => step_herdr_tag_refresh(app, -1),
         _ => {}
     }
 }
@@ -5294,6 +6040,7 @@ fn open_herdr_row_text_confirm(app: &mut App) {
             .to_string()
         }),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::HerdrDelegateRowText(path),
     }));
 }
@@ -5977,6 +6724,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::Switch(name.to_string()),
     }));
 }
@@ -6090,6 +6838,11 @@ fn open_divergence_modal(app: &mut App, active: &str) {
         active: active.to_string(),
         sibling,
         cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
     }));
 }
 
@@ -6189,6 +6942,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
             message: format!("these credentials already belong to '{existing}'."),
             detail: Some("capture anyway?".to_string()),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
         }));
         return;
@@ -6351,6 +7105,32 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.global_config_cursor + 1
             };
+        }
+        KeyCode::PageUp => {
+            let starts = app.global_config_row_starts.borrow();
+            let block_ends = app.global_config_block_ends.borrow();
+            let tips = app.global_config_tips.borrow();
+            app.global_config_cursor = page_up_cursor_by_rows(
+                app.global_config_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.global_config_viewport.get(),
+                app.global_config_offset.get(),
+                app.global_config_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            let starts = app.global_config_row_starts.borrow();
+            let block_ends = app.global_config_block_ends.borrow();
+            app.global_config_cursor = page_down_cursor_by_rows(
+                app.global_config_cursor,
+                &starts,
+                &block_ends,
+                app.global_config_viewport.get(),
+                app.global_config_offset.get(),
+                app.global_config_total.get(),
+            );
         }
         KeyCode::Char(' ') => {
             run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
@@ -6636,6 +7416,14 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
             };
             sync_profile_from_chain(app);
         }
+        KeyCode::PageUp => {
+            app.chain_cursor = selector_page_up(app.chain_cursor, &app.chain_selector);
+            sync_profile_from_chain(app);
+        }
+        KeyCode::PageDown => {
+            app.chain_cursor = selector_page_down(app.chain_cursor, &app.chain_selector);
+            sync_profile_from_chain(app);
+        }
         KeyCode::Enter => enter_fallback_detail(app),
         _ => {}
     }
@@ -6717,9 +7505,8 @@ fn toggle_wrap_off(app: &mut App) {
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
 /// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
-/// scheduler is needed since both `next_target` and `next_auto_switch_target`
-/// read the flag straight off the same shared `config` (`snapshot_chain`
-/// mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
+/// scheduler is needed since `next_auto_switch_target` reads the flag straight
+/// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -6789,10 +7576,10 @@ fn step_burn_horizon(app: &mut App) {
 
 /// Flip the master half of the real-money opt-in
 /// (`AppState.spend_budget_switching`). Same persistence shape as
-/// `toggle_burn_aware_switching`; both walk twins read the flag off the shared
-/// config (the UI twin directly, the scheduler's through `snapshot_chain`), so
-/// no separate propagation is needed. Flipping this on alone still spends
-/// nothing — every member's ceiling defaults to $0.
+/// `toggle_burn_aware_switching`; no separate propagation to the scheduler is
+/// needed since the walk reads the flag off the same shared `config`
+/// (`snapshot_chain` mirrors it into `ChainSnapshot`). Flipping this on alone
+/// still spends nothing — every member's ceiling defaults to $0.
 fn toggle_spend_budget_switching(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -7141,6 +7928,34 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            app.fallback_edit = None;
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
+            app.fallback_detail_cursor = page_up_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            app.fallback_edit = None;
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            app.fallback_detail_cursor = page_down_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
         // Continuous fields only — `max spend` (a dollar ceiling) has no
         // natural step unit and stays typed-only.
         KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
@@ -7183,6 +7998,32 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
+            app.fallback_detail_cursor = page_up_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            app.fallback_detail_cursor = page_down_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
             let would_mix = {
@@ -7196,6 +8037,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
                 }));
             } else {
@@ -8011,6 +8853,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 let max = app.help_max_scroll.get();
                 app.help_scroll = app.help_scroll.saturating_add(1).min(max);
             }
+            KeyCode::PageUp => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = page_up_scroll(
+                    app.help_scroll as usize,
+                    max as usize,
+                    app.help_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = page_down_scroll(
+                    app.help_scroll as usize,
+                    max as usize,
+                    app.help_viewport.get() as usize,
+                ) as u16;
+            }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
                 app.modals.pop();
             }
@@ -8021,6 +8879,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
+        Modal::PresetApply(_) => handle_preset_apply_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
@@ -8350,6 +9209,49 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
                 state.cursor = (state.cursor + 1) % len;
             }
         }
+        KeyCode::PageUp => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                let next = {
+                    let starts = state.starts.borrow();
+                    let block_ends = state.block_ends.borrow();
+                    page_up_cursor_by_rows(
+                        state.cursor,
+                        &starts,
+                        &block_ends,
+                        &[],
+                        state.viewport.get(),
+                        state.scroll.get(),
+                        state.total.get(),
+                    )
+                };
+                state.cursor = next;
+            }
+        }
+        KeyCode::PageDown => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                let next = {
+                    let starts = state.starts.borrow();
+                    let block_ends = state.block_ends.borrow();
+                    page_down_cursor_by_rows(
+                        state.cursor,
+                        &starts,
+                        &block_ends,
+                        state.viewport.get(),
+                        state.scroll.get(),
+                        state.total.get(),
+                    )
+                };
+                state.cursor = next;
+            }
+        }
         KeyCode::Enter => {
             let Some(Modal::ActionMenu(state)) = app.modals.last() else {
                 return;
@@ -8427,6 +9329,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
                     choice: true,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::Acknowledge,
                 }));
             }
@@ -8435,6 +9338,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::RotateOne(name.to_string()),
                 }));
             }
@@ -8749,6 +9653,14 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
         ConfigFocus::Profiles => match key.code {
             KeyCode::Up => step_profile_cursor(app, -1, sel_len),
             KeyCode::Down => step_profile_cursor(app, 1, sel_len),
+            KeyCode::PageUp => {
+                app.profile_cursor = selector_page_up(app.profile_cursor, &app.setup_selector);
+                app.reload_selected_note();
+            }
+            KeyCode::PageDown => {
+                app.profile_cursor = selector_page_down(app.profile_cursor, &app.setup_selector);
+                app.reload_selected_note();
+            }
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
@@ -8778,7 +9690,45 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         app.config_action_cursor + 1
                     };
                 }
+                KeyCode::PageUp => {
+                    disarm_armed_action(app);
+                    let starts = app.setup_detail_row_starts.borrow();
+                    let block_ends = app.setup_detail_block_ends.borrow();
+                    let tips = app.setup_detail_tips.borrow();
+                    app.config_action_cursor = page_up_cursor_by_rows(
+                        app.config_action_cursor,
+                        &starts,
+                        &block_ends,
+                        &tips,
+                        app.setup_detail_viewport.get(),
+                        app.setup_detail_offset.get(),
+                        app.setup_detail_total.get(),
+                    );
+                }
+                KeyCode::PageDown => {
+                    disarm_armed_action(app);
+                    let starts = app.setup_detail_row_starts.borrow();
+                    let block_ends = app.setup_detail_block_ends.borrow();
+                    app.config_action_cursor = page_down_cursor_by_rows(
+                        app.config_action_cursor,
+                        &starts,
+                        &block_ends,
+                        app.setup_detail_viewport.get(),
+                        app.setup_detail_offset.get(),
+                        app.setup_detail_total.get(),
+                    );
+                }
                 KeyCode::Enter => run_config_row(app, rows[app.config_action_cursor]),
+                KeyCode::Char('+' | '=')
+                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
+                {
+                    step_bell_threshold(app, 5.0);
+                }
+                KeyCode::Char('-' | '_')
+                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
+                {
+                    step_bell_threshold(app, -5.0);
+                }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
                     // Space cycles the `model` alias in place; ⏎ opens its custom
@@ -8795,54 +9745,14 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Detail rows for the current selection. `+ new` → create form; account →
-/// settings (auto-start only for OAuth).
-pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
-    let cfg = app.config();
-    let draft = app.config_draft.as_ref();
-    if app.profile_cursor >= cfg.profiles.len() {
-        // `+ new` create form. The api key only means something once a base url
-        // makes this an API account, so it stays hidden until one is typed.
-        let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
-        if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
-            rows.push(ConfigRow::ApiKey);
-        }
-        // Base model only — the alias overrides + env rows stay existing-account-only.
-        rows.push(ConfigRow::Model);
-        if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
-            rows.push(ConfigRow::Login);
-        }
-        // The live-login capture row sits right below `+ login` and survives
-        // into api mode (`+ login` doesn't): a live setup can be an endpoint
-        // too. Hidden while the live login is saved or absent — nothing to
-        // capture.
-        if app.unsaved_live_login {
-            rows.push(ConfigRow::CaptureLogin);
-        }
-        rows.push(ConfigRow::Create);
-        return rows;
-    }
-    let profile = cfg.profiles.get(app.profile_cursor);
-    // `is_api` tracks the base-url buffer live (draft wins): api key shows only
-    // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
-    // instant a base url is typed.
-    let is_api = match draft {
-        Some(d) => !d.base_url.value.trim().is_empty(),
-        None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
-    };
-    let mut rows = vec![ConfigRow::Name];
-    // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
-    if !is_api {
-        rows.push(ConfigRow::AutoStart);
-    }
-    rows.push(ConfigRow::BaseUrl);
-    if is_api {
-        rows.push(ConfigRow::ApiKey);
-    }
-    rows.push(ConfigRow::Model);
-
-    // Alias overrides collapse: render the ones set when the draft opened, tuck
-    // the rest behind a single `+ model override` reveal until ⏎ expands them.
+/// Alias overrides collapse: render the ones the draft shows (or, with no
+/// draft, the ones the profile sets), tuck the rest behind a single
+/// `+ model override` reveal until ⏎ expands them.
+fn push_override_rows(
+    rows: &mut Vec<ConfigRow>,
+    draft: Option<&ConfigDraft>,
+    profile: Option<&Profile>,
+) {
     let expanded = draft.is_some_and(|d| d.overrides_expanded);
     let override_set = |row: ConfigRow| match draft {
         Some(d) => d.overrides_shown.contains(&row),
@@ -8869,6 +9779,56 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     if any_collapsed {
         rows.push(ConfigRow::ModelOverrideAdd);
     }
+}
+
+/// Detail rows for the current selection. `+ new` → create form; account →
+/// settings (auto-start only for OAuth).
+pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
+    let cfg = app.config();
+    let draft = app.config_draft.as_ref();
+    if app.profile_cursor >= cfg.profiles.len() {
+        // `+ new` create form. The api key only means something once a base url
+        // makes this an API account, so it stays hidden until one is typed.
+        let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
+        if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
+            rows.push(ConfigRow::ApiKey);
+        }
+        // Env rows stay existing-account-only.
+        rows.push(ConfigRow::Model);
+        push_override_rows(&mut rows, draft, None);
+        if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
+            rows.push(ConfigRow::Login);
+        }
+        // The live-login capture row sits right below `+ login` and survives
+        // into api mode (`+ login` doesn't): a live setup can be an endpoint
+        // too. Hidden while the live login is saved or absent — nothing to
+        // capture.
+        if app.unsaved_live_login {
+            rows.push(ConfigRow::CaptureLogin);
+        }
+        rows.push(ConfigRow::Create);
+        return rows;
+    }
+    let profile = cfg.profiles.get(app.profile_cursor);
+    // `is_api` tracks the base-url buffer live (draft wins): api key shows only
+    // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
+    // instant a base url is typed.
+    let is_api = match draft {
+        Some(d) => !d.base_url.value.trim().is_empty(),
+        None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
+    };
+    let mut rows = vec![ConfigRow::Name];
+    // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
+    if !is_api {
+        rows.push(ConfigRow::AutoStart);
+    }
+    rows.push(ConfigRow::BellThreshold);
+    rows.push(ConfigRow::BaseUrl);
+    if is_api {
+        rows.push(ConfigRow::ApiKey);
+    }
+    rows.push(ConfigRow::Model);
+    push_override_rows(&mut rows, draft, profile);
 
     // One row per custom env entry (sorted), then the `+ add env` row. Indices
     // must match the sorted env snapshot used by the renderer and the commit path.
@@ -8949,6 +9909,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         haiku_model: InputState::new(""),
         fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
+        bell_threshold: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
@@ -8977,6 +9938,11 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
         fable_model: InputState::new(m.fable.as_deref().unwrap_or("")),
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
+        bell_threshold: InputState::new(&row_committed_value(
+            profile,
+            name,
+            ConfigRow::BellThreshold,
+        )),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
@@ -8988,10 +9954,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         captured_login: None,
         preset_env: std::collections::BTreeMap::new(),
     };
-    draft.overrides_shown = OVERRIDE_ROWS
-        .into_iter()
-        .filter(|&row| draft.field(row).is_some_and(|i| !i.value.trim().is_empty()))
-        .collect();
+    draft.overrides_shown = draft.filled_overrides();
     draft
 }
 
@@ -9043,6 +10006,22 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     }
     // Text rows plus the `model` row's custom field open an inline editor.
     if row.is_text() || row == ConfigRow::Model {
+        // The alert buffer reseeds from the profile as it opens: a reload may
+        // have moved the value since the draft was built.
+        if row == ConfigRow::BellThreshold {
+            let saved = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone())
+                .map(ProfileName::from)
+                .map(|name| {
+                    let cfg = app.config();
+                    row_committed_value(cfg.find(&name), &name, row)
+                });
+            if let (Some(saved), Some(d)) = (saved, app.config_draft.as_mut()) {
+                d.bell_threshold = InputState::new(&saved);
+            }
+        }
         if let Some(d) = app.config_draft.as_mut() {
             d.active = Some(row);
             if let Some(input) = d.field_mut(row) {
@@ -9163,6 +10142,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         "the browser login you already captured will be dropped".to_string(),
                     ),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
                 }));
                 return;
@@ -9191,6 +10171,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::BlankCredentials(name.to_string()),
                 }));
             }
@@ -9604,6 +10585,7 @@ fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
             message: "replace the captured login?".to_string(),
             detail: Some("the login you already captured will be dropped".to_string()),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::RestartLogin(name, is_new),
         }));
     } else {
@@ -9865,6 +10847,10 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         ConfigRow::SubagentModel => profile
             .and_then(|p| p.models.subagent.clone())
             .unwrap_or_default(),
+        ConfigRow::BellThreshold => profile
+            .and_then(|p| p.bell_threshold)
+            .map(format_weekly_pct)
+            .unwrap_or_default(),
         // The saved value of the i-th sorted env entry; reverts a value edit on ⎋.
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
@@ -9906,6 +10892,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
         | ConfigRow::SubagentModel => commit_model_field(app, field),
         ConfigRow::EnvEntry(i) => commit_env_value(app, i),
         ConfigRow::EnvAdd => commit_env_new_key(app),
+        ConfigRow::BellThreshold => commit_bell_threshold(app),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
@@ -9959,6 +10946,110 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
     }
 }
 
+/// ⏎ on the `alert at` field: a value in `0..=100` sets the bell, an empty one
+/// turns it off; anything else keeps the editor open, as the Fallback card's
+/// threshold editor does.
+fn commit_bell_threshold(app: &mut App) {
+    let raw = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.bell_threshold.trimmed().to_string())
+        .unwrap_or_default();
+    let Some(value) = parse_bell_threshold(&raw) else {
+        return;
+    };
+    write_bell_threshold(app, value);
+}
+
+/// A typed `alert at` value: a number in `0..=100`, or EMPTY, which turns the
+/// bell off. `Some(None)` = off, `Some(Some(v))` = set, `None` = refused.
+pub(crate) fn parse_bell_threshold(raw: &str) -> Option<Option<f64>> {
+    if raw.is_empty() {
+        return Some(None);
+    }
+    crate::fallback::parse_threshold(raw).map(Some)
+}
+
+/// `+`/`-` on the `alert at` row: step by `delta` inside the typed range,
+/// starting from 95% when the alert is off.
+fn step_bell_threshold(app: &mut App, delta: f64) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return;
+    };
+    let current = app.config().find(&name).and_then(|p| p.bell_threshold);
+    let next = match current {
+        // Rounded to hundredths, so a step off `5.01` lands on `0.01`, not on
+        // a float tail.
+        Some(v) => (((v + delta) * 100.0).round() / 100.0).clamp(
+            crate::fallback::MIN_THRESHOLD,
+            crate::fallback::MAX_THRESHOLD,
+        ),
+        None => DEFAULT_BELL_THRESHOLD,
+    };
+    write_bell_threshold(app, Some(next));
+}
+
+/// Where `+`/`-` start on an account with no alert: the commented-out default
+/// in a fresh `config.toml`.
+const DEFAULT_BELL_THRESHOLD: f64 = 95.0;
+
+/// Persist the drafted account's alert threshold, rolling memory back on a
+/// failed save, then reseed the row's buffer from what was saved.
+fn write_bell_threshold(app: &mut App, value: Option<f64>) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return;
+    };
+    // `-0` saves as `0`, the value a reload reads back.
+    let value = value.map(|v| v + 0.0);
+    let result = {
+        let mut cfg = app.config();
+        match cfg.find_mut(&name) {
+            None => None,
+            Some(profile) => {
+                let before = profile.bell_threshold;
+                profile.bell_threshold = value;
+                let saved = save_profile(profile);
+                if saved.is_err()
+                    && let Some(p) = cfg.find_mut(&name)
+                {
+                    p.bell_threshold = before;
+                }
+                Some(saved)
+            }
+        }
+    };
+    match result {
+        // The account left under the open editor (an outside delete or
+        // rename): end the edit rather than leave a dead ⏎.
+        None => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.active = None;
+            }
+        }
+        Some(Ok(())) => {
+            let shown = {
+                let cfg = app.config();
+                row_committed_value(cfg.find(&name), &name, ConfigRow::BellThreshold)
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.bell_threshold = InputState::new(&shown);
+                d.active = None;
+            }
+        }
+        Some(Err(e)) => app.toast(ToastKind::Danger, format!("alert update failed\n{e}")),
+    }
+}
+
 /// Fold a trimmed buffer into the matching [`ModelSettings`] field. Empty input
 /// clears it (scalar → `None`).
 fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
@@ -9975,6 +11066,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
+        | ConfigRow::BellThreshold
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
         | ConfigRow::ModelOverrideAdd
@@ -10280,6 +11372,12 @@ fn env_collision_form(
         existing_idx,
         // Default to the safe choice (cancel), per the modal cancel-default rule.
         cursor: EnvCollisionForm::options().len() - 1,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(false),
     }
 }
 
@@ -10287,6 +11385,69 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::EnvCollision(state)) = app.modals.last_mut() else {
         return;
     };
+    if state.reviewing_overwrite {
+        match key.code {
+            KeyCode::Up => {
+                state.scroll.set(
+                    state
+                        .scroll
+                        .get()
+                        .min(state.max_scroll.get() as usize)
+                        .saturating_sub(1),
+                );
+            }
+            KeyCode::Down => {
+                state.scroll.set(
+                    state
+                        .scroll
+                        .get()
+                        .saturating_add(1)
+                        .min(state.max_scroll.get() as usize),
+                );
+            }
+            KeyCode::PageUp => {
+                state.scroll.set(page_up_scroll(
+                    state.scroll.get(),
+                    state.max_scroll.get() as usize,
+                    state.viewport.get(),
+                ));
+            }
+            KeyCode::PageDown => {
+                state.scroll.set(page_down_scroll(
+                    state.scroll.get(),
+                    state.max_scroll.get() as usize,
+                    state.viewport.get(),
+                ));
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                state.confirm_overwrite = !state.confirm_overwrite;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                state.reviewing_overwrite = false;
+                state.confirm_overwrite = false;
+                state.scroll.set(0);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if state.confirm_overwrite {
+                    let name = ProfileName::from(state.profile.clone());
+                    let pending = state.key.clone();
+                    app.modals.pop();
+                    run_env_collision_choice(
+                        app,
+                        &name,
+                        &pending,
+                        None,
+                        EnvCollisionChoice::Overwrite,
+                    );
+                } else {
+                    state.reviewing_overwrite = false;
+                    state.scroll.set(0);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
     let last = EnvCollisionForm::options().len() - 1;
     match key.code {
         KeyCode::Up => {
@@ -10308,6 +11469,12 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
+            if choice == EnvCollisionChoice::Overwrite && state.overwrite_needs_review.get() {
+                state.reviewing_overwrite = true;
+                state.confirm_overwrite = false;
+                state.scroll.set(0);
+                return;
+            }
             let name = ProfileName::from(state.profile.clone());
             let pending = state.key.clone();
             let existing_idx = state.existing_idx;
@@ -10489,15 +11656,7 @@ fn commit_new_account(app: &mut App) {
     let name = d.name.trimmed().to_string();
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
-    let model = d.model.trimmed_some();
-    let models = crate::profile::ModelSettings {
-        default: model.clone(),
-        opus: d.opus_model.trimmed_some(),
-        sonnet: d.sonnet_model.trimmed_some(),
-        haiku: d.haiku_model.trimmed_some(),
-        fable: d.fable_model.trimmed_some(),
-        subagent: d.subagent_model.trimmed_some(),
-    };
+    let models = d.typed_models();
     let preset_env = d.preset_env.clone();
     // A draft-held mint only makes sense for an OAuth create; a typed base url
     // flipped the form to API mode (login row hidden), so the mint is dropped.
@@ -10512,6 +11671,15 @@ fn commit_new_account(app: &mut App) {
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::Mint(_)));
     let endpoint_overridden =
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::LiveLogin(_)));
+    // The form's model rows were picked for the form's endpoint, so a captured
+    // login on another one takes none of them.
+    let models_dropped = !models.is_empty()
+        && matches!(&captured, Some(DraftLogin::LiveLogin(s)) if s.base_url != base_url);
+    let models = if models_dropped {
+        ModelSettings::default()
+    } else {
+        models
+    };
     let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
@@ -10524,14 +11692,14 @@ fn commit_new_account(app: &mut App) {
             // Both stashes parked the login's uuid until this moment fixed the
             // name; the commit functions anchor it on the create.
             Some(DraftLogin::LiveLogin(snapshot)) => {
-                capture_into_profile(&mut cfg, name.clone(), model, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), models, *snapshot)
             }
             // The draft parked the login's uuid until this moment fixed the
             // name; `create_profile_from_login` anchors it on the commit.
             Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
-                model,
+                models,
                 login.credentials,
                 login.identity,
             ),
@@ -10555,10 +11723,18 @@ fn commit_new_account(app: &mut App) {
                     "base url set\nthe captured oauth login was discarded",
                 );
             }
-            if endpoint_overridden {
+            let unused = match (endpoint_overridden, models_dropped) {
+                (true, true) => Some("endpoint and model fields"),
+                (true, false) => Some("endpoint fields"),
+                (false, true) => Some("model fields"),
+                (false, false) => None,
+            };
+            if let Some(unused) = unused {
                 app.toast(
                     ToastKind::Info,
-                    "created from the captured current login\nthe typed endpoint fields were not used",
+                    format!(
+                        "created from the captured current login\nthe typed {unused} were not used"
+                    ),
                 );
             }
             app.refresh_tokens();
@@ -10594,6 +11770,7 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
                     .to_string(),
             ),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::DeleteLiveSession(name.to_string()),
         }));
         return;
@@ -10654,6 +11831,7 @@ fn toggle_focused_account_disabled(app: &mut App) {
         message: format!("disable '{name}'?"),
         detail: Some(DISABLE_DETAIL.to_string()),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::DisableOne(name.to_string()),
     }));
 }
@@ -10684,20 +11862,16 @@ fn prompt_save_preset(app: &mut App) {
 }
 
 /// `apply preset`: open the picker. The list always holds the built-ins, so
-/// it is never empty and needs no empty state. On `+ new` the target is the
-/// draft's name buffer (empty until the user types one); the preset's fields
+/// it is never empty and needs no empty state. On `+ new` the preset's fields
 /// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
     let target = if let Some((name, _, _)) = focused_account(app) {
-        name.to_string()
+        PresetTarget::from(name.to_string())
     } else if app.profile_cursor >= app.profile_count() {
         if app.config_draft.is_none() {
             app.config_draft = Some(build_draft_new());
         }
-        app.config_draft
-            .as_ref()
-            .map(|d| d.name.trimmed().to_string())
-            .unwrap_or_default()
+        PresetTarget::NewAccount
     } else {
         return;
     };
@@ -10705,6 +11879,11 @@ fn open_preset_picker(app: &mut App) {
         target,
         presets: crate::presets::list_presets(),
         cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
     }));
 }
 
@@ -10762,6 +11941,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                                     .to_string(),
                             ),
                             choice: false,
+                            scroll: ConfirmScroll::default(),
                             on_confirm: ConfirmAction::OverwritePreset(name, source),
                         }));
                         return;
@@ -10797,6 +11977,37 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
         // Drop a custom preset. Built-ins have no file to drop, so the pick says
         // so rather than no-opping: a list carries no dimmed row here. The toast
         // fires with the picker still mounted so the user can pick another.
@@ -10816,6 +12027,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::DeletePreset(preset.name),
             }));
         }
@@ -10823,142 +12035,185 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
             let picked = state.presets.get(state.cursor.min(last)).cloned();
             let target = state.target.clone();
             app.modals.pop();
-            let Some(preset) = picked else {
-                return;
-            };
-            // Naming the fields that would change is the whole point of the
-            // warning: "this overwrites settings" says nothing a user can act on.
-            let clobbered = {
-                let cfg = app.config();
-                cfg.find(&ProfileName::from(target.clone()))
-                    .map(preset_clobbers)
-                    .unwrap_or_default()
-            };
-            if clobbered.is_empty() {
-                apply_preset_to(app, &target, &preset.name);
-                return;
+            if let Some(preset) = picked {
+                offer_preset_apply(app, target, &preset);
             }
-            app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("apply '{}' over '{target}'?", preset.name),
-                detail: Some(format!("replaces {}.", clobbered.join(", "))),
-                choice: false,
-                on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
-            }));
         }
         _ => {}
     }
 }
 
-/// Which of the target's own fields an apply would land on, in row order and
-/// spelled the way the Setup rows are. Empty means the preset writes into a
-/// blank endpoint + model block and can go straight through. Every set field
-/// counts: the apply REPLACES both blocks wholesale, so a field the preset
-/// leaves unset is cleared rather than kept.
-fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if profile.base_url.is_some() {
-        out.push("base url");
-    }
-    let m = &profile.models;
-    for (label, set) in [
-        ("model", m.default.is_some()),
-        ("fable", m.fable.is_some()),
-        ("opus", m.opus.is_some()),
-        ("sonnet", m.sonnet.is_some()),
-        ("haiku", m.haiku.is_some()),
-        ("subagent", m.subagent.is_some()),
-    ] {
-        if set {
-            out.push(label);
+/// The endpoint + model block `apply preset` lands on: the draft's buffers on
+/// `+ new`, which stand in for an account's values, the saved account's own
+/// otherwise. `None` once the account is gone.
+fn preset_target_block(
+    app: &App,
+    target: &PresetTarget,
+) -> Option<(Option<String>, ModelSettings)> {
+    match target {
+        PresetTarget::NewAccount => app
+            .config_draft
+            .as_ref()
+            .map(|d| (d.base_url.trimmed_some(), d.typed_models())),
+        PresetTarget::Account(name) => {
+            let cfg = app.config();
+            cfg.find(&ProfileName::from(name.as_str()))
+                .map(|p| (p.base_url.clone(), p.models.clone()))
         }
     }
-    out
 }
 
-/// Stamp `preset` onto `target`. A saved account is written in a single locked
-/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
-/// its prior state. On `+ new` (cursor past the roster) the target names the
-/// unsaved draft, not a profile on disk — the preset's fields are written into
-/// the draft's input buffers directly and committed when the create form fires.
-/// Rebuilds the draft afterwards for a saved account, since every buffer it
-/// holds is stale.
+/// Apply `preset` to `target`, asking first whenever it would change a value:
+/// the keep / clear confirm when the target holds a value the preset leaves
+/// unset, the plain confirm when it only replaces values, straight through
+/// otherwise. Naming the fields is the point of asking: "this overwrites
+/// settings" says nothing a user can act on.
+fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::presets::Preset) {
+    let Some((base_url, models)) = preset_target_block(app, &target) else {
+        app.toast(ToastKind::Danger, format!("{target} is gone"));
+        return;
+    };
+    let (replaces, leaves) = preset.apply_diff(base_url.as_deref(), &models);
+    let message = format!("apply '{}' to {target}?", preset.name);
+    if !leaves.is_empty() {
+        app.open_modal(Modal::PresetApply(PresetApplyForm {
+            target,
+            preset: preset.name.clone(),
+            message,
+            replaces,
+            leaves,
+            focus: PresetApplyButton::Keep,
+            scroll: ConfirmScroll::default(),
+        }));
+    } else if !replaces.is_empty() {
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message,
+            detail: Some(format!("replaces {}.", replaces.join(", "))),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name.clone(), replaces),
+        }));
+    } else {
+        apply_preset_to(
+            app,
+            &target,
+            &preset.name,
+            crate::presets::Leftover::Keep,
+            &[],
+            &[],
+        );
+    }
+}
+
+/// Stamp `preset` onto `target`: every field the preset sets, and every field
+/// it leaves unset kept or cleared per `leftover`. `replaces` and `leaves` are
+/// the fields the confirm named; a reload or a preset edit since it opened can
+/// move them, and then the apply asks again over the fresh diff rather than
+/// change a field nobody was shown.
+///
+/// A saved account is written in a single locked transaction
+/// ([`edit_profile_preset`]) so a failure leaves the whole profile on its prior
+/// state, and its draft is rebuilt, since every buffer it holds is stale. On
+/// `+ new` the result lands in the draft's input buffers and is committed when
+/// the create form fires.
 ///
 /// The preset is re-read here rather than carried from the picker: a confirm can
 /// sit open across an edit to the store, and what the user confirmed was a NAME.
 /// The account's own api key is preserved — a template names an endpoint, never
 /// the credential for one.
-fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
+fn apply_preset_to(
+    app: &mut App,
+    target: &PresetTarget,
+    preset: &str,
+    leftover: crate::presets::Leftover,
+    replaces: &[&'static str],
+    leaves: &[&'static str],
+) {
     let Some(preset) = crate::presets::load_preset(preset) else {
         app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
         return;
     };
-    // `+ new`: target names the draft. Stamp the input buffers and return —
-    // nothing is on disk until the create form commits.
-    if app.profile_cursor >= app.profile_count() {
-        stamp_draft_from_preset(app, &preset);
+    let Some((base_url, models)) = preset_target_block(app, target) else {
+        app.toast(ToastKind::Danger, format!("{target} is gone"));
+        return;
+    };
+    if preset.apply_diff(base_url.as_deref(), &models) != (replaces.to_vec(), leaves.to_vec()) {
+        offer_preset_apply(app, target.clone(), &preset);
         return;
     }
-    let target = ProfileName::from(target);
+    let name = match target {
+        PresetTarget::NewAccount => {
+            let selected = config_rows(app).get(app.config_action_cursor).copied();
+            stamp_draft_from_preset(app, &preset, leftover);
+            if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
+                app.config_action_cursor = pos;
+            }
+            return;
+        }
+        PresetTarget::Account(name) => ProfileName::from(name.as_str()),
+    };
+    let (new_url, new_models) = preset.applied_to(&base_url, &models, leftover);
+    let repointed = new_url != base_url;
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(
-            &mut cfg,
-            &target,
-            preset.base_url.clone(),
-            preset.models.clone(),
-            &preset.env,
-        )
+        edit_profile_preset(&mut cfg, &name, new_url, new_models, &preset.env)
     };
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            // The repoint retires the old provider's verdicts — the shared
+            // A repoint retires the old provider's verdicts — the shared
             // clear keeps its streak from accusing the new endpoint.
-            clear_profile_status_chrome(app, &target);
+            if repointed {
+                clear_profile_status_chrome(app, &name);
+            }
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
                 let selected = config_rows(app).get(app.config_action_cursor).copied();
-                app.config_draft = Some(build_draft_existing(app, &target));
+                app.config_draft = Some(build_draft_existing(app, &name));
                 if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
                     app.config_action_cursor = pos;
                 }
             }
             app.toast(
                 ToastKind::Success,
-                format!("applied '{}' to '{target}'", preset.name),
+                format!("applied '{}' to '{name}'", preset.name),
             );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
     }
 }
 
-/// Write `preset`'s fields into the `+ new` draft's input buffers. Only fields
-/// the preset carries are touched — a draft is a work in progress, so clearing
-/// a buffer the user had typed (because the preset left that field unset) would
-/// lose their work for no reason. The model-override fields the preset does
-/// carry land in the corresponding tier row.
-fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
+/// Write `preset`'s fields into the `+ new` draft's input buffers, the typed
+/// buffers standing in for a saved account's values: the draft ends where the
+/// same apply leaves a saved account, alias rows shown the way that account's
+/// rebuilt pane shows them.
+fn stamp_draft_from_preset(
+    app: &mut App,
+    preset: &crate::presets::Preset,
+    leftover: crate::presets::Leftover,
+) {
     let Some(draft) = app.config_draft.as_mut() else {
         return;
     };
-    if let Some(url) = preset.base_url.as_deref() {
-        draft.base_url = InputState::new(url);
-    }
-    if let Some(m) = preset.models.default.as_deref() {
-        draft.model = InputState::new(m);
-    }
+    let (base_url, models) = preset.applied_to(
+        &draft.base_url.trimmed_some(),
+        &draft.typed_models(),
+        leftover,
+    );
     for (value, field) in [
-        (preset.models.opus.as_deref(), &mut draft.opus_model),
-        (preset.models.sonnet.as_deref(), &mut draft.sonnet_model),
-        (preset.models.haiku.as_deref(), &mut draft.haiku_model),
-        (preset.models.fable.as_deref(), &mut draft.fable_model),
-        (preset.models.subagent.as_deref(), &mut draft.subagent_model),
+        (base_url, &mut draft.base_url),
+        (models.default, &mut draft.model),
+        (models.opus, &mut draft.opus_model),
+        (models.sonnet, &mut draft.sonnet_model),
+        (models.haiku, &mut draft.haiku_model),
+        (models.fable, &mut draft.fable_model),
+        (models.subagent, &mut draft.subagent_model),
     ] {
-        if let Some(m) = value {
-            *field = InputState::new(m);
-        }
+        *field = InputState::new(value.as_deref().unwrap_or_default());
     }
     draft.preset_env.extend(preset.env.clone());
+    draft.overrides_expanded = false;
+    draft.overrides_shown = draft.filled_overrides();
     let name = preset.name.clone();
     app.toast(
         ToastKind::Success,
@@ -11113,6 +12368,30 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('y') => state.choice = true,
         KeyCode::Char('n') => state.choice = false,
+        KeyCode::Up => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = state.scroll.offset.min(max).saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = state.scroll.offset.saturating_add(1).min(max);
+        }
+        KeyCode::PageUp => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = page_up_scroll(
+                state.scroll.offset as usize,
+                max as usize,
+                state.scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::PageDown => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = page_down_scroll(
+                state.scroll.offset as usize,
+                max as usize,
+                state.scroll.viewport.get() as usize,
+            ) as u16;
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
         }
@@ -11122,6 +12401,75 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
             app.modals.pop();
             if confirmed {
                 run_confirm_action(app, action);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the apply-preset keep / clear confirm: the confirm's grammar over
+/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`/space
+/// choose, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
+fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
+    use PresetApplyButton::{Cancel, Clear, Keep};
+    let Some(Modal::PresetApply(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let scroll = &mut form.scroll;
+    match key.code {
+        KeyCode::Left => {
+            form.focus = match form.focus {
+                Clear => Keep,
+                Keep | Cancel => Cancel,
+            };
+        }
+        KeyCode::Right => {
+            form.focus = match form.focus {
+                Cancel => Keep,
+                Keep | Clear => Clear,
+            };
+        }
+        KeyCode::Tab => {
+            form.focus = match form.focus {
+                Cancel => Keep,
+                Keep => Clear,
+                Clear => Cancel,
+            };
+        }
+        KeyCode::Up => {
+            scroll.offset = scroll.offset.min(scroll.max_scroll.get()).saturating_sub(1);
+        }
+        KeyCode::Down => {
+            scroll.offset = scroll.offset.saturating_add(1).min(scroll.max_scroll.get());
+        }
+        KeyCode::PageUp => {
+            scroll.offset = page_up_scroll(
+                scroll.offset as usize,
+                scroll.max_scroll.get() as usize,
+                scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::PageDown => {
+            scroll.offset = page_down_scroll(
+                scroll.offset as usize,
+                scroll.max_scroll.get() as usize,
+                scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let leftover = match form.focus {
+                Cancel => None,
+                Keep => Some(crate::presets::Leftover::Keep),
+                Clear => Some(crate::presets::Leftover::Clear),
+            };
+            let (target, preset) = (form.target.clone(), form.preset.clone());
+            let (replaces, leaves) = (form.replaces.clone(), form.leaves.clone());
+            app.modals.pop();
+            if let Some(leftover) = leftover {
+                apply_preset_to(app, &target, &preset, leftover, &replaces, &leaves);
             }
         }
         _ => {}
@@ -11444,7 +12792,16 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &ProfileName::from(name)),
         ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
-        ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
+        ConfirmAction::ApplyPresetOver(target, preset, replaces) => {
+            apply_preset_to(
+                app,
+                &target,
+                &preset,
+                crate::presets::Leftover::Keep,
+                &replaces,
+                &[],
+            );
+        }
         ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
             Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
             Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
@@ -11474,6 +12831,37 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             // Just close — the prompt is on-demand now; the non-blocking
             // banner keeps carrying the signal until the divergence resolves.
@@ -11498,6 +12886,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                              account. the running claude is untouched."
                         )),
                         choice: false,
+                        scroll: ConfirmScroll::default(),
                         on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
                     }));
                 }
@@ -11549,6 +12938,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                     "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
             }));
         }
@@ -11594,6 +12984,11 @@ fn open_divergence_target_picker(app: &mut App) {
         .push(Modal::DivergenceTarget(DivergenceTargetForm {
             targets,
             cursor: preselect,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
         }));
 }
 
@@ -11620,6 +13015,37 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             } else {
                 form.cursor + 1
             };
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
@@ -11653,6 +13079,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                     "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
                 )),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
             }));
         }
@@ -11706,6 +13133,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                         "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
                     ),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::CaptureOverwrite(
                         snapshot,
                         existing,
@@ -11727,7 +13155,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), None, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), ModelSettings::default(), *snapshot)
             };
             match result {
                 Ok(()) => {
@@ -11833,7 +13261,7 @@ fn apply_status_incidents(
                 ToastKind::Info
             };
             if app.tab == Tab::Status {
-                let title = crate::format::truncate(&incident.title, 40);
+                let title = truncate(&incident.title, 40);
                 app.toast(severity, format!("new incident: {title}"));
             } else {
                 app.set_tab_activity(Tab::Status, severity);
@@ -12061,6 +13489,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
                 .to_string(),
             ),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
         }));
         if let Some(warning) = duplicate_warning {
@@ -12504,7 +13933,7 @@ fn update_banner(app: &mut App) {
             severity: BannerSeverity::Warning,
             message,
         })
-    } else if app.compact {
+    } else if app.compact || app.below_width_floor {
         // Terminal too small for the full layout. Lower severity than the
         // all-spent danger above, so danger wins the tie.
         Some(Banner {
@@ -12923,4 +14352,126 @@ fn toggle_preserve_non_login_keys(app: &mut App) {
         );
     }
     app.last_reload_fp = reload_fingerprint();
+}
+
+/// Direction a dashboard key moves card focus.
+enum DashDir {
+    Prev,
+    Next,
+    PageUp,
+    PageDown,
+}
+
+/// Move dashboard card focus one step (or one page) and reconcile the
+/// first-visible card, both through [`follow_dash_focus`].
+fn dash_move_focus(app: &mut App, dir: DashDir) {
+    let (new_focus, new_first) = {
+        let order = app.token_dash_order.get();
+        let rows = app.token_dash_rows.borrow();
+        if rows.len() != 7 {
+            return;
+        }
+        let viewport = app.token_dash_viewport.get();
+        let Some(pos) = order.iter().position(|&k| k == app.token_dash_focus) else {
+            return;
+        };
+        let starts: Vec<usize> = rows.iter().map(|&(top, _)| top as usize).collect();
+        let next = match dir {
+            DashDir::Prev => (pos + 6) % 7,
+            DashDir::Next => (pos + 1) % 7,
+            DashDir::PageUp => page_land_up(pos, &starts, viewport as usize),
+            DashDir::PageDown => page_land_down(pos, &starts, viewport as usize),
+        }
+        .min(6);
+        let focus = order[next];
+        let first = follow_dash_focus(&order, &rows, viewport, focus, app.token_dash_first.get());
+        (focus, first)
+    };
+    app.token_dash_focus = new_focus;
+    app.token_dash_first.set(new_first);
+}
+
+/// Reconcile the persisted first-visible card against the laid-out geometry and
+/// the focused card: it moves only when focus leaves the view. Pure — the key
+/// path and the render pass both call it.
+pub(crate) fn follow_dash_focus(
+    order: &[CardKind; 7],
+    rows: &[(u16, u16)],
+    viewport: u16,
+    focus: CardKind,
+    first: usize,
+) -> usize {
+    if rows.is_empty() || viewport == 0 {
+        return 0;
+    }
+    let last = rows.len() - 1;
+    if rows[last].1 <= rows[0].0 + viewport {
+        return 0; // grid fits: no scroll
+    }
+    let Some(mut focus_idx) = order.iter().position(|&k| k == focus) else {
+        return first.min(last);
+    };
+    focus_idx = focus_idx.min(last);
+    let mut first = dash_row_start(rows, first.min(last));
+    let view_top = rows[first].0;
+    let view_bottom = view_top + viewport;
+    let (f_top, f_bottom) = rows[focus_idx];
+    if f_top < view_top {
+        first = dash_row_start(rows, focus_idx);
+    } else if f_bottom > view_bottom {
+        // Scroll down the minimum that reveals the focused card's bottom.
+        let want = f_bottom.saturating_sub(viewport);
+        let k = (0..=focus_idx)
+            .find(|&k| rows[k].0 >= want)
+            .unwrap_or(focus_idx);
+        first = dash_row_start(rows, k);
+    }
+    first
+}
+
+/// Clamp the first-visible card after a resize: the view never starts past the
+/// last card top that still fills the body (no blank tail while cards above
+/// stay hidden), bounded so the focused card's bottom stays in view. Render-only.
+pub(crate) fn clamp_dash_first(
+    order: &[CardKind; 7],
+    rows: &[(u16, u16)],
+    viewport: u16,
+    focus: CardKind,
+    first: usize,
+) -> usize {
+    if rows.is_empty() || viewport == 0 {
+        return 0;
+    }
+    let last = rows.len() - 1;
+    if rows[last].1 <= rows[0].0 + viewport {
+        return 0; // grid fits
+    }
+    let Some(mut focus_idx) = order.iter().position(|&k| k == focus) else {
+        return first.min(last);
+    };
+    focus_idx = focus_idx.min(last);
+    let first = dash_row_start(rows, first.min(last));
+    if rows[last].1 >= rows[first].0 + viewport {
+        return first; // already fills the body
+    }
+    let max_top = rows[last].1 - viewport;
+    let focus_floor = rows[focus_idx].1.saturating_sub(viewport);
+    let mut k = first;
+    while k > 0 && rows[k].0 > max_top {
+        k -= 1;
+    }
+    if rows[k].0 < focus_floor {
+        while k < last && rows[k].0 < focus_floor {
+            k += 1;
+        }
+    }
+    dash_row_start(rows, k)
+}
+
+/// The first card of `i`'s visual row (side-by-side cards share a top).
+fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
+    while i > 0 && rows[i - 1].0 == rows[i].0 {
+        i -= 1;
+    }
+    i
 }

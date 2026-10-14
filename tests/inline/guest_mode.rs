@@ -212,8 +212,22 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
     // Wrap-off refuses; the unattended auto-switch stays put silently.
     let (config, out) = through_handle(config, crate::actions::switch_off);
     assert!(is_guest_refusal(&out.unwrap_err()));
-    let (mut config, out) =
-        through_handle(config, |h| crate::fallback::auto_switch_if_needed(h, None));
+    let (mut config, out) = through_handle(config, |h| {
+        use crate::lockorder::RankedMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        crate::fallback::auto_switch_if_needed(
+            h,
+            None,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+        )
+    });
     assert!(out.expect("auto-switch is a silent no-op").is_none());
     assert!(config.is_active(&ProfileName::from("one")), "nothing moved");
 

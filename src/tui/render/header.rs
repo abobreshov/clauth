@@ -23,16 +23,22 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Account gauge ────────────────────────────────────────────────────────
 //
-// `name  [███░░░░░] 38%` for the active profile's 5h window. Collapse
-// ladder sacrifices the bar before the name (bar shrinks → bar drops →
-// name truncates → name drops → hide).
+// `name 38% [███░░░░░]` for the active profile's 5h window — cloudy's pick
+// (2026-10-07): the percent leads the bar inside the gauge rung, single-spaced
+// throughout, a sanctioned house deviation. The bar keeps its sanctioned
+// brackets and they drop with it; the collapse ladder sacrifices the bar
+// before the name (bar shrinks → bar and brackets drop → name truncates →
+// name drops → hide).
 
-const GAUGE_NAME_GAP: usize = 2;
 const GAUGE_BAR_FULL: usize = 10;
 const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
 const GAUGE_NAME_MIN: usize = 3;
 const GAUGE_PCT_W: usize = 4;
+/// Flush bar brackets: `[` + `]`.
+const GAUGE_BAR_CHROME_W: usize = 2;
+/// Every gauge gap — name → percent, percent → bar, bare rung — 1 cell.
+const GAUGE_GAP: usize = 1;
 // ── Account-name pulse ───────────────────────────────────────────────────
 
 const PULSE_SWEEP_MS: u64 = 900;
@@ -82,13 +88,18 @@ fn gauge_tail_w(has_pct: bool) -> usize {
     if has_pct { GAUGE_PCT_W } else { 0 }
 }
 
+/// Whole-gauge width at a rung. While the bar renders, the percent leads it
+/// (`name` pct ` [bar]`, single-spaced); the brackets drop with the bar,
+/// leaving the bare `name` pct rung.
 fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
     let mut w = gauge_tail_w(has_pct);
     if bar_cells > 0 {
-        w += bar_cells + 2 + 1;
-    }
-    if name_w > 0 {
-        w += name_w + GAUGE_NAME_GAP;
+        w += bar_cells + GAUGE_BAR_CHROME_W + GAUGE_GAP;
+        if name_w > 0 {
+            w += name_w + GAUGE_GAP;
+        }
+    } else if name_w > 0 {
+        w += name_w + GAUGE_GAP;
     }
     w
 }
@@ -129,33 +140,35 @@ fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
 
 fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if fit.name_w > 0 {
-        let (nt, _pad) = fixed_split(name, fit.name_w);
-        let style = Style::default().fg(theme::text_color());
-        spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
-        spans.push(Span::raw("  "));
-    }
+    let push_name = |spans: &mut Vec<Span<'static>>, gap: &'static str| {
+        if fit.name_w > 0 {
+            let (nt, _pad) = fixed_split(name, fit.name_w);
+            let style = Style::default().fg(theme::text_color());
+            spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
+            spans.push(Span::raw(gap));
+        }
+    };
     match pct {
         Some(pct) if fit.bar_cells > 0 => {
             let style = Style::default().fg(theme::util_color(pct));
+            push_name(&mut spans, " ");
+            spans.push(Span::styled(crate::format::format_pct(pct), style));
+            spans.push(Span::raw(" "));
             spans.push(Span::styled("[", theme::dim()));
             spans.push(Span::styled(
                 bar_string_with_cells(pct, fit.bar_cells),
                 style,
             ));
             spans.push(Span::styled("]", theme::dim()));
-            spans.push(Span::styled(
-                format!(" {}", crate::format::format_pct(pct)),
-                style,
-            ));
         }
         Some(pct) => {
+            push_name(&mut spans, " ");
             spans.push(Span::styled(
                 crate::format::format_pct(pct),
                 Style::default().fg(theme::util_color(pct)),
             ));
         }
-        None => {}
+        None => push_name(&mut spans, " "),
     }
     spans
 }
@@ -302,7 +315,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             (crate::format::format_pct(pct).len() + 1).saturating_sub(GAUGE_PCT_W)
         });
         let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP + pct_extra);
-        let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
+        let fit = gauge_fit(
+            gauge_budget,
+            Span::raw(g.name.as_str()).width(),
+            g.pct.is_some(),
+        );
         if fit.visible {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
@@ -319,7 +336,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         prefix.append(&mut left_spans);
         left_spans = prefix;
     }
-    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_w: usize = left_spans.iter().map(Span::width).sum();
     let mut row1_spans = left_spans;
     if row1_width >= left_w + status_w + CONTENT_GAP {
         let gap = row1_width - left_w - status_w;
@@ -394,11 +411,11 @@ fn daemon_chip_color(app: &App) -> ratatui::style::Color {
 /// Alternatives in the same footprint (swap into `LOGO` to try one):
 // gantry: ["▗▄▄▄▄▄▄▄▖", "▐▌▄ ▄ ▄▐▌", "▐▌     ▐▌"]
 // gauge:  [" ▗▄▀▀▀▄▖ ", "▗▘   ▞ ▝▖", "▐▄▄▄▟▄▄▄▌"]
-const LOGO: [&str; 3] = ["▄▄▄▄   ▄▀", "▐▛▜▌ ▄▀  ", "▐██▌▀    "];
+const LOGO: [&str; 3] = ["▗▛▀▜▝  ▗▞", "▐▛▜▌ ▗▞  ", "▝▙▄▟▘    "];
 
 /// The window row while the booth light flickers on: the 200 ms beat every
 /// 6 s that the upstream mascot spent on its blink.
-const LOGO_FLICKER_MID: &str = "▐██▌ ▄▀  ";
+const LOGO_FLICKER_MID: &str = "▐▞▚▌ ▗▞  ";
 
 /// The logo rows for this frame, flicker applied.
 fn logo_rows(app: &App) -> [&'static str; 3] {
@@ -410,17 +427,59 @@ fn logo_rows(app: &App) -> [&'static str; 3] {
     }
 }
 
-/// The logo rows as lines in `accent_2` — the screen's one orange mark beside
-/// the active-account marker.
-fn logo_lines<'a>(rows: [&'a str; 3]) -> Vec<Line<'a>> {
-    let style = Style::default().fg(theme::accent_2_color());
+/// Palette roles for the booth, beacon, and moving barrier stripes.
+fn logo_cell_color(row: usize, col: usize, anim_ms: u64) -> ratatui::style::Color {
+    match (row, col) {
+        (0, 4) => {
+            if anim_ms % 6000 < 200 {
+                theme::warning_color()
+            } else {
+                theme::success_color()
+            }
+        }
+        (2, 4) | (1, 5..=6) | (0, 7..=8) => {
+            let stripe = match (row, col) {
+                (2, 4) => 0,
+                (1, 5) => 1,
+                (1, 6) => 2,
+                (0, 7) => 3,
+                _ => 4,
+            };
+            if (stripe + (anim_ms / 300) % 2).is_multiple_of(2) {
+                theme::warning_color()
+            } else {
+                theme::accent_color()
+            }
+        }
+        (0, 0..=3) | (1, 0 | 3) | (2, 0 | 3) => theme::accent_2_color(),
+        (1, 1..=2) => theme::warning_color(),
+        _ => theme::text_dim_color(),
+    }
+}
+
+/// Each logo cell carries its palette role on both terminal tiers.
+fn logo_lines(rows: [&str; 3], anim_ms: u64) -> Vec<Line<'static>> {
     rows.into_iter()
-        .map(|row| Line::from(Span::styled(row, style)).alignment(Alignment::Left))
+        .enumerate()
+        .map(|(row, text)| {
+            Line::from(
+                text.chars()
+                    .enumerate()
+                    .map(|(col, glyph)| {
+                        Span::styled(
+                            glyph.to_string(),
+                            Style::default().fg(logo_cell_color(row, col, anim_ms)),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .alignment(Alignment::Left)
+        })
         .collect()
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let para = Paragraph::new(logo_lines(logo_rows(app))).style(theme::base());
+    let para = Paragraph::new(logo_lines(logo_rows(app), app.anim_ms())).style(theme::base());
     frame.render_widget(para, area);
 }
 

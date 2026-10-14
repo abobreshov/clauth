@@ -4550,3 +4550,76 @@ fn home_walk_settings_are_additive_and_round_trip() {
     assert_eq!(restored.walk_cooldown_secs(), 0);
     assert_eq!(restored.last_switch_at, state.last_switch_at);
 }
+
+#[test]
+fn five_hour_alert_threshold_accepts_both_config_names() {
+    for key in ["bell_threshold", "five_hour_alert_threshold"] {
+        let cfg: ProfileConfig = toml::from_str(&format!("{key} = 85.0\n")).unwrap();
+        assert_eq!(cfg.bell_threshold, Some(85.0));
+    }
+    let mut profile = Profile::new("alert".to_string(), None, None);
+    profile.bell_threshold = Some(85.0);
+    assert_eq!(profile.five_hour_alert_threshold(), Some(85.0));
+    let rendered = render_config_toml(&profile);
+    let restored: ProfileConfig = toml::from_str(&rendered).unwrap();
+    assert_eq!(restored.bell_threshold, Some(85.0));
+    assert!(rendered.contains("fires an alert"));
+}
+
+#[test]
+fn five_hour_alert_command_accepts_legacy_name_and_round_trips() {
+    assert!(AppState::default().five_hour_alert_command.is_none());
+    for key in ["bell_command", "five_hour_alert_command"] {
+        let state: AppState =
+            toml::from_str(&format!("profiles = []\n{key} = 'notify-send %s'\n")).unwrap();
+        assert_eq!(
+            state.five_hour_alert_command.as_deref(),
+            Some("notify-send %s")
+        );
+        let saved = toml::to_string(&state).unwrap();
+        assert!(saved.contains("five_hour_alert_command ="));
+        let restored: AppState = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            restored.five_hour_alert_command,
+            state.five_hour_alert_command
+        );
+    }
+}
+
+#[test]
+fn saving_alert_aliases_canonicalizes_keys_without_losing_unknown_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = Profile::new("alert".to_string(), None, None);
+    save_profile(&profile).unwrap();
+    let path = profile_config_path(&profile.name).unwrap();
+    std::fs::write(
+        &path,
+        "five_hour_alert_threshold = 85.0\nfuture_setting = 7\n",
+    )
+    .unwrap();
+    profile.bell_threshold = Some(90.0);
+    save_profile(&profile).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let parsed: ProfileConfig = toml::from_str(&saved).unwrap();
+    assert_eq!(parsed.bell_threshold, Some(90.0));
+    assert!(!saved.contains("five_hour_alert_threshold ="));
+    assert!(saved.contains("future_setting = 7"));
+
+    let path = app_state_path().unwrap();
+    std::fs::write(
+        &path,
+        "profiles = []\nbell_command = 'notify-send %s'\nfuture_setting = 7\n",
+    )
+    .unwrap();
+    let mut state = load_app_state().unwrap();
+    state.five_hour_alert_command = Some("notify-send alert".to_string());
+    save_app_state(&state).unwrap();
+    let saved = std::fs::read_to_string(path).unwrap();
+    let parsed: AppState = toml::from_str(&saved).unwrap();
+    assert_eq!(
+        parsed.five_hour_alert_command.as_deref(),
+        Some("notify-send alert")
+    );
+    assert!(!saved.contains("bell_command ="));
+    assert!(saved.contains("future_setting = 7"));
+}

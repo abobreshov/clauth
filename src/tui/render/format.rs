@@ -18,28 +18,93 @@ pub(super) fn fixed(value: &str, width: usize) -> String {
     content
 }
 
+/// The rendered cell width of `value`: each grapheme's own width summed, the
+/// measure `styled_graphemes` and the buffer use (control graphemes dropped).
+/// The whole-string [`Span::width`] folds an Arabic lam-alef ligature to one
+/// cell while the buffer draws it per grapheme as two, so that measure lets a
+/// value overrun its budget.
+pub(super) fn grapheme_cells(value: &str) -> usize {
+    Span::raw(value)
+        .styled_graphemes(Style::default())
+        .map(|g| Span::raw(g.symbol).width())
+        .sum()
+}
+
+/// Keep whole graphemes from `value`, front to back, while they fit `budget`
+/// cells. Returns the kept prefix and its cell count.
+pub(super) fn prefix_in_cells(value: &str, budget: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for grapheme in Span::raw(value).styled_graphemes(Style::default()) {
+        let w = Span::raw(grapheme.symbol).width();
+        if used + w > budget {
+            break;
+        }
+        out.push_str(grapheme.symbol);
+        used += w;
+    }
+    (out, used)
+}
+
+/// The graphemes of `value` in reverse order, joined (control graphemes
+/// dropped, matching the renderer).
+fn reversed_graphemes(value: &str) -> String {
+    let mut graphemes: Vec<String> = Span::raw(value)
+        .styled_graphemes(Style::default())
+        .map(|g| g.symbol.to_owned())
+        .collect();
+    graphemes.reverse();
+    graphemes.into_iter().collect()
+}
+
+/// Truncate `value` to `width` display cells with a trailing `…`, splitting
+/// between graphemes — never inside one, so `⚠️` (two chars, one two-cell
+/// glyph) stays whole. Returns the kept content and the cell count it occupies
+/// (≤ `width`). Printable ASCII renders exactly as the old char-budgeting did.
+fn truncate_to_cells(value: &str, width: usize) -> (String, usize) {
+    let full = grapheme_cells(value);
+    if full <= width {
+        return (value.to_string(), full);
+    }
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    // One cell is reserved for `…`; the rest fills with whole graphemes.
+    let (mut out, used) = prefix_in_cells(value, width - 1);
+    out.push('…');
+    (out, used + 1)
+}
+
+/// Trailing-ellipsis truncation to `width` display cells, grapheme-safe.
+/// `pub(crate)` so `render` can re-export it for the app-level toast title.
+pub(crate) fn truncate(value: &str, width: usize) -> String {
+    truncate_to_cells(value, width).0
+}
+
 /// Truncates with `…` and returns `(content, padding)` separately so callers
 /// can style only the content without decorations bleeding past the text.
+/// Budgets display cells, so a CJK or emoji value keeps its `…` inside the
+/// column instead of overrunning the pane edge.
 pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
-    let mut content = String::with_capacity(width);
-    let mut count = 0;
-    // Peek instead of a plain `for`: the loop head must not consume the char
-    // AFTER the window, or a value exactly one char over `width` reads as
-    // exhausted and gets silently cropped with no ellipsis
-    // ("Max 20x" at 6 → "Max 20" instead of "Max 2…").
-    let mut iter = value.chars().peekable();
-    while count < width {
-        let Some(ch) = iter.next() else { break };
-        content.push(ch);
-        count += 1;
-    }
-    if width > 0 && iter.peek().is_some() {
-        content.pop();
-        content.push('…');
-        count = width;
-    }
-    let pad = " ".repeat(width - count);
+    let (content, cells) = truncate_to_cells(value, width);
+    let pad = " ".repeat(width.saturating_sub(cells));
     (content, pad)
+}
+
+/// Middle-ellipsis truncation (for paths / URLs / IDs — both ends carry
+/// meaning). The head and tail share what the ellipsis does not use; an odd
+/// budget spends its extra cell on the head. Budgets display cells, so a CJK
+/// path's head and tail stay inside the value column.
+pub(super) fn middle_truncate(s: &str, max: usize) -> String {
+    if grapheme_cells(s) <= max || max < 3 {
+        return truncate(s, max);
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let (front, _) = prefix_in_cells(s, head);
+    let back = reversed_graphemes(&prefix_in_cells(&reversed_graphemes(s), tail).0);
+    format!("{front}…{back}")
 }
 
 #[cfg(test)]

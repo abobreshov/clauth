@@ -2152,10 +2152,38 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
 /// `model` rides along the same way [`create_profile_from_login`]'s does: the
 /// Setup `+ new` form's typed default model. Every capture-from-a-name-prompt
 /// caller passes `None`.
+pub(crate) trait IntoProfileModels {
+    fn into_models(self) -> ModelSettings;
+}
+impl IntoProfileModels for Option<String> {
+    fn into_models(self) -> ModelSettings {
+        ModelSettings {
+            default: self,
+            ..Default::default()
+        }
+    }
+}
+impl IntoProfileModels for ModelSettings {
+    fn into_models(self) -> ModelSettings {
+        self
+    }
+}
+fn trimmed_models(models: ModelSettings) -> ModelSettings {
+    let trim = |m: Option<String>| m.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    ModelSettings {
+        default: trim(models.default),
+        opus: trim(models.opus),
+        sonnet: trim(models.sonnet),
+        haiku: trim(models.haiku),
+        fable: trim(models.fable),
+        subagent: trim(models.subagent),
+    }
+}
+
 pub(crate) fn capture_into_profile(
     config: &mut AppConfig,
     name: String,
-    model: Option<String>,
+    models: impl IntoProfileModels,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
     let CaptureSnapshot {
@@ -2166,13 +2194,10 @@ pub(crate) fn capture_into_profile(
     } = snapshot;
     let name = ProfileName::from(name);
     let seed_name = name.clone();
+    let models = trimmed_models(models.into_models());
     with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
-        profile.models.default = model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        profile.models = models;
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
         // hand-edited roster, a crash before the record landed): mark it pending
         // before writing, so the displaced anchor cannot authorize a walk.
@@ -2229,19 +2254,16 @@ pub(crate) fn capture_into_profile(
 pub(crate) fn create_profile_from_login(
     config: &mut AppConfig,
     name: String,
-    model: Option<String>,
+    models: impl IntoProfileModels,
     credentials: ClaudeCredentials,
     identity: Option<crate::profile_cache::AccountIdentity>,
 ) -> Result<()> {
     let name = ProfileName::from(name);
     let seed_name = name.clone();
+    let models = trimmed_models(models.into_models());
     with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), None, None);
-        profile.models.default = model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        profile.models = models;
         // Same orphan-dir guard as `capture_into_profile`: mark the install
         // pending before the store write.
         crate::profile_cache::begin_login_install(&name)?;

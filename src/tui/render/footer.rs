@@ -272,13 +272,21 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("?", "help"),
             ],
             ConfigFocus::Actions => {
-                // Row-aware: the `model` row cycles on space; env rows edit a value
-                // or open the add-env key editor.
+                // Row-aware: the `model` row cycles on space; `alert at` steps on
+                // `+`/`-`; env rows edit a value or open the add-env key editor.
                 match config_rows(app).get(app.config_action_cursor) {
                     Some(ConfigRow::Model) => &[
                         ("↑↓", "row"),
                         ("space", "cycle"),
                         ("↵", "custom"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ],
+                    Some(ConfigRow::BellThreshold) => &[
+                        ("↑↓", "row"),
+                        ("+", "raise"),
+                        ("-", "lower"),
+                        ("↵", "type"),
                         ("a", "actions"),
                         ("?", "help"),
                     ],
@@ -422,6 +430,17 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     };
 
     let mut hints = tail.to_vec();
+    if app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail {
+        if app.plugin.diagnostic_focus {
+            hints.retain(|(key, _)| !matches!(*key, "space/↵" | "+" | "-" | "↵"));
+            if let Some((_, label)) = hints.first_mut() {
+                *label = "row";
+            }
+        }
+        if app.plugin.detail_max_scroll.get() > 0 {
+            hints.insert(1, ("page up/down", "read"));
+        }
+    }
     // The armed remove's way out is its `esc cancel`: `q` ascends out of the
     // card the same way there, so `q back` would be a second name for it.
     if !(app.tab == Tab::Fallback && fallback_hint(app) == FallbackHint::DetailRemoveArmed) {

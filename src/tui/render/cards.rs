@@ -70,7 +70,7 @@ pub(super) fn draw_usage_rail(frame: &mut Frame<'_>, area: Rect, app: &App, sel:
         "accounts",
         focused,
         sel,
-        &app.usage_selector_offset,
+        &app.usage_selector,
         |w| {
             let profiles = cfg.profiles.iter().enumerate().map(|(i, p)| {
                 let ns = if p.is_disabled() {
@@ -107,6 +107,7 @@ pub(super) fn draw_observation_detail(
         &obs.label,
         app.usage_detail_focus == StatusFocus::Detail,
         false,
+        area.width,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);

@@ -1220,7 +1220,6 @@ fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
     );
     super::bootstrap_third_party(
         &tp_store,
-        &store,
         &tp_status,
         &last_fetched,
         &[tp_entry("hybrid")],
@@ -3556,6 +3555,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     scan_auto_switch(
         &config_handle(true),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3577,6 +3577,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     scan_auto_switch(
         &config_handle(false),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3638,6 +3639,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
     scan_auto_switch(
         &config,
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3661,10 +3663,10 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
 }
 
 /// `decision_fresh_any` unions BOTH status stores. Before the fix the scheduler
-/// twin read only the OAuth `StatusStore`, so a fresh third-party member looked
-/// stale to its fresh-preference/recovery gate while the UI twin (reading
-/// `Profile.fetch_status`, filled from both in `apply_usage`) saw it — the twins
-/// disagreed on a mixed OAuth+third-party chain (2026-07-17).
+/// read only the OAuth `StatusStore`, so a fresh third-party member looked
+/// stale to its fresh-preference/recovery gate while the config-side walk
+/// (reading `Profile.fetch_status`, filled from both in `apply_usage`) saw it —
+/// the two legs disagreed on a mixed OAuth+third-party chain (2026-07-17).
 #[test]
 fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
     use super::{FetchStatus, StatusStore, ThirdPartyStatusStore, decision_fresh_any};
@@ -3679,23 +3681,38 @@ fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
     ])));
 
     assert!(
-        decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("a")),
+        decision_fresh_any(&oauth, &tp, false, &crate::profile::ProfileName::from("a")),
         "OAuth-fresh counts"
     );
     assert!(
-        decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("b")),
+        decision_fresh_any(&oauth, &tp, true, &crate::profile::ProfileName::from("b")),
         "third-party-fresh must count too — the whole point of the fix"
     );
     assert!(
-        !decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("stale")),
+        !decision_fresh_any(
+            &oauth,
+            &tp,
+            false,
+            &crate::profile::ProfileName::from("stale")
+        ),
         "OAuth Cached is not fresh"
     );
     assert!(
-        !decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("tp-stale")),
+        !decision_fresh_any(
+            &oauth,
+            &tp,
+            true,
+            &crate::profile::ProfileName::from("tp-stale")
+        ),
         "third-party Cached is not fresh"
     );
     assert!(
-        !decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("unknown")),
+        !decision_fresh_any(
+            &oauth,
+            &tp,
+            false,
+            &crate::profile::ProfileName::from("unknown")
+        ),
         "absent in both stores is not fresh"
     );
 }
@@ -3789,6 +3806,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
         scan_auto_switch(
             &config_handle(),
             &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &status,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3915,11 +3933,23 @@ fn session_config_tp(
             .iter()
             .map(|n| {
                 if third_party.contains(n) {
-                    Profile::new(
+                    let mut p = Profile::new(
                         (*n).to_string(),
                         Some("https://example.com".to_string()),
                         Some("key".to_string()),
-                    )
+                    );
+                    // A real hybrid: an OAuth pair behind the base_url + key.
+                    p.credentials = Some(crate::profile::ClaudeCredentials {
+                        claude_ai_oauth: Some(crate::profile::OAuthToken {
+                            access_token: "at".into(),
+                            refresh_token: Some("rt".into()),
+                            expires_at: None,
+                            scopes: None,
+                            subscription_type: None,
+                            ..crate::profile::OAuthToken::default_extra()
+                        }),
+                    });
+                    p
                 } else {
                     Profile::new((*n).to_string(), None, None)
                 }
@@ -3986,11 +4016,34 @@ fn scan_sessions_with_streaks(
     super::scan_session_switches(
         config,
         store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+    );
+}
+
+/// [`scan_sessions`] with a provider store and a third-party status store — the
+/// inputs a third-party session member's picker path reads.
+fn scan_sessions_tp(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    tp_store: &super::ThirdPartyUsageStore,
+    status: &super::StatusStore,
+    tp_status: &super::ThirdPartyStatusStore,
+) {
+    super::scan_session_switches(
+        config,
+        store,
+        tp_store,
+        status,
+        tp_status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
     );
 }
@@ -5362,6 +5415,43 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
     }
 }
 
+/// A provider store entry whose provider publishes one live 5h bar at `pct`.
+fn tp_stats_with_bar(pct: f64) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        observed: None,
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "5h".to_string(),
+            pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// A provider store holding one profile's live 5h bar at `pct`.
+fn tp_store_with(name: &str, pct: f64) -> super::ThirdPartyUsageStore {
+    Arc::new(RankedMutex::new(HashMap::from([(
+        name.to_string(),
+        tp_stats_with_bar(pct),
+    )])))
+}
+
+/// A third-party status store holding one profile's `FetchStatus`.
+fn tp_status_with(name: &str, status: super::FetchStatus) -> super::ThirdPartyStatusStore {
+    Arc::new(RankedMutex::new(HashMap::from([(
+        name.to_string(),
+        status,
+    )])))
+}
+
 fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
     ThirdPartyEntry {
         name: crate::profile::ProfileName::from(name),
@@ -5954,8 +6044,7 @@ fn bootstrap_third_party_seeds_any_cache() {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, UsageStore,
-        bootstrap_third_party, now_ms,
+        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
     };
     use crate::profile::profile_subpath;
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
@@ -5966,9 +6055,6 @@ fn bootstrap_third_party_seeds_any_cache() {
     let store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    // The OAuth-shaped map the auto-switch walk reads: a seeded third-party
-    // account has to reach it too, or its window is invisible to the chain.
-    let usage_store_for_mirror: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     let stats = |pct: f64| ThirdPartyStats {
         is_available: true,
@@ -5997,26 +6083,14 @@ fn bootstrap_third_party_seeds_any_cache() {
         THIRD_PARTY_CACHE_FILE,
         &stats(20.0),
     );
-    // A best-effort cache the derivation declines: whatever the mirror held
-    // for the account must be REMOVED, not left standing — a provider that
-    // stopped publishing windows must not keep answering the walk with a
-    // frozen figure.
+    // A best-effort cache is still seeded raw — the walk's picker declines it,
+    // not the seed.
     let mut windowless = stats(50.0);
     windowless.best_effort = true;
     write_profile_cache(
         &crate::profile::ProfileName::from("windowless"),
         THIRD_PARTY_CACHE_FILE,
         &windowless,
-    );
-    usage_store_for_mirror.lock().unwrap().insert(
-        "windowless".to_string(),
-        crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 50.0,
-                resets_at: None,
-            }),
-            ..Default::default()
-        },
     );
     let stale_path = profile_subpath(
         &crate::profile::ProfileName::from("stale"),
@@ -6036,7 +6110,6 @@ fn bootstrap_third_party_seeds_any_cache() {
     ];
     bootstrap_third_party(
         &store,
-        &usage_store_for_mirror,
         &status,
         &last_fetched,
         &entries,
@@ -6052,33 +6125,12 @@ fn bootstrap_third_party_seeds_any_cache() {
         "a stale third-party cache is still seeded as a Cached starting point"
     );
     assert!(
+        store.lock().unwrap().contains_key("windowless"),
+        "a best-effort cache is seeded raw; the walk's picker declines it"
+    );
+    assert!(
         !store.lock().unwrap().contains_key("missing"),
         "a profile with no cache is left for the scheduler"
-    );
-    assert_eq!(
-        usage_store_for_mirror
-            .lock()
-            .unwrap()
-            .get("cached")
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization),
-        Some(12.0),
-        "the seeded window is mirrored into the map auto-switch reads"
-    );
-    assert!(
-        !usage_store_for_mirror
-            .lock()
-            .unwrap()
-            .contains_key("missing"),
-        "a profile with no cache contributes no mirrored window either"
-    );
-    assert!(
-        !usage_store_for_mirror
-            .lock()
-            .unwrap()
-            .contains_key("windowless"),
-        "a cache the derivation declines REMOVES the mirrored entry, so a \
-         stopped publication stops answering the walk"
     );
     assert_eq!(
         status.lock().unwrap().get("cached").copied(),
@@ -6109,42 +6161,6 @@ fn bootstrap_third_party_seeds_any_cache() {
     assert!(
         stamp <= now && stamp >= now.saturating_sub(5_000),
         "the seeded third-party profile stamps last_fetched at the cache mtime"
-    );
-}
-
-/// The mirror's `None` arm on its own — the stale-cache guard half of
-/// `publish_third_party_windows`'s own doc, which the bootstrap test above
-/// drives only through a seeded cache: a provider that stopped publishing
-/// windows has no current reading, and a frozen entry would keep answering
-/// the walk with a figure nothing refreshes.
-#[test]
-fn a_none_derivation_removes_the_mirrored_window() {
-    use super::publish_third_party_windows;
-    use crate::profile::ProfileName;
-    use crate::usage::{UsageInfo, UsageWindow};
-
-    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let name = ProfileName::from("windowless");
-    let live = UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 40.0,
-            resets_at: None,
-        }),
-        ..Default::default()
-    };
-    store
-        .lock()
-        .unwrap()
-        .insert("windowless".to_string(), live.clone());
-    publish_third_party_windows(&store, &name, None);
-    assert!(
-        !store.lock().unwrap().contains_key("windowless"),
-        "a stopped publication removes the entry the walk reads"
-    );
-    publish_third_party_windows(&store, &name, Some(live));
-    assert!(
-        store.lock().unwrap().contains_key("windowless"),
-        "a resumed publication re-inserts it"
     );
 }
 
@@ -8167,6 +8183,7 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
     scan_recovery(
         &recovery_config(None, &["b"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8202,6 +8219,7 @@ fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
     scan_recovery(
         &recovery_config(Some("a"), &["b"]),
         &recoverable_store(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8236,6 +8254,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
         scan_recovery(
             &recovery_config(None, &["b"]),
             &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &status,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &kick_blocks,
@@ -8254,6 +8273,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
     scan_recovery(
         &recovery_config(None, &["b"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8293,6 +8313,7 @@ fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
     scan_recovery(
         &recovery_config(None, &["b"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8322,6 +8343,7 @@ fn scan_recovery_queues_a_recovered_chain_member() {
     scan_recovery(
         &recovery_config(None, &["b"]),
         &recoverable_store(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8370,6 +8392,7 @@ fn scan_recovery_never_relinks_to_a_disabled_member() {
     scan_recovery(
         &config,
         &recoverable_store(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8424,6 +8447,7 @@ fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
     scan_recovery(
         &config,
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8440,8 +8464,7 @@ fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
 /// Same recovered-usage shape as the happy path, but the member's plan reads
 /// canceled — `/v1/messages` 403s no matter how idle its cached 5h window
 /// looks, so it must never be a relink target (mirrors the disabled/kick-
-/// rejected exclusions above; twin of the `fully_clear_target` canceled fix
-/// on the target-side walk).
+/// rejected exclusions above; the target-side walk's canceled fix).
 #[test]
 fn scan_recovery_never_relinks_to_a_canceled_member() {
     use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
@@ -8472,6 +8495,7 @@ fn scan_recovery_never_relinks_to_a_canceled_member() {
     scan_recovery(
         &recovery_config(None, &["b"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -8514,6 +8538,7 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
     scan_recovery(
         &config,
         &recoverable_store(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
@@ -12024,6 +12049,7 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
     scan_auto_switch(
         &session_config(&["a", "b"], Some("a")),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -12111,6 +12137,7 @@ fn run_third_party_scan(
     scan_auto_switch(
         &session_config(&["a", "b"], Some("a")),
         store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         status,
         tp_status,
         tp_streaks,
@@ -12269,6 +12296,318 @@ fn fetch_third_party_due_bumps_the_streak_on_a_provider_429() {
         state.third_party_streaks.lock().unwrap().get("tp-limited"),
         Some(&1),
         "a provider 429 must bump the consecutive-429 streak"
+    );
+}
+
+/// The walk/fallback decision for a hybrid reads the picker, not whichever leg
+/// wrote the merged store last: a hybrid active whose OAuth reading is exhausted
+/// but whose provider windows have headroom must stay put: the scan judges
+/// the provider side, never the stale OAuth reading.
+#[test]
+fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
+    use super::scan_auto_switch;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let live = |pct: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: pct,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    // The OAuth leg wrote the hybrid's reading as exhausted; b is a clear sibling.
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(10.0)),
+    ])));
+    // The provider leg wrote a 5h headroom bar for the hybrid.
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        crate::providers::ThirdPartyStats {
+            observed: None,
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![crate::providers::UsageBar {
+                label: "5h".to_string(),
+                pct: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    )])));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        super::FetchStatus::Fresh,
+    )])));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::FetchStatus::Fresh,
+    )])));
+    let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config_tp(&["a", "b"], Some("a"), &["a"]),
+        &store,
+        &tp_store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a hybrid active with provider headroom must not switch on its stale OAuth reading"
+    );
+}
+
+/// For a member the picker reads from the provider store, the freshness
+/// gate reads that member's third-party fetch status — a hybrid whose provider
+/// leg failed while its OAuth leg is Fresh must NOT act on the last provider
+/// stats; its OAuth leg's freshness says nothing about them.
+#[test]
+fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
+    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // a's OAuth leg is Fresh; its provider leg failed; its provider windows are
+    // spent. The picker reads the provider side, so the gate must refuse.
+    let store = session_store(&[("b", 10.0)]);
+    let tp_store = tp_store_with("a", 100.0);
+    let status = all_fresh(&["a", "b"]);
+    let tp_status = tp_status_with("a", super::FetchStatus::Failed);
+    let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config_tp(&["a", "b"], Some("a"), &["a"]),
+        &store,
+        &tp_store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a failed provider leg must refuse the switch despite the fresh OAuth leg"
+    );
+}
+
+/// Wrap-off recovery reads a third-party member's provider windows
+/// — a headroom provider bar (10%) must be relinked onto (emptying
+/// `third_party_names` reads the empty merged store as never-fetched and stays
+/// off).
+#[test]
+fn recovery_relinks_onto_a_third_party_member_with_provider_headroom() {
+    use super::{KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store = tp_store_with("b", 10.0);
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status = tp_status_with("b", super::FetchStatus::Fresh);
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    scan_recovery(
+        &session_config_tp(&["b"], None, &["b"]),
+        &store,
+        &tp_store,
+        &status,
+        &tp_status,
+        &kick_blocks,
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+    );
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::from([super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }]),
+        "a third-party member with provider headroom is a recovery target via the picker"
+    );
+}
+
+/// An env-token OAuth account (credentials + `base_url` +
+/// `ANTHROPIC_AUTH_TOKEN`, no api key) classifies OAuth
+/// (`usage_cache_is_third_party` false) even though `base_url.is_some()`, so a
+/// spent OAuth reading in the merged store drives the switch — classifying by
+/// `base_url.is_some()` would read the empty provider store and stay put.
+#[test]
+fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_reading() {
+    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    use std::collections::BTreeMap;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.base_url = Some("https://example.com".to_string());
+    a.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    a.env = BTreeMap::from([("ANTHROPIC_AUTH_TOKEN".to_string(), "tok".to_string())]);
+    assert!(
+        !a.usage_cache_is_third_party() && a.base_url.is_some(),
+        "fixture: the two predicates disagree"
+    );
+    let b = crate::profile::Profile::new("b".to_string(), None, None);
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![a, b],
+    }));
+
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::from([super::PendingSwitchTarget {
+            reason: None,
+            proactive: false,
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }]),
+        "an env-token OAuth account with a base_url must be walked off its spent OAuth reading"
+    );
+}
+
+/// A session that already swapped onto a member later edited into
+/// a hybrid (OAuth pair + base_url + key). The launch transport is rebuilt from
+/// the OAuth start profile, so OAuth siblings stay eligible and the member's
+/// picker answer decides: its provider windows are spent (100%), its OAuth
+/// reading has headroom (10%). The walk must move it.
+#[test]
+fn a_swapped_session_on_a_hybrid_member_walks_on_provider_windows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-7", "a");
+    row.current_member = Some("c".to_string());
+    let _marker = register_live_row(&row);
+
+    let store = session_store(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    let tp_store = tp_store_with("c", 100.0);
+    let status = all_fresh(&["a", "b", "c"]);
+    let tp_status = tp_status_with("c", super::FetchStatus::Fresh);
+    scan_sessions_tp(
+        &session_config_tp(&["a", "b", "c"], Some("a"), &["c"]),
+        &store,
+        &tp_store,
+        &status,
+        &tp_status,
+    );
+    let (intended, _cursor) = decision_of("4242-7");
+    assert!(
+        intended.is_some(),
+        "a session on a spent hybrid member must be moved"
+    );
+}
+
+/// `reading_dead_names` decides "stuck" from the same side the picker
+/// reads. A windowless-provider hybrid whose OAuth leg is deep-stuck but whose
+/// provider leg is Fresh must NOT be flagged reading-dead (the OAuth-first
+/// reading would flag it and lose the exhaustion gate).
+#[test]
+fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() {
+    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, PollStreaks, scan_auto_switch};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // b is the clear OAuth sibling; a holds no merged entry (its windows are
+    // provider-only, and the provider publishes no 5h bar → windowless).
+    let store = session_store(&[("b", 10.0)]);
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        crate::providers::ThirdPartyStats {
+            observed: None,
+            is_available: true,
+            rows: Vec::new(),
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    )])));
+    // a's OAuth leg is deep-stuck (the shape the OAuth-first reading flags);
+    // its provider leg is Fresh.
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), super::FetchStatus::RateLimited),
+        ("b".to_string(), super::FetchStatus::Fresh),
+    ])));
+    let streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: super::ACTIVE_CAP_MAX_STREAK + 1,
+            refresh_fail: 0,
+        },
+    )])));
+    let tp_status = tp_status_with("a", super::FetchStatus::Fresh);
+    let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config_tp(&["a", "b"], Some("a"), &["a"]),
+        &store,
+        &tp_store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a fresh provider leg must keep a windowless hybrid off the reading-dead bypass"
     );
 }
 
@@ -12653,6 +12992,7 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
     scan_auto_switch(
         &session_config_tp(&["a", "b"], Some("a"), &["a"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &tp_status,
         &tp_streaks,
@@ -12682,6 +13022,7 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
 fn scan_records_key_rejected(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
+    tp_store: &super::ThirdPartyUsageStore,
     status: &super::StatusStore,
     tp_status: &super::ThirdPartyStatusStore,
     tp_streaks: &super::ThirdPartyStreaks,
@@ -12694,6 +13035,7 @@ fn scan_records_key_rejected(
     scan_auto_switch(
         config,
         store,
+        tp_store,
         status,
         tp_status,
         tp_streaks,
@@ -12712,20 +13054,32 @@ fn scan_records_key_rejected(
 /// record carries no key-rejection cause and a later repair does not drop it.
 #[test]
 fn scan_auto_switch_does_not_label_an_independently_exhausted_key_rejected_active() {
-    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = crate::testutil::HomeSandbox::new();
-    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
-        Some(super::FetchStatus::Fresh),
-        None,
-        Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: 100.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-            }),
-            ..Default::default()
-        }),
-        None,
-    );
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(Some(super::FetchStatus::Fresh), None, None, None);
+    // The hybrid's provider windows are what the picker reads: a spent 5h bar
+    // makes the active independently exhausted (exhaustion would force the walk
+    // without key rejection).
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        crate::providers::ThirdPartyStats {
+            observed: None,
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![crate::providers::UsageBar {
+                label: "5h".to_string(),
+                pct: 100.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    )])));
     let entry_a = tp_entry("a");
     let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -12734,6 +13088,7 @@ fn scan_auto_switch_does_not_label_an_independently_exhausted_key_rejected_activ
     let records = scan_records_key_rejected(
         &session_config_tp(&["a", "b"], Some("a"), &["a"]),
         &store,
+        &tp_store,
         &status,
         &tp_status,
         &tp_streaks,
@@ -12771,8 +13126,15 @@ fn scan_auto_switch_does_not_label_an_independent_healthy_home_return_beside_key
         .find_mut(&crate::profile::ProfileName::from("b"))
         .unwrap()
         .preferred = true;
-    let records =
-        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    let records = scan_records_key_rejected(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
@@ -12824,8 +13186,15 @@ fn scan_auto_switch_records_the_cause_when_key_rejection_changes_the_target() {
         .find_mut(&crate::profile::ProfileName::from("c"))
         .unwrap()
         .preferred = true;
-    let records =
-        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    let records = scan_records_key_rejected(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
@@ -12864,8 +13233,15 @@ fn scan_auto_switch_records_the_cause_when_the_active_day_claim_reclaims_home() 
             .unwrap()
             .preferred = true;
     }
-    let records =
-        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    let records = scan_records_key_rejected(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
@@ -12904,8 +13280,15 @@ fn scan_auto_switch_does_not_label_a_two_claimant_day_collision_beside_key_rejec
             .unwrap()
             .preferred_days = days;
     }
-    let records =
-        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    let records = scan_records_key_rejected(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
@@ -12937,8 +13320,15 @@ fn scan_auto_switch_does_not_label_a_key_rejected_auth_broken_active() {
         .state
         .auth_broken
         .push(crate::profile::ProfileName::from("a"));
-    let records =
-        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    let records = scan_records_key_rejected(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
     assert_eq!(
         records,
         vec![super::PendingSwitchTarget {
@@ -12970,6 +13360,7 @@ fn scan_auto_switch_does_not_label_a_reading_dead_key_rejected_active() {
     let records = scan_records_key_rejected(
         &session_config_tp(&["a", "b"], Some("a"), &["a"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &tp_status,
         &tp_streaks,
@@ -13001,6 +13392,7 @@ fn scan_auto_switch_keeps_a_console_lapse_active() {
     scan_auto_switch(
         &session_config(&["a", "b"], Some("a")),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &tp_status,
         &tp_streaks,
@@ -13063,6 +13455,7 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
     scan_auto_switch(
         &session_config_tp(&["a", "b"], Some("a"), &["b"]),
         &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),

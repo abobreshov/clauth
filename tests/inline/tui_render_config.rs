@@ -1710,3 +1710,268 @@ fn setup_disk_snapshot_blank_org_uuid_is_unknown_for_duplicate_comparison() {
         }
     }
 }
+
+/// The `alert at` row at rest shows the SAVED value (the snapshot), never a
+/// stale draft buffer: the percent in the accent while set, a faint `off`
+/// while not; the editor shows the raw buffer; the hint names each state.
+#[test]
+fn the_alert_row_shows_its_percent_or_off_and_hints_each_state() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut snap = Snap::blank("a");
+    let stale_draft = InputState::new("40");
+
+    snap.bell_threshold = "90".into();
+    let set = one_row(
+        ConfigRow::BellThreshold,
+        true,
+        false,
+        None,
+        &snap,
+        &stale_draft,
+    );
+    assert_eq!(set.spans[1].content.trim_end(), "alert at");
+    assert_eq!(set.spans[2].content, "90%");
+    assert_eq!(set.spans[2].style.fg, theme::accent().fg);
+    assert_eq!(
+        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        "alerts once when 5h usage reaches this, again after it drops below"
+    );
+
+    snap.bell_threshold = "97.5".into();
+    let fraction = one_row(
+        ConfigRow::BellThreshold,
+        false,
+        false,
+        None,
+        &snap,
+        &stale_draft,
+    );
+    assert_eq!(fraction.spans[2].content, "97.5%");
+
+    snap.bell_threshold = String::new();
+    let off = one_row(
+        ConfigRow::BellThreshold,
+        false,
+        false,
+        None,
+        &snap,
+        &stale_draft,
+    );
+    assert_eq!(off.spans[2].content, "off");
+    assert_eq!(off.spans[2].style.fg, theme::faint().fg);
+    assert_eq!(
+        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        concat!(
+            "no alert when 5h usage climbs; ",
+            key_lit!("↵"),
+            " or ",
+            key_lit!("+"),
+            " to set one"
+        )
+    );
+
+    let editing = one_row(
+        ConfigRow::BellThreshold,
+        true,
+        true,
+        None,
+        &snap,
+        &InputState::new("8"),
+    );
+    assert_eq!(editing.spans[1].content.trim_end(), "alert at");
+    assert_eq!(
+        editing.spans[2].content, "8",
+        "the editor shows the raw buffer"
+    );
+    assert_eq!(editing.spans[2].style.fg, theme::body().fg);
+    assert_eq!(editing.spans[3].content, " %");
+    assert_eq!(editing.spans[3].style.fg, theme::faint().fg);
+
+    let refused = one_row(
+        ConfigRow::BellThreshold,
+        true,
+        true,
+        None,
+        &snap,
+        &InputState::new("101"),
+    );
+    assert_eq!(refused.spans[2].content, "101");
+    assert_eq!(refused.spans[2].style.fg, theme::danger().fg);
+    assert_eq!(refused.spans[3].style.fg, theme::danger().fg);
+}
+
+/// While typing, the `alert at` field carries its accepted range under it,
+/// faint while the buffer would save and DANGER while it would be refused.
+#[test]
+fn the_alert_editor_names_its_range_and_turns_danger_on_a_refused_buffer() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (raw, refused) in [
+        ("90", false),
+        ("", false),
+        ("0", false),
+        ("100", false),
+        ("101", true),
+        ("abc", true),
+        ("-1", true),
+    ] {
+        let lines = alert_range_tooltip(&InputState::new(raw), WIDE);
+        assert_eq!(lines.len(), 1, "{raw:?}");
+        assert_eq!(
+            line_text(&lines[0]),
+            " └ 0-100 % · empty turns it off",
+            "{raw:?}"
+        );
+        let want = if refused {
+            theme::danger().fg
+        } else {
+            theme::faint().fg
+        };
+        assert_eq!(lines[0].spans[1].style.fg, want, "{raw:?}");
+    }
+}
+
+/// A non-editing form value clamps to the value column by cells: a CJK name
+/// that would overrun ends in `…` inside the pane.
+#[test]
+fn the_name_value_clamps_to_the_value_column_by_cells() {
+    let input = InputState::new("cjk-日本語アカウント");
+    let lines = kv_field(
+        ratatui::text::Span::raw("  "),
+        "name",
+        &input,
+        false,
+        false,
+        false,
+        false,
+        24,
+    );
+    let text = line_text(&lines[0]);
+    assert_eq!(text, "  name            cjk-…");
+    assert_eq!(
+        ratatui::text::Span::raw(&text).width(),
+        23,
+        "the whole line stays inside the pane, measured in cells: {text}"
+    );
+}
+
+/// A long env-key label widens the key cell past DETAIL_KEY_W, so the value
+/// column opens after the RENDERED key — a value clamped against the constant
+/// overruns the pane. The whole line stays inside the pane by cells, pinned
+/// whole-row at every width.
+#[test]
+fn a_long_env_key_measures_the_rendered_lead_not_the_constant() {
+    let input = InputState::new("claude-haiku-4-5-20251001-fast");
+    let want: &[(usize, &[&str])] = &[
+        (
+            27,
+            &["  ANTHROPIC_DEFAULT_HAIK…  ", "  claude-haiku-4-5-2025100…"],
+        ),
+        (
+            28,
+            &[
+                "  ANTHROPIC_DEFAULT_HAIKU…  ",
+                "  claude-haiku-4-5-20251001…",
+            ],
+        ),
+        (
+            34,
+            &[
+                "  ANTHROPIC_DEFAULT_HAIKU_MODEL  ",
+                "  claude-haiku-4-5-20251001-fast",
+            ],
+        ),
+        (45, &["  ANTHROPIC_DEFAULT_HAIKU_MODEL  claude-haik…"]),
+    ];
+    for (w, expected) in want {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            &input,
+            false,
+            false,
+            false,
+            false,
+            *w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(got, *expected, "env-key row at {w} cols");
+    }
+}
+
+/// A `base url` value middle-ellipsizes, so both the scheme head and the path
+/// tail survive around the `…` — a CJK host in the middle is what used to push
+/// the tail past the value column.
+#[test]
+fn a_base_url_value_middle_ellipsizes_with_both_ends_surviving() {
+    let input = InputState::new("https://api.日本語アカウント.example.com/v1/chat");
+    let want: &[(usize, &[&str])] = &[
+        (27, &["  base url        http…chat"]),
+        (28, &["  base url        https…chat"]),
+        (34, &["  base url        https://…v1/chat"]),
+        (45, &["  base url        https://api.…e.com/v1/chat"]),
+    ];
+    for (w, expected) in want {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "base url",
+            &input,
+            false,
+            false,
+            false,
+            true,
+            *w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(got, *expected, "base-url row at {w} cols");
+    }
+}
+
+/// Desktop pin: the env-key lead opens after the rendered key, so the value
+/// renders whole at 80/160 — byte-identical to the pre-S9 render.
+#[test]
+fn a_long_env_key_desktop_row_matches_the_pre_s9_render() {
+    let input = InputState::new("claude-haiku-4-5-20251001-fast");
+    for w in [80usize, 160] {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            &input,
+            false,
+            false,
+            false,
+            false,
+            w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            got,
+            vec!["  ANTHROPIC_DEFAULT_HAIKU_MODEL  claude-haiku-4-5-20251001-fast"],
+            "env-key row at {w} cols"
+        );
+    }
+}
+
+/// Desktop pin: the `base url` value renders whole at 80/160 — byte-identical to
+/// the pre-S9 render.
+#[test]
+fn a_base_url_value_desktop_row_matches_the_pre_s9_render() {
+    let input = InputState::new("https://api.日本語アカウント.example.com/v1/chat");
+    for w in [80usize, 160] {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "base url",
+            &input,
+            false,
+            false,
+            false,
+            true,
+            w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            got,
+            vec!["  base url        https://api.日本語アカウント.example.com/v1/chat"],
+            "base-url row at {w} cols"
+        );
+    }
+}

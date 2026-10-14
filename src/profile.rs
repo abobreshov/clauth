@@ -436,6 +436,11 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
+    /// Threshold for the five-hour alert; the legacy TOML key remains accepted.
+    pub(crate) fn five_hour_alert_threshold(&self) -> Option<f64> {
+        self.bell_threshold
+    }
+
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
@@ -913,6 +918,13 @@ pub(crate) struct AppState {
     /// [`AppState::walk_order`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_order: Option<WalkOrder>,
+    /// Command run by a headless five-hour alert; never configured through TUI input.
+    #[serde(
+        default,
+        alias = "bell_command",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) five_hour_alert_command: Option<String>,
     /// Minimum weekly-reset improvement for a proactive home walk (minutes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_min_gain_mins: Option<u64>,
@@ -1328,6 +1340,7 @@ impl Default for AppState {
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             walk_order: None,
+            five_hour_alert_command: None,
             walk_min_gain_mins: None,
             walk_cooldown_mins: None,
             last_switch_at: None,
@@ -1792,6 +1805,7 @@ struct ProfileConfig {
     #[serde(default)]
     check_scoped: Option<bool>,
     #[serde(default)]
+    #[serde(alias = "five_hour_alert_threshold")]
     bell_threshold: Option<f64>,
     #[serde(default)]
     disabled: bool,
@@ -2787,7 +2801,11 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
+        .filter(|(k, _)| {
+            k != "bell_command"
+                && !modelled.contains(k.as_str())
+                && !rendered_table.contains_key(k.as_str())
+        })
         .collect();
     if carried.is_empty() {
         return rendered; // the common case: nothing unmodelled on disk
@@ -3960,7 +3978,11 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
+        .filter(|(k, _)| {
+            k != "five_hour_alert_threshold"
+                && !modelled.contains(k.as_str())
+                && !rendered_table.contains_key(k.as_str())
+        })
         .collect();
     if carried.is_empty() {
         return merged; // the common case
@@ -4283,7 +4305,7 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which tollgate fires a bell\n");
+    out.push_str("# 5-hour utilization percentage at/above which tollgate fires an alert\n");
     out.push_str("# notification in the overview tab. Range 0..=100.\n");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
