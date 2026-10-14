@@ -895,7 +895,7 @@ fn carry_external_rotation(
 /// and that refresh is exactly what surfaces `auth_broken` (AUTH-1) instead of the
 /// account hiding behind `RateLimited` forever. Unknown expiry stays conservative
 /// (never rotate). Truth table pinned by the scheduler `rate_limited_*` tests.
-fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
+pub(crate) fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
     access_expires_at.is_some_and(|exp| now_ms >= exp)
 }
 

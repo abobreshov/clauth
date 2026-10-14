@@ -653,9 +653,8 @@ pub(crate) fn switch_profile_noninteractive(
             Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
             Some(DivergenceChoice::NewProfile) | None => {
                 let active = previous.as_deref().unwrap_or_default();
-                return Err(SwitchError::Refused(format!(
-                    "'{active}' has a login tollgate hasn't saved, {}",
-                    crate::format::RESOLVE_IN_TUI
+                return Err(SwitchError::Refused(crate::format::unsaved_live_login(
+                    active,
                 )));
             }
         }
@@ -1999,13 +1998,15 @@ pub(crate) fn set_profile_default_model(
 /// Staleness caveat: CC trusts the cached `oauthAccount` block and does not
 /// re-derive it from a swapped credentials file (exactly why tollgate strips it on
 /// switch — [`crate::claude_json::strip_home_oauth_account`]). So a tier-2 hit is "CC's
-/// last booted identity", not fresh proof of the live token's account. That can
-/// only bias the verdict conservatively: pointing at a SIBLING routes the
-/// divergence to the banner (user decides), and pointing at the active profile
-/// is filtered out by the caller (`note_divergence` drops an owner equal to
-/// active) — the same as no match, so the configured default applies unchanged.
-/// The tier can never manufacture the one harmful outcome — auto-capturing a
-/// sibling's login into the wrong profile — so its worst case is the banner.
+/// last booted identity", not fresh proof of the live token's account. For the
+/// divergence callers that can only bias the verdict conservatively: pointing at
+/// a SIBLING routes the divergence to the banner (user decides), and pointing at
+/// the active profile is filtered out by the caller (`note_divergence` drops an
+/// owner equal to active) — the same as no match, so the configured default
+/// applies unchanged, and the worst case is the banner. `clauth __oauth-token`
+/// is the exception: it takes an owner equal to the active profile as the
+/// permission to print that profile's live token, so a stale block naming the
+/// active account in front of another account's login prints that login.
 pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<ProfileName> {
     let live = read_claude_credentials().ok().flatten()?;
     let live_access = live.access_token().filter(|t| !t.is_empty());

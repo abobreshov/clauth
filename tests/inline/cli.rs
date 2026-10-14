@@ -1293,12 +1293,13 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
 
 // ── the hidden entry points ─────────────────────────────────────────────────
 
-/// The five internal entry points must still dispatch when invoked directly
-/// (CC's `apiKeyHelper`, the bundled `asyncRewake` hook, the bundled
-/// profile-change note hook, the bundled SessionStart self-heal hook, and the
-/// completion scripts' name shellout all run them by name) while staying out
-/// of every help surface. The spelling is the contract: `plugins/hooks/hooks.json`
-/// invokes three of them by the exact string clap derives from the variant name.
+/// The six internal entry points must still dispatch when invoked directly
+/// (CC's `apiKeyHelper`, a script reading an OAuth token, the bundled
+/// `asyncRewake` hook, the bundled profile-change note hook, the bundled
+/// SessionStart self-heal hook, and the completion scripts' name shellout all
+/// run them by name) while staying out of every help surface. The spelling is
+/// the contract: `plugins/hooks/hooks.json` invokes three of them by the exact
+/// string clap derives from the variant name.
 #[test]
 fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(
@@ -1343,6 +1344,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::ApiKey { profile, .. } => assert_eq!(profile.as_deref(), Some("acme")),
         other => panic!("__tollgate-api-key must parse, got {other:?}"),
     }
+    match command(&["__oauth-token", "acme"]) {
+        Command::OauthToken { profile } => assert_eq!(profile, "acme"),
+        other => panic!("__oauth-token must parse, got {other:?}"),
+    }
     assert!(matches!(command(&["run"]), Command::Run { .. }));
 
     let help = Cli::command().render_help().to_string();
@@ -1350,6 +1355,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     for hidden in [
         "__complete",
         "__tollgate-api-key",
+        "__oauth-token",
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",
@@ -2201,7 +2207,7 @@ mod api_key_helper_tests {
     #[test]
     fn write_api_key_emits_no_trailing_newline() {
         let mut buf: Vec<u8> = Vec::new();
-        write_api_key(&mut buf, "sk-test-12345").expect("write");
+        write_api_key(&mut buf, "sk-test-12345", "api_key").expect("write");
         assert_eq!(
             buf,
             b"sk-test-12345".to_vec(),
@@ -2212,7 +2218,7 @@ mod api_key_helper_tests {
         // before this fn on None), but the writer itself handles it without
         // inventing output.
         let mut empty: Vec<u8> = Vec::new();
-        write_api_key(&mut empty, "").expect("write empty");
+        write_api_key(&mut empty, "", "api_key").expect("write empty");
         assert!(empty.is_empty(), "an empty key writes zero bytes");
     }
 
@@ -2234,6 +2240,394 @@ mod api_key_helper_tests {
     fn dispatch_api_key_helper_fails_closed_for_missing_profile() {
         let _home = HomeSandbox::new();
         dispatch_api_key("ghost-profile").expect_err("missing profile must fail closed");
+    }
+}
+
+// ── hidden `tollgate __oauth-token <profile>` (the OAuth twin of `__tollgate-api-key`) ────
+//
+// Every refresh here goes to a loopback stub through `EndpointSandbox`; the
+// printed bytes themselves are pinned against the real binary in
+// `tests/oauth_token_cli.rs`, since stdout can't be captured from a
+// same-process `dispatch` call.
+
+#[cfg(unix)]
+mod oauth_token_helper_tests {
+    use super::*;
+    use crate::profile::{ClaudeCredentials, OAuthToken, Profile, save_profile};
+    use crate::testutil::{EndpointSandbox, HomeSandbox};
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    /// 2001-09-09: long past, so the gate must refresh.
+    const PAST_EXPIRY_MS: i64 = 1_000_000_000_000;
+
+    const FRESH_PAIR: &str =
+        r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#;
+
+    fn stored_pair(expires_at: i64) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-old".into(),
+                refresh_token: Some("rt-old".into()),
+                expires_at: Some(expires_at),
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn oauth_profile(name: &str) -> Profile {
+        oauth_profile_expiring_at(name, PAST_EXPIRY_MS)
+    }
+
+    fn oauth_profile_expiring_at(name: &str, expires_at: i64) -> Profile {
+        let mut profile = crate::testutil::blank_profile(&ProfileName::from(name));
+        profile.credentials = Some(stored_pair(expires_at));
+        profile
+    }
+
+    /// Epoch-ms `minutes` from now.
+    fn minutes_from_now(minutes: i64) -> i64 {
+        crate::usage::now_ms() as i64 + minutes * 60_000
+    }
+
+    /// Save `profile` and register it, so `load_config` inside the command
+    /// finds it the way a real roster would.
+    fn save_registered(profile: &Profile) {
+        save_profile(profile).expect("save profile");
+        crate::testutil::register_names(&[profile.name.as_str()]);
+    }
+
+    /// Save `profile`, register it, and make it the globally active profile.
+    fn save_registered_active(profile: &Profile) {
+        save_registered(profile);
+        let mut state = crate::profile::load_app_state().expect("load app state");
+        state.active_profile = Some(profile.name.clone());
+        crate::profile::save_app_state(&state).expect("save app state");
+    }
+
+    /// Install a re-login over `name`'s store mid-refresh (the 2696d84b shape):
+    /// the store moves under the gate, whose persist then refuses and answers
+    /// for the new login.
+    fn relogin_into(name: &str, expires_at: i64) {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &ProfileName::from(name),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(ClaudeCredentials {
+                    claude_ai_oauth: Some(OAuthToken {
+                        access_token: "at-relogin".to_string(),
+                        refresh_token: Some("rt-relogin".to_string()),
+                        expires_at: Some(expires_at),
+                        scopes: None,
+                        subscription_type: None,
+                        ..OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login");
+    }
+
+    fn dispatch_oauth_token(profile: &str) -> Result<()> {
+        dispatch(
+            Cli::try_parse_from(["tollgate", "__oauth-token", profile])
+                .expect("hidden arm must parse"),
+        )
+    }
+
+    fn token_endpoint_answering(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        // One above the single refresh a correct run makes, so a second spend
+        // is recorded rather than refused.
+        crate::testutil::serve_endpoints(2, move |path, _| {
+            if path.starts_with("/v1/oauth/token") {
+                (status, body.to_string())
+            } else {
+                (404, String::new())
+            }
+        })
+    }
+
+    /// A token with 30 minutes left, which a switch would install as-is, is
+    /// inside the command's hour: one POST to the token endpoint, and the
+    /// rotated pair is what the store holds afterwards.
+    #[test]
+    fn dispatch_oauth_token_refreshes_a_token_with_under_an_hour_left() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let (base, server) = token_endpoint_answering(200, FRESH_PAIR);
+        let endpoints = EndpointSandbox::new(&home, &base);
+
+        let result = dispatch_oauth_token("acme");
+        assert!(
+            result.is_ok(),
+            "a token with 30 minutes left refreshes and prints: {result:?}"
+        );
+
+        drop(endpoints);
+        let seen = server.join().expect("listener");
+        assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-new"));
+        assert_eq!(stored.refresh_token(), Some("rt-new"));
+    }
+
+    /// A token with 90 minutes left is outside the hour: nothing is sent and
+    /// the stored pair stays.
+    #[test]
+    fn dispatch_oauth_token_leaves_a_token_with_over_an_hour_left() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(90)));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let result = dispatch_oauth_token("acme");
+        assert!(
+            result.is_ok(),
+            "a token with 90 minutes left prints as-is: {result:?}"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-old"));
+    }
+
+    /// A disabled profile is refused by name with the wording every other
+    /// disabled refusal uses, and its chain is never spent.
+    #[test]
+    fn dispatch_oauth_token_refuses_a_disabled_profile() {
+        let home = HomeSandbox::new();
+        let mut profile = oauth_profile("parked");
+        profile.disabled = true;
+        save_registered(&profile);
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("parked").expect_err("a disabled profile must fail");
+        assert_eq!(
+            err.to_string(),
+            "'parked': account is disabled, run `tollgate enable parked`"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// The refresh takes the profile's rotation lock: while another holder has
+    /// it the command cannot finish, and once it is released the refresh runs.
+    #[test]
+    fn dispatch_oauth_token_waits_for_a_held_rotation_lock() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (base, server) = token_endpoint_answering(200, FRESH_PAIR);
+        let endpoints = EndpointSandbox::new(&home, &base);
+        let holder = crate::testutil::hold_rotation_lock("acme");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(dispatch_oauth_token("acme").map_err(|e| e.to_string()));
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(500)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the refresh must wait for the profile's rotation lock"
+        );
+        drop(holder);
+        let result = rx
+            .recv()
+            .expect("the command finishes once the lock is free");
+        worker.join().expect("worker");
+        assert_eq!(result, Ok(()));
+
+        drop(endpoints);
+        let seen = server.join().expect("listener");
+        assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    }
+
+    /// An endpoint profile that also holds an OAuth pair is still an endpoint
+    /// profile: refused by name, and its pair is never refreshed.
+    #[test]
+    fn dispatch_oauth_token_refuses_an_endpoint_profile_holding_a_pair() {
+        let home = HomeSandbox::new();
+        let mut profile = oauth_profile("hybrid");
+        profile.base_url = Some("https://api.deepseek.com/anthropic".into());
+        profile.api_key = Some("sk-fixture-key".into());
+        save_registered(&profile);
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("hybrid").expect_err("an endpoint profile must fail");
+        assert_eq!(err.to_string(), "profile 'hybrid' has no OAuth login");
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// A profile routed through `[env] ANTHROPIC_BASE_URL` with no `base_url` is
+    /// an endpoint profile too: refused by name, its pair never refreshed.
+    #[test]
+    fn dispatch_oauth_token_refuses_an_env_routed_profile_holding_a_pair() {
+        let home = HomeSandbox::new();
+        let mut profile = oauth_profile("routed");
+        profile.env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.deepseek.com/anthropic".to_string(),
+        );
+        save_registered(&profile);
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("routed").expect_err("an env-routed profile must fail");
+        assert_eq!(err.to_string(), "profile 'routed' has no OAuth login");
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// Where a live session's Claude Code holds a Keychain item clauth can't
+    /// write (macOS; forced here through the override seam), the gate leaves the
+    /// refresh to that session, so a token with 30 minutes left, inside the
+    /// command's hour, prints as-is and nothing is sent.
+    #[test]
+    fn dispatch_oauth_token_prints_as_is_when_a_live_session_owns_the_refresh() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        crate::runtime::set_rotation_blocked_override(Some(true));
+        let result = dispatch_oauth_token("acme");
+        crate::runtime::set_rotation_blocked_override(None);
+
+        assert!(
+            result.is_ok(),
+            "a refusal the session owns prints the stored token: {result:?}"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-old"));
+    }
+
+    /// The same live-session arm on an already-expired token: it is never
+    /// refreshed here, and it never prints; the refusal names the `claude` run
+    /// that refreshes it.
+    #[test]
+    fn dispatch_oauth_token_refuses_an_expired_token_a_live_session_owns() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        crate::runtime::set_rotation_blocked_override(Some(true));
+        let result = dispatch_oauth_token("acme");
+        crate::runtime::set_rotation_blocked_override(None);
+
+        let err = result.expect_err("an expired token must never print");
+        assert_eq!(
+            err.to_string(),
+            "'acme': its token has expired and a running `claude` owns its refresh, run `claude` \
+             on it once and retry"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// A refresh the server rejects as `invalid_grant` refuses with the shared
+    /// re-login line, never a token.
+    #[test]
+    fn dispatch_oauth_token_refuses_a_dead_chain_with_the_login_hint() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (base, _server) = token_endpoint_answering(400, r#"{"error": "invalid_grant"}"#);
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("acme").expect_err("a dead chain must fail");
+        assert_eq!(
+            err.to_string(),
+            "login for 'acme' has expired: refresh token revoked or invalid: run `tollgate login acme`"
+        );
+    }
+
+    /// A transient refresh failure refuses with the status and the retry advice.
+    #[test]
+    fn dispatch_oauth_token_refuses_a_transient_failure_with_its_status() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (base, _server) = token_endpoint_answering(503, "<html>down</html>");
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("acme").expect_err("a 503 must fail");
+        assert_eq!(
+            err.to_string(),
+            "could not refresh 'acme': anthropic is having trouble (HTTP 503): retry in a moment"
+        );
+    }
+
+    /// A re-login lands mid-refresh: the store moved, so the persist refuses
+    /// and the gate answers for the new login, which is itself inside the hour.
+    /// The refresh DID land, so the sentence stands alone with no `could not
+    /// refresh` head — the same line the switch CLI prints for the same event.
+    #[test]
+    fn dispatch_oauth_token_shows_a_login_change_with_no_failure_head() {
+        let _home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let refresher = |rt: &str, _scopes: Option<&str>| {
+            assert_eq!(rt, "rt-old", "the gate spends the store's token");
+            relogin_into("acme", minutes_from_now(30));
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 28800,
+                scope: None,
+            })
+        };
+        let err =
+            oauth_token_for_profile("acme", refresher).expect_err("a login change defers the read");
+        assert_eq!(
+            err.to_string(),
+            "'acme' login changed during its refresh and the new login expires soon · retry in a moment"
+        );
+    }
+
+    /// The globally active profile is never refreshed, even when it holds a
+    /// refreshable pair inside the hour: a refresh would race the running
+    /// `claude` on the active chain, so nothing is sent and the stored token
+    /// prints unchanged.
+    #[test]
+    fn dispatch_oauth_token_never_refreshes_the_active_profile() {
+        let home = HomeSandbox::new();
+        save_registered_active(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let result = dispatch_oauth_token("acme");
+        assert!(
+            result.is_ok(),
+            "the active profile prints its stored token without refreshing: {result:?}"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-old"));
+    }
+
+    /// The value handed back after a refresh is the NEW access token: neither
+    /// the stale one the profile loaded with nor the refresh token.
+    #[test]
+    fn oauth_token_for_profile_returns_the_refreshed_access_token() {
+        let _home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let refresher = |_rt: &str, _scopes: Option<&str>| {
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 28800,
+                scope: None,
+            })
+        };
+        let token = oauth_token_for_profile("acme", refresher).expect("refreshed token");
+        assert_eq!(token, "at-new");
     }
 }
 

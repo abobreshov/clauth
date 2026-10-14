@@ -297,9 +297,24 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
 /// `config.toml`) would inject or malform a header. Callers trim first, so any
 /// remaining whitespace or control char is a real defect.
 pub(crate) fn validate_api_key(key: &str) -> Result<()> {
-    if key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    validate_credential_chars(key, "api key")
+}
+
+/// [`validate_api_key`]'s check for the OAuth access token `clauth __oauth-token`
+/// prints: the same header-injection boundary, with the noun the surface names.
+pub(crate) fn validate_oauth_token(token: &str) -> Result<()> {
+    validate_credential_chars(token, "oauth token")
+}
+
+/// The shared check behind [`validate_api_key`] and [`validate_oauth_token`]:
+/// refuse a credential holding whitespace or a control char, since CC forwards
+/// the helper's stdout verbatim as a header value and an interior CRLF would
+/// inject one. `noun` is caller-specific — the two surfaces name the credential
+/// they print differently.
+fn validate_credential_chars(value: &str, noun: &str) -> Result<()> {
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
         anyhow::bail!(
-            "api key contains whitespace or control characters — a bad paste or an edited config"
+            "{noun} contains whitespace or control characters — a bad paste or an edited config"
         );
     }
     Ok(())

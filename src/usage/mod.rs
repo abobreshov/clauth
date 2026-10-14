@@ -93,6 +93,7 @@ pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
 #[cfg(test)]
 pub(crate) use scheduler::scan_auto_switch;
+pub(crate) use scheduler::token_clock_expired;
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.

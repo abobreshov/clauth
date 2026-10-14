@@ -529,6 +529,36 @@ fn gate_valid_token_ready_without_refresh() {
     ));
 }
 
+/// Both switch entry points keep the five-minute grace: a token with 30
+/// minutes left installs as-is, so widening either entry point's margin reds
+/// here.
+#[test]
+fn gate_keeps_the_five_minute_grace_for_switch_callers() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-thirty-minutes";
+    let thirty_minutes = crate::usage::now_ms() as i64 + 30 * 60_000;
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-good"),
+        Some(thirty_minutes),
+    )));
+    let target = crate::profile::ProfileName::from(name);
+    assert!(
+        matches!(
+            ensure_installable(&handle, &target, never_refresh),
+            AuthGate::Ready
+        ),
+        "the switch gate refreshes only inside five minutes"
+    );
+    assert!(
+        matches!(
+            ensure_installable_from_main_loop(&handle, &target, never_refresh),
+            AuthGate::Ready
+        ),
+        "the daemon's switch gate refreshes only inside five minutes"
+    );
+}
+
 /// Off macOS a live `tollgate start` session no longer short-circuits the switch
 /// gate to `Ready` (which installed the STALE token as-is): the session reads
 /// the same credential file, so refreshing hands it a fresh pair. On macOS the

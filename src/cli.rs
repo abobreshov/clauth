@@ -613,6 +613,18 @@ pub(crate) enum Command {
         session: Option<String>,
     },
 
+    /// The OAuth twin of `__tollgate-api-key`: print the access token a switch to the
+    /// profile would install, refreshed first through the switch gate when it
+    /// has under an hour left. The active profile prints what a running
+    /// `claude` last wrote to `~/.claude`, unrefreshed, once that login is tied
+    /// to the profile's own account. The refresh token never
+    /// leaves tollgate; an endpoint or disabled profile gets nothing.
+    #[command(name = "__oauth-token", hide = true)]
+    OauthToken {
+        /// Profile whose OAuth access token to print.
+        profile: String,
+    },
+
     /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
     /// on stdin, wait for a background delegate, and wake the model.
     #[command(hide = true)]
