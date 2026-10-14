@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — 2026-10-14
+
+### Usage
+
+- An official Grok CLI login appears in `tollgate usage` and `tollgate usage --json` without `monitor add`. The account shows the plan, the weekly window and its reset, and `creditUsagePercent` when Grok publishes it. A missing percent stays unknown. Product shares appear when present. Prepaid balance and on-demand figures stay out. The Grok auth store is only read.
+
 ## 0.3.0 — 2026-10-07
 
 ### Authentication and account identity
