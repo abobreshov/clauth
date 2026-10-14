@@ -4525,6 +4525,23 @@ fn a_default_serve_table_carries_a_stray_key() {
     );
 }
 
+// `bell_command` is a hand-edited key: a rewrite keeps the operator's quoting
+// byte for byte.
+#[test]
+fn app_state_bell_command_round_trips_through_a_save() {
+    let _home = HomeSandbox::new();
+    let template = "notify-send 'tollgate alert' %s";
+    save_app_state(&AppState {
+        bell_command: Some(template.to_string()),
+        ..AppState::default()
+    })
+    .expect("save state with a bell command");
+    assert_eq!(
+        load_app_state().expect("reload").bell_command.as_deref(),
+        Some(template)
+    );
+}
+
 #[test]
 fn home_walk_settings_are_additive_and_round_trip() {
     let old: AppState = toml::from_str("profiles = []").unwrap();

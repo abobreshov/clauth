@@ -784,7 +784,7 @@ pub(crate) fn edit_profile_endpoint(
             // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
             // a daemon boot/standby promotion, or the stood-down TUI's
             // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory mirror entry survives
+            // the reseed; a LIVE process's in-memory provider-store entry survives
             // until the profile's next fetch (≤ one interval; until restart
             // if the edit left it no fetch leg) — no cross-process clear
             // exists.
@@ -948,10 +948,10 @@ pub(crate) fn edit_profile_preset(
             // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
             // a daemon boot/standby promotion, or the stood-down TUI's
             // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory mirror entry survives
-            // until the profile's next fetch (≤ one interval; until restart
-            // if the edit left it no fetch leg) — no cross-process clear
-            // exists.
+            // the reseed; a LIVE process's in-memory provider-store entry
+            // survives until the profile's next fetch (≤ one interval; until
+            // restart if the edit left it no fetch leg) — no cross-process
+            // clear exists.
             crate::profile_cache::remove_profile_cache(
                 name,
                 crate::profile_cache::THIRD_PARTY_CACHE_FILE,

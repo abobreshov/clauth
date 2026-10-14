@@ -50,7 +50,7 @@ use crate::profile::tollgate_dir;
 /// the next morning. Measured from `done_at`, not from the mint: a
 /// mint-anchored TTL would expire every long run's salvage envelope the instant
 /// it finalizes, since the run's age is already whatever the run cost.
-pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+pub(crate) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// A `running` file SILENT this long is orphaned (its server died mid-job); reap
 /// it.
 ///
@@ -209,11 +209,13 @@ pub(crate) struct JobRecord {
     /// session's credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spawned_by: Option<String>,
-    /// The Claude Code session id the spawning `tollgate mcp` server started
-    /// under (`CLAUDE_CODE_SESSION_ID` in its environment): the host identity
-    /// a reader matches when either side's pid is unknown, valid until the
-    /// host's first `/clear`. `None` on a record an older server wrote and on
-    /// a server launched outside Claude Code.
+    /// The Claude Code conversation the spawning server's host was in when the
+    /// job was minted: the host's session record id, which a `/clear` moves,
+    /// else the server's startup `CLAUDE_CODE_SESSION_ID`. The host identity a
+    /// reader matches when either side's pid is unknown. A record an older
+    /// server wrote carries the startup id, valid until the host's first
+    /// `/clear`. `None` on a record older still and on a server launched
+    /// outside Claude Code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) host_session: Option<String>,
     /// The `claude` process hosting the spawning conversation (the server's
@@ -1067,6 +1069,13 @@ pub(crate) fn running_is_silent(record: &JobRecord, now: u64) -> bool {
     now.saturating_sub(retention_anchor(record)) > RUNNING_TTL_MS
 }
 
+/// Whether a `done` record is past [`DONE_TTL_MS`]: the startup sweep's reap
+/// rule, shared with any reader that must not offer a result that sweep is
+/// about to delete.
+pub(crate) fn done_is_expired(record: &JobRecord, now: u64) -> bool {
+    now.saturating_sub(retention_anchor(record)) > DONE_TTL_MS
+}
+
 /// Whether the server that minted `record` is gone: its marker released, or —
 /// the pid-reuse arm — this process now holds the flock under a record minted
 /// by a DIFFERENT server epoch that once owned our pid. The start stamp is what
@@ -1431,7 +1440,7 @@ fn sweep(now: u64, scope: Scope) {
         };
         let kind = record_kind(&path);
         let expired = match record.state {
-            JobState::Done => full && now.saturating_sub(retention_anchor(&record)) > DONE_TTL_MS,
+            JobState::Done => full && done_is_expired(&record, now),
             JobState::Running => running_is_corpse(&record, now),
         };
         if !expired {

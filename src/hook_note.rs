@@ -166,8 +166,8 @@ impl Note<'_> {
 }
 
 /// The fields of a hook payload this subcommand reads; everything else is
-/// ignored. `pub(crate)` because the context leg (`hook_context`) reads the
-/// same payload.
+/// ignored. `pub(crate)` because the other legs (`hook_context`, `hook_jobs`,
+/// `hook_resume`) read the same payload.
 pub(crate) struct Payload {
     /// Echoed back in the output envelope, so the host routes the context to the
     /// event it came from.
@@ -242,6 +242,10 @@ pub(crate) struct NoteRecord {
     /// Last persisted herdr resume report sequence, absent on older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_seq: Option<u64>,
+    /// herdr refused this scope's last resume report as not yet attachable
+    /// (`resume_not_accepted`), so the next main-scope fire re-sends it.
+    #[serde(default)]
+    pub(crate) resume_pending: bool,
 }
 
 /// The session id encoded in this process's `CLAUDE_CONFIG_DIR`, when that is
@@ -452,16 +456,12 @@ pub(crate) fn run() -> Result<()> {
     if let Some(note) = fire.note {
         notes.push(note);
     }
-    if let Some(read) = read_nudge(&payload, config.get().and_then(|loaded| loaded.as_ref()))
-        && let Some(note) = nudge_note(&payload, &read)
-    {
-        notes.push(note);
-    }
-    if let Some(note) = crate::hook_context::note(&payload) {
-        notes.push(note);
-    }
+    notes.extend(leg_notes(
+        &payload,
+        config.get().and_then(|loaded| loaded.as_ref()),
+    ));
     // One envelope, whatever fired: two JSON documents on stdout would parse
-    // as none, and one `additionalContext` field carries both notes when both
+    // as none, and one `additionalContext` field carries every note that
     // earned the turn.
     if !notes.is_empty() {
         outln!("{}", joined_envelope(&payload.event, &notes));
@@ -482,8 +482,23 @@ pub(crate) fn run() -> Result<()> {
     Ok(())
 }
 
+/// The notes every leg after the account note earns on this fire, in envelope
+/// order. Split from [`run`] so the wiring is assertable without stdin or
+/// stdout; `config` is whatever the account note's resolve already loaded.
+fn leg_notes(payload: &Payload, config: Option<&crate::profile::AppConfig>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(read) = read_nudge(payload, config)
+        && let Some(note) = nudge_note(payload, &read)
+    {
+        notes.push(note);
+    }
+    notes.extend(crate::hook_context::note(payload));
+    notes.extend(crate::hook_jobs::note(payload));
+    notes
+}
+
 /// [`envelope`] over the fire's earned notes joined — whatever earned the turn,
-/// one note or two, renders as ONE `additionalContext` field and so ONE JSON
+/// however many notes, renders as ONE `additionalContext` field and so ONE JSON
 /// document on stdout (two documents would parse as none). Split from the
 /// print for the same reason [`envelope`] is: the join is assertable without
 /// capturing stdout.
@@ -897,8 +912,10 @@ fn touch_record(path: &Path) {
 /// The deadline is also what keeps a NESTED acquisition soft — `flock` blocks a
 /// second fd in the same process, so a future caller that takes this around
 /// something already holding it degrades after the wait instead of hanging.
-/// Today there is no such nesting: `note_for_inner`, `nudge_note` and
-/// `gc_conversation_records` are the only holders and none reaches another.
+/// Today there is no such nesting: `note_for_inner`, `nudge_note`,
+/// `gc_conversation_records`, `hook_context::context_note` and the
+/// resume-report leg's seq mint and re-send arm are the only holders and none
+/// reaches another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
@@ -926,10 +943,11 @@ impl ScopeLock {
         Self::acquire_within(Duration::from_secs(2))
     }
 
-    /// The same hold with a shorter wait, for a leg whose product is optional:
-    /// the resume-command report's mint degrades to silence under contention,
-    /// and a maxed stack of full waits must not push a hook fire past the
-    /// manifest's 10 s host timeout on the very fires the leg reports on.
+    /// The same hold with a shorter wait, for a leg whose product is optional
+    /// (the resume-command report): a maxed stack of full waits must not push
+    /// a hook fire past the manifest's 10 s host timeout on the very fires the
+    /// leg reports on. Past the wait it proceeds unlocked, like
+    /// [`Self::acquire`], so a contended write can lose a peer's field update.
     pub(crate) fn acquire_within(wait: Duration) -> Self {
         let held = (|| {
             let dir = records_dir().ok()?;
@@ -1378,17 +1396,14 @@ fn render_nudge(f: &NudgeFigures) -> Option<String> {
 /// active: a pinned runtime session can resolve to a member a switch never
 /// moves, and a walk anchored on the global active would answer "the chain
 /// would act" about that switch
-/// ([`crate::fallback::snapshot_chain_from`]). Same call the leg makes,
-/// `fallback::next_auto_switch_target`, fed a store hydrated from the caches
-/// the daemon's own store is persisted to and hydrated from — OAuth caches and
-/// third-party caches alike, the latter through the same `to_usage_info`
-/// derivation the scheduler's mirror runs, so a provider window judges this
-/// replay exactly as it judges the live leg. A member with no cached usage
-/// reads exactly as it reads in the real store (absent entry = headroom). The `Arc<RankedMutex>` wrapper is the entry point's
-/// signature, not shared state: the mutex is process-private, never
-/// contended, locked only for the walk's own snapshot clone, and taken while
-/// this process holds no other rank — so no rank in the global order is
-/// acquired in a context that could invert it. The walk's `fresh` and
+/// ([`crate::fallback::snapshot_chain_from`]). Same walk the leg runs,
+/// `fallback::next_auto_switch_target_with_usage`, fed each member's windows
+/// off its own disk cache by the same `usage_cache_is_third_party` split the
+/// live leg's picker makes (`profile_windows_for`): OAuth caches as they are,
+/// third-party caches through `to_usage_info`, and the third-party names
+/// passed along so a burn-aware walk never projects a provider window from
+/// OAuth burn history here either. A member with no cached usage reads
+/// exactly as it reads in the live leg (absent entry = headroom). The walk's `fresh` and
 /// `kick_rejected` channels stay empty, which the snapshot type documents as
 /// "not config state": freshness is a preference the any-fresh pass renders
 /// moot, and a kick-rejected member reads as headroom here where the live
@@ -1412,31 +1427,35 @@ fn chain_would_act(
     // replay that reads it as headroom would answer "the chain would act"
     // about a switch nothing will make.
     snapshot.broken.extend(key_rejected);
-    let usage: std::collections::HashMap<String, crate::usage::UsageInfo> = snapshot
-        .chain
-        .iter()
-        .filter_map(|m| {
-            let derived = match crate::profile_json::profile_windows_for(&m.name) {
-                crate::profile_json::ProfileWindows::Oauth {
-                    usage: Some(usage), ..
-                } => *usage,
-                // A third-party member's provider windows are windows the live
-                // leg walks on — the scheduler mirrors this same derivation
-                // into its own store — so the replay must judge them too. An
-                // OAuth-only replay reads the member as windowless headroom
-                // and answers "the chain would act" about a switch the live
-                // leg refuses.
-                crate::profile_json::ProfileWindows::ThirdParty {
-                    stats: Some(stats), ..
-                } => stats.to_usage_info()?,
-                _ => return None,
-            };
-            Some((m.name.to_string(), derived))
-        })
-        .collect();
-    let store: crate::usage::UsageStore =
-        std::sync::Arc::new(crate::lockorder::RankedMutex::new(usage));
-    crate::fallback::next_auto_switch_target(&snapshot, &store).is_some()
+    let mut usage = std::collections::HashMap::new();
+    let mut third_party_names = std::collections::HashSet::new();
+    for m in &snapshot.chain {
+        match crate::profile_json::profile_windows_for(&m.name) {
+            crate::profile_json::ProfileWindows::Oauth {
+                usage: Some(info), ..
+            } => {
+                usage.insert(m.name.to_string(), *info);
+            }
+            crate::profile_json::ProfileWindows::Oauth { usage: None, .. } => {}
+            // A third-party member's provider windows are windows the live leg
+            // walks on, so the replay judges them too: an OAuth-only replay
+            // reads the member as windowless headroom and answers "the chain
+            // would act" about a switch the live leg refuses.
+            crate::profile_json::ProfileWindows::ThirdParty { stats, .. } => {
+                third_party_names.insert(m.name.clone());
+                if let Some(info) = stats.as_ref().and_then(|s| s.to_usage_info()) {
+                    usage.insert(m.name.to_string(), info);
+                }
+            }
+        }
+    }
+    crate::fallback::next_auto_switch_target_with_usage(
+        &snapshot,
+        &usage,
+        &third_party_names,
+        crate::fallback::ActiveBurnRate::FromDisk,
+    )
+    .is_some()
 }
 
 /// The nudge verdict against the state this scope remembers.

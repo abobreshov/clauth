@@ -1,5 +1,6 @@
 mod actions;
 mod alibaba_login;
+mod bell;
 mod claude;
 mod claude_json;
 mod cli;
@@ -16,6 +17,7 @@ mod harness;
 mod herdr;
 mod hermes;
 mod hook_context;
+mod hook_jobs;
 mod hook_note;
 mod hook_resume;
 mod hot_swap;

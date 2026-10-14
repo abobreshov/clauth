@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::log_rotate::{LOG_KEEP_BYTES, LOG_MAX_BYTES, rotate_log_if_large};
-use super::probe::{DaemonLock, REPLACE_WAIT, terminate_pid};
+use super::probe::{DaemonLock, REPLACE_POLL, REPLACE_WAIT, terminate_pid};
 use crate::gateway::{
     GatewayEnv, GatewayRecord, HEALTH_PROBE_TIMEOUT, Health, NotToml, VERSION_FLOOR,
     check_version_floor, gateway_bind, gateway_cwd, gateway_env, gateway_shutdown_timeout,
@@ -93,7 +93,8 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// How long a daemon exiting on a signal waits for its gateway before it exits
 /// anyway. `--replace` escalates to SIGKILL once [`REPLACE_WAIT`] passes with
 /// the singleton flock still held, so the stop gets that window less 1 s for
-/// the release to be seen at `--replace`'s 50 ms poll. A `/health` probe does
+/// the release to be seen at `--replace`'s 50 ms poll, including the
+/// 500 ms supervisor answer grace. A `/health` probe does
 /// not eat into it: a shutdown preempts a probe, so the budget bounds only the
 /// child's exit. A gateway still draining past it is left running with its
 /// stop deadline in the child marker; shunt bounds its own drain, and the next
@@ -102,6 +103,19 @@ pub(crate) const DAEMON_STOP_BUDGET: Duration = REPLACE_WAIT.saturating_sub(Dura
 
 /// How often a stop waiting inside [`DAEMON_STOP_BUDGET`] polls the child.
 const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// How long past its budget a stop waits for the supervisor's answer before
+/// it calls the supervisor stuck. Only the supervisor's own timer decides that
+/// the deadline passed, and that timer can oversleep: a 50 ms sleep on
+/// GitHub's macOS runner returned up to 150 ms late (CI run 38386356570), so a
+/// one-poll grace raced every stop whose child outlived its budget. The grace
+/// stays inside the second of [`REPLACE_WAIT`] the budget leaves for
+/// `--replace` to see the flock go.
+const STOP_ANSWER_GRACE: Duration = Duration::from_millis(500);
+const _: () = assert!(
+    DAEMON_STOP_BUDGET.as_millis() + STOP_ANSWER_GRACE.as_millis() + REPLACE_POLL.as_millis()
+        < REPLACE_WAIT.as_millis()
+);
 
 const CHILD_MARKER_FILE: &str = "gateway-child.json";
 
@@ -1807,6 +1821,8 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
             match inbox.recv_timeout(SUPERVISE_POLL) {
                 Ok(RunMessage::Shutdown(req)) => {
                     supervisor.shutdown(req.deadline);
+                    #[cfg(all(test, unix))]
+                    probe_seam::answer_delay();
                     let _ = req.done.send(());
                     return;
                 }
@@ -1852,6 +1868,8 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
                     match inbox.try_recv() {
                         Ok(RunMessage::Shutdown(req)) => {
                             supervisor.shutdown(req.deadline);
+                            #[cfg(all(test, unix))]
+                            probe_seam::answer_delay();
                             let _ = req.done.send(());
                             return;
                         }
@@ -1864,6 +1882,8 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
                 }
                 Ok(RunMessage::Shutdown(req)) => {
                     supervisor.shutdown(req.deadline);
+                    #[cfg(all(test, unix))]
+                    probe_seam::answer_delay();
                     let _ = req.done.send(());
                     return;
                 }
@@ -1911,6 +1931,8 @@ fn drain_until(
         match inbox.recv_timeout(deadline - now) {
             Ok(RunMessage::Shutdown(req)) => {
                 supervisor.shutdown(req.deadline);
+                #[cfg(all(test, unix))]
+                probe_seam::answer_delay();
                 let _ = req.done.send(());
                 return true;
             }
@@ -1930,8 +1952,8 @@ enum StopOutcome {
     Stopped,
     /// The thread ended in a panic.
     Panicked,
-    /// The thread did not answer within the budget plus one poll: it is
-    /// stuck, and is left running.
+    /// The thread did not answer within the budget plus
+    /// [`STOP_ANSWER_GRACE`]: it is stuck, and is left running.
     MissedBudget,
 }
 
@@ -1947,7 +1969,7 @@ impl StopOutcome {
 
 impl SupervisorThread {
     /// Stop the gateway within `budget` and end the thread. `false` when the
-    /// thread did not answer within `budget` plus one poll (it is stuck) or
+    /// thread did not answer within `budget` plus [`STOP_ANSWER_GRACE`] (it is stuck) or
     /// ended in a panic; a gateway then left running is named by its child
     /// marker, the next daemon start finishes the stop, and the cause is
     /// logged.
@@ -1984,11 +2006,12 @@ impl SupervisorThread {
         {
             return StopOutcome::of_join(thread);
         }
-        // The thread preempts whatever it is doing (a probe included) to
-        // answer, so its reply lands well inside the budget; the extra poll is
-        // margin for the delivery. A dropped `done` is a thread that unwound
-        // before answering, so the join returns at once.
-        match answered.recv_timeout(budget.saturating_add(STOP_POLL)) {
+        // The thread preempts whatever it is doing (a probe included) and
+        // answers once its own deadline wake decides, which can run late
+        // ([`STOP_ANSWER_GRACE`]), so this wait only catches a stuck thread. A
+        // dropped `done` is a thread that unwound before answering, so the
+        // join returns at once.
+        match answered.recv_timeout(budget.saturating_add(STOP_ANSWER_GRACE)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => StopOutcome::of_join(thread),
             Err(RecvTimeoutError::Timeout) => StopOutcome::MissedBudget,
         }
@@ -2146,6 +2169,42 @@ mod probe_seam {
     /// Set by [`arm_panic`]: the next probe or supervisor shutdown to reach
     /// the seam panics there.
     static PANIC_NEXT: AtomicBool = AtomicBool::new(false);
+
+    /// Set by [`delay_answer`]: the supervisor thread carrying this name
+    /// sleeps this long before it answers a stop. One slot: the tests that arm
+    /// it hold a `HomeSandbox`, which serializes them.
+    static ANSWER_DELAY: Mutex<Option<(&'static str, Duration)>> = Mutex::new(None);
+
+    /// Delay the stop answer of the supervisor thread named `thread` by `by`.
+    /// The returned guard disarms it on drop.
+    pub fn delay_answer(thread: &'static str, by: Duration) -> DelayArm {
+        *ANSWER_DELAY
+            .lock()
+            .expect("the answer delay is not poisoned") = Some((thread, by));
+        DelayArm
+    }
+
+    pub struct DelayArm;
+
+    impl Drop for DelayArm {
+        fn drop(&mut self) {
+            *ANSWER_DELAY
+                .lock()
+                .expect("the answer delay is not poisoned") = None;
+        }
+    }
+
+    /// Sleep the armed delay when the calling thread carries its name.
+    pub fn answer_delay() {
+        let armed = *ANSWER_DELAY
+            .lock()
+            .expect("the answer delay is not poisoned");
+        if let Some((name, by)) = armed
+            && std::thread::current().name() == Some(name)
+        {
+            std::thread::sleep(by);
+        }
+    }
 
     /// Arm the seam to panic the next probe or `Supervisor::shutdown` to
     /// reach it, whichever comes first. The returned guard disarms it on

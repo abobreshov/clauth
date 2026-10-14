@@ -805,7 +805,7 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
     );
 }
 
-/// The non-active guard: `snapshot_chain` / `next_target` deliberately never
+/// The non-active guard: `snapshot_chain` and the walk deliberately never
 /// drop a disabled ACTIVE member from the walk (the bit is candidate-only), so
 /// claiming `Disabled` there would be the second opinion `blocked_reason` must
 /// never be. Unreachable through `actions::disable_profile` today — which

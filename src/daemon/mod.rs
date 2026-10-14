@@ -517,7 +517,7 @@ fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
 /// chain is testable without capturing log output.
 ///
 /// A disabled member is excluded: it is never spend-armed by the walk
-/// (`next_target` skips it as a candidate), so it can't be the uncapped
+/// (the walk skips it as a candidate), so it can't be the uncapped
 /// spender this names. Auth-broken and canceled members stay named even though
 /// that same walk skips them too: both clear on their own (a re-login, a
 /// re-subscribe), so going quiet about a member one re-auth away from billing
@@ -1061,6 +1061,10 @@ struct Daemon {
     /// changes at the midnight rollover and on a config edit, and is
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
+    /// The headless bell's latch over the published `profiles[]` figures.
+    bells: crate::bell::BellLatch,
+    /// Runs `bell_command`; a seam so tests record the ring instead.
+    ring_bell: fn(&str, &str) -> anyhow::Result<()>,
     status_path: PathBuf,
     /// The slot the gateway supervisor publishes, read by every status write.
     gateway: gateway::GatewayHandle,
@@ -1103,6 +1107,8 @@ impl Daemon {
             switch_backoff: None,
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
+            bells: crate::bell::BellLatch::default(),
+            ring_bell: crate::bell::run_command,
             status_path,
             gateway: gateway::new_handle(),
         }
@@ -1148,7 +1154,6 @@ impl Daemon {
         );
         bootstrap_third_party(
             &self.third_party_usage_store,
-            &self.usage_store,
             &self.third_party_status,
             &self.last_fetched,
             &third_party,
@@ -1305,7 +1310,7 @@ impl Daemon {
     /// profile's cache files and sweeps the session flocks, and holding CONFIG
     /// across that disk work every tick stalls every other config user (a switch,
     /// a TUI edit) behind it. The clone is a handful of small strings.
-    fn write_status(&self) {
+    fn write_status(&mut self) {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
         let snapshot = self.live_stores().snapshot();
         let live = snapshot.signals();
@@ -1326,6 +1331,33 @@ impl Daemon {
                 }
             }
             Err(e) => logline!("tollgate daemon: failed to serialize status.json: {e}"),
+        }
+        self.ring_bells(&body.profiles, cfg_snap.state.bell_command.as_deref());
+    }
+
+    /// The headless half of the 5h bell, judged on the figures this tick just
+    /// published so the bell and the feed never disagree. With no
+    /// `bell_command` the latch is left as it is,
+    /// so setting one mid-crossing does not re-announce a bell already rung.
+    fn ring_bells(&mut self, entries: &[status_json::ProfileEntry], command: Option<&str>) {
+        let Some(command) = command else { return };
+        let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+        for entry in entries {
+            let fresh = !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status);
+            let util = entry
+                .windows
+                .iter()
+                .find(|w| w.label == crate::usage::LABEL_5H)
+                .map(|w| w.utilization_pct);
+            let Some(message) =
+                self.bells
+                    .observe(entry.name.as_str(), entry.bell_threshold, util, fresh)
+            else {
+                continue;
+            };
+            if let Err(e) = (self.ring_bell)(command, &message) {
+                logline!("tollgate daemon: alert for '{}' failed: {e:#}", entry.name);
+            }
         }
     }
 }
