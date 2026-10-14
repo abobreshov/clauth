@@ -230,6 +230,92 @@ pub(crate) fn map_billing(
         ..Reading::default()
     })
 }
+
+/// The monitor row an official login gets when nobody has added one.
+/// Same non-secret fields as `tollgate monitor add grok`.
+fn official_monitor() -> super::config::MonitorConfig {
+    super::config::MonitorConfig {
+        id: "grok".into(),
+        kind: MonitorKind::Grok,
+        provider: None,
+        label: Some("Grok (CLI login)".into()),
+        api_key_env: None,
+        billing_key_env: None,
+        hermes_home: None,
+        tool_home: Some("~/.grok".into()),
+        auth_entry: None,
+        via: None,
+        probe_model: None,
+        probe: false,
+        budget_usd_month: None,
+        alert_pct: None,
+        ttl_secs: Some(300),
+        enabled: true,
+    }
+}
+
+/// One official CLI login, or nothing. Several logins need an explicit
+/// `auth_entry`; this path does not guess.
+fn single_official_login(home: &Path) -> bool {
+    let Ok(entries) = read_entries(&home.join(".grok")) else {
+        return false;
+    };
+    entries.keys().filter(|name| official_login(name)).count() == 1
+}
+
+/// Fetch only when this monitor has never been read. A later `usage` call
+/// stays on the cache; the daemon's own poll refreshes on the TTL.
+fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now_ms: u64) {
+    if let Some(cache) = super::cache::load(&cfg.id)
+        && cache.matches(cfg)
+        && (cache.reading.is_some() || cache.checked_at_ms.is_some())
+    {
+        return;
+    }
+    let deps = super::cache::RefreshDeps {
+        http,
+        notifier: None,
+        env: &super::source::process_env,
+        now_ms,
+    };
+    let _ = super::cache::refresh_one(cfg, &deps, true);
+}
+
+/// Make one official Grok login visible to the normal monitor collector.
+///
+/// Writes only tollgate's own monitor row and cache, and only when that row
+/// is missing or its cache has never been filled. Does not refresh, lock, or
+/// rewrite the Grok auth store. A missing or ambiguous login leaves the
+/// report unchanged.
+pub(crate) fn ensure_official_grok(http: &dyn MonitorHttp, now_ms: u64) {
+    let Ok(home) = crate::profile::home_dir() else {
+        return;
+    };
+    if !single_official_login(&home) {
+        return;
+    }
+    let Ok(monitors) = super::config::load() else {
+        return;
+    };
+    if let Some(existing) = monitors.iter().find(|m| m.kind == MonitorKind::Grok) {
+        if existing.enabled {
+            fill_if_empty(existing, http, now_ms);
+        }
+        return;
+    }
+    let cfg = official_monitor();
+    if super::config::add(&cfg).is_err() {
+        if let Ok(monitors) = super::config::load()
+            && let Some(existing) = monitors
+                .iter()
+                .find(|m| m.kind == MonitorKind::Grok && m.enabled)
+        {
+            fill_if_empty(existing, http, now_ms);
+        }
+        return;
+    }
+    fill_if_empty(&cfg, http, now_ms);
+}
 #[cfg(test)]
 #[path = "../../../tests/inline/usage_monitor_grok.rs"]
 mod tests;

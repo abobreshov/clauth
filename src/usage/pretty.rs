@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use super::cards::{CardCtx, CardLine, plain_text, report_lines};
-use super::collect::{CollectOpts, collect};
+use super::collect::CollectOpts;
 use super::derive::{account_severity, countdown_to, format_money, hhmm_at_offset, lead_window};
 use super::observation::{AccountObservation, MoneyKind, Origin};
 use crate::out::{out, outln};
@@ -262,7 +262,7 @@ pub(crate) fn run(args: &UsageArgs) -> Result<()> {
         if args.json {
             super::report::run(true, &args.opts)?;
         } else {
-            let accounts = collect(&args.opts);
+            let accounts = super::report::accounts(&args.opts, &super::monitor::source::LiveHttp);
             let now_secs = crate::usage::now_epoch_secs();
             let offset_secs = local_offset_secs(now_secs);
             if args.waybar {

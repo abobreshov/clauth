@@ -13,6 +13,7 @@ use super::derive::{
     account_severity, countdown_with_local, format_money, lead_window, meter_severity, window_pace,
     window_severity,
 };
+use super::monitor::source::MonitorHttp;
 use super::observation::{AccountObservation, Freshness, MoneyKind, SCHEMA_VERSION};
 use crate::out::outln;
 
@@ -40,6 +41,16 @@ impl UsageReport {
     }
 }
 
+/// The accounts `tollgate usage` reports.
+///
+/// An official Grok CLI login is adopted into the monitor list the first
+/// time this runs, and its allowance is fetched once into that monitor's
+/// cache. Later calls, including the MCP `usage` tool, read the cache.
+pub(crate) fn accounts(opts: &CollectOpts, http: &dyn MonitorHttp) -> Vec<AccountObservation> {
+    super::monitor::grok::ensure_official_grok(http, crate::usage::now_ms());
+    collect(opts)
+}
+
 /// `tollgate usage [--json] [--all] [--account A] [--provider P]`.
 pub(crate) fn run(json: bool, opts: &CollectOpts) -> Result<()> {
     if json {
@@ -50,7 +61,7 @@ pub(crate) fn run(json: bool, opts: &CollectOpts) -> Result<()> {
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let accounts = collect(opts);
+    let accounts = accounts(opts, &super::monitor::source::LiveHttp);
     let now_secs = crate::usage::now_epoch_secs();
     if accounts.is_empty() {
         outln!("no accounts yet. add one with `tollgate login <name>`.");

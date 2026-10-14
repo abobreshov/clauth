@@ -201,8 +201,12 @@ pub(crate) fn redact_endpoint(raw: &str) -> String {
 
 /// Every observation the collector makes, redacted. The one read path the
 /// HTTP routes and the MCP `usage` tool share.
+///
+/// Also the path that adopts an official Grok CLI login into the monitor
+/// cache the first time the allowance is missing, so this envelope and
+/// `tollgate usage` show the same account.
 pub(crate) fn observations(opts: &CollectOpts) -> Vec<AccountObservation> {
-    let mut all = collect(opts);
+    let mut all = crate::usage::report::accounts(opts, &crate::usage::monitor::source::LiveHttp);
     all.iter_mut().for_each(redact);
     all
 }
