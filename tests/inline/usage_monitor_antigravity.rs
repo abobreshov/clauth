@@ -885,4 +885,3 @@ fn agy_map_summary_orders_5h_before_7d_within_each_group() {
     assert_eq!(hourly.windows[1].label, "7d Gemini Models");
     assert_eq!(hourly.windows[1].window_secs, Some(604800));
 }
-

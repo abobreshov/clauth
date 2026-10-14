@@ -3914,9 +3914,15 @@ fn overview_extra_row_renders_5h_and_7d_columns_for_model_scoped_monitor_windows
         now,
     ));
     assert!(text.contains("25%"), "expected 5h share in row: {text}");
-    assert!(text.contains("(1h 0m)"), "expected 5h countdown in row: {text}");
+    assert!(
+        text.contains("(1h 0m)"),
+        "expected 5h countdown in row: {text}"
+    );
     assert!(text.contains("60%"), "expected 7d share in row: {text}");
-    assert!(text.contains("(1d 0h)"), "expected 7d countdown in row: {text}");
+    assert!(
+        text.contains("(1d 0h)"),
+        "expected 7d countdown in row: {text}"
+    );
     assert!(
         !text.contains("(5h Gemini Models)"),
         "5h lead must not render fallback label in 7d column: {text}"
@@ -3995,5 +4001,3 @@ fn overview_extra_row_renders_5h_and_7d_columns_for_model_scoped_monitor_windows
     assert!(monthly_text.contains("40%"), "{monthly_text}");
     assert!(monthly_text.contains("(30d)"), "{monthly_text}");
 }
-
-
