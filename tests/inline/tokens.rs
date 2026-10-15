@@ -18,6 +18,164 @@ fn make_claude_dir(sandbox: &HomeSandbox) -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn transcript_placeholder_models_keep_messages_without_token_buckets() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    let path = project.join("session.jsonl");
+    std::fs::write(
+        &path,
+        [
+            jsonl_line("2026-06-11T10:00:00+00:00", "<synthetic>", 0, 0, 0, 0),
+            jsonl_line("2026-06-11T10:01:00+00:00", "claude-opus-4", 120, 30, 0, 0),
+            jsonl_line(
+                "2026-06-11T10:02:00+00:00",
+                "model<placeholder>",
+                4,
+                3,
+                0,
+                0,
+            ),
+            jsonl_line(
+                "2026-06-11T10:03:00+00:00",
+                "minimax/minimax-m3:free",
+                8,
+                2,
+                0,
+                0,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(stats.total_messages, 4);
+    assert_eq!(
+        stats
+            .models
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude-opus-4", "minimax/minimax-m3:free"]
+    );
+    assert_eq!(stats.daily.len(), 1);
+    assert_eq!(stats.daily[0].date, "2026-06-11");
+    assert_eq!(stats.daily[0].tokens, 160);
+    assert_eq!(
+        stats
+            .daily_models
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude-opus-4", "minimax/minimax-m3:free"]
+    );
+    assert_eq!(stats.total_input, 128);
+    assert_eq!(stats.total_output, 32);
+    let weekly = period_models(&stats.daily_models, "2026-06-08", "2026-06-14");
+    assert_eq!(weekly.len(), 2);
+    assert_eq!(
+        weekly.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+        vec!["claude-opus-4", "minimax/minimax-m3:free"]
+    );
+}
+
+#[test]
+fn todays_placeholder_keeps_the_message_and_no_today_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    let date = today_date();
+    std::fs::write(
+        project.join("session.jsonl"),
+        [
+            jsonl_line(&format!("{date}T10:00:00+00:00"), "<synthetic>", 0, 0, 0, 0),
+            jsonl_line(
+                &format!("{date}T10:01:00+00:00"),
+                "minimax/minimax-m3:free",
+                8,
+                2,
+                0,
+                0,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    let today = stats.today.expect("today summary");
+    assert_eq!(today.messages, 2);
+    assert_eq!(today.models.len(), 1);
+    assert_eq!(today.models[0].model, "minimax/minimax-m3:free");
+    assert_eq!((today.input, today.output), (8, 2));
+}
+
+#[test]
+fn placeholder_streamed_deltas_count_as_one_message() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(
+        project.join("session.jsonl"),
+        [
+            streamed_line(
+                "2026-06-11T10:00:00+00:00",
+                "msg_1",
+                "u1",
+                "<synthetic>",
+                0,
+                0,
+            ),
+            streamed_line(
+                "2026-06-11T10:00:01+00:00",
+                "msg_1",
+                "u2",
+                "<synthetic>",
+                0,
+                0,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(stats.total_messages, 1);
+    assert!(stats.models.is_empty());
+    assert!(stats.daily_models.is_empty());
+}
+
+#[test]
+fn transcript_usage_without_a_model_keeps_unknown_bucket() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let path = dir.join("unknown.jsonl");
+    std::fs::write(
+        &path,
+        r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+    )
+    .expect("write transcript");
+    let records = parse_file(&path);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].has_usage);
+    assert_eq!(records[0].model, "unknown");
+    assert_eq!((records[0].input, records[0].output), (3, 1));
+}
+
 // ── 1. base stats parsing ─────────────────────────────────────────────────────
 
 #[test]
@@ -583,6 +741,217 @@ fn top_up_counts_nested_subagent_transcripts() {
         .expect("opus");
     assert_eq!(opus.input, 400); // 100 + 300
     assert_eq!(opus.output, 250); // 50 + 200
+}
+
+// ── 7. deepseek served-model mapping ──────────────────────────────────────────
+
+fn write_owner_store(home: &std::path::Path, json: &str) {
+    let dir = home.join(".tollgate");
+    std::fs::create_dir_all(&dir).expect("create .tollgate");
+    std::fs::write(dir.join("session_profiles.json"), json).expect("write owner store");
+}
+
+fn save_base_url_profile(name: &str, base_url: &str) {
+    let mut profile = crate::testutil::blank_profile(&name.into());
+    profile.base_url = Some(base_url.to_owned());
+    crate::profile::save_profile(&profile).expect("save profile");
+}
+
+/// A stats-cache, a deepseek-owned conversation `sess` and its transcript
+/// holding `lines`: the attribution the map must ignore, set up so a mapping
+/// keyed on the owner would fire.
+fn deepseek_owned_transcript(sb: &HomeSandbox, lines: &[String]) -> PathBuf {
+    let claude_dir = make_claude_dir(sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"D1"}}}"#);
+    save_base_url_profile("D1", "https://api.deepseek.com");
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    std::fs::write(proj_dir.join("sess.jsonl"), lines.join("\n")).expect("write transcript");
+    claude_dir
+}
+
+fn model_splits(stats: &TokenStats) -> Vec<(&str, u64, u64)> {
+    let mut rows: Vec<_> = stats
+        .models
+        .iter()
+        .map(|m| (m.model.as_str(), m.input, m.output))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+#[test]
+fn a_uuid_message_id_maps_requested_claude_ids_to_the_served_deepseek_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    // A contested conversation and one an anthropic profile owns: the ids
+    // alone decide, whatever the owner.
+    write_owner_store(
+        sb.home(),
+        r#"{"sessions":{"sess":"contested","sess2":{"known":"cld"}}}"#,
+    );
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    std::fs::write(
+        proj_dir.join("sess2.jsonl"),
+        jsonl_line_with_ids(
+            "2026-06-11T10:03:00+00:00",
+            "r4",
+            "3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "claude-opus-5-5",
+            5,
+            2,
+        ),
+    )
+    .expect("write transcript");
+    std::fs::write(
+        proj_dir.join("sess.jsonl"),
+        [
+            jsonl_line_with_ids(
+                "2026-06-11T10:00:00+00:00",
+                "r1",
+                "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                100,
+                50,
+            ),
+            jsonl_line_with_ids(
+                "2026-06-11T10:01:00+00:00",
+                "r2",
+                "1a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-sonnet-5-5",
+                40,
+                20,
+            ),
+            // A served deepseek id passes untouched.
+            jsonl_line_with_ids(
+                "2026-06-11T10:02:00+00:00",
+                "r3",
+                "2a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "deepseek-v4-flash",
+                30,
+                10,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(
+        model_splits(&stats),
+        vec![
+            ("deepseek-flash", 40, 20),
+            ("deepseek-v4-flash", 30, 10),
+            ("deepseek-v4-pro", 105, 52)
+        ]
+    );
+}
+
+#[test]
+fn an_anthropic_message_id_keeps_its_claude_id_in_a_deepseek_owned_conversation() {
+    let sb = HomeSandbox::new();
+    let claude_dir = deepseek_owned_transcript(
+        &sb,
+        &[
+            jsonl_line_with_ids(
+                "2026-06-11T10:00:00+00:00",
+                "r1",
+                "msg_01AbCdEfGhIjKlMnOpQrStUv",
+                "claude-opus-5-5",
+                100,
+                50,
+            ),
+            jsonl_line_with_ids(
+                "2026-06-11T10:01:00+00:00",
+                "r2",
+                "3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                7,
+                3,
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(
+        model_splits(&stats),
+        vec![("claude-opus-5-5", 100, 50), ("deepseek-v4-pro", 7, 3)]
+    );
+}
+
+#[test]
+fn an_id_less_line_never_maps() {
+    let sb = HomeSandbox::new();
+    let claude_dir = deepseek_owned_transcript(
+        &sb,
+        &[jsonl_line(
+            "2026-06-11T10:00:00+00:00",
+            "claude-opus-5-5",
+            100,
+            50,
+            10,
+            0,
+        )],
+    );
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(model_splits(&stats), vec![("claude-opus-5-5", 100, 50)]);
+}
+
+#[test]
+fn only_a_lowercase_hyphenated_uuid_reads_as_a_deepseek_message_id() {
+    let cases = [
+        (
+            "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            Some("deepseek-v4-pro"),
+        ),
+        ("0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D", None),
+        ("0a1b2c3d4e5f4a6b8c7d9e0f1a2b3c4d", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4de", None),
+        ("0a1b2c3d4-e5f-4a6b-8c7d-9e0f1a2b3c4d", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4g", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c-d", None),
+        ("msg_01AbCdEfGhIjKlMnOpQrStUv", None),
+        ("msg_20261009abcdef0123456789abcd", None),
+        ("", None),
+    ];
+    for (id, want) in cases {
+        assert_eq!(
+            crate::providers::deepseek_served_model("claude-opus-5-5", id),
+            want,
+            "{id:?}"
+        );
+    }
+}
+
+#[test]
+fn a_deepseek_message_id_maps_only_requested_claude_ids() {
+    let id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    let cases = [
+        ("claude-opus-5-5", Some("deepseek-v4-pro")),
+        ("claude-opus-5", Some("deepseek-v4-pro")),
+        ("claude-sonnet-5-5", Some("deepseek-flash")),
+        ("claude-haiku-5-5", Some("deepseek-flash")),
+        ("claude-foo-1", Some("deepseek-flash")),
+        ("deepseek-v4-pro", None),
+        ("deepseek-flash", None),
+        ("<synthetic>", None),
+        ("glm-5.3-flash", None),
+    ];
+    for (requested, want) in cases {
+        assert_eq!(
+            crate::providers::deepseek_served_model(requested, id),
+            want,
+            "{requested:?}"
+        );
+    }
 }
 
 #[test]
@@ -1561,8 +1930,8 @@ fn backfill_fills_hours_when_corpus_totals_match() {
         "2026-06-15",
         &ModelTokens {
             model: "claude-opus-4".into(),
-            input: 300,
-            output: 100,
+            input: 350,
+            output: 110,
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
@@ -1581,14 +1950,10 @@ fn backfill_fills_hours_when_corpus_totals_match() {
         10,
     );
     std::fs::write(&p, format!("{line}\n")).expect("write");
-    // mtime before the recorded_through cutoff (00:00 UTC 2026-06-16), so the
-    // backfill owns the file (the top-up owns anything newer).
     set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
-    // A file the mtime guard must exclude: touched after the widened
-    // end-of-watermark-day bound (00:00 UTC of the day after the watermark),
-    // holding a pre-cutoff line that would push the derived totals past the
-    // stored ones (and thereby block the fill) if the guard ever stopped
-    // filtering.
+    // A live session's transcript, touched after the watermark day: the
+    // stored totals were recorded from its 06-15 line too, so the sweep must
+    // read it or the day never matches.
     let late = proj_dir.join("late.jsonl");
     let late_line = jsonl_line("2026-06-15T11:00:00+00:00", "claude-opus-4", 50, 10, 0, 0);
     std::fs::write(&late, format!("{late_line}\n")).expect("write");
@@ -1611,10 +1976,10 @@ fn backfill_fills_hours_when_corpus_totals_match() {
         .iter()
         .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
         .expect("ledger day folded");
-    assert_eq!(row.in_out, 400, "flat totals unchanged");
+    assert_eq!(row.in_out, 460, "flat totals unchanged");
     let split = row.split.as_ref().expect("split");
-    assert_eq!(split.input, 300);
-    assert_eq!(split.output, 100);
+    assert_eq!(split.input, 350);
+    assert_eq!(split.output, 110);
     assert_eq!(split.cache_read, 20);
     assert_eq!(split.cache_create, 10);
     let hours = row.hours.expect("hours filled");
@@ -1622,6 +1987,8 @@ fn backfill_fills_hours_when_corpus_totals_match() {
     assert_eq!(hours[10].output, 100);
     assert_eq!(hours[10].cache_read, 20);
     assert_eq!(hours[10].cache_create, 10);
+    assert_eq!(hours[11].input, 50);
+    assert_eq!(hours[11].output, 10);
     assert_eq!(hours[9].input, 0);
 
     // The flag + hours survive the save/reload round trip. Pinned on the
@@ -1730,27 +2097,20 @@ fn backfill_routes_crossing_cutoff_lines_by_line_date() {
     let on_cutoff = jsonl_line("2026-06-16T08:00:00+00:00", "claude-opus-4", 7, 3, 0, 0);
     let after = jsonl_line("2026-06-17T10:00:00+00:00", "claude-opus-4", 999, 999, 0, 0);
     std::fs::write(&p, format!("{before}\n{on_cutoff}\n{after}\n")).expect("write");
-    // mtime ON the watermark day (noon 2026-06-16): admitted by the widened
-    // end-of-watermark-day bound, and exactly the case that bound exists for
-    // — a file touched on the watermark day whose pre-watermark lines the
-    // stored v1 totals include. An 00:00-instant bound would exclude it and
-    // leave both days unfilled forever.
+    // Touched on and after the watermark day: a file's mtime never gates
+    // it, its lines route by their own dates.
     set_mtime(&p, epoch_day("2026-06-16") + Duration::from_secs(12 * 3600));
-    // A second file whose mtime sits EXACTLY at the end-of-watermark-day
-    // instant (00:00 UTC 2026-06-17 == the widened bound): admitted by the
-    // `>` comparison. Flipping it to `>=` would exclude this file and leave
-    // day 06-14 unfilled.
-    let boundary = proj_dir.join("boundary.jsonl");
+    let late = proj_dir.join("late.jsonl");
     let b_line = jsonl_line("2026-06-14T14:00:00+00:00", "claude-opus-4", 5, 2, 0, 0);
-    std::fs::write(&boundary, format!("{b_line}\n")).expect("write");
-    set_mtime(&boundary, epoch_day("2026-06-17"));
+    std::fs::write(&late, format!("{b_line}\n")).expect("write");
+    set_mtime(&late, epoch_day("2026-06-17"));
 
-    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {}).expect("cutoff parseable");
+    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {});
     assert_eq!(sweep.files_parsed, 2);
     let day14 = sweep
         .derived
         .get(&("2026-06-14".to_owned(), "claude-opus-4".to_owned()))
-        .expect("the boundary-instant file is admitted");
+        .expect("the file touched after the watermark day is read");
     assert_eq!(day14.flat.input, 5);
     assert_eq!(day14.hours[14].input, 5);
     let day15 = sweep
@@ -1849,7 +2209,7 @@ fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
         set_mtime(&f, epoch_day("2026-06-15") + Duration::from_secs(60));
     }
 
-    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {}).expect("cutoff parseable");
+    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {});
     assert_eq!(sweep.files_parsed, 2);
     let acc = sweep
         .derived
@@ -3071,5 +3431,111 @@ fn rederive_runs_once() {
     assert!(
         !super::run_rederive(&claude_dir, &mut ledger, "2026-06-21", &mut progress2),
         "second run is a no-op"
+    );
+}
+
+// ── served-model re-derive (days recorded under the requested alias) ─────────
+
+/// Days recorded before the served-model map counted DeepSeek-served lines
+/// under the requested `claude-*` alias. The one-shot pass re-keys a day the
+/// corpus still fully covers onto the served model, whatever file holds its
+/// lines (one here was touched after the watermark day, as a live session's
+/// transcript is), and leaves a day the corpus no longer covers as recorded.
+#[test]
+fn persist_ledger_rekeys_covered_days_onto_the_served_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let tollgate_dir = sb.home().join(".tollgate");
+    std::fs::create_dir_all(&tollgate_dir).expect("mkdir");
+    std::fs::write(
+        tollgate_dir.join("token_ledger.json"),
+        r#"{
+            "recorded_through": "2026-06-16",
+            "backfill_done": true,
+            "shape_clf": 3,
+            "days": {
+                "2026-06-14": {
+                    "claude-opus-5-5": {"input": 50, "output": 20, "cache_read": 0, "cache_create": 0}
+                },
+                "2026-06-15": {
+                    "claude-opus-5-5": {"input": 107, "output": 53, "cache_read": 0, "cache_create": 0}
+                }
+            }
+        }"#,
+    )
+    .expect("write ledger");
+
+    let proj = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let anthropic = proj.join("a.jsonl");
+    std::fs::write(
+        &anthropic,
+        jsonl_line_with_ids(
+            "2026-06-15T10:00:00+00:00",
+            "r1",
+            "msg_01AbCdEfGhIjKlMnOpQrStUv",
+            "claude-opus-5-5",
+            100,
+            50,
+        ),
+    )
+    .expect("write");
+    set_mtime(
+        &anthropic,
+        epoch_day("2026-06-15") + Duration::from_secs(11 * 3600),
+    );
+    let live = proj.join("b.jsonl");
+    std::fs::write(
+        &live,
+        [
+            jsonl_line_with_ids(
+                "2026-06-15T11:00:00+00:00",
+                "r2",
+                "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                7,
+                3,
+            ),
+            // The 06-14 day lost its transcript: only part of it survives.
+            jsonl_line_with_ids(
+                "2026-06-14T09:00:00+00:00",
+                "r3",
+                "1a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                30,
+                12,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write");
+    set_mtime(&live, SystemTime::now());
+
+    let mut ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
+    persist_ledger(
+        &claude_dir,
+        &mut ledger,
+        &tollgate_dir,
+        &TokenStats::default(),
+        "2026-06-20",
+        |_, _| {},
+    );
+
+    let ledger = crate::token_ledger::Ledger::load(&tollgate_dir);
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-15", "claude-opus-5-5"),
+        Some((100, 50, 0, 0, UsageShape::Healthy, true))
+    );
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-15", "deepseek-v4-pro"),
+        Some((7, 3, 0, 0, UsageShape::Healthy, true))
+    );
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-14", "claude-opus-5-5"),
+        Some((50, 20, 0, 0, UsageShape::Healthy, false))
+    );
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-14", "deepseek-v4-pro"),
+        None
     );
 }

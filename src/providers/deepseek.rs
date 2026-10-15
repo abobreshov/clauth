@@ -27,6 +27,43 @@ pub(super) fn matches_base_url(url: &str) -> bool {
     url_matches_host(url, ORIGIN)
 }
 
+/// The model DeepSeek served for one transcript line that records a
+/// requested `claude-*` id, or `None` when the line names its model already
+/// or DeepSeek did not serve it. The message id tells which endpoint
+/// answered: DeepSeek's are lowercase hyphenated UUIDs, where Anthropic's
+/// read `msg_01…` and z.ai's `msg_2026…`. The alias then decides the model:
+/// `opus` binds to `deepseek-v4-pro`, every other `claude-*` id, unknown
+/// ones included, to `deepseek-flash`.
+pub(crate) fn served_model(model: &str, message_id: &str) -> Option<&'static str> {
+    if !is_uuid(message_id) {
+        None
+    } else if model.starts_with("claude-opus") {
+        Some(SERVES_OPUS)
+    } else if model.starts_with("claude-") {
+        Some(SERVES_OTHER)
+    } else {
+        None
+    }
+}
+
+const SERVES_OPUS: &str = "deepseek-v4-pro";
+const SERVES_OTHER: &str = "deepseek-flash";
+
+/// Whether [`served_model`] can move tokens onto or off `model`: every
+/// `claude-*` id and every model it names. A key outside this set counts the
+/// same before and after the map.
+pub(crate) fn served_model_may_move(model: &str) -> bool {
+    model.starts_with("claude-") || model == SERVES_OPUS || model == SERVES_OTHER
+}
+
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
 pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
     let text = super::get_json(BALANCE_URL, api_key)?;
     let raw: DeepSeekResponse = serde_json::from_str(&text).map_err(|_| ThirdPartyError::Parse)?;

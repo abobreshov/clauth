@@ -5986,6 +5986,101 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     );
 }
 
+/// A failed endpoint save restores the in-memory profile to exactly its
+/// pre-call value: the save mutates the profile first, so without the restore
+/// the TUI's roster would hold the new endpoint/key while disk kept the old,
+/// and the next write would persist the change the error said did not happen.
+#[cfg(unix)]
+#[test]
+fn a_failed_endpoint_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let mut p = Profile::new(
+        "alice".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    p.third_party_usage = Some(crate::testutil::stats_with_bars(vec![
+        crate::testutil::bar("5h", 80.0),
+    ]));
+    crate::profile::save_profile(&p).expect("save the profile");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice"))
+        .expect("profile dir");
+    let mut config = inactive_config(p);
+    let before = config
+        .find(&crate::profile::ProfileName::from("alice"))
+        .expect("alice in the roster")
+        .clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("alice"),
+        Some("http://127.0.0.1:3001".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&crate::profile::ProfileName::from("alice"))
+        .expect("alice still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// A failed endpoint save leaves the third-party DISK cache as it was: the
+/// removal runs only after `save_profile_config` landed. `config.toml` is made a
+/// directory so the save fails while the profile dir stays writable — a
+/// read-only dir would also block the removal, hiding the ordering.
+#[test]
+fn a_failed_endpoint_save_keeps_the_third_party_cache() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new(
+        "alice".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["alice"]);
+    let name = crate::profile::ProfileName::from("alice");
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]),
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    assert!(cache.exists(), "the fixture wrote the cache file");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    std::fs::remove_file(&config_toml).expect("remove config.toml");
+    std::fs::create_dir_all(&config_toml).expect("replace config.toml with a directory");
+    let mut config = inactive_config(p);
+    let err = edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("http://127.0.0.1:3001".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect_err("the save must fail");
+    assert!(
+        cache.exists(),
+        "a failed save keeps the third-party cache file: {err:#}"
+    );
+}
+
 // ── codex login capture (`tollgate login <name> --codex`) ────────────────────
 
 fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&str>) {
@@ -7032,5 +7127,143 @@ fn captured_proven_login_commits_identity_snapshot_with_anchor() {
             account: identity.account_uuid.clone(),
             details: Some(identity)
         }
+    );
+}
+
+// ── settings edits save config.toml only ─────────────────────────────────────
+
+/// Another process (the daemon's rotation) landed a new pair while this
+/// process's in-memory profile still holds the old one. A model edit from that
+/// stale memory must not write the old pair back over the store.
+#[test]
+fn a_model_edit_never_rewinds_a_pair_another_process_landed() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("settings-stale-pair");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("save state");
+    let store = crate::profile::profile_dir(&name)
+        .expect("dir")
+        .join("credentials.json");
+    std::fs::write(
+        &store,
+        r#"{"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-2"}}"#,
+    )
+    .expect("another process lands its pair");
+
+    let models = ModelSettings {
+        default: Some("opus".to_string()),
+        ..ModelSettings::default()
+    };
+    edit_profile_model(&mut config, &name, models).expect("edit the model");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-2"),
+        "a settings edit saves config.toml only"
+    );
+}
+
+/// A profile holding a login and an UNPARSEABLE spent record beside it.
+fn profile_with_a_corrupt_spent_record(name: &ProfileName) -> AppConfig {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("save state");
+    std::fs::write(
+        crate::profile::profile_dir(name)
+            .expect("dir")
+            .join("auth.spent.json"),
+        "not json",
+    )
+    .expect("corrupt the record");
+    config
+}
+
+/// F6: a login install retires the spent record, so an unparseable one never
+/// outlives the next login (it would hold every spend of the new login off).
+#[test]
+fn a_login_install_retires_the_spent_record() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("record-relogin");
+    let mut config = profile_with_a_corrupt_spent_record(&name);
+
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-relogin".to_string(),
+                    refresh_token: Some("rt-relogin".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    )
+    .expect("install the re-login");
+
+    assert!(
+        !crate::profile::profile_dir(&name)
+            .expect("dir")
+            .join("auth.spent.json")
+            .exists()
+    );
+}
+
+/// F6: a clear retires it too.
+#[test]
+fn a_login_clear_retires_the_spent_record() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("record-clear");
+    let mut config = profile_with_a_corrupt_spent_record(&name);
+
+    clear_profile_credentials(&mut config, &name).expect("clear");
+
+    assert!(
+        !crate::profile::profile_dir(&name)
+            .expect("dir")
+            .join("auth.spent.json")
+            .exists()
     );
 }

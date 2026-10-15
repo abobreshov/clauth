@@ -106,17 +106,25 @@ A preset is a named `base_url` + `[models]` pair, plus a few non-secret env swit
 
 | Preset | Endpoint | Models | Env it adds |
 |---|---|---|---|
-| `DeepSeek` | `https://api.deepseek.com/anthropic` | `default = deepseek-chat` | none |
-| `Z.ai` | `https://api.z.ai/api/anthropic` | `default = glm-5.2` | none |
-| `OpenRouter` | `https://openrouter.ai/api` | `opus` / `subagent` = `~anthropic/claude-opus-latest[1m]`, `sonnet` = `~anthropic/claude-sonnet-latest[1m]`, `haiku` = `~anthropic/claude-haiku-latest`; no `default` | `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1` |
-| `MiniMax` | `https://api.minimax.io/anthropic` | `default = MiniMax-M3` | none |
+| `DeepSeek` | `https://api.deepseek.com/anthropic` | tier binds below; `default = opus` | none |
+| `Z.ai` | `https://api.z.ai/api/anthropic` | tier binds below; `default = opus` | none |
+| `OpenRouter` | `https://openrouter.ai/api` | `default = opus`, `opus` = `~anthropic/claude-opus-latest[1m]`, `sonnet` = `~anthropic/claude-sonnet-latest[1m]`, `haiku` = `~anthropic/claude-haiku-latest`, `fable` = `~anthropic/claude-fable-latest[1m]`; subagent unset | `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1` |
+| `MiniMax` | `https://api.minimax.io/anthropic` | tier binds below; `default = opus` | none |
 | `Qwen-TokenPlan-Intl` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | every tier `qwen3.8-max` | none |
 | `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` | every tier `qwen3.8-max` | none |
 | `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` | every tier `qwen3-coder-plus` | none |
 | `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | every tier `qwen3-coder-plus` | none |
 | `Ollama-Cloud` | `https://ollama.com` | none | `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `DISABLE_ERROR_REPORTING=1`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` |
 
-`DeepSeek`, `Z.ai` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. `OpenRouter` pins the tiers to OpenRouter's `~anthropic/…-latest` aliases instead of the old `openrouter/auto` default, which can route to non-Anthropic models; OpenRouter only guarantees Claude Code against the Anthropic first-party provider. The four Alibaba ones fill every row, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. `Ollama-Cloud` sets the endpoint and no model at all (see below). All nine leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+`DeepSeek`, `Z.ai` and `MiniMax` bind the provider's strongest current model to `opus` and `fable` and its fast one to `sonnet` and `haiku`, and set `default` to `opus`, so the main model follows the `opus` row:
+
+| Preset | `opus`, `fable` | `sonnet`, `haiku` |
+|---|---|---|
+| `DeepSeek` | `deepseek-v4-pro[1m]` | `deepseek-flash[1m]` |
+| `Z.ai` | `glm-5.3[1m]` | `glm-5.3-flash[1m]` |
+| `MiniMax` | `MiniMax-M3[1m]` | `MiniMax-M3.1-Flash-Preview[1m]` |
+
+MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-point `sonnet` and `haiku`. `OpenRouter` serves the real Claude models, so each row takes its own family's moving alias: `~anthropic/claude-opus-latest[1m]`, `~anthropic/claude-sonnet-latest[1m]`, `~anthropic/claude-haiku-latest` and `~anthropic/claude-fable-latest[1m]`, with `default` on `opus` too. The `[1m]` suffix tells Claude Code the model takes a 1M-token context. The four Alibaba ones put their one model on every row, the subagent row included, because those endpoints reject a Claude model id outright rather than serving something for it, so any row left unpinned fails on use. `Ollama-Cloud` sets the endpoint and no model at all (see below). All nine leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.tollgate/presets/<name>.json`:
 
@@ -395,7 +403,9 @@ The daemon must be started from an environment that holds the named variables; `
   profiles/
     work/
       config.toml          # everything in the table above
-      credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
+      credentials.json     # OAuth snapshot
+      credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
+      auth.spent.json      # fingerprints of the last 64 refresh tokens tollgate traded in, never the tokens
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
@@ -438,7 +448,7 @@ The daemon must be started from an environment that holds the named variables; `
 
 Five static lock files sit alongside and are never deleted on purpose: `.lock`, `tollgated.lock`, `tollgated-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other tollgate-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Everything under `~/.tollgate` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
+Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting `credentials.json.staged` before tollgate lands it can sign that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 
 The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) tollgate builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)).
 

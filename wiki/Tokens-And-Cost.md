@@ -10,7 +10,9 @@ The Tokens tab is a dashboard over Claude Code's own token history on this machi
 | `~/.claude/projects/**/*.jsonl` | live session transcripts newer than that rollup |
 | `~/.tollgate/token_ledger.json` | tollgate's durable per-day record |
 
-Claude Code prunes old transcripts and its rollup freezes at a date, so tollgate keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable.
+Claude Code prunes old transcripts and its rollup freezes at a date, so tollgate keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable. Transcript model ids containing `<` or `>` do not contribute token totals or model rows, but their messages still count; previously recorded placeholder model rows are dropped when the ledger loads.
+
+DeepSeek's endpoint answers a Claude model id with its own model and names only the id you asked for in the transcript. tollgate recognizes DeepSeek's replies by their message ids and counts each under the model that served it: `deepseek-v4-pro` for an opus request, `deepseek-flash` for any other Claude id. Ledger days recorded before tollgate did this are re-keyed once, on the first refresh after the upgrade, wherever the transcripts still hold all of that day's Claude, `deepseek-v4-pro` and `deepseek-flash` usage; any other day keeps its recorded rows.
 
 The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `tollgate start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 

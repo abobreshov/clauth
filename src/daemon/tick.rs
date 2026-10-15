@@ -294,8 +294,11 @@ impl super::Daemon {
         // target before install; a revoked token is quarantined (`auth_broken`) and
         // dropped — retrying can't help until `tollgate login`. The gate does its HTTP
         // refresh with no config lock held, so it cannot wedge the run loop mid-lock.
-        match crate::oauth::ensure_installable(&self.config, &target, crate::oauth::refresh_result)
-        {
+        match crate::oauth::ensure_installable_from_main_loop(
+            &self.config,
+            &target,
+            crate::oauth::refresh_result,
+        ) {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
             crate::oauth::AuthGate::Broken => {
                 // The gate persisted `auth_broken`; adopt that fingerprint so the
@@ -312,11 +315,12 @@ impl super::Daemon {
             crate::oauth::AuthGate::Transient(e) => {
                 // The daemon log is an operator surface with no companion log of
                 // its own, so it names the status like CLI stderr does.
-                self.fail_switch(
-                    &decision,
-                    now,
-                    &format!("refresh failed transiently ({})", e.text_with_status()),
-                );
+                let reason = if e.is_login_change() {
+                    e.text()
+                } else {
+                    format!("refresh failed transiently ({})", e.text_with_status())
+                };
+                self.fail_switch(&decision, now, &reason);
                 return;
             }
         }

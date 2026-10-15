@@ -522,6 +522,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             (Some(profile), None) => cmd_api_key(&profile),
             (None, None) => Err(usage_error("a profile or --session is required")),
         },
+        Command::OauthToken { profile } => cmd_oauth_token(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
         Command::Hermes { cmd } => cmd_hermes(cmd),
@@ -1680,15 +1681,18 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
     // just reported cleared.
-    let _guard = runtime::RotationGuard::acquire(target)
+    let guard = runtime::RotationGuard::acquire(target)
         .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
+    // The relink below puts the store in front of Claude Code: a staged pair
+    // lands first.
+    oauth::land_stage_for_install(target, &guard)
+        .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
     // Everything the ACTIONS key off is re-read under the guard; the snapshot
     // above fed the prompt's copy and nothing else. The prompt is an unbounded
-    // wait, and a rotation, a switch, or a re-login can all land during it —
-    // `save_profile` persists the WHOLE profile, so writing the pre-prompt
-    // snapshot back would rewind `credentials.json` to a spent refresh token
-    // (the exact hazard `adopt_disk_rotation` names, one layer up), and acting
-    // on the pre-prompt `active` relinks the wrong world in both directions.
+    // wait, and a switch, a re-login or another config edit can all land
+    // during it — `save_profile_config` writes the WHOLE config, so writing
+    // the pre-prompt snapshot back would rewind that edit, and acting on the
+    // pre-prompt `active` relinks the wrong world in both directions.
     let mut on_disk = profile::load_profile(target)?;
     // The other-login REFUSAL re-checks here too — it is the one decision in
     // this function that can strip a profile of its last credential, and the
@@ -1707,7 +1711,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         on_disk.rolling_token = false;
-        profile::save_profile(&on_disk)?;
+        profile::save_profile_config(&on_disk)?;
     }
     // A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
     // detect, and one the operator did not name: the prompt says "the
@@ -2276,7 +2280,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         && let Some(profile) = cfg.find_mut(&canonical)
     {
         profile.rolling_token = true;
-        profile::save_profile(profile)?;
+        profile::save_profile_config(profile)?;
     }
     let armed =
         oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
@@ -2297,7 +2301,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             profile.rolling_token = false;
             // The arming error is the one the operator needs; a rollback that
             // then cannot save its own config write must not replace it.
-            if let Err(save_err) = profile::save_profile(profile) {
+            if let Err(save_err) = profile::save_profile_config(profile) {
                 errln!("{}", rollback_stranded_warning(&canonical, &save_err));
             }
         }
@@ -2460,8 +2464,12 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // Arriving at the error means the lock file could not be created or opened
     // — a filesystem or permissions problem under `~/.tollgate` — and the
     // original error says which, so it is kept rather than replaced.
-    let _guard = runtime::RotationGuard::acquire(&canonical)
+    let guard = runtime::RotationGuard::acquire(&canonical)
         .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
+    // The relink below puts the install source in front of Claude Code, the
+    // store whenever the mint does not restore: a staged pair lands first.
+    oauth::land_stage_for_install(&canonical, &guard)
+        .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
     // Flag OFF first, before the restore is known to land — DELIBERATE, and
     // load-bearing for every bail arm below, none of which rolls it back. The
     // command's primary effect is the disarm: with the flag still on, the
@@ -2474,13 +2482,12 @@ fn cmd_static_token(name: &str) -> Result<()> {
     //
     // Written from a fresh DISK read, never the pre-acquire config snapshot:
     // the blocking acquire above can WAIT out an in-flight rotation, and
-    // `save_profile` persists the whole profile — writing the snapshot back
-    // would rewind the very rotation it just waited for to a spent refresh
-    // token.
+    // `save_profile_config` writes the whole config — writing the snapshot
+    // back would rewind any config edit that landed meanwhile.
     let mut on_disk = profile::load_profile(&canonical)?;
     if on_disk.rolling_token {
         on_disk.rolling_token = false;
-        profile::save_profile(&on_disk)?;
+        profile::save_profile_config(&on_disk)?;
     }
     let is_active = load_config()?.is_active(&canonical);
     // The flag flip above is already durable, so a restore that ERRORS (the
@@ -2590,21 +2597,25 @@ fn cmd_api_key(name: &str) -> Result<()> {
         anyhow::bail!("profile '{name}' has no api_key");
     };
     let mut stdout = std::io::stdout().lock();
-    write_api_key(&mut stdout, &key)
+    write_api_key(&mut stdout, &key, "api_key")
 }
 
-/// Write the api_key verbatim to `writer` — NO trailing newline, NO framing.
+/// Write a credential verbatim to `writer` — NO trailing newline, NO framing.
 /// CC's `apiKeyHelper` contract does not document whether stdout is trimmed
 /// (the docs say only "any shell command that prints the current credential
 /// to stdout"), so the no-newline form strictly dominates: it is correct
 /// whether CC trims or not, whereas `key + "\n"` would only be correct under
 /// the unverified trim assumption. For a credential path, fail safe — CC
-/// reads the bytes via EOF on process exit, no line-read hang.
-fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str) -> Result<()> {
+/// reads the bytes via EOF on process exit, no line-read hang. `what` names the
+/// credential in a failed write's error line, since the OAuth twin prints an
+/// OAuth token, never an api key.
+fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str, what: &str) -> Result<()> {
     writer
         .write_all(key.as_bytes())
-        .context("writing api_key to stdout")?;
-    writer.flush().context("flushing api_key to stdout")
+        .with_context(|| format!("writing {what} to stdout"))?;
+    writer
+        .flush()
+        .with_context(|| format!("flushing {what} to stdout"))
 }
 
 /// Read a profile's stored api_key from `config.toml`. Returns `Ok(None)` for
@@ -2636,6 +2647,184 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
         claude::validate_api_key(k)?;
     }
     Ok(key.map(str::to_string))
+}
+
+/// `tollgate __oauth-token <profile>`, the OAuth twin of [`cmd_api_key`]: prints
+/// the access token a switch to the profile would install, with the same
+/// no-newline framing. Fails closed with no stdout when the profile has no
+/// OAuth login, so a script that tries `__tollgate-api-key` first and falls back to this
+/// one never receives an endpoint profile's key as an OAuth token.
+fn cmd_oauth_token(name: &str) -> Result<()> {
+    let token = oauth_token_for_profile(name, oauth::refresh_result)?;
+    let mut stdout = std::io::stdout().lock();
+    write_api_key(&mut stdout, &token, "oauth token")
+}
+
+/// How much life a token [`cmd_oauth_token`] prints must have left before it is
+/// refreshed first. Far wider than a switch's five-minute grace because the
+/// consumer runs long sessions on the bare access token, with no refresh token
+/// to renew it once it dies.
+const OAUTH_TOKEN_HORIZON_MS: i64 = 60 * 60 * 1000;
+
+/// The token [`cmd_oauth_token`] prints. The refresh under the profile's
+/// `RotationGuard`, the staged-pair landing and the long-lived and rolling
+/// sidecars are all the switch gate's ([`oauth::ensure_installable_within`]),
+/// run at [`OAUTH_TOKEN_HORIZON_MS`]. Off the active profile the token comes
+/// from the install source rather than `credentials.json`, because a split
+/// profile's sessions run on its sidecar and the rotating usage pair is never
+/// handed to one. `refresher` is injected so the refresh leg is testable
+/// offline.
+fn oauth_token_for_profile(
+    name: &str,
+    refresher: impl Fn(
+        &str,
+        Option<&str>,
+    ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
+) -> Result<String> {
+    let config = load_config()?;
+    let canonical = resolve_or_bail(&config, name, "__oauth-token")?;
+    let Some(profile) = config.find(&canonical) else {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    };
+    // Asked of where requests go, not of `base_url` alone: an `[env]`-routed
+    // profile is an endpoint profile too, and the gate would pass a `base_url`
+    // one through as Ready without looking at any pair it holds.
+    if profile.routing_endpoint().is_some() {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    }
+    refuse_if_disabled(&config, &canonical)?;
+    let refresh_less = profile.refresh_token().is_none()
+        && !profile.rolling_token
+        && !claude::has_session_token(&canonical);
+    // Whether an expired token here is one some running `claude` refreshes:
+    // true on the arms that never refresh it themselves, false on a login with
+    // nothing to refresh it, where re-login is the real fix.
+    let refreshed_elsewhere;
+    let source = if config.is_active(&canonical) {
+        if claude::has_session_token(&canonical) {
+            // A long-lived setup token is what the profile's sessions run on
+            // and what a switch installs, so it prints for the active profile
+            // too — never the live slot's or `credentials.json`'s rotating pair
+            // (cloudy 2026-10-13: "year-long token wins"). The mint is static,
+            // so the same five-minute window as the inactive arm and the switch
+            // gate applies: inside it the re-mint line below fires, then the
+            // re-login error, exactly as the inactive arm prints on the same
+            // bytes.
+            if let Some(claude::SessionTokenStatus::LongLived(Some(exp))) =
+                claude::session_token_status(&canonical)
+                && crate::usage::now_ms() as i64 + claude::BACKUP_EXPIRY_GRACE_MS >= exp
+            {
+                oauth::log_long_lived_token_expiry(&canonical);
+                anyhow::bail!("{}", format::login_expired(&canonical).line());
+            }
+            refreshed_elsewhere = false;
+            claude::install_source_path(&canonical)?
+        } else if crate::identity::upstream_active() {
+            // In guest mode upstream clauth owns `~/.claude/.credentials.json`,
+            // so tollgate never reads or exports the global live slot.
+            refreshed_elsewhere = false;
+            claude::install_source_path(&canonical)?
+        } else {
+            // A plain `claude` refreshes the active chain outside any tollgate
+            // lock and replaces the live file rather than writing through
+            // tollgate's link, so the store lags it: print what that `claude`
+            // last wrote, and never refresh, the switch paths' rule for the
+            // active profile. With no live file there is nothing newer than
+            // the store, so the store prints. The logged-out shell is Claude
+            // Code's record that its own refresh died, so the store's copy of
+            // that chain is not printed either. A diverged slot prints only
+            // once the divergence path's owner check ties it to this profile
+            // and the live file either matches the stored token or outdates a
+            // lagging store, because the caller spends exactly the profile it
+            // names.
+            let link = claude::classify_credentials_link(&canonical)?;
+            if claude::live_credentials_are_shell() {
+                anyhow::bail!("{}", format::login_expired(&canonical).line());
+            }
+            if link == claude::LinkState::Missing {
+                // Off macOS a missing file means no `claude` holds this chain
+                // at all, so only a re-login revives an expired one; on macOS
+                // the live login sits in the Keychain item, where a `claude`
+                // run refreshes it.
+                refreshed_elsewhere = cfg!(target_os = "macos");
+                claude::install_source_path(&canonical)?
+            } else if link == claude::LinkState::Diverged
+                && !diverged_live_slot_belongs_to_active(&config, profile, &canonical)
+            {
+                anyhow::bail!("{}", format::unsaved_live_login(&canonical));
+            } else {
+                refreshed_elsewhere = true;
+                claude::claude_credentials_path()?
+            }
+        }
+    } else if refresh_less {
+        // The gate's only move for a login with nothing to refresh it is a
+        // quarantine, which is a switch's answer, not this read's.
+        refreshed_elsewhere = false;
+        claude::install_source_path(&canonical)?
+    } else {
+        // The gate refreshes everything inside the hour, so the one expired
+        // token it hands back is the as-is install it leaves to a live
+        // session's own refresh (`runtime::rotation_blocked_for`).
+        refreshed_elsewhere = true;
+        let handle: profile::ConfigHandle =
+            std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+        match oauth::ensure_installable_within(
+            &handle,
+            &canonical,
+            refresher,
+            OAUTH_TOKEN_HORIZON_MS,
+        ) {
+            oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
+            oauth::AuthGate::Broken => {
+                anyhow::bail!("{}", format::login_expired(&canonical).line())
+            }
+            oauth::AuthGate::Transient(e) => {
+                anyhow::bail!(
+                    "{}",
+                    format::refresh_transient_oauth_token(&canonical, &e).line()
+                )
+            }
+        }
+        claude::install_source_path(&canonical)?
+    };
+    let Some(creds) = profile::read_json_file::<profile::ClaudeCredentials>(&source).ok() else {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    };
+    let Some(token) = creds.access_token().filter(|t| !t.is_empty()) else {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    };
+    // A hand-edited store can poison the token with a control char: emitting it
+    // verbatim would inject the bearer CC forwards, so refuse to print (the
+    // same boundary `api_key_for_profile` holds for keys).
+    claude::validate_oauth_token(token)?;
+    // Every arm that prints without refreshing (the active profile, a login
+    // with no refresh token, the gate's own as-is installs) can reach a dead
+    // token, and the session it goes to cannot renew one.
+    if crate::usage::token_clock_expired(
+        creds.access_token_expires_at(),
+        crate::usage::now_ms() as i64,
+    ) {
+        if refreshed_elsewhere {
+            anyhow::bail!("{}", format::expired_token_refreshed_by_claude(&canonical));
+        }
+        anyhow::bail!("{}", format::login_expired(&canonical).line());
+    }
+    Ok(token.to_string())
+}
+
+fn diverged_live_slot_belongs_to_active(
+    _config: &profile::AppConfig,
+    profile: &profile::Profile,
+    _canonical: &profile::ProfileName,
+) -> bool {
+    let Some(live) = claude::read_claude_credentials().ok().flatten() else {
+        return false;
+    };
+    let live_access = live.access_token().filter(|t| !t.is_empty());
+    let live_refresh = live.refresh_token().filter(|t| !t.is_empty());
+    (live_refresh.is_some() && profile.refresh_token() == live_refresh)
+        || (live_access.is_some() && profile.access_token() == live_access)
 }
 
 /// A bare `tollgate` reached with stdout not a terminal: the full-screen TUI has

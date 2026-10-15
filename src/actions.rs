@@ -22,7 +22,7 @@ use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
     ModelSettings, Profile, ProfileName, load_app_state, load_profile, profile_dir, save_app_state,
-    save_profile,
+    save_profile, save_profile_config,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -495,6 +495,11 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 /// tollgate surface already spells the same way. A reflectable refusal: it
 /// names the condition and the fix, never a path.
 ///
+/// [`SwitchError::Deferred`] is a refusal that names no failure: the gate's
+/// refresh met a login change whose kept login is expiring, so the switch waits
+/// for a retry. Same reflection rules as a refusal; surfaces that frame a
+/// refusal as a failure show its sentence alone.
+///
 /// [`SwitchError::Failed`] carries the open anyhow chain (the IO arms and
 /// path-bearing contexts under `finish_switch` and the link/snapshot
 /// helpers). A chain like that names absolute paths under the operator's
@@ -506,6 +511,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 #[derive(Debug)]
 pub(crate) enum SwitchError {
     Refused(String),
+    Deferred(String),
     Failed(anyhow::Error),
 }
 
@@ -515,7 +521,7 @@ impl SwitchError {
     /// asked of the chain rather than caught at one site.
     pub(crate) fn state_lock_timeout(&self) -> Option<&StateLockTimeout> {
         match self {
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::Deferred(_) => None,
             Self::Failed(e) => e.downcast_ref(),
         }
     }
@@ -525,7 +531,7 @@ impl SwitchError {
     /// a 409 rather than answering an authored refusal with the 500 literal.
     pub(crate) fn deep_refusal(&self) -> Option<String> {
         match self {
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::Deferred(_) => None,
             Self::Failed(e) => e
                 .downcast_ref::<DeepRefusal>()
                 .map(|r| r.0.clone())
@@ -544,7 +550,7 @@ impl std::fmt::Display for SwitchError {
             // surface (daemon.log) that may read it. The plain form keeps
             // anyhow's head-line semantics, so the MCP tool's `reason`
             // payload stays byte-identical for every input.
-            Self::Refused(sentence) => f.write_str(sentence),
+            Self::Refused(sentence) | Self::Deferred(sentence) => f.write_str(sentence),
             Self::Failed(e) => {
                 if f.alternate() {
                     write!(f, "{e:#}")
@@ -622,9 +628,12 @@ pub(crate) fn switch_profile_noninteractive(
             // NOT a CLI stderr path — this is the MCP tool's JSON `reason`, so it
             // keeps the canned line without the status.
             oauth::AuthGate::Transient(e) => {
-                return Err(SwitchError::Refused(
-                    crate::format::refresh_transient(target, &e).line(),
-                ));
+                let sentence = crate::format::refresh_transient(target, &e).line();
+                return Err(if e.is_login_change() {
+                    SwitchError::Deferred(sentence)
+                } else {
+                    SwitchError::Refused(sentence)
+                });
             }
         }
     }
@@ -644,9 +653,8 @@ pub(crate) fn switch_profile_noninteractive(
             Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
             Some(DivergenceChoice::NewProfile) | None => {
                 let active = previous.as_deref().unwrap_or_default();
-                return Err(SwitchError::Refused(format!(
-                    "'{active}' has a login tollgate hasn't saved, {}",
-                    crate::format::RESOLVE_IN_TUI
+                return Err(SwitchError::Refused(crate::format::unsaved_live_login(
+                    active,
                 )));
             }
         }
@@ -767,6 +775,10 @@ pub(crate) fn edit_profile_endpoint(
 ) -> Result<()> {
     with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
+        // A failed save must leave the in-memory profile matching disk: the
+        // next write would otherwise persist a change the error said did not
+        // happen.
+        let snapshot = profile.clone();
         let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
         profile.api_key = api_key;
@@ -778,20 +790,10 @@ pub(crate) fn edit_profile_endpoint(
             .base_url
             .as_deref()
             .and_then(crate::providers::Provider::from_base_url);
-        if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
+        let drop_cache =
+            provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key);
+        if drop_cache {
             profile.third_party_usage = None;
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
-            // a daemon boot/standby promotion, or the stood-down TUI's
-            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory mirror entry survives
-            // until the profile's next fetch (≤ one interval; until restart
-            // if the edit left it no fetch leg) — no cross-process clear
-            // exists.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            );
         }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
@@ -804,7 +806,25 @@ pub(crate) fn edit_profile_endpoint(
             profile.console = None;
         }
         profile.provider = provider;
-        save_profile(profile)?;
+        if let Err(e) = save_profile_config(profile) {
+            *profile = snapshot;
+            return Err(e);
+        }
+        if drop_cache {
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
+            // a daemon boot/standby promotion, or the stood-down TUI's
+            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
+            // the reseed; a LIVE process's in-memory mirror entry survives
+            // until the profile's next fetch (≤ one interval; until restart
+            // if the edit left it no fetch leg) — no cross-process clear
+            // exists. Only after the save lands: a failed save restores the
+            // in-memory profile, so it must leave the cache as it was too.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
+        }
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -838,7 +858,7 @@ pub(crate) fn store_console_login(
         let profile = config.find_mut(name).context("profile not found")?;
         profile.console = Some(console);
         profile.third_party_usage = None;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
         crate::profile_cache::remove_profile_cache(
             name,
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -858,7 +878,7 @@ pub(crate) fn edit_profile_model(
     with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.models = models;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             // A model-only edit never touches the generic `env` map, so passing
@@ -900,7 +920,7 @@ pub(crate) fn edit_profile_preferred_days(
         }
         let mut fresh = load_profile(name)?;
         fresh.preferred_days = edit(&fresh.preferred_days);
-        save_profile(&fresh)?;
+        save_profile_config(&fresh)?;
         if let Some(profile) = config.find_mut(name) {
             profile.preferred_days = fresh.preferred_days.clone();
         }
@@ -958,7 +978,7 @@ pub(crate) fn edit_profile_preset(
             );
         }
         profile.provider = provider;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -984,7 +1004,7 @@ pub(crate) fn edit_profile_env(
         // settings when it appears in `prev` but not in the new `profile.env`.
         let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
         profile.env = env;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -1828,7 +1848,7 @@ pub(crate) fn disable_profile(config: &mut AppConfig, name: &ProfileName) -> Res
         }
         let profile = config.find_mut(name).context("profile not found")?;
         profile.disabled = true;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
         Ok(true)
     })
 }
@@ -1848,7 +1868,7 @@ pub(crate) fn enable_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
             return Ok(false);
         }
         profile.disabled = false;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
         Ok(true)
     })
 }
@@ -1990,13 +2010,15 @@ pub(crate) fn set_profile_default_model(
 /// Staleness caveat: CC trusts the cached `oauthAccount` block and does not
 /// re-derive it from a swapped credentials file (exactly why tollgate strips it on
 /// switch — [`crate::claude_json::strip_home_oauth_account`]). So a tier-2 hit is "CC's
-/// last booted identity", not fresh proof of the live token's account. That can
-/// only bias the verdict conservatively: pointing at a SIBLING routes the
-/// divergence to the banner (user decides), and pointing at the active profile
-/// is filtered out by the caller (`note_divergence` drops an owner equal to
-/// active) — the same as no match, so the configured default applies unchanged.
-/// The tier can never manufacture the one harmful outcome — auto-capturing a
-/// sibling's login into the wrong profile — so its worst case is the banner.
+/// last booted identity", not fresh proof of the live token's account. For the
+/// divergence callers that can only bias the verdict conservatively: pointing at
+/// a SIBLING routes the divergence to the banner (user decides), and pointing at
+/// the active profile is filtered out by the caller (`note_divergence` drops an
+/// owner equal to active) — the same as no match, so the configured default
+/// applies unchanged, and the worst case is the banner. `tollgate __oauth-token`
+/// requires Tier-1 credential token equality (`refresh_token` or `access_token`
+/// match) before exporting a diverged live slot and never relies on the cached
+/// `oauthAccount` UUID alone.
 pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<ProfileName> {
     let live = read_claude_credentials().ok().flatten()?;
     let live_access = live.access_token().filter(|t| !t.is_empty());
@@ -2177,6 +2199,7 @@ pub(crate) fn capture_into_profile(
         // hand-edited roster, a crash before the record landed): mark it pending
         // before writing, so the displaced anchor cannot authorize a walk.
         crate::profile_cache::begin_login_install(&name)?;
+        crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2245,6 +2268,7 @@ pub(crate) fn create_profile_from_login(
         // Same orphan-dir guard as `capture_into_profile`: mark the install
         // pending before the store write.
         crate::profile_cache::begin_login_install(&name)?;
+        crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2410,6 +2434,7 @@ pub(crate) fn overwrite_captured_profile(
         profile.usage = None;
         profile.fetch_status = None;
         profile.third_party_usage = None;
+        crate::oauth::retire_unreadable_spent_record(&profile.name);
         save_profile(profile)?;
         match &anchor {
             AnchorAction::Proven(identity) => {
@@ -2528,8 +2553,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         profile.usage = None;
         profile.fetch_status = None;
         profile.third_party_usage = None;
+        crate::oauth::retire_unreadable_spent_record(name);
         save_profile(profile)?;
-        // Drop any uncommitted rotation sidecar too: with credentials.json gone,
+        // Drop any legacy `.pending` rotation sidecar too: with credentials.json gone,
         // `recover_pending_credentials` would treat the sidecar as a failed commit
         // and resurrect the just-deleted login on next load.
         crate::profile::clear_staged_credentials(name);
@@ -2688,7 +2714,7 @@ pub(crate) fn set_member_threshold(
     }
     with_state_lock(|_held| {
         // Fresh roster AND fresh chain off disk, not the in-memory copies: the
-        // daemon's config can lag a concurrent CLI/TUI edit, and `save_profile`
+        // daemon's config can lag a concurrent CLI/TUI edit, and the save
         // would recreate the profile file for a member that is gone, or write
         // a threshold on one the chain just dropped.
         let fresh = load_app_state()?;
@@ -2708,7 +2734,7 @@ pub(crate) fn set_member_threshold(
         // only this leg's field, then mirror it into the in-memory profile.
         let mut fresh = load_profile(name)?;
         fresh.fallback_threshold = Some(value);
-        save_profile(&fresh)?;
+        save_profile_config(&fresh)?;
         if let Some(profile) = config.find_mut(name) {
             profile.fallback_threshold = Some(value);
         }

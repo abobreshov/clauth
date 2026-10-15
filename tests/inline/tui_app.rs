@@ -92,7 +92,7 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
@@ -108,7 +108,7 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
@@ -123,13 +123,151 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
     assert!(
         !crate::usage::is_idle(&app.activity, &name),
         "a pending switch outlives an unrelated rotation result"
+    );
+}
+
+/// Run a manual rotate of `name` whose token endpoint runs `change` before it
+/// answers, so the change lands between the refresh and its persist. The app
+/// shares the rotated config handle, so its token list shows what the drain
+/// rebuilt.
+fn rotate_across_a_login_change(
+    name: &'static str,
+    change: impl Fn() + Send + 'static,
+) -> (App, crate::testutil::HomeSandbox) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        change();
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut app = bare_app();
+    app.config = config;
+    app.refresh_tokens();
+
+    crate::oauth::rotate_one(
+        &app.config,
+        &crate::profile::ProfileName::from(name),
+        &app.refetch_queue,
+        &app.activity,
+        &app.op_sender,
+    );
+    super::drain_op_results(&mut app);
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the rotate spent the old login once"
+    );
+    (app, home)
+}
+
+fn token_pairs(app: &App) -> Vec<(String, String, Option<String>)> {
+    app.usage_tokens
+        .lock()
+        .expect("usage_tokens")
+        .iter()
+        .map(|t| {
+            (
+                t.name.to_string(),
+                t.access_token.clone(),
+                t.refresh_token.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A re-login landing while a manual rotate refreshes the old login is kept,
+/// and the toast says so: nothing failed, so it is neither the Danger
+/// "refresh failed" toast nor the "rotated token" one. The token list follows
+/// the kept login.
+#[test]
+fn a_relogin_during_a_manual_rotate_toasts_the_kept_login() {
+    let (app, _home) = rotate_across_a_login_change("rotate-relogin", || {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &crate::profile::ProfileName::from("rotate-relogin"),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at-relogin".to_string(),
+                        refresh_token: Some("rt-relogin".to_string()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login mid-refresh");
+    });
+
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            super::ToastKind::Info,
+            "'rotate-relogin' login changed during the refresh · kept the change"
+        )]
+    );
+    assert_eq!(
+        token_pairs(&app),
+        vec![(
+            "rotate-relogin".to_string(),
+            "at-relogin".to_string(),
+            Some("rt-relogin".to_string())
+        )],
+        "the token list follows the kept login"
+    );
+}
+
+/// A log out landing while a manual rotate refreshes reads the same way, and
+/// the token list drops the logged-out account.
+#[test]
+fn a_logout_during_a_manual_rotate_toasts_the_kept_change() {
+    let (app, _home) = rotate_across_a_login_change("rotate-logout", || {
+        let store =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("rotate-logout"))
+                .expect("profile dir")
+                .join("credentials.json");
+        std::fs::remove_file(store).expect("log out mid-refresh");
+    });
+
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            super::ToastKind::Info,
+            "'rotate-logout' login changed during the refresh · kept the change"
+        )]
+    );
+    assert_eq!(
+        token_pairs(&app),
+        Vec::new(),
+        "the logged-out account leaves the token list"
     );
 }
 
@@ -2380,14 +2518,18 @@ fn the_openrouter_preset_stamps_tiers_and_its_env_switch_onto_an_account() {
     super::apply_preset_to(&mut app, "or", "OpenRouter");
 
     let reloaded = crate::profile::load_profile(&ProfileName::from("or")).expect("reload");
-    assert_eq!(reloaded.models.default, None, "openrouter/auto is dropped");
+    assert_eq!(
+        reloaded.models.default.as_deref(),
+        Some("opus"),
+        "the main model follows the opus tier instead of openrouter/auto"
+    );
     assert_eq!(
         reloaded.models.opus.as_deref(),
         Some("~anthropic/claude-opus-latest[1m]")
     );
     assert_eq!(
-        reloaded.models.subagent.as_deref(),
-        Some("~anthropic/claude-opus-latest[1m]")
+        reloaded.models.fable.as_deref(),
+        Some("~anthropic/claude-fable-latest[1m]")
     );
     assert_eq!(
         reloaded
@@ -2396,6 +2538,7 @@ fn the_openrouter_preset_stamps_tiers_and_its_env_switch_onto_an_account() {
             .map(String::as_str),
         Some("1")
     );
+    assert_eq!(reloaded.models.subagent, None);
     assert_eq!(reloaded.env.get("MY_OWN").map(String::as_str), Some("keep"));
     assert!(!reloaded.env.contains_key("ANTHROPIC_AUTH_TOKEN"));
     assert_eq!(reloaded.api_key.as_deref(), Some("sk-or-v1-placeholder"));
@@ -2426,7 +2569,8 @@ fn a_new_account_stamped_from_the_openrouter_preset_keeps_its_pins() {
 
     let p = crate::profile::load_profile(&ProfileName::from("or-new")).expect("created");
     assert_eq!(p.base_url.as_deref(), Some("https://openrouter.ai/api"));
-    assert_eq!(p.models.default, None);
+    assert_eq!(p.models.default.as_deref(), Some("opus"));
+    assert_eq!(p.models.subagent, None);
     assert_eq!(
         p.models.sonnet.as_deref(),
         Some("~anthropic/claude-sonnet-latest[1m]")
@@ -3895,6 +4039,51 @@ fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
         "the refusal is loud, got {:?}",
         app.toasts
     );
+}
+
+/// The clear relinks the store in front of Claude Code, so a live stage a
+/// failed persist left lands first: after the clear the store holds the staged
+/// pair (`rt-mid`) and the stage is gone. The stage's base is fp("rt-old"),
+/// hand-computed: the first 8 bytes of its SHA-256, hex.
+#[test]
+fn clear_session_token_lands_a_live_stage_before_it_relinks() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("staged".to_string(), None, None);
+    acct.credentials = Some(split_creds("at-old", Some("rt-old")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("staged", None);
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("staged"))
+        .expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    std::fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+
+    let mut app = app_with(vec![acct]);
+    make_active(&mut app, "staged");
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("staged"),
+    ));
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let store: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&dir.join("credentials.json")).expect("read the store");
+    assert_eq!(
+        store.refresh_token(),
+        Some("rt-mid"),
+        "toasts: {:?}",
+        app.toasts
+    );
+    assert!(!dir.join("credentials.json.staged").exists());
 }
 
 /// Overview and Usage carry the focused account's own actions plus the
@@ -9908,9 +10097,10 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
         &mut app,
         crate::profile::ProfileName::from("dead".to_string()),
         |_, _| {
-            Err(crate::oauth::RefreshError::Invalid(
-                crate::oauth::TokenFailure::Status(400),
-            ))
+            Err(crate::oauth::RefreshError::Invalid {
+                failure: crate::oauth::TokenFailure::Status(400),
+                invalid_grant: true,
+            })
         },
     );
     super::drain_switch_gates(&mut app);
@@ -9994,6 +10184,70 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
             .iter()
             .any(|t| t.kind == ToastKind::Danger && t.body.contains("could not refresh 'flaky'")),
         "the refusal says retry, not re-login"
+    );
+}
+
+/// A re-login landing while the switch gate refreshes, into a login that is
+/// itself expiring: nothing failed, so the refusal is the login-change sentence
+/// alone, as a warning, under no "could not refresh" head.
+#[test]
+fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![stored_oauth_profile("moved", already_expired())]);
+
+    super::spawn_switch_gate(
+        &mut app,
+        crate::profile::ProfileName::from("moved".to_string()),
+        |_, _| {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::overwrite_captured_profile(
+                &mut cfg,
+                &crate::profile::ProfileName::from("moved"),
+                crate::actions::CaptureSnapshot {
+                    credentials: Some(crate::profile::ClaudeCredentials {
+                        claude_ai_oauth: Some(crate::profile::OAuthToken {
+                            access_token: "at-relogin".to_string(),
+                            refresh_token: Some("rt-relogin".to_string()),
+                            expires_at: Some(already_expired()),
+                            scopes: None,
+                            subscription_type: None,
+                            ..crate::profile::OAuthToken::default_extra()
+                        }),
+                    }),
+                    base_url: None,
+                    api_key: None,
+                    anchor: crate::actions::AnchorAction::Unproven,
+                },
+            )
+            .expect("install the re-login mid-refresh");
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+        },
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        !app.config()
+            .is_active(&crate::profile::ProfileName::from("moved")),
+        "the expiring re-login waits for a retry"
+    );
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            ToastKind::Warning,
+            "'moved' login changed during its refresh and the new login expires soon · retry in a moment"
+        )]
     );
 }
 
@@ -11835,7 +12089,24 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
 
     let draft = app.config_draft.as_ref().expect("draft still mounted");
     assert_eq!(draft.base_url.value, "https://api.deepseek.com/anthropic");
-    assert_eq!(draft.model.value, "deepseek-chat");
+    assert_eq!(
+        [
+            draft.model.value.as_str(),
+            draft.opus_model.value.as_str(),
+            draft.sonnet_model.value.as_str(),
+            draft.haiku_model.value.as_str(),
+            draft.fable_model.value.as_str(),
+            draft.subagent_model.value.as_str(),
+        ],
+        [
+            "opus",
+            "deepseek-v4-pro[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-v4-pro[1m]",
+            "",
+        ],
+    );
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("acct"))
@@ -12063,6 +12334,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     target.models.default = Some("keep-me".to_string());
     target.models.opus = Some("old-opus".to_string());
     target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
     crate::profile::save_profile(&target).expect("save target");
 
     let mut app = app_with(vec![target]);
@@ -12078,7 +12350,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     assert_eq!(state.message, "apply 'DeepSeek' over 'target'?");
     assert_eq!(
         state.detail.as_deref(),
-        Some("replaces base url, model, fable, opus."),
+        Some("replaces base url, model, fable, opus, subagent."),
         "the warning names the fields in the Setup rows' order",
     );
     assert!(!state.choice, "the warning defaults to cancel");
@@ -12103,9 +12375,16 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
         applied.base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic")
     );
-    assert_eq!(applied.models.default.as_deref(), Some("deepseek-chat"));
     assert_eq!(
-        applied.models.opus, None,
+        applied.models,
+        crate::profile::ModelSettings {
+            default: Some("opus".to_string()),
+            opus: Some("deepseek-v4-pro[1m]".to_string()),
+            sonnet: Some("deepseek-flash[1m]".to_string()),
+            haiku: Some("deepseek-flash[1m]".to_string()),
+            fable: Some("deepseek-v4-pro[1m]".to_string()),
+            subagent: None,
+        },
         "the apply replaces the model block whole, it does not merge into it",
     );
 }
@@ -17372,4 +17651,56 @@ fn verify_login_toasts_sanitize_email_and_both_organization_uuids() {
     crate::usage::seed_login_identity(&"twin".into(), Some(&twin));
     send(&mut app, identity);
     assert!(app.toasts.back().unwrap().body.contains("likely one quota"));
+}
+
+// ── settings edits save config.toml only ─────────────────────────────────────
+
+/// The daemon's rotation landed a new pair while the TUI's in-memory profile
+/// still holds the old one. A chain toggle saved from that memory must not
+/// write the old pair back over the store.
+#[test]
+fn a_chain_toggle_never_rewinds_a_pair_another_process_landed() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    let store = crate::profile::profile_dir(&name)
+        .expect("dir")
+        .join("credentials.json");
+    std::fs::write(
+        &store,
+        r#"{"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-2"}}"#,
+    )
+    .expect("the daemon lands its pair");
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(
+        app.config().find(&name).map(|p| p.last_resort),
+        Some(true),
+        "precondition: the toggle ran and saved"
+    );
+    let stored: ClaudeCredentials = crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-2"),
+        "a settings edit saves config.toml only"
+    );
 }
