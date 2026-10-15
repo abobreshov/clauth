@@ -619,7 +619,7 @@ pub(crate) enum Command {
     /// `claude` last wrote to `~/.claude`, unrefreshed, once that login is tied
     /// to the profile's own account. The refresh token never
     /// leaves tollgate; an endpoint or disabled profile gets nothing.
-    #[command(name = "__oauth-token", hide = true)]
+    #[command(name = "__oauth-token", alias = "oauth-token", hide = true)]
     OauthToken {
         /// Profile whose OAuth access token to print.
         profile: String,

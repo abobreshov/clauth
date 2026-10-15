@@ -2016,9 +2016,9 @@ pub(crate) fn set_profile_default_model(
 /// the active profile is filtered out by the caller (`note_divergence` drops an
 /// owner equal to active) — the same as no match, so the configured default
 /// applies unchanged, and the worst case is the banner. `tollgate __oauth-token`
-/// is the exception: it takes an owner equal to the active profile as the
-/// permission to print that profile's live token, so a stale block naming the
-/// active account in front of another account's login prints that login.
+/// requires Tier-1 token equality or a live expiry strictly newer than the
+/// lagged store alongside the active owner match, so a stale block in front of
+/// an unrotated foreign login is refused.
 pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<ProfileName> {
     let live = read_claude_credentials().ok().flatten()?;
     let live_access = live.access_token().filter(|t| !t.is_empty());

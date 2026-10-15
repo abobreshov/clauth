@@ -2719,6 +2719,11 @@ fn oauth_token_for_profile(
             }
             refreshed_elsewhere = false;
             claude::install_source_path(&canonical)?
+        } else if crate::identity::upstream_active() {
+            // In guest mode upstream clauth owns `~/.claude/.credentials.json`,
+            // so tollgate never reads or exports the global live slot.
+            refreshed_elsewhere = false;
+            claude::install_source_path(&canonical)?
         } else {
             // A plain `claude` refreshes the active chain outside any tollgate
             // lock and replaces the live file rather than writing through
@@ -2728,8 +2733,10 @@ fn oauth_token_for_profile(
             // the store, so the store prints. The logged-out shell is Claude
             // Code's record that its own refresh died, so the store's copy of
             // that chain is not printed either. A diverged slot prints only
-            // once the divergence path's owner check ties it to this profile,
-            // because the caller spends exactly the profile it names.
+            // once the divergence path's owner check ties it to this profile
+            // and the live file either matches the stored token or outdates a
+            // lagging store, because the caller spends exactly the profile it
+            // names.
             let link = claude::classify_credentials_link(&canonical)?;
             if claude::live_credentials_are_shell() {
                 anyhow::bail!("{}", format::login_expired(&canonical).line());
@@ -2742,7 +2749,7 @@ fn oauth_token_for_profile(
                 refreshed_elsewhere = cfg!(target_os = "macos");
                 claude::install_source_path(&canonical)?
             } else if link == claude::LinkState::Diverged
-                && actions::identify_live_login_owner(&config).as_ref() != Some(&canonical)
+                && !diverged_live_slot_belongs_to_active(&config, profile, &canonical)
             {
                 anyhow::bail!("{}", format::unsaved_live_login(&canonical));
             } else {
@@ -2804,6 +2811,34 @@ fn oauth_token_for_profile(
         anyhow::bail!("{}", format::login_expired(&canonical).line());
     }
     Ok(token.to_string())
+}
+
+fn diverged_live_slot_belongs_to_active(
+    config: &profile::AppConfig,
+    profile: &profile::Profile,
+    canonical: &profile::ProfileName,
+) -> bool {
+    if actions::identify_live_login_owner(config).as_ref() != Some(canonical) {
+        return false;
+    }
+    let Some(live) = claude::read_claude_credentials().ok().flatten() else {
+        return false;
+    };
+    let live_access = live.access_token().filter(|t| !t.is_empty());
+    let live_refresh = live.refresh_token().filter(|t| !t.is_empty());
+    let token_match = (live_refresh.is_some() && profile.refresh_token() == live_refresh)
+        || (live_access.is_some() && profile.access_token() == live_access);
+    let store_lags = match (
+        live.access_token_expires_at(),
+        profile
+            .credentials
+            .as_ref()
+            .and_then(profile::ClaudeCredentials::access_token_expires_at),
+    ) {
+        (Some(live_exp), Some(store_exp)) => live_exp > store_exp,
+        _ => false,
+    };
+    token_match || store_lags
 }
 
 /// A bare `tollgate` reached with stdout not a terminal: the full-screen TUI has

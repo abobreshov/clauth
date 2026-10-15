@@ -192,6 +192,80 @@ fn oauth_token_refuses_an_active_profiles_live_login_from_another_account() {
     );
 }
 
+/// A stale `~/.claude.json` `oauthAccount.accountUuid` matching the active
+/// profile's anchor does not authorize exporting a diverged live login when the
+/// profile's own stored token is not lagging that live file.
+#[test]
+fn oauth_token_refuses_diverged_live_login_behind_stale_identity_when_store_is_current() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = seed_active(home.path(), "acme");
+    std::fs::write(dir.join("credentials.json"), login_json("at-fixture-own")).unwrap();
+    std::fs::write(dir.join("account_id.json"), "\"acct-own\"").unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(
+        claude.join(".credentials.json"),
+        login_json("at-fixture-other-account"),
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"acct-own"}}"#,
+    )
+    .unwrap();
+
+    let out = run_oauth_token(home.path(), "acme");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, Vec::<u8>::new());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: 'acme' has a login tollgate hasn't saved, resolve the divergence in the tollgate TUI\n"
+    );
+}
+
+/// In guest mode (`~/.clauth` present), upstream clauth owns
+/// `~/.claude/.credentials.json`, so `tollgate oauth-token` reads the profile's
+/// own store and never exports the upstream live slot.
+#[test]
+fn oauth_token_in_guest_mode_ignores_upstream_live_slot_and_prints_own_store() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = seed_active(home.path(), "acme");
+    std::fs::write(dir.join("credentials.json"), login_json("at-fixture-own")).unwrap();
+    std::fs::write(dir.join("account_id.json"), "\"acct-own\"").unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(
+        claude.join(".credentials.json"),
+        login_json("at-fixture-other-account"),
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"acct-own"}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join(".clauth")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tollgate"))
+        .args(["oauth-token", "acme"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("TOLLGATE_NO_UPDATE", "1")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tollgate oauth-token");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"at-fixture-own".to_vec());
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
 /// An active split profile whose live slot still links to its own sidecar is
 /// the profile's own without any identity record: the mint prints, though no
 /// `account_id.json` anchor and no `~/.claude.json` exist to prove it.
