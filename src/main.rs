@@ -2814,31 +2814,17 @@ fn oauth_token_for_profile(
 }
 
 fn diverged_live_slot_belongs_to_active(
-    config: &profile::AppConfig,
+    _config: &profile::AppConfig,
     profile: &profile::Profile,
-    canonical: &profile::ProfileName,
+    _canonical: &profile::ProfileName,
 ) -> bool {
-    if actions::identify_live_login_owner(config).as_ref() != Some(canonical) {
-        return false;
-    }
     let Some(live) = claude::read_claude_credentials().ok().flatten() else {
         return false;
     };
     let live_access = live.access_token().filter(|t| !t.is_empty());
     let live_refresh = live.refresh_token().filter(|t| !t.is_empty());
-    let token_match = (live_refresh.is_some() && profile.refresh_token() == live_refresh)
-        || (live_access.is_some() && profile.access_token() == live_access);
-    let store_lags = match (
-        live.access_token_expires_at(),
-        profile
-            .credentials
-            .as_ref()
-            .and_then(profile::ClaudeCredentials::access_token_expires_at),
-    ) {
-        (Some(live_exp), Some(store_exp)) => live_exp > store_exp,
-        _ => false,
-    };
-    token_match || store_lags
+    (live_refresh.is_some() && profile.refresh_token() == live_refresh)
+        || (live_access.is_some() && profile.access_token() == live_access)
 }
 
 /// A bare `tollgate` reached with stdout not a terminal: the full-screen TUI has

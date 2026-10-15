@@ -132,39 +132,42 @@ fn link_live_slot(home: &Path, target: &Path) {
     std::os::unix::fs::symlink(target, claude.join(".credentials.json")).unwrap();
 }
 
-/// Seed `name` as the active profile with an expired, refresh-less store login
-/// (`at-store-stale`) and a live `~/.claude/.credentials.json` that a refresh
-/// replaced as a regular file holding `live_token`. Identity is CC's cached
-/// `~/.claude.json` `oauthAccount.accountUuid` (`live_uuid`) against the
-/// profile's `account_id.json` anchor (`acct-live`), the divergence path's own
-/// check: the credentials file carries no account of its own.
-fn seed_active_with_live_login(home: &Path, name: &str, live_token: &str, live_uuid: &str) {
+/// Seed `name` as the active profile with an expired store login (`at-store-stale`,
+/// `rt-live`) and a live `~/.claude/.credentials.json` that a refresh replaced
+/// as a regular file holding `live_token` and `live_refresh`. Ownership is tied
+/// directly to the credential (`refreshToken`), never the stale `~/.claude.json`
+/// UUID cache alone.
+fn seed_active_with_live_login(home: &Path, name: &str, live_token: &str, live_refresh: &str) {
     let dir = seed_active(home, name);
     std::fs::write(
         dir.join("credentials.json"),
-        login_json_expiring("at-store-stale", 1_000_000_000_000),
+        r#"{"claudeAiOauth":{"accessToken":"at-store-stale","refreshToken":"rt-live","expiresAt":1000000000000}}"#,
     )
     .unwrap();
     std::fs::write(dir.join("account_id.json"), "\"acct-live\"").unwrap();
     let claude = home.join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
-    std::fs::write(claude.join(".credentials.json"), login_json(live_token)).unwrap();
+    std::fs::write(
+        claude.join(".credentials.json"),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{live_token}","refreshToken":"{live_refresh}","expiresAt":{FAR_EXPIRY_MS}}}}}"#
+        ),
+    )
+    .unwrap();
     std::fs::write(
         home.join(".claude.json"),
-        format!(r#"{{"oauthAccount":{{"accountUuid":"{live_uuid}"}}}}"#),
+        r#"{"oauthAccount":{"accountUuid":"acct-live"}}"#,
     )
     .unwrap();
 }
 
 /// The globally active profile prints what a plain `claude` last wrote, never
-/// the store's superseded copy, once the live login is proven its own, and is
-/// never refreshed: the store's login is expired and refresh-less, so a refresh
-/// attempt would end in the dead-chain refusal (exit 1) instead of reaching any
-/// endpoint.
+/// the store's superseded copy, once the live login is proven its own by
+/// credential match, and is never refreshed.
 #[test]
 fn oauth_token_prints_the_active_profiles_live_token_without_refreshing() {
     let home = tempfile::tempdir().unwrap();
-    seed_active_with_live_login(home.path(), "live", "at-live-fresh", "acct-live");
+    seed_active_with_live_login(home.path(), "live", "at-live-fresh", "rt-live");
 
     let out = run_oauth_token(home.path(), "live");
     assert_eq!(
@@ -181,7 +184,7 @@ fn oauth_token_prints_the_active_profiles_live_token_without_refreshing() {
 #[test]
 fn oauth_token_refuses_an_active_profiles_live_login_from_another_account() {
     let home = tempfile::tempdir().unwrap();
-    seed_active_with_live_login(home.path(), "live", "at-other-account", "acct-other");
+    seed_active_with_live_login(home.path(), "live", "at-other-account", "rt-other");
 
     let out = run_oauth_token(home.path(), "live");
     assert_eq!(out.status.code(), Some(1));
@@ -193,34 +196,41 @@ fn oauth_token_refuses_an_active_profiles_live_login_from_another_account() {
 }
 
 /// A stale `~/.claude.json` `oauthAccount.accountUuid` matching the active
-/// profile's anchor does not authorize exporting a diverged live login when the
-/// profile's own stored token is not lagging that live file.
+/// profile's anchor does not authorize exporting a diverged foreign live login,
+/// even when the foreign live login has a later expiry than a still-current or
+/// expired store.
 #[test]
 fn oauth_token_refuses_diverged_live_login_behind_stale_identity_when_store_is_current() {
-    let home = tempfile::tempdir().unwrap();
-    let dir = seed_active(home.path(), "acme");
-    std::fs::write(dir.join("credentials.json"), login_json("at-fixture-own")).unwrap();
-    std::fs::write(dir.join("account_id.json"), "\"acct-own\"").unwrap();
-    let claude = home.path().join(".claude");
-    std::fs::create_dir_all(&claude).unwrap();
-    std::fs::write(
-        claude.join(".credentials.json"),
-        login_json("at-fixture-other-account"),
-    )
-    .unwrap();
-    std::fs::write(
-        home.path().join(".claude.json"),
-        r#"{"oauthAccount":{"accountUuid":"acct-own"}}"#,
-    )
-    .unwrap();
+    for store_expiry in [FAR_EXPIRY_MS - 1, 1_000_000_000_000] {
+        let home = tempfile::tempdir().unwrap();
+        let dir = seed_active(home.path(), "acme");
+        std::fs::write(
+            dir.join("credentials.json"),
+            login_json_expiring("at-fixture-own", store_expiry),
+        )
+        .unwrap();
+        std::fs::write(dir.join("account_id.json"), "\"acct-own\"").unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join(".credentials.json"),
+            login_json_expiring("at-fixture-other-account", FAR_EXPIRY_MS),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"acct-own"}}"#,
+        )
+        .unwrap();
 
-    let out = run_oauth_token(home.path(), "acme");
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(out.stdout, Vec::<u8>::new());
-    assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        "Error: 'acme' has a login tollgate hasn't saved, resolve the divergence in the tollgate TUI\n"
-    );
+        let out = run_oauth_token(home.path(), "acme");
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(out.stdout, Vec::<u8>::new());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "Error: 'acme' has a login tollgate hasn't saved, resolve the divergence in the tollgate TUI\n"
+        );
+    }
 }
 
 /// In guest mode (`~/.clauth` present), upstream clauth owns
