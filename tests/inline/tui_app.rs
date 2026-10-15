@@ -2518,14 +2518,18 @@ fn the_openrouter_preset_stamps_tiers_and_its_env_switch_onto_an_account() {
     super::apply_preset_to(&mut app, "or", "OpenRouter");
 
     let reloaded = crate::profile::load_profile(&ProfileName::from("or")).expect("reload");
-    assert_eq!(reloaded.models.default, None, "openrouter/auto is dropped");
+    assert_eq!(
+        reloaded.models.default.as_deref(),
+        Some("opus"),
+        "the main model follows the opus tier instead of openrouter/auto"
+    );
     assert_eq!(
         reloaded.models.opus.as_deref(),
         Some("~anthropic/claude-opus-latest[1m]")
     );
     assert_eq!(
-        reloaded.models.subagent.as_deref(),
-        Some("~anthropic/claude-opus-latest[1m]")
+        reloaded.models.fable.as_deref(),
+        Some("~anthropic/claude-fable-latest[1m]")
     );
     assert_eq!(
         reloaded
@@ -2534,6 +2538,7 @@ fn the_openrouter_preset_stamps_tiers_and_its_env_switch_onto_an_account() {
             .map(String::as_str),
         Some("1")
     );
+    assert_eq!(reloaded.models.subagent, None);
     assert_eq!(reloaded.env.get("MY_OWN").map(String::as_str), Some("keep"));
     assert!(!reloaded.env.contains_key("ANTHROPIC_AUTH_TOKEN"));
     assert_eq!(reloaded.api_key.as_deref(), Some("sk-or-v1-placeholder"));
@@ -2564,7 +2569,8 @@ fn a_new_account_stamped_from_the_openrouter_preset_keeps_its_pins() {
 
     let p = crate::profile::load_profile(&ProfileName::from("or-new")).expect("created");
     assert_eq!(p.base_url.as_deref(), Some("https://openrouter.ai/api"));
-    assert_eq!(p.models.default, None);
+    assert_eq!(p.models.default.as_deref(), Some("opus"));
+    assert_eq!(p.models.subagent, None);
     assert_eq!(
         p.models.sonnet.as_deref(),
         Some("~anthropic/claude-sonnet-latest[1m]")
