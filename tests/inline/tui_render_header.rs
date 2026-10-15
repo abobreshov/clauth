@@ -996,10 +996,7 @@ fn fractional_header_percentages_round_to_two_decimals_without_clipping_the_feed
     }
 }
 
-// Three rows of nine cells in the 10-cell logo column, block and quadrant
-// glyphs only, drawn with palette colors. The candidates the owner picks from are
-// kept here at real size; `cargo nextest run logo_candidates --no-capture`
-// prints them as the terminal draws them.
+// ── `TollgateLogo` pixel-art widget tests ─────────────────────────────────
 
 /// The wired mark first, then the alternatives `header.rs` keeps commented.
 const LOGO_CANDIDATES: [(&str, [&str; 3]); 3] = [
@@ -1010,20 +1007,6 @@ const LOGO_CANDIDATES: [(&str, [&str; 3]); 3] = [
 
 /// The upstream clauth mascot this mark replaced.
 const UPSTREAM_MASCOT: [&str; 4] = [" ▐▛███▜▌ ", " ▐█████▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  "];
-
-/// A candidate drawn alone into the 10 × 3 logo column, as `draw_logo` draws.
-fn render_logo(rows: [&str; 3]) -> Vec<String> {
-    let mut term = Terminal::new(TestBackend::new(10, 3)).unwrap();
-    term.draw(|f| {
-        let area = f.area();
-        f.render_widget(
-            ratatui::widgets::Paragraph::new(logo_lines(rows, 1000)).style(theme::base()),
-            area,
-        );
-    })
-    .unwrap();
-    crate::testutil::buffer_rows(term.backend().buffer())
-}
 
 /// The header drawn with the animation clock pinned at `anim_ms`.
 fn render_header_at(anim_ms: u64, width: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
@@ -1044,14 +1027,307 @@ fn is_block_glyph(c: char) -> bool {
 }
 
 #[test]
+fn logo_bitmap_dimensions_and_cell_colour_constraints_are_valid() {
+    assert_eq!(LOGO_PIXEL_WIDTH, 24);
+    assert_eq!(LOGO_PIXEL_HEIGHT, 10);
+    assert_eq!(LOGO_CELL_WIDTH, 12);
+    assert_eq!(LOGO_CELL_HEIGHT, 5);
+    assert_eq!(LOGO_BITMAP.len(), LOGO_PIXEL_HEIGHT);
+    for (y, row) in LOGO_BITMAP.iter().enumerate() {
+        assert_eq!(
+            row.len(),
+            LOGO_PIXEL_WIDTH,
+            "row {y} must be 24 pixels wide"
+        );
+    }
+
+    // Every 2×2 block must contain at most 2 distinct colours (and at most 1
+    // non-background colour) so terminal cell rendering is completely lossless.
+    for cy in 0..LOGO_CELL_HEIGHT {
+        for cx in 0..LOGO_CELL_WIDTH {
+            let py = cy * 2;
+            let px = cx * 2;
+            let sub = [
+                LOGO_BITMAP[py][px],
+                LOGO_BITMAP[py][px + 1],
+                LOGO_BITMAP[py + 1][px],
+                LOGO_BITMAP[py + 1][px + 1],
+            ];
+            let mut non_bg: Vec<Px> = sub.into_iter().filter(|&p| p != Px::Bg).collect();
+            non_bg.dedup();
+            for i in 0..non_bg.len() {
+                for j in (i + 1)..non_bg.len() {
+                    assert_eq!(
+                        non_bg[i], non_bg[j],
+                        "cell ({cx}, {cy}) mixes incompatible foreground colours: {sub:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn quadrant_character_mapping_follows_bitmask_convention() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let expected_lut: [char; 16] = [
+        ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+    ];
+    assert_eq!(QUADRANT_GLYPHS, expected_lut);
+
+    for (mask, &expected_char) in expected_lut.iter().enumerate() {
+        let ul = if (mask & 1) != 0 { Px::Booth } else { Px::Bg };
+        let ur = if (mask & 2) != 0 { Px::Booth } else { Px::Bg };
+        let ll = if (mask & 4) != 0 { Px::Booth } else { Px::Bg };
+        let lr = if (mask & 8) != 0 { Px::Booth } else { Px::Bg };
+        let (ch, fg, bg) = quadrant_cell(ul, ur, ll, lr);
+        assert_eq!(
+            ch, expected_char,
+            "bitmask {mask:#06b} must map to {expected_char:?}"
+        );
+        assert_eq!(bg, theme::bg());
+        if mask != 0 {
+            assert_eq!(fg, Px::Booth.color());
+        }
+    }
+}
+
+#[test]
+fn barrier_occupies_constant_logical_y_coordinates_and_identical_segment_thickness() {
+    let is_barrier = |p: Px| matches!(p, Px::BarrierRed | Px::BarrierWhite);
+
+    let mut barrier_cols: Vec<(usize, Vec<usize>, Px)> = Vec::new();
+    for x in 0..LOGO_PIXEL_WIDTH {
+        let ys: Vec<(usize, Px)> = LOGO_BITMAP
+            .iter()
+            .enumerate()
+            .filter_map(|(y, row)| is_barrier(row[x]).then_some((y, row[x])))
+            .collect();
+        if let Some(&(_, color)) = ys.first() {
+            for &(y, px) in &ys {
+                assert_eq!(
+                    px, color,
+                    "barrier column ({x}, {y}) must have uniform segment colour"
+                );
+            }
+            let y_coords: Vec<usize> = ys.into_iter().map(|(y, _)| y).collect();
+            barrier_cols.push((x, y_coords, color));
+        }
+    }
+
+    assert!(
+        !barrier_cols.is_empty(),
+        "logo must contain horizontal barrier pixels"
+    );
+
+    // Barrier X-coordinates must be contiguous from start to end.
+    let first_x = barrier_cols.first().unwrap().0;
+    let last_x = barrier_cols.last().unwrap().0;
+    assert_eq!(
+        barrier_cols.len(),
+        last_x - first_x + 1,
+        "barrier must be horizontally contiguous with no gaps"
+    );
+
+    // Every X column in the barrier must occupy the exact same logical Y-coordinates (0° horizontal).
+    let expected_ys = &barrier_cols[0].1;
+    let expected_thickness = expected_ys.len();
+    assert!(expected_thickness > 0);
+    for (x, ys, _) in &barrier_cols {
+        assert_eq!(
+            ys, expected_ys,
+            "barrier at x={x} must occupy constant logical Y-coordinates {expected_ys:?}"
+        );
+        assert_eq!(
+            ys.len(),
+            expected_thickness,
+            "barrier at x={x} must have constant thickness {expected_thickness}"
+        );
+    }
+
+    // Group contiguous columns by colour into segments and verify identical thickness & width,
+    // plus alternating coral-red and off-white colours.
+    let mut segments: Vec<(Px, usize, usize)> = Vec::new();
+    for (x, ys, color) in barrier_cols {
+        if let Some(last) = segments.last_mut()
+            && last.0 == color
+        {
+            last.1 += 1;
+            assert_eq!(last.2, ys.len());
+        } else {
+            segments.push((color, 1, ys.len()));
+        }
+        let _ = x;
+    }
+    assert!(
+        segments.len() >= 3,
+        "barrier must have alternating red and white segments: {segments:?}"
+    );
+    let seg_width = segments[0].1;
+    let seg_thickness = segments[0].2;
+    for (idx, &(color, width, thickness)) in segments.iter().enumerate() {
+        assert_eq!(
+            thickness, seg_thickness,
+            "segment {idx} must have identical thickness"
+        );
+        assert_eq!(width, seg_width, "segment {idx} must have identical width");
+        let expected_color = if idx % 2 == 0 {
+            Px::BarrierRed
+        } else {
+            Px::BarrierWhite
+        };
+        assert_eq!(
+            color, expected_color,
+            "segment {idx} must alternate BarrierRed and BarrierWhite"
+        );
+    }
+}
+
+#[test]
+fn logo_contains_no_yellow_or_orange_pixels_and_renders_booth_and_usage_bars() {
+    let all_variants = [
+        Px::Bg,
+        Px::Booth,
+        Px::Prompt,
+        Px::BarrierRed,
+        Px::BarrierWhite,
+        Px::UsageGrey,
+        Px::UsageBlue,
+        Px::UsageGreen,
+    ];
+    for px in all_variants {
+        let (r, g, b) = px.rgb();
+        // Yellow/orange colours have high red and green significantly above blue (R > 180, G > B + 20).
+        let is_yellow_or_orange = r > 180 && g > b.saturating_add(20);
+        assert!(
+            !is_yellow_or_orange,
+            "pixel variant {px:?} rgb({r}, {g}, {b}) must not be yellow or orange"
+        );
+    }
+
+    // Verify usage bars: muted grey, blue, and green vertical bars of different heights
+    // aligned to a common baseline below the barrier.
+    let bar_metrics = |target: Px| -> (usize, usize, usize) {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for (y, row) in LOGO_BITMAP.iter().enumerate() {
+            for (x, &p) in row.iter().enumerate() {
+                if p == target {
+                    xs.push(x);
+                    ys.push(y);
+                }
+            }
+        }
+        xs.sort_unstable();
+        xs.dedup();
+        assert_eq!(xs.len(), 1, "{target:?} must form a single vertical bar");
+        let min_y = *ys.iter().min().unwrap();
+        let max_y = *ys.iter().max().unwrap();
+        let height = max_y - min_y + 1;
+        assert_eq!(
+            ys.len(),
+            height,
+            "{target:?} bar must be vertically contiguous"
+        );
+        (xs[0], max_y, height)
+    };
+
+    let (grey_x, grey_base, grey_h) = bar_metrics(Px::UsageGrey);
+    let (blue_x, blue_base, blue_h) = bar_metrics(Px::UsageBlue);
+    let (green_x, green_base, green_h) = bar_metrics(Px::UsageGreen);
+
+    assert_eq!(
+        grey_base, blue_base,
+        "grey and blue bars share a common baseline"
+    );
+    assert_eq!(
+        blue_base, green_base,
+        "blue and green bars share a common baseline"
+    );
+    assert!(
+        grey_x < blue_x && blue_x < green_x,
+        "bars are ordered left-to-right"
+    );
+    assert!(
+        grey_h != blue_h && blue_h != green_h && grey_h != green_h,
+        "all three usage bars must have different heights: ({grey_h}, {blue_h}, {green_h})"
+    );
+
+    let _home = crate::testutil::HomeSandbox::new();
+    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let warning = theme::warning_color();
+        let orange = theme::accent_2_color();
+        let width = 100usize;
+        let (rows, buf) = render_header_at(1000, width as u16);
+        for (y, want) in LOGO.iter().enumerate() {
+            let cells: String = rows[y].chars().take(10).collect();
+            assert_eq!(cells, format!("{want} "), "{tier:?} header logo row {y}");
+            for x in 0..10 {
+                let cell = &buf.content[y * width + x];
+                assert!(
+                    cell.fg != warning && cell.bg != warning,
+                    "{tier:?}: no yellow/warning colour in logo at ({x}, {y})"
+                );
+                assert!(
+                    cell.fg != orange && cell.bg != orange,
+                    "{tier:?}: no orange/accent_2 colour in logo at ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rendering_logo_does_not_panic_when_area_is_smaller_than_12_by_5() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for width in 0..=15u16 {
+        for height in 0..=7u16 {
+            let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 20, 10));
+            let area = Rect::new(2, 1, width, height);
+            TollgateLogo.render(area, &mut buf);
+
+            // Cells outside `area` must remain untouched (' ').
+            for y in 0..10u16 {
+                for x in 0..20u16 {
+                    let inside = x >= area.x
+                        && x < area.x + area.width
+                        && y >= area.y
+                        && y < area.y + area.height;
+                    if !inside {
+                        assert_eq!(
+                            buf[(x, y)].symbol(),
+                            " ",
+                            "cell ({x}, {y}) outside {area:?} must not be overwritten"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn logo_candidates_fill_the_three_by_nine_footprint_in_block_glyphs() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 3));
+    TollgateLogo.render(Rect::new(0, 0, 10, 3), &mut buf);
+    let drawn = crate::testutil::buffer_rows(&buf);
+
+    for (y, row) in LOGO.iter().enumerate() {
+        assert_eq!(row.chars().count(), 9, "LOGO row {y} is nine cells");
+        assert!(
+            row.chars().all(is_block_glyph),
+            "LOGO row {y} is block and quadrant glyphs only: {row:?}"
+        );
+        assert_eq!(
+            drawn[y],
+            format!("{row} "),
+            "LOGO row {y} draws as written, the tenth cell a gap"
+        );
+    }
+
     for (name, rows) in LOGO_CANDIDATES {
-        let drawn = render_logo(rows);
-        eprintln!("{name}:");
-        for line in &drawn {
-            eprintln!("  |{line}|");
-        }
         for (y, row) in rows.iter().enumerate() {
             assert_eq!(row.chars().count(), 9, "{name} row {y} is nine cells");
             assert!(
@@ -1061,11 +1337,6 @@ fn logo_candidates_fill_the_three_by_nine_footprint_in_block_glyphs() {
             assert!(
                 row.chars().any(|c| c != ' '),
                 "{name} row {y} carries ink: {row:?}"
-            );
-            assert_eq!(
-                drawn[y],
-                format!("{row} "),
-                "{name} row {y} draws as written, the tenth cell a gap"
             );
         }
         assert!(
@@ -1097,146 +1368,6 @@ fn every_logo_alternative_stays_commented_beside_the_wired_one() {
             "the upstream mascot row {mascot:?} is gone from header.rs"
         );
     }
-}
-
-#[test]
-fn the_header_draws_the_logo_in_palette_colors_on_both_tiers() {
-    let _home = crate::testutil::HomeSandbox::new();
-    assert_eq!(LOGO, ["▗▛▀▜▝  ▗▞", "▐▛▜▌ ▗▞  ", "▝▙▄▟▘    "]);
-    assert_eq!(LOGO_FLICKER_MID, "▐▞▚▌ ▗▞  ");
-    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
-        let _tier = crate::testutil::TierSandbox::new(tier);
-        let roof = theme::accent_2_color();
-        let window = theme::warning_color();
-        let plinth = theme::text_dim_color();
-        let beacon = theme::success_color();
-        let stripe = theme::accent_color();
-        let expected = [
-            [
-                roof, roof, roof, roof, beacon, plinth, plinth, window, stripe,
-            ],
-            [
-                roof, window, window, roof, plinth, window, stripe, plinth, plinth,
-            ],
-            [
-                roof, plinth, plinth, roof, stripe, plinth, plinth, plinth, plinth,
-            ],
-        ];
-        if tier == theme::Tier::Compatible {
-            for color in [roof, window, plinth, beacon, stripe] {
-                assert!(matches!(color, ratatui::style::Color::Indexed(_)));
-            }
-        }
-        let width = 100usize;
-        let (rows, buf) = render_header_at(1000, width as u16);
-        for (y, want) in LOGO.iter().enumerate() {
-            let cells: String = rows[y].chars().take(10).collect();
-            assert_eq!(cells, format!("{want} "), "{tier:?} logo row {y}");
-            for (x, color) in expected[y].iter().enumerate() {
-                assert_eq!(
-                    buf.content[y * width + x].fg,
-                    *color,
-                    "{tier:?} logo cell ({x}, {y})"
-                );
-            }
-            for x in 10..width {
-                let cell = &buf.content[y * width + x];
-                assert!(
-                    cell.fg != roof && cell.bg != roof,
-                    "no accent_2 beyond logo on {tier:?} at ({x}, {y})"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn the_barrier_stripes_swap_every_three_hundred_ms_on_both_tiers() {
-    let _home = crate::testutil::HomeSandbox::new();
-    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
-        let _tier = crate::testutil::TierSandbox::new(tier);
-        for (ms, odd) in [
-            (0, false),
-            (299, false),
-            (300, true),
-            (599, true),
-            (600, false),
-            (6300, true),
-        ] {
-            let (_, buf) = render_header_at(ms, 60);
-            for (stripe, (y, x)) in [(2, 4), (1, 5), (1, 6), (0, 7), (0, 8)]
-                .into_iter()
-                .enumerate()
-            {
-                let expected = if (stripe % 2 == 1) == odd {
-                    theme::warning_color()
-                } else {
-                    theme::accent_color()
-                };
-                assert_eq!(
-                    buf.content[y * 60 + x].fg,
-                    expected,
-                    "{tier:?} barrier stripe {stripe} at {ms} ms"
-                );
-            }
-        }
-    }
-}
-
-/// Orange once per screen: with no active account the logo is the header's
-/// only `accent_2` ink.
-#[test]
-fn the_logo_is_the_only_orange_in_the_header() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let orange = theme::accent_2_color();
-    let width = 100usize;
-    let (rows, buf) = render_header_at(1000, width as u16);
-    for (y, row) in rows.iter().enumerate() {
-        for x in 10..width {
-            let cell = &buf.content[y * width + x];
-            assert!(
-                cell.fg != orange && cell.bg != orange,
-                "no orange past the logo column at ({x}, {y}): {row:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn the_booth_window_and_beacon_flicker_on_the_six_second_beat() {
-    let _home = crate::testutil::HomeSandbox::new();
-    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
-        let _tier = crate::testutil::TierSandbox::new(tier);
-        for (ms, lit) in [
-            (0, true),
-            (199, true),
-            (200, false),
-            (5999, false),
-            (6000, true),
-            (6199, true),
-            (6200, false),
-        ] {
-            let (rows, buf) = render_header_at(ms, 60);
-            let logo: Vec<String> = rows.iter().map(|r| r.chars().take(9).collect()).collect();
-            let mid = if lit { LOGO_FLICKER_MID } else { LOGO[1] };
-            assert_eq!(logo, [LOGO[0], mid, LOGO[2]], "{tier:?} logo at {ms} ms");
-            assert_eq!(
-                buf.content[4].fg,
-                if lit {
-                    theme::warning_color()
-                } else {
-                    theme::success_color()
-                },
-                "{tier:?} beacon at {ms} ms"
-            );
-            for x in 1..=2 {
-                assert_eq!(buf.content[60 + x].fg, theme::warning_color());
-            }
-        }
-    }
-    assert_ne!(LOGO_FLICKER_MID, LOGO[1]);
-    assert_eq!(LOGO_FLICKER_MID.chars().count(), 9);
 }
 
 #[test]

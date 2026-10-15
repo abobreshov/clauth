@@ -300,6 +300,16 @@ fn pick(role: Role) -> Color {
     }
 }
 
+/// Fixed RGB swatch resolved at the active tier (`Color::Rgb` on [`Tier::Full`],
+/// nearest xterm-256 index on [`Tier::Compatible`]).
+#[inline]
+pub(crate) fn rgb_or_256(r: u8, g: u8, b: u8) -> Color {
+    match tier() {
+        Tier::Full => Color::Rgb(r, g, b),
+        Tier::Compatible => Color::Indexed(nearest_xterm256((r, g, b))),
+    }
+}
+
 // ── Surfaces ──────────────────────────────────────────────────────────────────
 #[inline]
 pub(crate) fn bg() -> Color {

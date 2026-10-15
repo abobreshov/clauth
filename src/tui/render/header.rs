@@ -10,10 +10,11 @@
 //! title. The collapse ladder drops the usage bar before the name.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 
 use super::super::app::{App, Tab, live_count_text};
 use super::super::theme;
@@ -405,82 +406,203 @@ fn daemon_chip_color(app: &App) -> ratatui::style::Color {
 
 // ── Logo ─────────────────────────────────────────────────────────────────
 
-/// The tollgate mark: a toll booth (roof, lit window, base) with its barrier
-/// arm raised on the diagonal. Three rows of nine cells, block and quadrant
-/// glyphs only, so it draws the same on the Full and the Compatible tier.
-/// Alternatives in the same footprint (swap into `LOGO` to try one):
+/// Logical pixel width of the [`TollgateLogo`] canvas (12 terminal columns × 2).
+pub(crate) const LOGO_PIXEL_WIDTH: usize = 24;
+
+/// Logical pixel height of the [`TollgateLogo`] canvas (5 terminal rows × 2).
+pub(crate) const LOGO_PIXEL_HEIGHT: usize = 10;
+
+/// Terminal column footprint of [`TollgateLogo`].
+pub(crate) const LOGO_CELL_WIDTH: usize = LOGO_PIXEL_WIDTH / 2;
+
+/// Terminal row footprint of [`TollgateLogo`].
+pub(crate) const LOGO_CELL_HEIGHT: usize = LOGO_PIXEL_HEIGHT / 2;
+
+/// 16-entry quadrant lookup table indexed by bitmask:
+/// `UL = 1`, `UR = 2`, `LL = 4`, `LR = 8`.
+pub(crate) const QUADRANT_GLYPHS: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+/// Logical pixel palette for [`TollgateLogo`].
+/// Contains no yellow or orange swatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Px {
+    /// Transparent / dark interior matching the TUI background (`#1E1B2A`).
+    Bg,
+    /// Light grey / off-white booth outline (`#CDD0DF`).
+    Booth,
+    /// Green terminal prompt `>_` inside the booth (`#72DF83`).
+    Prompt,
+    /// Coral-red horizontal barrier segment (`#F26D7D`).
+    BarrierRed,
+    /// Off-white horizontal barrier segment (`#E8E8F0`).
+    BarrierWhite,
+    /// Muted grey vertical usage bar (`#656C88`).
+    UsageGrey,
+    /// Blue vertical usage bar (`#739AF5`).
+    UsageBlue,
+    /// Green vertical usage bar (`#67D987`).
+    UsageGreen,
+}
+
+impl Px {
+    /// Truecolor RGB tuple from the Tollgate pixel-logo specification.
+    #[inline]
+    pub(crate) const fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Self::Bg => (0x1E, 0x1B, 0x2A),
+            Self::Booth => (0xCD, 0xD0, 0xDF),
+            Self::Prompt => (0x72, 0xDF, 0x83),
+            Self::BarrierRed => (0xF2, 0x6D, 0x7D),
+            Self::BarrierWhite => (0xE8, 0xE8, 0xF0),
+            Self::UsageGrey => (0x65, 0x6C, 0x88),
+            Self::UsageBlue => (0x73, 0x9A, 0xF5),
+            Self::UsageGreen => (0x67, 0xD9, 0x87),
+        }
+    }
+
+    /// Resolve this logical pixel to a Ratatui [`Color`] for the active tier.
+    #[inline]
+    pub(crate) fn color(self) -> Color {
+        match self {
+            Self::Bg => theme::bg(),
+            other => {
+                let (r, g, b) = other.rgb();
+                theme::rgb_or_256(r, g, b)
+            }
+        }
+    }
+}
+
+use Px::{
+    BarrierRed as R, BarrierWhite as W, Bg as O, Booth as B, Prompt as P, UsageBlue as U,
+    UsageGreen as E, UsageGrey as G,
+};
+
+/// Fixed 24×10 logical pixel matrix (12×5 terminal cells at 2×2 subpixels per cell):
+/// - Left (`x = 0..8, y = 0..6`): rectangular booth outline (`B`) with dark interior (`O`)
+///   and green `>_` terminal prompt (`P`) inside (`>` at `(2,2),(3,3)`, `_` at `(4,3),(5,3)`).
+/// - Top-right (`x = 8..18, y = 1`): 0° horizontal barrier of constant 1px thickness
+///   with five 2px alternating coral-red (`R`) and off-white (`W`) segments.
+/// - Bottom-right (`x = 11, 13, 15, y = 3..6`): three vertical usage bars of heights
+///   1px (`G`), 2px (`U`), and 3px (`E`) aligned to baseline `y = 5`.
+///
+/// Alternatives in the 3×9 header footprint:
 // gantry: ["▗▄▄▄▄▄▄▄▖", "▐▌▄ ▄ ▄▐▌", "▐▌     ▐▌"]
 // gauge:  [" ▗▄▀▀▀▄▖ ", "▗▘   ▞ ▝▖", "▐▄▄▄▟▄▄▄▌"]
-const LOGO: [&str; 3] = ["▗▛▀▜▝  ▗▞", "▐▛▜▌ ▗▞  ", "▝▙▄▟▘    "];
+pub(crate) const LOGO_BITMAP: [[Px; LOGO_PIXEL_WIDTH]; LOGO_PIXEL_HEIGHT] = [
+    // x: 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+    [
+        B, B, B, B, B, B, B, B, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+    ], // y=0
+    [
+        B, O, O, O, O, O, O, B, R, R, W, W, R, R, W, W, R, R, O, O, O, O, O, O,
+    ], // y=1
+    [
+        B, O, P, O, O, O, O, B, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+    ], // y=2
+    [
+        B, O, O, P, O, P, O, B, O, O, O, O, O, O, O, E, O, O, O, O, O, O, O, O,
+    ], // y=3
+    [
+        B, O, O, O, O, O, O, B, O, O, O, O, O, U, O, E, O, O, O, O, O, O, O, O,
+    ], // y=4
+    [
+        B, B, B, B, B, B, B, B, O, O, O, G, O, U, O, E, O, O, O, O, O, O, O, O,
+    ], // y=5
+    [
+        O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+    ], // y=6
+    [
+        O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+    ], // y=7
+    [
+        O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+    ], // y=8
+    [
+        O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+    ], // y=9
+];
 
-/// The window row while the booth light flickers on: the 200 ms beat every
-/// 6 s that the upstream mascot spent on its blink.
-const LOGO_FLICKER_MID: &str = "▐▞▚▌ ▗▞  ";
+/// Top-left 3×9 glyph rows rendered by [`LOGO_BITMAP`] in the 3-row header.
+#[cfg(test)]
+pub(crate) const LOGO: [&str; 3] = ["▛▀▀▜▄▄▄▄▄", "▌▚▗▐   ▗ ", "▙▄▄▟ ▗▐▐ "];
 
-/// The logo rows for this frame, flicker applied.
-fn logo_rows(app: &App) -> [&'static str; 3] {
-    let flicker = (app.anim_ms() % 6000) < 200;
-    if flicker {
-        [LOGO[0], LOGO_FLICKER_MID, LOGO[2]]
-    } else {
-        LOGO
+/// Convert a 2×2 logical pixel block into `(glyph, fg, bg)` using the
+/// quadrant bitmask convention: `UL = 1`, `UR = 2`, `LL = 4`, `LR = 8`.
+#[inline]
+pub(crate) fn quadrant_cell(ul: Px, ur: Px, ll: Px, lr: Px) -> (char, Color, Color) {
+    let sub = [ul, ur, ll, lr];
+    let Some(fg) = sub.into_iter().find(|&p| p != Px::Bg) else {
+        let bg = theme::bg();
+        return (' ', theme::text_dim_color(), bg);
+    };
+    let bg_px = sub
+        .into_iter()
+        .find(|&p| p != fg && p != Px::Bg)
+        .unwrap_or(Px::Bg);
+    let mut mask = 0usize;
+    if ul == fg {
+        mask |= 1;
+    }
+    if ur == fg {
+        mask |= 2;
+    }
+    if ll == fg {
+        mask |= 4;
+    }
+    if lr == fg {
+        mask |= 8;
+    }
+    (QUADRANT_GLYPHS[mask], fg.color(), bg_px.color())
+}
+
+/// Reusable Ratatui widget that renders the 24×10 logical pixel logo into up to
+/// 12×5 terminal character cells using Unicode quadrant characters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TollgateLogo;
+
+impl Widget for TollgateLogo {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let bg = theme::bg();
+        let base_fg = theme::text_color();
+        for dy in 0..area.height {
+            for dx in 0..area.width {
+                if let Some(cell) = buf.cell_mut((area.x + dx, area.y + dy)) {
+                    cell.set_char(' ');
+                    cell.set_fg(base_fg);
+                    cell.set_bg(bg);
+                }
+            }
+        }
+        let cols = (area.width as usize).min(LOGO_CELL_WIDTH);
+        let rows = (area.height as usize).min(LOGO_CELL_HEIGHT);
+        for cy in 0..rows {
+            let py = cy * 2;
+            for cx in 0..cols {
+                let px = cx * 2;
+                let (ch, fg, cell_bg) = quadrant_cell(
+                    LOGO_BITMAP[py][px],
+                    LOGO_BITMAP[py][px + 1],
+                    LOGO_BITMAP[py + 1][px],
+                    LOGO_BITMAP[py + 1][px + 1],
+                );
+                if let Some(cell) = buf.cell_mut((area.x + cx as u16, area.y + cy as u16)) {
+                    cell.set_char(ch);
+                    cell.set_fg(fg);
+                    cell.set_bg(cell_bg);
+                }
+            }
+        }
     }
 }
 
-/// Palette roles for the booth, beacon, and moving barrier stripes.
-fn logo_cell_color(row: usize, col: usize, anim_ms: u64) -> ratatui::style::Color {
-    match (row, col) {
-        (0, 4) => {
-            if anim_ms % 6000 < 200 {
-                theme::warning_color()
-            } else {
-                theme::success_color()
-            }
-        }
-        (2, 4) | (1, 5..=6) | (0, 7..=8) => {
-            let stripe = match (row, col) {
-                (2, 4) => 0,
-                (1, 5) => 1,
-                (1, 6) => 2,
-                (0, 7) => 3,
-                _ => 4,
-            };
-            if (stripe + (anim_ms / 300) % 2).is_multiple_of(2) {
-                theme::warning_color()
-            } else {
-                theme::accent_color()
-            }
-        }
-        (0, 0..=3) | (1, 0 | 3) | (2, 0 | 3) => theme::accent_2_color(),
-        (1, 1..=2) => theme::warning_color(),
-        _ => theme::text_dim_color(),
-    }
-}
-
-/// Each logo cell carries its palette role on both terminal tiers.
-fn logo_lines(rows: [&str; 3], anim_ms: u64) -> Vec<Line<'static>> {
-    rows.into_iter()
-        .enumerate()
-        .map(|(row, text)| {
-            Line::from(
-                text.chars()
-                    .enumerate()
-                    .map(|(col, glyph)| {
-                        Span::styled(
-                            glyph.to_string(),
-                            Style::default().fg(logo_cell_color(row, col, anim_ms)),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .alignment(Alignment::Left)
-        })
-        .collect()
-}
-
-fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let para = Paragraph::new(logo_lines(logo_rows(app), app.anim_ms())).style(theme::base());
-    frame.render_widget(para, area);
+fn draw_logo(frame: &mut Frame<'_>, area: Rect, _app: &App) {
+    frame.render_widget(TollgateLogo, area);
 }
 
 #[cfg(test)]
