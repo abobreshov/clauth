@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — 2026-10-15
+
+### Usage and monitors
+
+- An official Antigravity (`agy`) login in the Secret Service keyring appears in `tollgate usage`, `tollgate usage --json`, and the TUI without `monitor add` once a single unlocked entry is present. `loadCodeAssist` falls back to `g1Tier` and the default `allowedTiers` entry when `paidTier` and `currentTier` are absent, quota windows sort `1h` / `5h` before `7d` within each model group with integer-rounded utilization, and the Overview table renders both the short (`5h` or tagged `1h`) and `7d` windows in their respective columns.
+
+### Authentication, daemon, and TUI
+
+- Ported upstream `5a7802c4..0336e802`: staged refresh-chain recovery and spent-token ledger, `tollgate oauth-token` / `__oauth-token` with guest-mode live-slot isolation and credential-bound divergence verification, atomic endpoint config saves, built-in model tier presets, DeepSeek served-model token attribution and placeholder filtering, daemon `bell_command` and 5h alert latch across TUI and daemon surfaces, startup and scheduler fallback parity through 429 bursts, delegated helper isolation, and TUI paging, narrow-pane reflow, and a multi-color quadrant-dot animated header logo.
+
 ## 0.3.1 — 2026-10-14
 
 ### Usage

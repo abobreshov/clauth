@@ -16,7 +16,7 @@ Out of scope: upstream clauth itself (report to [uwuclxdy/clauth](https://github
 
 ## Supported versions
 
-Only the newest commit on the `feat/tollgate` branch (0.3.1 at the time of writing). There are no signed releases yet and self-update is compiled out, so update by reinstalling from source.
+Only the newest commit on the `feat/tollgate` branch (0.4.0 at the time of writing). There are no signed releases yet and self-update is compiled out, so update by reinstalling from source.
 
 ## Secrets handling, in short
 
