@@ -300,7 +300,7 @@ pub(crate) fn validate_api_key(key: &str) -> Result<()> {
     validate_credential_chars(key, "api key")
 }
 
-/// [`validate_api_key`]'s check for the OAuth access token `clauth __oauth-token`
+/// [`validate_api_key`]'s check for the OAuth access token `tollgate __oauth-token`
 /// prints: the same header-injection boundary, with the noun the surface names.
 pub(crate) fn validate_oauth_token(token: &str) -> Result<()> {
     validate_credential_chars(token, "oauth token")

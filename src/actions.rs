@@ -2015,7 +2015,7 @@ pub(crate) fn set_profile_default_model(
 /// a SIBLING routes the divergence to the banner (user decides), and pointing at
 /// the active profile is filtered out by the caller (`note_divergence` drops an
 /// owner equal to active) — the same as no match, so the configured default
-/// applies unchanged, and the worst case is the banner. `clauth __oauth-token`
+/// applies unchanged, and the worst case is the banner. `tollgate __oauth-token`
 /// is the exception: it takes an owner equal to the active profile as the
 /// permission to print that profile's live token, so a stale block naming the
 /// active account in front of another account's login prints that login.

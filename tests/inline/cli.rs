@@ -2487,7 +2487,7 @@ mod oauth_token_helper_tests {
         crate::testutil::assert_nothing_sent(&listener);
     }
 
-    /// Where a live session's Claude Code holds a Keychain item clauth can't
+    /// Where a live session's Claude Code holds a Keychain item tollgate can't
     /// write (macOS; forced here through the override seam), the gate leaves the
     /// refresh to that session, so a token with 30 minutes left, inside the
     /// command's hour, prints as-is and nothing is sent.

@@ -3058,7 +3058,7 @@ pub(crate) fn ensure_installable(
 
 /// [`ensure_installable`] with a caller-chosen refresh margin in place of
 /// [`AUTH_GATE_GRACE_MS`], for a caller whose token outlives a switch's
-/// install: `clauth __oauth-token` hands it to a session that cannot refresh
+/// install: `tollgate __oauth-token` hands it to a session that cannot refresh
 /// it. Only the refresh decisions move; a long-lived mint's clock verdict keeps
 /// the switch grace, since nothing can refresh a mint.
 pub(crate) fn ensure_installable_within(
@@ -3876,7 +3876,7 @@ fn expiring(expires_at: Option<i64>, flagged: bool) -> bool {
 /// [`AUTH_GATE_GRACE_MS`]; the CLA-ROLL re-stamp leg passes
 /// [`ROLLING_RESTAMP_HORIZON_MS`] so a rolling bearer is renewed HOURS before its
 /// clock death, not minutes — the margin that keeps a running session alive
-/// across daemon idle gaps and machine sleep; `clauth __oauth-token` passes an
+/// across daemon idle gaps and machine sleep; `tollgate __oauth-token` passes an
 /// hour through [`ensure_installable_within`].
 fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> bool {
     flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + horizon_ms >= exp)

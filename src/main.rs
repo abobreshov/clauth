@@ -2720,9 +2720,9 @@ fn oauth_token_for_profile(
             refreshed_elsewhere = false;
             claude::install_source_path(&canonical)?
         } else {
-            // A plain `claude` refreshes the active chain outside any clauth
+            // A plain `claude` refreshes the active chain outside any tollgate
             // lock and replaces the live file rather than writing through
-            // clauth's link, so the store lags it: print what that `claude`
+            // tollgate's link, so the store lags it: print what that `claude`
             // last wrote, and never refresh, the switch paths' rule for the
             // active profile. With no live file there is nothing newer than
             // the store, so the store prints. The logged-out shell is Claude
