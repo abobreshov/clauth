@@ -405,8 +405,9 @@ pub(crate) struct Profile {
     /// windows are ignored here: the account stays in rotation for use with
     /// other models. Default on.
     pub(crate) check_scoped: bool,
-    /// Utilization % at/above which a bell toast fires in the overview tab.
-    /// None = no bell for this profile.
+    /// 5h utilization % at/above which the alert fires: the TUI toast and the
+    /// daemon's `bell_command`.
+    /// None = no alert for this profile.
     pub(crate) bell_threshold: Option<f64>,
     /// USER CHOICE (not the auto-quarantine `AppState::auth_broken`): when
     /// true, this account is invisible to every operational surface — the
@@ -883,7 +884,7 @@ pub(crate) struct AppState {
     /// threshold check when no burn rate is available yet. Off by default:
     /// the static threshold stays the default auto-switch behavior (issue #8
     /// follow-up b). Candidate selection and `soonest_resume` are unaffected
-    /// either way — see `fallback::is_exhausted_active`.
+    /// either way — the ACTIVE-side check is the walk's own.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
     /// Which member the fallback-chain walk lands on WITHIN one accept pass
@@ -897,6 +898,13 @@ pub(crate) struct AppState {
     /// [`AppState::walk_order`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_order: Option<WalkOrder>,
+    /// The program the daemon runs when an account's 5h usage crosses its
+    /// `bell_threshold`, `%s` standing for the bell's text; split by POSIX
+    /// quoting rules and run without a shell (`bell::run_command`). `None` =
+    /// no headless bell. Only a hand edit of profiles.toml sets it: no TUI row
+    /// and no API route writes a program to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bell_command: Option<String>,
     /// Minimum weekly-reset improvement for a proactive home walk (minutes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_min_gain_mins: Option<u64>,
@@ -912,7 +920,7 @@ pub(crate) struct AppState {
     /// `Profile::max_auto_spend` ceiling. Off by default, and every ceiling
     /// defaults to `$0`, so BOTH halves must be set before a cent is spent
     /// unattended. Spend-armed members rank below every subscription member
-    /// with free quota — see `fallback::next_target`.
+    /// with free quota — see the fallback walk's spend pass.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) spend_budget_switching: bool,
     /// What to do once a billing account has spent its `max_auto_spend` budget:
@@ -1312,6 +1320,7 @@ impl Default for AppState {
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             walk_order: None,
+            bell_command: None,
             walk_min_gain_mins: None,
             walk_cooldown_mins: None,
             last_switch_at: None,
@@ -4337,8 +4346,8 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which tollgate fires a bell\n");
-    out.push_str("# notification in the overview tab. Range 0..=100.\n");
+    out.push_str("# 5-hour utilization percentage at/above which tollgate alerts: a TUI toast,\n");
+    out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
         None => out.push_str("# bell_threshold = 95.0\n"),

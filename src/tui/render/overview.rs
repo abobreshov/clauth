@@ -1,11 +1,12 @@
 //! Overview tab: accounts table + fallback flow, inside one content frame.
 
+use std::collections::HashSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, Paragraph};
-use std::collections::HashSet;
 
 use super::super::app::{App, CodexRow, HarnessFilter, HermesRow, MainItemKind};
 use super::super::theme;
@@ -22,9 +23,7 @@ use super::panes::{
 };
 use super::prose::{self, cmd_lit};
 use super::usage::{eta_left_secs, window_rate_unit};
-use crate::fallback::{
-    BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
-};
+use crate::fallback::{BlockedReason, SwitchAction, blocked_reason, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::derive::{format_money, lead_window};
@@ -915,7 +914,7 @@ fn render_overview_row(
     } else if token_danger {
         spans.push(Span::styled("⊘", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if app.bell_fired.contains_key(profile.name.as_str()) {
+    } else if app.bell_fired.is_ringing(profile.name.as_str()) {
         spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if active {
@@ -1212,6 +1211,10 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // (both stores rank below it) — never a durable read under the guard.
     let key_rejected = app.key_rejected_names();
     let narrow = super::panes::narrow(width as u16);
+    // The projected switch, computed BEFORE the Config lock: the caption's
+    // decision reads the stores (which rank below `Config`), so it must not run
+    // under the guard below. `projected_switch` reads the config itself.
+    let projection = projected_switch(app, &key_rejected);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
         let mut lines = vec![Line::from(Span::styled(
@@ -1283,8 +1286,8 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     // Project the active profile's next switch once, up front: a `To(target)`
     // renders inline on the target member's row (right side); `Off` has no
-    // single target row, so it stays a caption below.
-    let projection = projected_switch(app, &cfg, &key_rejected);
+    // single target row, so it stays a caption below. `projection` was computed
+    // before the Config lock (the stores rank below it).
     let switch_to = match &projection {
         Some((SwitchAction::To(target), secs)) => Some((target.clone(), *secs)),
         _ => None,
@@ -1408,31 +1411,30 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 /// The active profile's projected next switch (action + eta secs), or `None`
-/// when none is imminent. Guards the projection the same way the old inline line
-/// did: only when the active crosses its threshold BEFORE its 5h window resets
-/// (past the reset the window refills and no switch fires). Shared by the inline
-/// `To` hint (on the target's row) and the `Off` caption.
-fn projected_switch(
-    app: &App,
-    cfg: &AppConfig,
-    key_rejected: &HashSet<ProfileName>,
-) -> Option<(SwitchAction, i64)> {
-    if cfg.state.fallback_chain.len() <= 1 {
-        return None;
-    }
-    let active_name = cfg.state.active_profile.as_ref()?;
-    let profile = cfg.find(active_name)?;
-    let usage_info = profile.usage.as_ref()?;
-    let usage = usage_info.five_hour.as_ref()?;
-    let threshold = threshold_for(profile);
-    // In-memory rate (`app.history_cache`) — no disk read while `cfg` is held.
-    let active_rate = app.active_burn_rate(active_name, usage_info);
-    let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold)?;
+/// when none is imminent. The action is the scheduler walk's answer to "where
+/// does the chain land when the active crosses its threshold"
+/// ([`App::auto_switch_projection`]); the eta guards the projection the same
+/// way the old inline line did: only when the active crosses its threshold
+/// BEFORE its 5h window resets (past the reset the window refills and no switch
+/// fires). Shared by the inline `To` hint (on the target's row) and the `Off`
+/// caption.
+fn projected_switch(app: &App, key_rejected: &HashSet<ProfileName>) -> Option<(SwitchAction, i64)> {
+    let projection = app.auto_switch_projection(key_rejected);
+    let action = projection.action?;
+    let usage = projection.active_usage.as_ref()?.five_hour.as_ref()?;
+    // In-memory rate (`history_cache`) — no disk read under any guard. A
+    // third-party member has no burn history to pair with its provider window
+    // (maintainer ruling 2026-09-10), so no rate and no projection.
+    let eta_secs = burn_rate_eta(
+        projection.active_rate,
+        usage.utilization,
+        projection.active_threshold,
+    )?;
     let reset_secs = super::format::reset_in_secs(usage);
     if reset_secs.is_some_and(|reset| eta_secs >= reset) {
         return None;
     }
-    next_target(cfg, active_rate, key_rejected).map(|action| (action, eta_secs))
+    Some((action, eta_secs))
 }
 
 /// Cells between the widest chain row's content and the shared trailer column.
@@ -1458,9 +1460,9 @@ impl ChainRow {
     /// Pad the content out to `col`, then append whichever trailers fit inside
     /// `width` (the panel's inner width). A projected-switch target carries the
     /// `↲ ~eta` hint; a blocked member carries its 1-cell reason marker. BOTH can
-    /// apply to one row: `next_target`'s headroom walk only prefers a fresh
-    /// member and falls through to a stale-but-unexhausted one (`is_exhausted`
-    /// ignores `fetch_status`), so a `To` target can also be `Stale`. Render both
+    /// apply to one row: the walk's headroom pass only prefers a fresh
+    /// member and falls through to a stale-but-unexhausted one, so a `To`
+    /// target can also be `Stale`. Render both
     /// then (hint, then marker outermost) instead of dropping the imminent-switch
     /// projection. Too narrow for the pair → keep the marker (the persistent
     /// signal) and drop the hint; too narrow for even that → drop both.

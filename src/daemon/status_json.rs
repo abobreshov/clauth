@@ -28,8 +28,8 @@ use crate::profile_json::{
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, LegKey, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms,
-    selected_next_refresh, windows_maxed,
+    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, now_ms, selected_next_refresh,
+    windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -97,7 +97,7 @@ pub(crate) struct LiveSignals<'a> {
     pub(crate) gateway: Option<&'a GatewaySlot>,
 }
 
-fn fetch_status_str(s: FetchStatus) -> &'static str {
+pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
     match s {
         FetchStatus::Fresh => "Fresh",
         FetchStatus::Cached => "Cached",
@@ -109,7 +109,7 @@ fn fetch_status_str(s: FetchStatus) -> &'static str {
 
 /// ISO-8601 (UTC) from an epoch-millisecond instant.
 fn iso_from_ms(ms: u64) -> String {
-    epoch_secs_to_iso((ms / 1000) as i64)
+    crate::providers::ms_to_iso(ms)
 }
 
 /// The `fallback` object for a profile: chain membership (`position` is

@@ -64,11 +64,12 @@ pub(crate) use scheduler::{
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch,
     bootstrap_third_party, clear_activity, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, current_key_rejected_names, end_rotation, is_idle, is_stuck_rate_limited,
-    is_stuck_streak, kick_block_switch_grade, mark_activity, mark_fetch_activity,
-    profile_credential_fingerprint, queued_switch_away_is_stale, rotation_into_fetch,
-    selected_activity, selected_next_refresh, spawn_refresher, switch_gate_in_flight,
-    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
+    collect_tokens, current_key_rejected_names, decision_fresh_any, end_rotation,
+    fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
+    kick_block_switch_grade, mark_activity, mark_fetch_activity, profile_credential_fingerprint,
+    queued_switch_away_is_stale, rotation_into_fetch, selected_activity, selected_next_refresh,
+    spawn_refresher, switch_gate_in_flight, switch_grade_kick_blocked_from_cache,
+    switch_grade_kick_lifts, third_party_credentialed,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is

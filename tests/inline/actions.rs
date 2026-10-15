@@ -575,7 +575,7 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
 /// account forever.
 #[test]
 fn auto_switch_if_needed_walks_off_a_broken_active() {
-    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::fallback::SwitchAction;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
@@ -630,9 +630,8 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -647,7 +646,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
 /// one cadence on a dead account.
 #[test]
 fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
-    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::fallback::SwitchAction;
     use crate::providers::Provider;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
@@ -702,9 +701,8 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -715,10 +713,10 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
 
 /// The scoped trigger through the REAL UI one-shot: `auto_switch_if_needed`
 /// must hop off an otherwise-healthy active whose per-model week is spent —
-/// through `fully_clear_target`, its only walk — and actually land the switch.
+/// through the scoped trigger's target walk — and actually land the switch.
 #[test]
 fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
-    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::fallback::SwitchAction;
     use crate::usage::{ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
@@ -782,9 +780,8 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -795,13 +792,12 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
 
 /// Twin of the hop-off test above, but the only sibling is canceled: its
 /// cached 5h window reads as idle headroom (the exact shape `is_canceled`
-/// exists to catch), yet every request against it 403s. `fully_clear_target`
-/// — the scoped trigger's only walk — must skip it same as `next_target`
-/// does, so the trigger finds nothing and leaves the scoped-blocked active in
-/// place rather than relinking onto a dead account.
+/// exists to catch), yet every request against it 403s. The scoped trigger's
+/// target walk must skip it same as the main walk does, so the trigger finds
+/// nothing and leaves the scoped-blocked active in place rather than relinking
+/// onto a dead account.
 #[test]
 fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_member() {
-    use crate::fallback::auto_switch_if_needed;
     use crate::usage::{
         PlanInfo, PlanTier, ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs,
     };
@@ -875,9 +871,8 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
         profiles: vec![a, b],
     };
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action, None,
         "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
@@ -894,7 +889,6 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
 /// `scoped_active_trigger_stays_parked_on_a_pinned_sink`).
 #[test]
 fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
-    use crate::fallback::auto_switch_if_needed;
     use crate::usage::{ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
@@ -949,9 +943,8 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
         profiles: vec![a, b],
     };
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(action, None, "a pinned sink stays parked");
     assert!(config.is_active(&crate::profile::ProfileName::from("a")));
 }
@@ -998,6 +991,94 @@ fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: boo
     }
 }
 
+/// The store bundle `auto_switch_if_needed` reads, seeded from the profiles'
+/// `Profile.usage` fields. A third-party-classified member takes its provider
+/// stats (one 5h bar at its 5h utilization); an OAuth member its OAuth entry.
+/// Freshness/staleness/kick verdicts stay empty: none of these tests drives a
+/// freshness preference or a kick bypass.
+fn one_shot_stores(config: &AppConfig) -> OneShotStores {
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use std::collections::HashMap;
+    let mut oauth: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    let mut third_party: HashMap<String, ThirdPartyStats> = HashMap::new();
+    for p in &config.profiles {
+        let Some(usage) = p.usage.as_ref() else {
+            continue;
+        };
+        if p.usage_cache_is_third_party() {
+            third_party.insert(
+                p.name.to_string(),
+                ThirdPartyStats {
+                    is_available: true,
+                    rows: Vec::new(),
+                    bars: usage
+                        .five_hour
+                        .as_ref()
+                        .map(|w| UsageBar {
+                            label: "5h".to_string(),
+                            pct: w.utilization,
+                            resets_at: w.resets_at.clone(),
+                            used: None,
+                            total: None,
+                        })
+                        .into_iter()
+                        .collect(),
+                    plan: None,
+                    endpoint: None,
+                    best_effort: false,
+
+                    observed: None,
+                },
+            );
+        } else {
+            oauth.insert(p.name.to_string(), usage.clone());
+        }
+    }
+    OneShotStores {
+        store: std::sync::Arc::new(crate::lockorder::RankedMutex::new(oauth)),
+        third_party_usage_store: std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+            third_party,
+        )),
+        status: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+        third_party_status: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+        streaks: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+        third_party_streaks: std::sync::Arc::new(
+            crate::lockorder::RankedMutex::new(HashMap::new()),
+        ),
+        kick_blocks: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+    }
+}
+
+struct OneShotStores {
+    store: crate::usage::UsageStore,
+    third_party_usage_store: crate::usage::ThirdPartyUsageStore,
+    status: crate::usage::StatusStore,
+    third_party_status: crate::usage::ThirdPartyStatusStore,
+    streaks: crate::usage::PollStreaks,
+    third_party_streaks: crate::usage::ThirdPartyStreaks,
+    kick_blocks: crate::usage::KickBlocks,
+}
+
+impl OneShotStores {
+    fn run(
+        &self,
+        config: &crate::profile::ConfigHandle,
+        rate: Option<f64>,
+    ) -> Result<Option<crate::fallback::SwitchAction>> {
+        crate::fallback::auto_switch_if_needed(
+            config,
+            rate,
+            &self.store,
+            &self.third_party_usage_store,
+            &self.status,
+            &self.third_party_status,
+            &self.streaks,
+            &self.third_party_streaks,
+            &self.kick_blocks,
+        )
+    }
+}
+
 /// Drive one decision/dispatch ordering cell: arm the rendezvous for
 /// `expected`, run the REAL `auto_switch_if_needed` on its own thread, release
 /// a REAL `switch_profile(&disk_handle, "c")` into the interval after the
@@ -1015,14 +1096,14 @@ fn assert_explicit_switch_waits_out_the_auto_transaction(
     let wrap_off = expected == crate::fallback::SwitchAction::Off;
     let sibling_util = if wrap_off { 96.0 } else { 10.0 };
     let config = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
+    let stores = one_shot_stores(&config);
 
     let handle: crate::profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     let auto_handle = std::sync::Arc::clone(&handle);
     let (decision_rx, permit_tx) =
         crate::fallback::install_auto_decision_rendezvous(expected.clone());
-    let auto_worker =
-        std::thread::spawn(move || crate::fallback::auto_switch_if_needed(&auto_handle, None));
+    let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
 
     let reached = decision_rx
         .recv_timeout(std::time::Duration::from_secs(30))
@@ -1107,6 +1188,102 @@ fn an_explicit_switch_cannot_slip_between_the_auto_off_decision_and_its_dispatch
     assert_explicit_switch_waits_out_the_auto_transaction(crate::fallback::SwitchAction::Off, "c");
 }
 
+/// The decide-then-hold gap's DISK half: a cross-process switch (the shape
+/// `tollgate switch` / MCP takes) writes only the on-disk active marker, never
+/// this process's in-memory config. Landed after the decision but before the
+/// hold, the re-validate's disk read must see it and drop the stale decision
+/// instead of overwriting it. Removing the disk half of the re-validate
+/// survives the re-check and reds here.
+#[test]
+fn a_disk_only_switch_landed_after_the_decision_is_not_overwritten() {
+    let _home = HomeSandbox::new();
+    let config = seed_auto_dispatch_fixture(96.0, 10.0, false);
+    let stores = one_shot_stores(&config);
+
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let auto_handle = std::sync::Arc::clone(&handle);
+    let (gap_rx, gap_tx) = crate::fallback::install_auto_decision_gap();
+    let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
+
+    let decided = gap_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the automatic actor reached the decision/hold gap");
+    assert_eq!(
+        decided,
+        crate::fallback::SwitchAction::To("b".to_string()),
+        "the fixture forces exactly this decision"
+    );
+    // A disk-only switch: it lands on the independent handle, so this TUI's
+    // in-memory config still names "a" while the on-disk marker becomes "c".
+    let writer_handle = switch_handle_from_disk();
+    switch_profile(&writer_handle, &"c".into()).expect("disk-only switch lands");
+    gap_tx.send(()).expect("release the automatic actor");
+
+    let result = auto_worker
+        .join()
+        .expect("the automatic actor did not panic")
+        .expect("the decision phase succeeded");
+    assert_eq!(result, None, "the one-shot drops the stale decision");
+    assert_eq!(persisted_active(), "c", "the disk-only switch survives");
+}
+
+/// The decide-then-hold gap's IN-MEMORY half: an in-process active change (the
+/// shape a worker thread's switch takes) updates this process's config without
+/// a matching disk write first. Landed after the decision but before the hold,
+/// the re-validate's in-memory read must see it and drop the stale decision.
+/// Removing the in-memory half of the re-validate survives the re-check and
+/// reds here.
+#[test]
+fn an_in_process_active_change_landed_after_the_decision_is_not_overwritten() {
+    let _home = HomeSandbox::new();
+    let config = seed_auto_dispatch_fixture(96.0, 10.0, false);
+    let stores = one_shot_stores(&config);
+
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let auto_handle = std::sync::Arc::clone(&handle);
+    let (gap_rx, gap_tx) = crate::fallback::install_auto_decision_gap();
+    let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
+
+    let decided = gap_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the automatic actor reached the decision/hold gap");
+    assert_eq!(
+        decided,
+        crate::fallback::SwitchAction::To("b".to_string()),
+        "the fixture forces exactly this decision"
+    );
+    // An in-memory-only change: the config names "c", the on-disk marker stays
+    // "a" — no writer touched it.
+    {
+        let mut cfg = handle.lock().expect("config mutex poisoned");
+        cfg.state.active_profile = Some("c".into());
+    }
+    gap_tx.send(()).expect("release the automatic actor");
+
+    let result = auto_worker
+        .join()
+        .expect("the automatic actor did not panic")
+        .expect("the decision phase succeeded");
+    assert_eq!(result, None, "the one-shot drops the stale decision");
+    assert_eq!(
+        handle
+            .lock()
+            .expect("config mutex poisoned")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("c"),
+        "the in-process active change survives"
+    );
+    assert_eq!(
+        persisted_active(),
+        "a",
+        "an in-memory-only change never touches the on-disk marker"
+    );
+}
+
 /// CONTROL, green before and after the fix: a healthy active below its
 /// threshold yields no decision, the call dispatches nothing and republishes
 /// nothing, and a following explicit switch lands and stays.
@@ -1114,10 +1291,9 @@ fn an_explicit_switch_cannot_slip_between_the_auto_off_decision_and_its_dispatch
 fn auto_switch_with_headroom_yields_no_dispatch_and_leaves_an_explicit_switch_in_place() {
     let home = HomeSandbox::new();
     let config = seed_auto_dispatch_fixture(10.0, 10.0, false);
+    let stores = one_shot_stores(&config);
 
-    let (_config, action) = through_handle(config, |h| {
-        crate::fallback::auto_switch_if_needed(h, None).expect("auto decision")
-    });
+    let (_config, action) = through_handle(config, |h| stores.run(h, None).expect("auto decision"));
     assert_eq!(action, None, "a healthy active yields no decision");
     assert!(
         !home.home().join(".tollgate").join("status.json").exists(),

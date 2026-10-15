@@ -2,7 +2,8 @@
 #![cfg(unix)]
 
 //! Pins for the herdr resume-command report leg (`hook_resume`): the trigger
-//! (`SessionStart`, a real attribution change, nothing else), the report
+//! (`SessionStart`, a real attribution change, a re-send herdr's refusal
+//! armed, nothing else), the report
 //! argv, the no-op cases (no pane seat, no attributable profile, a subagent
 //! fire, an unchanged account), the durable strictly-increasing seq, and the
 //! swallow-don't-fail posture. A shim herdr binary (via `HERDR_BIN_PATH`)
@@ -16,8 +17,8 @@ use std::time::Duration;
 use super::*;
 use crate::hook_note::{Payload, load_record, record_path, store_record};
 use crate::testutil::{
-    EnvPin, HomeSandbox, echo_shim, exit1_shim, hang_shim, herdr_pane_env, report_lines, seq_of,
-    wait_for_lines,
+    EnvPin, HomeSandbox, echo_shim, exit1_shim, hang_shim, herdr_error_shim, herdr_pane_env,
+    refuse_always_shim, refuse_once_shim, report_lines, seq_of, wait_for_lines,
 };
 
 /// A main-scope payload carrying only what these tests vary.
@@ -36,7 +37,7 @@ fn payload(event: &str, session: &str) -> Payload {
 /// seq itself is pinned by the range and monotonicity assertions.
 fn expected_line(pane: &str, sid: &str, profile: &str, seq: u64) -> String {
     format!(
-        "pane report-agent {pane} --source tollgate --agent claude --state working \
+        "pane report-agent-session {pane} --source tollgate --agent claude \
          --seq {seq} -- tollgate resume {sid} --profile {profile}"
     )
 }
@@ -77,14 +78,12 @@ fn an_attribution_change_reports_the_new_profile() {
 fn the_report_argv_is_pinned() {
     let expected: Vec<String> = [
         "pane",
-        "report-agent",
+        "report-agent-session",
         "w1:p1",
         "--source",
         "tollgate",
         "--agent",
         "claude",
-        "--state",
-        "working",
         "--seq",
         "42",
         "--",
@@ -98,6 +97,23 @@ fn the_report_argv_is_pinned() {
     .map(|s| s.to_string())
     .collect();
     assert_eq!(build_report_args("w1:p1", "sid", "prof", 42), expected);
+}
+
+/// herdr 0.9 stores a `pane report-agent` state from a non-herdr source as the
+/// pane's lifecycle authority, above its own screen detection. tollgate never
+/// reports `idle`, so a `--state working` report pinned the pane at `working`
+/// for the rest of its life. The resume command needs no state: herdr records
+/// it from a session report while no reporter holds the pane.
+#[test]
+fn the_report_never_claims_a_lifecycle_state() {
+    let args = build_report_args("w1:p1", "sid", "prof", 42);
+    assert_eq!(args[1], "report-agent-session");
+    let before_resume = &args[..args.iter().position(|a| a == "--").unwrap()];
+    assert!(!before_resume.iter().any(|a| a == "--state"), "{args:?}");
+    assert!(
+        !before_resume.iter().any(|a| a == "--agent-session-id"),
+        "{args:?}"
+    );
 }
 
 #[test]
@@ -197,6 +213,108 @@ fn a_failing_herdr_report_is_swallowed() {
     // all proves the failing status was swallowed.
     let lines = wait_for_lines(home.home(), 1, WAIT);
     assert_eq!(lines.len(), 1);
+}
+
+/// A `SessionStart` can reach herdr before its detector has seen Claude in the
+/// pane; herdr then answers `resume_not_accepted` and records nothing. The
+/// hook never waits for detection: the next main-scope fire re-sends, and an
+/// accepted re-send disarms it.
+#[test]
+fn a_refused_report_is_resent_on_the_next_fire_until_accepted() {
+    let home = HomeSandbox::new();
+    let shim = refuse_once_shim(home.home(), "herdr");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    report_for_fire(&payload("SessionStart", "sidrace"), Some("prof"), false);
+    assert_eq!(
+        report_lines(home.home()).len(),
+        1,
+        "the refused fire must not wait for herdr's detector"
+    );
+    let prompt = payload("UserPromptSubmit", "sidrace");
+    report_for_fire(&prompt, Some("prof"), false);
+    let lines = report_lines(home.home());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let (first, second) = (seq_of(&lines[0]), seq_of(&lines[1]));
+    assert!(
+        second > first,
+        "the re-send mints a newer seq: {first} then {second}"
+    );
+    assert_eq!(lines[1], expected_line("w1:p1", "sidrace", "prof", second));
+    report_for_fire(&prompt, Some("prof"), false);
+    assert_eq!(
+        report_lines(home.home()).len(),
+        2,
+        "an accepted re-send disarms the next fire"
+    );
+}
+
+/// Every fire sends at most once, so a pane where herdr never accepts costs
+/// each fire one report and never a wait.
+#[test]
+fn a_report_herdr_keeps_refusing_is_sent_once_per_fire() {
+    let home = HomeSandbox::new();
+    let shim = refuse_always_shim(home.home(), "herdr");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    report_for_fire(&payload("SessionStart", "sidnever"), Some("prof"), false);
+    assert_eq!(report_lines(home.home()).len(), 1);
+    let tool = payload("PostToolUse", "sidnever");
+    report_for_fire(&tool, Some("prof"), false);
+    report_for_fire(&tool, Some("prof"), false);
+    assert_eq!(report_lines(home.home()).len(), 3);
+}
+
+/// Only herdr's not-yet-accepted refusal arms a re-send: any other failure
+/// keeps the logged-silence posture, so a broken herdr is never re-spawned on
+/// every tool call.
+#[test]
+fn a_failure_other_than_a_refusal_arms_no_resend() {
+    let home = HomeSandbox::new();
+    let shim = exit1_shim(home.home(), "herdr");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    report_for_fire(&payload("SessionStart", "sidbroken"), Some("prof"), false);
+    report_for_fire(
+        &payload("UserPromptSubmit", "sidbroken"),
+        Some("prof"),
+        false,
+    );
+    assert_eq!(report_lines(home.home()).len(), 1);
+}
+
+/// The arm reads herdr's error code, not the bare fact of an error envelope:
+/// a stale pane id answers `pane_not_found` on every call, and re-sending it
+/// per tool call would buy nothing.
+#[test]
+fn another_herdr_error_code_arms_no_resend() {
+    let home = HomeSandbox::new();
+    let shim = herdr_error_shim(home.home(), "herdr", "pane_not_found");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    report_for_fire(&payload("SessionStart", "sidgone"), Some("prof"), false);
+    report_for_fire(&payload("UserPromptSubmit", "sidgone"), Some("prof"), false);
+    assert_eq!(report_lines(home.home()).len(), 1);
+}
+
+/// An armed re-send waits for a fire that can name the account and is the
+/// conversation's own: an unattributed fire and a subagent's fire send
+/// nothing and leave it armed.
+#[test]
+fn an_armed_resend_skips_unattributed_and_subagent_fires() {
+    let home = HomeSandbox::new();
+    let shim = refuse_once_shim(home.home(), "herdr");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    report_for_fire(&payload("SessionStart", "sidwait"), Some("prof"), false);
+    let prompt = payload("UserPromptSubmit", "sidwait");
+    report_for_fire(&prompt, None, false);
+    let mut sub = payload("PostToolUse", "sidwait");
+    sub.agent_id = Some("agent-1".to_string());
+    report_for_fire(&sub, Some("prof"), false);
+    assert_eq!(report_lines(home.home()).len(), 1);
+    report_for_fire(&prompt, Some("prof"), false);
+    let lines = report_lines(home.home());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines[1],
+        expected_line("w1:p1", "sidwait", "prof", seq_of(&lines[1]))
+    );
 }
 
 #[test]

@@ -232,6 +232,7 @@ How the Omarchy keys map onto tollgate's colour roles:
 | `walk_min_gain_mins` | integer | `60` | minimum earlier weekly reset for a proactive home walk (minimum effective gain is 60 seconds, including when set to `0`) |
 | `walk_cooldown_mins` | integer | `30` | dwell after a successful global switch (or the session’s own swap) before another proactive move; `0` disables the cooldown; future switch timestamps are ignored |
 | `last_switch_at` | integer | absent | saved Unix time of the last successful global switch; maintained by tollgate |
+| `bell_command` | string | none | the program the daemon runs once each time an account's 5h usage reaches its `bell_threshold` ([below](Configuration#configtoml)), with `%s` standing for the alert's text (`alert: work at 95%`). Split by shell quoting rules and run without a shell: `notify-send 'tollgate' %s`, or `sh -c 'logger "$1"' sh %s` when you want a shell (the text stays one argument). A Windows path goes in single quotes (`'C:\tools\notify.exe' %s`). An unbalanced quote, a trailing backslash or an empty value is logged and runs nothing. Hand-edited only; unset means no headless alert |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
@@ -292,7 +293,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `preferred` | bool | `false` | the home account tollgate returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
-| `bell_threshold` | float | none | 5h % that fires a bell toast |
+| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `tollgate rolling-token`, cleared by `tollgate static-token` (bare or `--clear`) |
 | `billing_key_env` | string | none | the NAME of an environment variable holding a monitoring-only key (an OpenRouter management key today). Only the name is stored. The daemon reads the value from its own environment at fetch time and sends it to `GET /api/v1/credits` and nowhere else; it is never written, printed or handed to a session, and every named variable is scrubbed from each `claude` / `codex` spawn. Process variables (`PATH`, `HOME`, `XDG_*`, …) are refused as names. Set it by hand; no TUI row writes it |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
