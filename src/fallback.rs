@@ -2120,8 +2120,6 @@ pub(crate) fn next_target(
 struct UsageReading {
     usage: HashMap<String, UsageInfo>,
     now_ms: u64,
-    third_party_names: HashSet<ProfileName>,
-    rate: ActiveBurnRate,
     burn_rates: std::cell::RefCell<HashMap<ProfileName, Option<f64>>>,
     third_party_names: HashSet<ProfileName>,
     rate: ActiveBurnRate,
@@ -2132,8 +2130,6 @@ impl UsageReading {
         Self {
             usage,
             now_ms,
-            third_party_names: HashSet::new(),
-            rate: ActiveBurnRate::FromDisk,
             burn_rates: std::cell::RefCell::new(HashMap::new()),
             third_party_names: HashSet::new(),
             rate: ActiveBurnRate::FromDisk,
@@ -2662,7 +2658,7 @@ fn next_auto_switch_target_core(
 #[cfg(test)]
 pub(crate) fn find_recovered_member_for_test(
     chain: &[ChainMember],
-    usage: &HashMap<String, UsageInfo>,
+    store: &UsageStore,
     kick_rejected: &[ProfileName],
     walk_order: WalkOrder,
 ) -> Option<String> {
@@ -2932,6 +2928,8 @@ pub(crate) fn auto_switch_if_needed(
     third_party_streaks: &ThirdPartyStreaks,
     kick_blocks: &KickBlocks,
 ) -> Result<Option<SwitchAction>> {
+    // Guest mode: the global account is upstream clauth's to switch. A silent
+    // stay-put, since this runs unattended.
     if crate::identity::upstream_active() {
         return Ok(None);
     }
@@ -3024,82 +3022,3 @@ pub(crate) fn auto_switch_if_needed(
 #[cfg(test)]
 #[path = "../tests/inline/fallback.rs"]
 mod tests;
-
-#[derive(Clone, Copy)]
-pub(crate) enum ActiveBurnRate {
-    FromDisk,
-    Supplied(Option<f64>),
-}
-
-// ── test-only decision/hold gap ──────────────────────────────────────────────
-//
-// `auto_switch_if_needed` decides BEFORE it takes the config+flock hold; this
-// seam is what makes the gap between the two falsifiable. A test arms it; when
-// the actor reaches the gap with a decision in hand it reports and parks until
-// the controller releases it — holding NO locks, since the decision phase
-// already dropped the config guard — so the controller can land a disk-only
-// switch (the shape `tollgate switch` / MCP takes) that the re-validate under the
-// hold must then see and drop. Fires at most once per arming, so every unarmed
-// caller passes through untouched.
-#[cfg(test)]
-struct AutoDecisionGap {
-    reached: std::sync::mpsc::Sender<SwitchAction>,
-    release: std::sync::mpsc::Receiver<()>,
-}
-
-#[cfg(test)]
-static AUTO_DECISION_GAP: std::sync::Mutex<Option<AutoDecisionGap>> = std::sync::Mutex::new(None);
-
-/// Arm the gap seam: the next decision reports its action on the returned
-/// receiver and parks until a send on the returned sender. One gap at a time;
-/// tests arming one hold a `HomeSandbox`, which serializes them.
-#[cfg(test)]
-pub(crate) fn install_auto_decision_gap() -> (
-    std::sync::mpsc::Receiver<SwitchAction>,
-    std::sync::mpsc::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let mut slot = AUTO_DECISION_GAP.lock().unwrap_or_else(|e| e.into_inner());
-    assert!(slot.is_none(), "only one auto-decision gap may be armed");
-    *slot = Some(AutoDecisionGap {
-        reached: reached_tx,
-        release: release_rx,
-    });
-    (reached_rx, release_tx)
-}
-
-/// The gap's park: report the decision, then hold the actor here until the
-/// controller releases it — under no locks, exactly like the production path
-/// between the decision and the config+flock hold.
-#[cfg(test)]
-fn auto_decision_gap(action: &SwitchAction) {
-    let gap = {
-        let mut slot = AUTO_DECISION_GAP.lock().unwrap_or_else(|e| e.into_inner());
-        slot.take()
-    };
-    let Some(gap) = gap else {
-        return;
-    };
-    gap.reached
-        .send(action.clone())
-        .expect("gap controller stays alive until the gap is reached");
-    gap.release
-        .recv()
-        .expect("gap controller releases the actor");
-}
-
-#[cfg(test)]
-fn find_recovered_member_for_test(
-    chain: &[ChainMember],
-    store: &UsageStore,
-    kick_rejected: &[ProfileName],
-    walk_order: WalkOrder,
-) -> Option<String> {
-    find_recovered_member(
-        chain,
-        &usage_snapshot(store).usage,
-        kick_rejected,
-        walk_order,
-    )
-}

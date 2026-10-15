@@ -4313,7 +4313,7 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     );
     static_config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&static_config, &HashSet::new()),
+        next_target(&static_config, None, &HashSet::new()),
         Some(SwitchAction::Off),
         "static mode: 96% is over the 95% threshold → Off"
     );

@@ -437,11 +437,6 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
-    /// Threshold for the five-hour alert; the legacy TOML key remains accepted.
-    pub(crate) fn five_hour_alert_threshold(&self) -> Option<f64> {
-        self.bell_threshold
-    }
-
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {

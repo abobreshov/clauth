@@ -688,7 +688,6 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         }),
         ..Default::default()
     };
-    let window = spent.five_hour.expect("spent provider window");
     daemon
         .third_party_usage_store
         .lock()

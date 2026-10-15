@@ -11006,7 +11006,7 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) {
             Some(profile) => {
                 let before = profile.bell_threshold;
                 profile.bell_threshold = value;
-                let saved = save_profile(profile);
+                let saved = save_profile_config(profile);
                 if saved.is_err()
                     && let Some(p) = cfg.find_mut(&name)
                 {
