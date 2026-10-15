@@ -4776,3 +4776,211 @@ fn truncate_chain_keeps_all_complete_narrow_members_when_their_rows_fit() {
         ]
     );
 }
+
+#[test]
+fn antigravity_multi_group_windows_render_separate_overview_rows() {
+    use crate::usage::observation::{
+        AccountObservation, AuthKind, Origin, QuotaWindow, SourceId, Timestamp, WindowScope,
+        account_id,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(vec![], None, vec![]));
+    let widths = OverviewWidths::new(140, &app);
+    let now = 1_790_000_000_i64;
+
+    let mut obs = AccountObservation::new(
+        account_id(Origin::Monitor, "antigravity"),
+        SourceId::Antigravity,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Antigravity (agy login)",
+    );
+    obs.plan = Some("Google AI Ultra".into());
+
+    let mut gemini_5h = QuotaWindow::new(
+        "agy.gemini-5h",
+        "5h Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    gemini_5h.window_secs = Some(18_000);
+    gemini_5h.used_pct = Some(4.0);
+    gemini_5h.resets_at = Some(Timestamp(now + 4 * 3_600 + 38 * 60));
+
+    let mut gemini_7d = QuotaWindow::new(
+        "agy.gemini-weekly",
+        "7d Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    gemini_7d.window_secs = Some(604_800);
+    gemini_7d.used_pct = Some(49.0);
+    gemini_7d.resets_at = Some(Timestamp(now + 5 * 86_400 + 22 * 3_600));
+
+    let mut claude_5h = QuotaWindow::new(
+        "agy.3p-5h",
+        "5h Claude and GPT models",
+        WindowScope::Model {
+            models: vec!["Claude and GPT models".into()],
+        },
+    );
+    claude_5h.window_secs = Some(18_000);
+    claude_5h.used_pct = Some(0.0);
+    claude_5h.resets_at = Some(Timestamp(now + 2 * 3_600 + 40 * 60));
+
+    let mut claude_7d = QuotaWindow::new(
+        "agy.3p-weekly",
+        "7d Claude and GPT models",
+        WindowScope::Model {
+            models: vec!["Claude and GPT models".into()],
+        },
+    );
+    claude_7d.window_secs = Some(604_800);
+    claude_7d.used_pct = Some(0.0);
+    claude_7d.resets_at = Some(Timestamp(now + 6 * 86_400 + 21 * 3_600));
+
+    obs.windows = vec![gemini_5h, gemini_7d, claude_5h, claude_7d];
+
+    let rendered = render_extra_rows(&obs, &widths, false, false, ResetFmt::default(), now);
+    assert_eq!(
+        rendered.len(),
+        2,
+        "two model groups render two overview rows"
+    );
+    let row_gemini = line_text(&rendered[0]);
+    let row_claude = line_text(&rendered[1]);
+    assert!(
+        row_gemini.contains("Antigravity (Gemini)")
+            && row_gemini.contains("4% (4h 38m)")
+            && row_gemini.contains("49% (5d 22h)"),
+        "first row shows Gemini 5h and 7d windows: {row_gemini}"
+    );
+    assert!(
+        row_claude.contains("Antigravity (Claude/GPT)")
+            && row_claude.contains("0% (2h 40m)")
+            && row_claude.contains("0% (6d 21h)"),
+        "second row shows Claude/GPT 5h and 7d windows: {row_claude}"
+    );
+
+    crate::tui::app::set_usage_extras(&mut app, vec![obs]);
+    let rows = overview_text(&app, 140, 12);
+    let _ = row_with(&rows, "Antigravity (Gemini)");
+    let _ = row_with(&rows, "Antigravity (Claude/GPT)");
+}
+
+#[test]
+fn grok_single_7d_window_renders_in_7d_column_and_renders_refresh_spinner() {
+    use crate::usage::observation::{
+        AccountObservation, AuthKind, Origin, QuotaWindow, SourceId, Timestamp, WindowScope,
+        account_id,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(vec![], None, vec![]));
+    let now = 1_790_000_000_i64;
+
+    let mut grok = AccountObservation::new(
+        account_id(Origin::Monitor, "grok"),
+        SourceId::Grok,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Grok (CLI login)",
+    );
+    grok.plan = Some("xAI".into());
+    let mut win = QuotaWindow::new("grok.shared", "7d", WindowScope::Shared);
+    win.window_secs = Some(604_800);
+    win.used_pct = Some(5.0);
+    win.resets_at = Some(Timestamp(now + 6 * 86_400 + 3 * 3_600));
+    grok.windows = vec![win];
+
+    let widths = OverviewWidths::new(140, &app);
+    let text = line_text(&render_extra_row(
+        &grok,
+        &widths,
+        false,
+        false,
+        ResetFmt::default(),
+        now,
+    ));
+    assert!(text.contains("5% (6d 3h)"), "7d window in 7d slot: {text}");
+    assert!(
+        !text.contains("(7d)"),
+        "single 7d window must not print literal (7d) in 7d column: {text}"
+    );
+    let before_weekly = text
+        .split("5% (6d 3h)")
+        .next()
+        .expect("text before weekly cell");
+    assert!(
+        before_weekly.contains(NO_DATA),
+        "5h column is marked empty with NO_DATA dash before the 7d column: {text}"
+    );
+
+    crate::tui::app::set_usage_extras(&mut app, vec![grok]);
+    app.monitor_refresh_inflight
+        .lock()
+        .unwrap()
+        .insert("monitor:grok".into());
+    let rows = overview_text(&app, 140, 12);
+    let grok_row = row_with(&rows, "Grok (CLI login)");
+    assert!(
+        grok_row.contains(spinner_frame(app.tick_count)),
+        "monitor row renders loading spinner in TIMER_SLOT while refreshing: {grok_row}"
+    );
+}
+
+#[test]
+fn overview_groups_accounts_and_monitors_by_provider() {
+    use crate::usage::observation::{AccountObservation, AuthKind, Origin, SourceId, account_id};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![
+            profile("personal", 80.0, 10.0, 3_600),
+            profile("work", 60.0, 20.0, 3_600),
+        ],
+        Some("personal"),
+        vec![],
+    ));
+    let grok_1 = AccountObservation::new(
+        account_id(Origin::Monitor, "grok-1"),
+        SourceId::Grok,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Grok 1",
+    );
+    let agy = AccountObservation::new(
+        account_id(Origin::Monitor, "antigravity"),
+        SourceId::Antigravity,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Antigravity (agy login)",
+    );
+    let grok_2 = AccountObservation::new(
+        account_id(Origin::Monitor, "grok-2"),
+        SourceId::Grok,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Grok 2",
+    );
+    crate::tui::app::set_usage_extras(&mut app, vec![grok_1, agy, grok_2]);
+
+    let rows = overview_text(&app, 120, 20);
+    let text = rows.join("\n");
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{text}"))
+    };
+
+    assert!(at("Anthropic") < at("personal"), "{text}");
+    assert!(at("personal") < at("work"), "{text}");
+    assert!(at("work") < at("monitors · Grok"), "{text}");
+    assert!(at("monitors · Grok") < at("Grok 1"), "{text}");
+    assert!(at("Grok 1") < at("Grok 2"), "{text}");
+    assert!(at("Grok 2") < at("monitors · Antigravity"), "{text}");
+    assert!(
+        at("monitors · Antigravity") < at("Antigravity (agy logi"),
+        "{text}"
+    );
+}

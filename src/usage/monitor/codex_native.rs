@@ -173,6 +173,136 @@ impl UsageSource for CodexNativeSource {
         })
     }
 }
+pub(crate) fn has_recovered_login(
+    cfg: &super::config::MonitorConfig,
+    failure_msg: &str,
+    checked_at_ms: u64,
+    now_secs: i64,
+) -> bool {
+    let Ok(home) = crate::profile::home_dir() else {
+        return false;
+    };
+    let tool_home = cfg.tool_home_in(&home);
+    if read_auth(&tool_home, now_secs).is_err() {
+        return false;
+    }
+    failure_msg != "codex's login was rejected; run codex"
+        || super::cache::file_modified_after(&tool_home.join("auth.json"), checked_at_ms)
+}
+
+/// The monitor row an official login gets when nobody has added one.
+/// Same non-secret fields as `tollgate monitor add codex-native`.
+fn official_monitor() -> super::config::MonitorConfig {
+    super::config::MonitorConfig {
+        id: "codex-native".into(),
+        kind: super::config::MonitorKind::CodexNative,
+        provider: None,
+        label: Some("Codex (~/.codex login)".into()),
+        api_key_env: None,
+        billing_key_env: None,
+        hermes_home: None,
+        tool_home: Some("~/.codex".into()),
+        auth_entry: None,
+        via: None,
+        probe_model: None,
+        probe: false,
+        budget_usd_month: None,
+        alert_pct: None,
+        ttl_secs: Some(300),
+        enabled: true,
+    }
+}
+
+fn single_official_login(home: &Path, now_secs: i64) -> bool {
+    read_auth(&home.join(".codex"), now_secs).is_ok()
+}
+
+pub(crate) fn ensure_official_codex_config(now_ms: u64) {
+    let Ok(home) = crate::profile::home_dir() else {
+        return;
+    };
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+    if !single_official_login(&home, now_secs) {
+        return;
+    }
+    let Ok(monitors) = super::config::load() else {
+        return;
+    };
+    if monitors
+        .iter()
+        .any(|m| m.kind == super::config::MonitorKind::CodexNative)
+    {
+        return;
+    }
+    let cfg = official_monitor();
+    let _ = super::config::add(&cfg);
+}
+
+fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now_ms: u64) {
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+    if let Some(cache) = super::cache::load(&cfg.id)
+        && cache.matches(cfg)
+        && (cache.reading.is_some() || cache.checked_at_ms.is_some())
+    {
+        let checked_ms = cache.checked_at_ms.unwrap_or(0);
+        let recovered = cache.failure.as_ref().is_some_and(|f| {
+            f.kind == FailureKind::AuthRequired
+                && has_recovered_login(cfg, &f.message, checked_ms, now_secs)
+        });
+        if !recovered {
+            return;
+        }
+    }
+    let deps = super::cache::RefreshDeps {
+        http,
+        notifier: None,
+        env: &super::source::process_env,
+        now_ms,
+    };
+    let _ = super::cache::refresh_one(cfg, &deps, true);
+}
+
+/// Make one official regular-file `~/.codex/auth.json` login visible to the
+/// normal monitor collector.
+///
+/// Writes only tollgate's own monitor row and cache, and only when that row
+/// is missing or its cache has never been filled. Does not refresh, lock, or
+/// rewrite the Codex auth store. A missing, expired, or symlinked login
+/// leaves the report unchanged.
+pub(crate) fn ensure_official_codex(http: &dyn MonitorHttp, now_ms: u64) {
+    let Ok(home) = crate::profile::home_dir() else {
+        return;
+    };
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+    if !single_official_login(&home, now_secs) {
+        return;
+    }
+    let Ok(monitors) = super::config::load() else {
+        return;
+    };
+    if let Some(existing) = monitors
+        .iter()
+        .find(|m| m.kind == super::config::MonitorKind::CodexNative)
+    {
+        if existing.enabled {
+            fill_if_empty(existing, http, now_ms);
+        }
+        return;
+    }
+    let cfg = official_monitor();
+    if super::config::add(&cfg).is_err() {
+        if let Ok(monitors) = super::config::load()
+            && let Some(existing) = monitors
+                .iter()
+                .find(|m| m.kind == super::config::MonitorKind::CodexNative && m.enabled)
+        {
+            fill_if_empty(existing, http, now_ms);
+        }
+        return;
+    }
+    fill_if_empty(&cfg, http, now_ms);
+}
+
 #[cfg(test)]
 #[path = "../../../tests/inline/usage_monitor_codex_native.rs"]
 mod tests;

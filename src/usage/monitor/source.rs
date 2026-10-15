@@ -176,6 +176,8 @@ pub(crate) struct Reading {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plan_checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cloudaicompanion_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) probe_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) probe_model_at: Option<i64>,

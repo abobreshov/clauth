@@ -55,6 +55,12 @@ pub(crate) fn poll_detached() {
     }
     LAST_SCAN_MS.store(now, Ordering::Relaxed);
     crate::secrets::reload_if_changed();
+    #[cfg(not(test))]
+    {
+        super::grok::ensure_official_grok_config();
+        super::antigravity::ensure_official_antigravity_config(now);
+        super::codex_native::ensure_official_codex_config(now);
+    }
     let monitors = match super::config::load() {
         Ok(m) => m,
         Err(e) => {

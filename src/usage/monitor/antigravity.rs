@@ -245,7 +245,7 @@ struct Token {
     )]
     expiry: Option<Value>,
 }
-pub(crate) fn parse_blob(bytes: &[u8], now: i64) -> Result<Secret, Failure> {
+pub(crate) fn parse_blob_with_expiry(bytes: &[u8], now: i64) -> Result<(Secret, i64), Failure> {
     if bytes.len() > 1024 * 1024 {
         return Err(Failure::new(
             FailureKind::Unavailable,
@@ -277,7 +277,7 @@ pub(crate) fn parse_blob(bytes: &[u8], now: i64) -> Result<Secret, Failure> {
         None => crate::codex_auth::jwt_exp_ms(access.expose()).map(|ms| ms / 1000),
     };
     match expiry {
-        Some(exp) if exp > now.saturating_add(60) => Ok(access),
+        Some(exp) if exp > now.saturating_add(60) => Ok((access, exp)),
         Some(_) => Err(Failure::new(
             FailureKind::AuthRequired,
             "agy's token expired; open agy for a moment",
@@ -288,12 +288,22 @@ pub(crate) fn parse_blob(bytes: &[u8], now: i64) -> Result<Secret, Failure> {
         )),
     }
 }
-pub(crate) fn read_token(probe: &dyn KeyringProbe, now: i64) -> Result<Secret, Failure> {
+#[cfg(test)]
+pub(crate) fn parse_blob(bytes: &[u8], now: i64) -> Result<Secret, Failure> {
+    parse_blob_with_expiry(bytes, now).map(|(access, _)| access)
+}
+pub(crate) fn read_token_with_expiry(
+    probe: &dyn KeyringProbe,
+    now: i64,
+) -> Result<(Secret, i64), Failure> {
     if !probe.has_owner()? {
         return Err(unavailable());
     }
     check_items(&probe.metadata()?)?;
-    parse_blob(&probe.secret()?, now)
+    parse_blob_with_expiry(&probe.secret()?, now)
+}
+pub(crate) fn read_token(probe: &dyn KeyringProbe, now: i64) -> Result<Secret, Failure> {
+    read_token_with_expiry(probe, now).map(|(access, _)| access)
 }
 fn status(reply: &HttpReply, now: i64) -> Result<(), Failure> {
     match reply.status {
@@ -325,6 +335,15 @@ fn status(reply: &HttpReply, now: i64) -> Result<(), Failure> {
         )),
     }
 }
+pub(crate) fn needs_project_backfill(reading: &Reading) -> bool {
+    reading
+        .cloudaicompanion_project
+        .as_deref()
+        .is_none_or(str::is_empty)
+        && (reading.plan.as_deref() == Some("Gemini Code Assist")
+            || (!reading.windows.is_empty()
+                && reading.windows.iter().all(|w| w.id.starts_with("agy.3p-"))))
+}
 #[cfg(target_os = "linux")]
 pub(crate) fn fetch_with(
     target: &MonitorTarget,
@@ -341,8 +360,9 @@ pub(crate) fn fetch_with(
         return fetch_cli(&LiveCliRunner, target.now_secs);
     }
     let token = read_token(probe, target.now_secs)?;
-    let send = |host: &str, path: &str, agent: &'static str| {
-        let url = format!("https://{host}.googleapis.com/v1internal:{path}");
+    let host = std::cell::Cell::new("daily-cloudcode-pa");
+    let send_one = |h: &str, path: &str, agent: &'static str, body: &[u8]| {
+        let url = format!("https://{h}.googleapis.com/v1internal:{path}");
         http.send(
             MonitorKind::Antigravity,
             &Request {
@@ -350,41 +370,95 @@ pub(crate) fn fetch_with(
                 url: &url,
                 auth: Auth::Bearer(&token),
                 extra: &[("User-Agent", agent)],
-                json_body: Some(b"{}"),
+                json_body: Some(body),
             },
         )
     };
-    let mut host = "daily-cloudcode-pa";
-    let first = send(host, "retrieveUserQuotaSummary", "antigravity");
-    let quota = if first
-        .as_ref()
-        .map_or(true, |r| r.status == 404 || r.status >= 500)
-    {
-        host = "cloudcode-pa";
-        send(host, "retrieveUserQuotaSummary", "antigravity")?
-    } else {
-        first?
+    let send_post = |path: &str, agent: &'static str, body: &[u8]| -> Result<HttpReply, Failure> {
+        let first = send_one(host.get(), path, agent, body);
+        if host.get() == "daily-cloudcode-pa"
+            && first
+                .as_ref()
+                .map_or(true, |r| r.status == 404 || r.status >= 500)
+        {
+            host.set("cloudcode-pa");
+            send_one(host.get(), path, agent, body)
+        } else {
+            first
+        }
     };
+    let previous = target.previous.as_ref();
+    let mut plan = previous.and_then(|p| p.plan.clone());
+    let mut plan_checked_at = previous.and_then(|p| p.plan_checked_at);
+    let mut project = previous.and_then(|p| p.cloudaicompanion_project.clone());
+    if plan_checked_at.is_none_or(|at| target.now_secs.saturating_sub(at) >= 86400)
+        || previous.is_some_and(needs_project_backfill)
+    {
+        let reply = send_post(
+            "loadCodeAssist",
+            "antigravity",
+            br#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#,
+        )?;
+        status(&reply, target.now_secs)?;
+        let raw: Value = serde_json::from_str(&reply.body).map_err(|_| {
+            Failure::new(FailureKind::Unavailable, "agy plan response unrecognized")
+        })?;
+        let root = raw.get("response").unwrap_or(&raw);
+        let resolved_project = extract_project(root);
+        let has_paid_tier = root["paidTier"]["name"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
+        plan = if !has_paid_tier && let Some(proj) = resolved_project.as_deref() {
+            let body = serde_json::json!({
+                "cloudaicompanionProject": proj,
+                "metadata": { "ideType": "ANTIGRAVITY" }
+            })
+            .to_string();
+            let reply2 = send_post("loadCodeAssist", "antigravity", body.as_bytes())?;
+            status(&reply2, target.now_secs)?;
+            let raw2: Value = serde_json::from_str(&reply2.body).map_err(|_| {
+                Failure::new(FailureKind::Unavailable, "agy plan response unrecognized")
+            })?;
+            let root2 = raw2.get("response").unwrap_or(&raw2);
+            extract_plan(root2).or_else(|| extract_plan(root))
+        } else {
+            extract_plan(root)
+        };
+        project = resolved_project;
+        plan_checked_at = Some(target.now_secs);
+    }
+    let quota_body = match project.as_deref().filter(|s| !s.is_empty()) {
+        Some(proj) => serde_json::json!({ "project": proj }).to_string(),
+        None => "{}".to_string(),
+    };
+    let quota = send_post(
+        "retrieveUserQuotaSummary",
+        "antigravity",
+        quota_body.as_bytes(),
+    )?;
     status(&quota, target.now_secs)?;
     let quota: Value = serde_json::from_str(&quota.body)
         .map_err(|_| Failure::new(FailureKind::Unavailable, "agy quota response unrecognized"))?;
     let mut reading = map_summary(&quota)?;
-    let previous = target.previous.as_ref();
-    reading.plan = previous.and_then(|p| p.plan.clone());
-    reading.plan_checked_at = previous.and_then(|p| p.plan_checked_at);
-    if reading
-        .plan_checked_at
-        .is_none_or(|at| target.now_secs.saturating_sub(at) >= 86400)
+    if host.get() == "daily-cloudcode-pa"
+        && reading.windows.iter().all(|w| w.id.starts_with("agy.3p-"))
     {
-        let plan = send(host, "loadCodeAssist", "agy")?;
-        status(&plan, target.now_secs)?;
-        let plan: Value = serde_json::from_str(&plan.body).map_err(|_| {
-            Failure::new(FailureKind::Unavailable, "agy plan response unrecognized")
+        host.set("cloudcode-pa");
+        let prod = send_one(
+            host.get(),
+            "retrieveUserQuotaSummary",
+            "antigravity",
+            quota_body.as_bytes(),
+        )?;
+        status(&prod, target.now_secs)?;
+        let prod: Value = serde_json::from_str(&prod.body).map_err(|_| {
+            Failure::new(FailureKind::Unavailable, "agy quota response unrecognized")
         })?;
-        let plan = plan.get("response").unwrap_or(&plan);
-        reading.plan = extract_plan(plan);
-        reading.plan_checked_at = Some(target.now_secs);
+        reading = map_summary(&prod)?;
     }
+    reading.plan = plan;
+    reading.plan_checked_at = plan_checked_at;
+    reading.cloudaicompanion_project = project;
     Ok(reading)
 }
 #[cfg(not(target_os = "linux"))]
@@ -394,6 +468,14 @@ pub(crate) fn fetch_with(
     _: &dyn KeyringProbe,
 ) -> Result<Reading, Failure> {
     Err(Failure::new(FailureKind::Unavailable, "Linux only in 0.1"))
+}
+fn extract_project(root: &Value) -> Option<String> {
+    root["cloudaicompanionProject"]
+        .as_str()
+        .or_else(|| root["cloudaicompanionProject"]["id"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 fn extract_plan(root: &Value) -> Option<String> {
     root["paidTier"]["name"]
@@ -879,20 +961,45 @@ fn official_monitor() -> super::config::MonitorConfig {
     }
 }
 
-fn single_official_login(now_secs: i64) -> bool {
+fn current_official_login_expiry(now_secs: i64) -> Option<i64> {
     #[cfg(test)]
     if let Some(probe) = TEST_KEYRING.with(|p| p.borrow().clone()) {
-        return read_token(probe.as_ref(), now_secs).is_ok();
+        return read_token_with_expiry(probe.as_ref(), now_secs)
+            .ok()
+            .map(|(_, exp)| exp);
     }
-    read_token(&LiveKeyring, now_secs).is_ok()
+    read_token_with_expiry(&LiveKeyring, now_secs)
+        .ok()
+        .map(|(_, exp)| exp)
+}
+
+pub(crate) fn single_official_login(now_secs: i64) -> bool {
+    current_official_login_expiry(now_secs).is_some()
+}
+
+pub(crate) fn has_recovered_login(failure_msg: &str, checked_secs: i64, now_secs: i64) -> bool {
+    let Some(exp) = current_official_login_expiry(now_secs) else {
+        return false;
+    };
+    failure_msg != "open agy and sign in" || exp > checked_secs.saturating_add(3540)
 }
 
 fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now_ms: u64) {
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
     if let Some(cache) = super::cache::load(&cfg.id)
         && cache.matches(cfg)
         && (cache.reading.is_some() || cache.checked_at_ms.is_some())
     {
-        return;
+        let checked_secs = (cache.checked_at_ms.unwrap_or(0) / 1000) as i64;
+        let recovered = cache.failure.as_ref().is_some_and(|f| {
+            f.kind == FailureKind::AuthRequired
+                && has_recovered_login(&f.message, checked_secs, now_secs)
+        });
+        let backfill =
+            cache.failure.is_none() && cache.reading.as_ref().is_some_and(needs_project_backfill);
+        if !recovered && !backfill {
+            return;
+        }
     }
     let deps = super::cache::RefreshDeps {
         http,
@@ -901,6 +1008,21 @@ fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now
         now_ms,
     };
     let _ = super::cache::refresh_one(cfg, &deps, true);
+}
+
+pub(crate) fn ensure_official_antigravity_config(now_ms: u64) {
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+    if !single_official_login(now_secs) {
+        return;
+    }
+    let Ok(monitors) = super::config::load() else {
+        return;
+    };
+    if monitors.iter().any(|m| m.kind == MonitorKind::Antigravity) {
+        return;
+    }
+    let cfg = official_monitor();
+    let _ = super::config::add(&cfg);
 }
 
 /// Make one unlocked official Antigravity keyring login visible to the normal

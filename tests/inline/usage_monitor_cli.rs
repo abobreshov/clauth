@@ -202,6 +202,10 @@ fn monitor_add_codex_native_and_agy_aliases() {
         add_args(&["codex-native"]).to_config().unwrap().kind,
         MonitorKind::CodexNative
     );
+    assert_eq!(
+        add_args(&["codex"]).to_config().unwrap().kind,
+        MonitorKind::CodexNative
+    );
     let m = add_args(&["agy", "--id", "agy-two"]).to_config().unwrap();
     assert_eq!(m.id, "agy-two");
     assert_eq!(m.via.as_deref(), Some("keyring"));

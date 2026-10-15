@@ -634,6 +634,26 @@ fn value_label(v: &Value) -> Option<String> {
     }
 }
 
+pub(crate) fn has_recovered_login(
+    cfg: &super::config::MonitorConfig,
+    failure_msg: &str,
+    checked_at_ms: u64,
+    now_secs: i64,
+) -> bool {
+    if cfg.api_key_env.is_some() || cfg.billing_key_env.is_some() {
+        return false;
+    }
+    let Ok(home) = crate::profile::home_dir() else {
+        return false;
+    };
+    let tool_home = cfg.tool_home_in(&home);
+    if read_hermes_token(&tool_home, now_secs).is_err() {
+        return false;
+    }
+    failure_msg != "Nous login rejected; run hermes and log in to Nous"
+        || super::cache::file_modified_after(&tool_home.join("auth.json"), checked_at_ms)
+}
+
 #[cfg(test)]
 #[path = "../../../tests/inline/usage_monitor_nous.rs"]
 mod tests;

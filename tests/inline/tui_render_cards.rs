@@ -189,3 +189,48 @@ fn monitor_detail_scroll_reaches_the_last_window_without_local_account_hints() {
     handle_key(&mut app, key(KeyCode::Esc));
     assert_eq!(app.usage_detail_focus, StatusFocus::List);
 }
+
+#[test]
+fn usage_rail_groups_accounts_by_provider() {
+    use crate::usage::observation::{AccountObservation, AuthKind, Origin, SourceId, account_id};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    let grok = AccountObservation::new(
+        account_id(Origin::Monitor, "grok"),
+        SourceId::Grok,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Grok (CLI login)",
+    );
+    let agy = AccountObservation::new(
+        account_id(Origin::Monitor, "antigravity"),
+        SourceId::Antigravity,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Antigravity (agy login)",
+    );
+    let app = app_with_extras(vec![grok, agy]);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| super::super::usage::draw(f, f.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let text = rows.join("\n");
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{text}"))
+    };
+
+    assert!(at("  Anthropic") < at("❯ work"), "{text}");
+    assert!(at("❯ work") < at("  Grok"), "{text}");
+    assert!(at("  Grok") < at("Grok (CLI login) · moni"), "{text}");
+    assert!(
+        at("Grok (CLI login) · moni") < at("  Antigravity"),
+        "{text}"
+    );
+    assert!(
+        at("  Antigravity") < at("Antigravity (agy login)"),
+        "{text}"
+    );
+}

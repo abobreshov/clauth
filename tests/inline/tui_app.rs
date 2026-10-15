@@ -20226,3 +20226,61 @@ fn pick_pinned_test_preset(app: &mut App) {
     form.cursor = form.presets.len();
     form.presets.push(preset);
 }
+
+#[test]
+fn manual_refresh_queues_third_party_profiles_and_monitors_with_loading_state() {
+    use crate::usage::monitor::config::{MonitorConfig, MonitorKind};
+    use crate::usage::observation::{AccountObservation, AuthKind, Origin, SourceId, account_id};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut grok_cfg = MonitorConfig::new("grok", MonitorKind::Grok);
+    grok_cfg.label = Some("Grok (CLI login)".into());
+    crate::usage::monitor::config::add(&grok_cfg).unwrap();
+
+    let tp =
+        crate::testutil::api_key_profile("ds", "https://api.deepseek.com/anthropic", "sk-test");
+    let mut app = app_with(vec![tp]);
+    let obs = AccountObservation::new(
+        account_id(Origin::Monitor, "grok"),
+        SourceId::Grok,
+        AuthKind::NativeLogin,
+        Origin::Monitor,
+        "Grok (CLI login)",
+    );
+    crate::tui::app::set_usage_extras(&mut app, vec![obs]);
+
+    app.tab = super::Tab::Overview;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+
+    assert!(
+        app.refetch_queue.lock().unwrap().contains("ds"),
+        "Overview r queues third-party profiles for refetch"
+    );
+    assert!(
+        app.is_monitor_refreshing("monitor:grok"),
+        "Overview r marks enabled monitors in-flight for loading spinner"
+    );
+
+    // Clear in-flight state and verify Usage `r` on a focused monitor refreshes that monitor and shows spinner in detail pane.
+    app.monitor_refresh_inflight.lock().unwrap().clear();
+    app.tab = super::Tab::Usage;
+    app.usage_extra_cursor = Some(0);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert!(
+        app.is_monitor_refreshing("monitor:grok"),
+        "Usage r on a focused monitor marks it refreshing"
+    );
+    assert_eq!(
+        app.toasts.back().unwrap().body,
+        "refreshing 'Grok (CLI login)'"
+    );
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let rendered = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(
+        rendered.contains("fetching"),
+        "Usage detail header shows fetching indicator while monitor is refreshing:\n{rendered}"
+    );
+}

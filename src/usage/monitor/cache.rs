@@ -150,6 +150,39 @@ pub(crate) fn remove(id: &str) {
     }
 }
 
+pub(crate) fn file_modified_after(path: &std::path::Path, checked_at_ms: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .is_some_and(|mtime_ms| mtime_ms > checked_at_ms)
+}
+
+fn has_recovered_local_auth(
+    cfg: &MonitorConfig,
+    failure_msg: &str,
+    checked_at_ms: u64,
+    now_secs: i64,
+) -> bool {
+    let checked_secs = (checked_at_ms / 1_000) as i64;
+    match cfg.kind {
+        super::config::MonitorKind::Antigravity if cfg.via.as_deref() != Some("cli") => {
+            super::antigravity::has_recovered_login(failure_msg, checked_secs, now_secs)
+        }
+        super::config::MonitorKind::Grok => {
+            super::grok::has_recovered_login(cfg, failure_msg, checked_at_ms, now_secs)
+        }
+        super::config::MonitorKind::Nous => {
+            super::nous::has_recovered_login(cfg, failure_msg, checked_at_ms, now_secs)
+        }
+        super::config::MonitorKind::CodexNative => {
+            super::codex_native::has_recovered_login(cfg, failure_msg, checked_at_ms, now_secs)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `cfg` should be fetched at `now_ms` given its cache.
 pub(crate) fn is_due(cfg: &MonitorConfig, cache: Option<&MonitorCache>, now_ms: u64) -> bool {
     let Some(cache) = cache.filter(|c| c.matches(cfg)) else {
@@ -158,9 +191,37 @@ pub(crate) fn is_due(cfg: &MonitorConfig, cache: Option<&MonitorCache>, now_ms: 
     if cache.held(now_ms) {
         return false;
     }
-    cache
-        .checked_at_ms
-        .is_none_or(|at| now_ms.saturating_sub(at) >= cfg.ttl_ms() || now_ms < at)
+    let Some(at) = cache.checked_at_ms else {
+        return true;
+    };
+    if now_ms.saturating_sub(at) >= cfg.ttl_ms() || now_ms < at {
+        return true;
+    }
+    let checked_secs = (at / 1_000) as i64;
+    let now_secs = (now_ms / 1_000) as i64;
+    if let Some(failure) = cache.failure.as_ref()
+        && failure.kind == FailureKind::AuthRequired
+        && has_recovered_local_auth(cfg, &failure.message, at, now_secs)
+    {
+        return true;
+    }
+    if cfg.kind == super::config::MonitorKind::Antigravity
+        && cfg.via.as_deref() != Some("cli")
+        && cache.failure.is_none()
+        && cache
+            .reading
+            .as_ref()
+            .is_some_and(super::antigravity::needs_project_backfill)
+        && super::antigravity::single_official_login(now_secs)
+    {
+        return true;
+    }
+    cache.reading.as_ref().is_some_and(|r| {
+        r.windows.iter().any(|w| {
+            w.resets_at
+                .is_some_and(|t| checked_secs < t.secs() && now_secs >= t.secs())
+        })
+    })
 }
 
 /// What one refresh did.

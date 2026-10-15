@@ -50,6 +50,7 @@ pub(crate) fn accounts(opts: &CollectOpts, http: &dyn MonitorHttp) -> Vec<Accoun
     let now_ms = crate::usage::now_ms();
     super::monitor::grok::ensure_official_grok(http, now_ms);
     super::monitor::antigravity::ensure_official_antigravity(http, now_ms);
+    super::monitor::codex_native::ensure_official_codex(http, now_ms);
     collect(opts)
 }
 

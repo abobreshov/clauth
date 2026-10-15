@@ -213,7 +213,10 @@ pub(crate) fn window_summary_spans_bracketed_at(
 
     let figure = crate::format::format_pct(pct);
     let figure_w = figure.len().max(4);
-    if include_bar && width >= 22 + figure_w {
+    let secs = reset_in_secs_at(window, now);
+    let bare_reset_fits = width >= 26
+        && secs.is_some_and(|s| 13 + figure_w + 3 + humanize_duration(s).chars().count() <= width);
+    if include_bar && (width >= 22 + figure_w || bare_reset_fits) {
         // [██████░░░░] XX% (reset)
         let mut spans = vec![
             Span::styled("[", bracket),
@@ -221,7 +224,7 @@ pub(crate) fn window_summary_spans_bracketed_at(
             Span::styled("]", bracket),
             Span::styled(format!(" {figure:>4}"), fill_style),
         ];
-        if let Some(secs) = reset_in_secs_at(window, now) {
+        if let Some(secs) = secs {
             let style = reset_style.unwrap_or_else(theme::faint);
             spans.extend(reset_suffix_spans(secs, fmt, width, style));
         }

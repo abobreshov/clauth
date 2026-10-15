@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-10-15
+
+### Usage and monitors
+
+- Official Codex (`~/.codex/auth.json`) CLI logins are now automatically adopted into `monitors.toml` (`codex-native`) and fetched into the monitor cache on first `tollgate usage` or TUI/daemon poll, matching Grok and Antigravity (`agy`), and `tollgate monitor add codex` is accepted as an alias for `codex-native`.
+- Antigravity keyring fetches now resolve and persist `cloudaicompanionProject` from `loadCodeAssist` before calling `retrieveUserQuotaSummary`, returning all 4 model-group quota windows (`Gemini Models` 5h/7d and `Claude and GPT models` 5h/7d) and backfilling cached readings missing project-scoped buckets.
+- In the TUI Overview tab, multi-group model monitors (such as Antigravity) render separate rows per model group (`Antigravity (Gemini)` and `Antigravity (Claude/GPT)`), and single-`7d` monitors (such as Grok) render their weekly bar in the `7d` column with `—` in the `5h` column.
+- Pressing `r` (`refresh`) or `R` (`refresh all`) in the TUI Overview and Usage tabs now refreshes configured monitors with an animated spinner alongside profile refreshes, and the daemon scheduler ticks `poll_detached` to keep monitor caches fresh automatically.
+
 ## 0.4.0 — 2026-10-15
 
 ### Usage and monitors

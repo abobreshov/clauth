@@ -263,14 +263,40 @@ fn single_official_login(home: &Path) -> bool {
     entries.keys().filter(|name| official_login(name)).count() == 1
 }
 
-/// Fetch only when this monitor has never been read. A later `usage` call
-/// stays on the cache; the daemon's own poll refreshes on the TTL.
+pub(crate) fn has_recovered_login(
+    cfg: &super::config::MonitorConfig,
+    failure_msg: &str,
+    checked_at_ms: u64,
+    now_secs: i64,
+) -> bool {
+    let Ok(home) = crate::profile::home_dir() else {
+        return false;
+    };
+    let tool_home = cfg.tool_home_in(&home);
+    if read_token(&tool_home, cfg.auth_entry.as_deref(), now_secs).is_err() {
+        return false;
+    }
+    failure_msg != "open grok to refresh its login"
+        || super::cache::file_modified_after(&tool_home.join("auth.json"), checked_at_ms)
+}
+
+/// Fetch when this monitor has never been read or when its local CLI login just
+/// recovered from `AuthRequired`. A later `usage` call stays on the cache; the
+/// daemon's own poll refreshes on the TTL.
 fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now_ms: u64) {
+    let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
     if let Some(cache) = super::cache::load(&cfg.id)
         && cache.matches(cfg)
         && (cache.reading.is_some() || cache.checked_at_ms.is_some())
     {
-        return;
+        let checked_ms = cache.checked_at_ms.unwrap_or(0);
+        let recovered = cache.failure.as_ref().is_some_and(|f| {
+            f.kind == FailureKind::AuthRequired
+                && has_recovered_login(cfg, &f.message, checked_ms, now_secs)
+        });
+        if !recovered {
+            return;
+        }
     }
     let deps = super::cache::RefreshDeps {
         http,
@@ -279,6 +305,23 @@ fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now
         now_ms,
     };
     let _ = super::cache::refresh_one(cfg, &deps, true);
+}
+
+pub(crate) fn ensure_official_grok_config() {
+    let Ok(home) = crate::profile::home_dir() else {
+        return;
+    };
+    if !single_official_login(&home) {
+        return;
+    }
+    let Ok(monitors) = super::config::load() else {
+        return;
+    };
+    if monitors.iter().any(|m| m.kind == MonitorKind::Grok) {
+        return;
+    }
+    let cfg = official_monitor();
+    let _ = super::config::add(&cfg);
 }
 
 /// Make one official Grok login visible to the normal monitor collector.

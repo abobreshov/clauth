@@ -3737,6 +3737,8 @@ fn tick(state: &SchedulerState) {
     // chain that just re-stamped its access token polls with the fresh one
     // instead of spending a tick on a 401 the kick then has to undo.
     codex_usage_tick(state);
+    #[cfg(not(test))]
+    crate::usage::monitor::poll_detached();
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -3940,6 +3942,16 @@ const CODEX_USAGE_ORIGIN: &str = "chatgpt.com";
 static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
+/// Expire the codex poll cadence stamps so the next scheduler tick re-polls
+/// every codex account immediately (Overview `r`).
+pub(crate) fn clear_codex_polled_at() {
+    if let Ok(mut guard) = CODEX_POLLED_AT.lock()
+        && let Some(seen) = guard.as_mut()
+    {
+        seen.clear();
+    }
+}
+
 /// Codex accounts whose last poll answered 401. Their access token is stale, so
 /// the standby leg force-refreshes them on its next pass — see
 /// [`crate::codex_auth::kick_codex`], whose only production caller this is.
@@ -4118,6 +4130,8 @@ fn standdown_transition_log(msg: &str) {
 ///     would freeze the row's spinner;
 ///   * skip rotation and both auto-switch scans entirely.
 fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
+    #[cfg(not(test))]
+    crate::usage::monitor::poll_detached();
     let forced: HashSet<String> = state
         .refetch_queue
         .lock()

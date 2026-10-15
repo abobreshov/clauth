@@ -96,13 +96,29 @@ struct HeaderState {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let profiles = app.config().profiles.len();
+    let cfg = app.config();
+    let profiles = cfg.profiles.len();
     let items = profiles + app.usage_extras.len();
     let (selector, detail) = master_detail(area, items);
 
+    let multi_provider_profiles = {
+        let mut first_prov: Option<&str> = None;
+        cfg.profiles.iter().any(|p| {
+            let prov = crate::tui::app::profile_provider_name(p);
+            match first_prov {
+                None => {
+                    first_prov = Some(prov);
+                    false
+                }
+                Some(prev) => !prev.eq_ignore_ascii_case(prov),
+            }
+        })
+    };
+    drop(cfg);
+
     // Monitoring / upstream accounts ride below the profiles on the rail and
     // render through the shared metric-card layout.
-    if app.usage_extras.is_empty() {
+    if app.usage_extras.is_empty() && !multi_provider_profiles {
         draw_profile_selector(
             frame,
             selector,

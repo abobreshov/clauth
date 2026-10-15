@@ -626,3 +626,104 @@ fn persisted_costs_only_hold_is_removed_before_the_next_health_poll() {
     assert!(new.reading.as_ref().unwrap().verdict.is_none());
     assert_eq!(http.calls().len(), 1);
 }
+
+#[test]
+fn a_lapsed_window_makes_the_monitor_due_before_its_ttl() {
+    use crate::usage::observation::{QuotaWindow, Timestamp, WindowScope};
+    let monitor = MonitorConfig::new("agy", MonitorKind::Antigravity);
+    let mut cache = MonitorCache::empty(&monitor);
+    cache.checked_at_ms = Some(T0);
+    cache.observed_at_ms = Some(T0);
+    let mut win = QuotaWindow::new(
+        "agy.gemini-5h",
+        "5h Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    win.window_secs = Some(18_000);
+    win.used_pct = Some(26.42);
+    win.resets_at = Some(Timestamp((T0 / 1000 + 60) as i64));
+    cache.reading = Some(Reading {
+        windows: vec![win],
+        ..Reading::default()
+    });
+
+    assert!(
+        !is_due(&monitor, Some(&cache), T0 + 30_000),
+        "before the window resets and before the 10m TTL, the monitor is not due"
+    );
+    assert!(
+        is_due(&monitor, Some(&cache), T0 + 60_000),
+        "once a cached window crosses resets_at, the monitor becomes due immediately even before TTL"
+    );
+}
+
+#[test]
+fn recovered_agy_login_and_legacy_project_backfill_make_monitor_due_immediately() {
+    use crate::usage::monitor::antigravity::{KeyringMetadata, KeyringProbe, with_test_keyring};
+    struct Probe {
+        expiry: i64,
+    }
+    impl KeyringProbe for Probe {
+        fn has_owner(&self) -> Result<bool, Failure> {
+            Ok(true)
+        }
+        fn metadata(&self) -> Result<KeyringMetadata, Failure> {
+            Ok(KeyringMetadata {
+                unlocked: 1,
+                locked: 0,
+            })
+        }
+        fn secret(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, Failure> {
+            Ok(zeroize::Zeroizing::new(
+                format!(r#"{{"access_token":"FIXTURE","expiry":{}}}"#, self.expiry).into_bytes(),
+            ))
+        }
+    }
+
+    let monitor = MonitorConfig::new("agy", MonitorKind::Antigravity);
+    let mut cache = MonitorCache::empty(&monitor);
+    cache.checked_at_ms = Some(T0);
+    cache.failure = Some(Failure::new(
+        FailureKind::AuthRequired,
+        "agy's token expired; open agy for a moment",
+    ));
+
+    let expired_probe = std::rc::Rc::new(Probe {
+        expiry: (T0 / 1000) as i64,
+    });
+    with_test_keyring(expired_probe, || {
+        assert!(
+            !is_due(&monitor, Some(&cache), T0 + 5_000),
+            "still expired locally: must wait out TTL rather than spin"
+        );
+    });
+
+    let fresh_probe = std::rc::Rc::new(Probe {
+        expiry: (T0 / 1000 + 3600) as i64,
+    });
+    with_test_keyring(fresh_probe.clone(), || {
+        assert!(
+            is_due(&monitor, Some(&cache), T0 + 5_000),
+            "once agy refreshes the keyring token, the monitor is due immediately"
+        );
+    });
+
+    // Legacy cache with Gemini Code Assist and no cloudaicompanion_project is also due immediately.
+    let mut legacy = MonitorCache::empty(&monitor);
+    legacy.checked_at_ms = Some(T0);
+    legacy.observed_at_ms = Some(T0);
+    legacy.reading = Some(Reading {
+        plan: Some("Gemini Code Assist".into()),
+        plan_checked_at: Some((T0 / 1000) as i64),
+        cloudaicompanion_project: None,
+        ..Reading::default()
+    });
+    with_test_keyring(fresh_probe, || {
+        assert!(
+            is_due(&monitor, Some(&legacy), T0 + 5_000),
+            "legacy cache missing cloudaicompanion_project is due immediately for backfill"
+        );
+    });
+}

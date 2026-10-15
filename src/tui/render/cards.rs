@@ -7,13 +7,16 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{ListItem, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
+use super::format::{spinner_frame, spinner_style};
 use super::panes::{
-    draw_scrollbar, draw_selector_list, name_color, picker_row, section_box_verbatim,
+    draw_following_list, draw_scrollbar, empty_state, name_color, picker_row, section_box,
+    section_box_verbatim,
 };
+use crate::usage::ProfileActivity;
 use crate::usage::cards::{CardCtx, CardLine, Seg, account_body, header_line};
 use crate::usage::observation::{AccountObservation, Origin};
 
@@ -60,39 +63,96 @@ fn origin_tag(obs: &AccountObservation) -> &'static str {
 }
 
 /// The Usage tab rail: every profile, then every extra account (tagged
-/// `· monitor` / `· clauth`). `sel` indexes the combined list.
+/// `· monitor` / `· clauth`), grouped under per-provider headers. `sel`
+/// indexes the combined selectable list.
 pub(super) fn draw_usage_rail(frame: &mut Frame<'_>, area: Rect, app: &App, sel: usize) {
     let cfg = app.config();
     let focused = app.usage_detail_focus == StatusFocus::List;
-    draw_selector_list(
-        frame,
-        area,
-        "accounts",
-        focused,
-        sel,
-        &app.usage_selector,
-        |w| {
-            let profiles = cfg.profiles.iter().enumerate().map(|(i, p)| {
-                let ns = if p.is_disabled() {
-                    theme::dim()
-                } else {
-                    name_color(cfg.is_active(&p.name))
-                };
-                picker_row(i == sel, focused, p.name.to_string(), ns, w)
-            });
-            let base = cfg.profiles.len();
-            let extras = app.usage_extras.iter().enumerate().map(|(i, o)| {
-                picker_row(
-                    base + i == sel,
-                    focused,
-                    format!("{} · {}", o.label, origin_tag(o)),
-                    name_color(o.active),
-                    w,
-                )
-            });
-            profiles.chain(extras).collect()
-        },
-    );
+    let block = section_box("accounts", focused, true, area.width);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let total_items = cfg.profiles.len() + app.usage_extras.len();
+    if total_items == 0 {
+        app.usage_selector.offset.set(0);
+        app.usage_selector.viewport.set(0);
+        app.usage_selector.total.set(0);
+        app.usage_selector.starts.replace(Vec::new());
+        app.usage_selector.block_ends.replace(Vec::new());
+        app.usage_selector.tips.replace(Vec::new());
+        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        return;
+    }
+
+    let w = inner.width;
+    let mut rows: Vec<ListItem<'static>> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(total_items);
+    let mut selected_row = 0;
+    let mut last_provider: Option<&str> = None;
+
+    for (i, p) in cfg.profiles.iter().enumerate() {
+        let prov = crate::tui::app::profile_provider_name(p);
+        if !last_provider.is_some_and(|prev| prev.eq_ignore_ascii_case(prov)) {
+            if !rows.is_empty() {
+                rows.push(ListItem::new(Line::default()));
+            }
+            rows.push(ListItem::new(Line::from(Span::styled(
+                format!("  {prov}"),
+                theme::dim(),
+            ))));
+            last_provider = Some(prov);
+        }
+        let ns = if p.is_disabled() {
+            theme::dim()
+        } else {
+            name_color(cfg.is_active(&p.name))
+        };
+        starts.push(rows.len());
+        if i == sel {
+            selected_row = rows.len();
+        }
+        rows.push(ListItem::new(picker_row(
+            i == sel,
+            focused,
+            p.name.to_string(),
+            ns,
+            w,
+        )));
+    }
+
+    let base = cfg.profiles.len();
+    for (i, o) in app.usage_extras.iter().enumerate() {
+        let prov = o.provider.as_str();
+        if !last_provider.is_some_and(|prev| prev.eq_ignore_ascii_case(prov)) {
+            if !rows.is_empty() {
+                rows.push(ListItem::new(Line::default()));
+            }
+            rows.push(ListItem::new(Line::from(Span::styled(
+                format!("  {prov}"),
+                theme::dim(),
+            ))));
+            last_provider = Some(prov);
+        }
+        let idx = base + i;
+        starts.push(rows.len());
+        if idx == sel {
+            selected_row = rows.len();
+        }
+        rows.push(ListItem::new(picker_row(
+            idx == sel,
+            focused,
+            format!("{} · {}", o.label, origin_tag(o)),
+            name_color(o.active),
+            w,
+        )));
+    }
+
+    draw_following_list(frame, inner, rows, selected_row, &app.usage_selector);
+    app.usage_selector
+        .block_ends
+        .replace(starts.iter().map(|s| s + 1).collect());
+    app.usage_selector.tips.replace(vec![0; starts.len()]);
+    app.usage_selector.starts.replace(starts);
 }
 
 /// The detail pane for an extra account: its label as the box title, then the
@@ -111,12 +171,22 @@ pub(super) fn draw_observation_detail(
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let lines = observation_lines(
+    let mut lines = observation_lines(
         obs,
         inner.width,
         crate::usage::now_epoch_secs(),
         app.guest_mode,
     );
+    if app.is_monitor_refreshing(&obs.id)
+        && let Some(first) = lines.first_mut()
+    {
+        let st = spinner_style(ProfileActivity::Fetching);
+        first.spans.push(Span::styled(" · ", theme::dim()));
+        first.spans.push(Span::styled(
+            format!("{} fetching", spinner_frame(app.tick_count)),
+            st,
+        ));
+    }
     let total = lines.len();
     let viewport = usize::from(inner.height);
     let max = if viewport == 0 {

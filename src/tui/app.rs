@@ -2423,6 +2423,13 @@ pub(crate) struct App {
     pub(crate) usage_extra_cursor: Option<usize>,
     /// When the extras were last read.
     usage_extras_polled: Option<std::time::Instant>,
+    /// Monitor observation IDs (`"monitor:<id>"`) with an active manual refresh
+    /// worker in flight; read by the Overview and Usage renders to draw a
+    /// spinner while refreshing.
+    pub(crate) monitor_refresh_inflight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Set by a monitor refresh worker on completion so `poll_usage_extras`
+    /// re-reads the updated cache immediately on the next tick.
+    pub(crate) monitor_refresh_dirty: Arc<AtomicBool>,
     /// The live palette reloader (plan §4.5), set by `tui::run` only — tests
     /// and headless constructions never touch the operator's theme files.
     palette_watch: Option<super::theme::PaletteWatch>,
@@ -3033,6 +3040,8 @@ impl App {
             usage_extras: Vec::new(),
             usage_extra_cursor: None,
             usage_extras_polled: None,
+            monitor_refresh_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            monitor_refresh_dirty: Arc::new(AtomicBool::new(false)),
             palette_watch: None,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
@@ -3917,27 +3926,159 @@ impl App {
         }
     }
 
-    /// Queue every profile for an immediate re-fetch (Overview `r`). Reuses each
-    /// profile's cached plan/tier — only the single-profile refresh re-pulls
-    /// `/profile`, keeping the global refresh light on the rate-limited host.
+    /// Queue every profile and monitor for an immediate re-fetch (Overview `r`).
+    /// Reuses each profile's cached plan/tier — only the single-profile refresh
+    /// re-pulls `/profile`, keeping the global refresh light on the rate-limited
+    /// host.
     pub(crate) fn manual_refresh(&self) {
         #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let names: Vec<ProfileName> = self
+        let mut names: Vec<ProfileName> = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
             .iter()
             .map(|e| e.name.clone())
             .collect();
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        let tp_names: Vec<ProfileName> = self
+            .third_party_tokens
+            .lock()
+            .expect("third_party_tokens mutex poisoned")
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        for name in tp_names {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
         for name in names {
             self.enqueue_refetch(&name, false);
         }
+        crate::usage::clear_codex_polled_at();
+        let _ = self.refresh_monitors(None);
     }
 
     /// Queue a single profile for an immediate re-fetch (Usage `r` / action
     /// menu), also re-pulling its `/profile` (plan / tier).
     pub(crate) fn manual_refresh_one(&self, name: &ProfileName) {
         self.enqueue_refetch(name, true);
+    }
+
+    /// Whether a monitor observation (`"monitor:<id>"`) currently has an
+    /// in-flight manual refresh.
+    pub(crate) fn is_monitor_refreshing(&self, obs_id: &str) -> bool {
+        self.monitor_refresh_inflight
+            .lock()
+            .is_ok_and(|set| set.contains(obs_id))
+    }
+
+    /// Refresh one monitor observation (`"monitor:<id>"`), returning `true`
+    /// when a matching enabled monitor exists in `monitors.toml`.
+    pub(crate) fn refresh_monitor_one(&self, obs_id: &str) -> bool {
+        let Some(id) = obs_id.strip_prefix("monitor:") else {
+            return false;
+        };
+        self.refresh_monitors(Some(id)) > 0
+    }
+
+    /// Spawn a forced refresh for all enabled monitors (or a single `target_id`),
+    /// marking each in `monitor_refresh_inflight` while the worker runs.
+    pub(crate) fn refresh_monitors(&self, target_id: Option<&str>) -> usize {
+        self.refresh_monitors_with(target_id, true)
+    }
+
+    /// Spawn a background refresh for any enabled monitor that is currently due,
+    /// marking each in `monitor_refresh_inflight` while the worker runs.
+    pub(crate) fn refresh_due_monitors(&self) -> usize {
+        self.refresh_monitors_with(None, false)
+    }
+
+    fn refresh_monitors_with(&self, target_id: Option<&str>, force: bool) -> usize {
+        use crate::usage::observation::{Origin, account_id};
+        let Ok(monitors) = crate::usage::monitor::config::load() else {
+            return 0;
+        };
+        let now_ms = crate::usage::now_ms();
+        let targets: Vec<crate::usage::monitor::config::MonitorConfig> = monitors
+            .into_iter()
+            .filter(|m| {
+                m.enabled
+                    && target_id.is_none_or(|id| m.id == id)
+                    && (force
+                        || crate::usage::monitor::cache::is_due(
+                            m,
+                            crate::usage::monitor::cache::load(&m.id).as_ref(),
+                            now_ms,
+                        ))
+            })
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        let mut to_spawn = Vec::new();
+        if let Ok(mut inflight) = self.monitor_refresh_inflight.lock() {
+            for m in targets {
+                let key = account_id(Origin::Monitor, &m.id);
+                if inflight.insert(key) {
+                    to_spawn.push(m);
+                }
+            }
+        }
+        let count = to_spawn.len();
+        if to_spawn.is_empty() {
+            return 0;
+        }
+        #[cfg(test)]
+        let test_http = TEST_MONITOR_HTTP.with(|cell| cell.borrow().clone());
+        #[cfg(test)]
+        if test_http.is_none() {
+            return count;
+        }
+        let inflight = Arc::clone(&self.monitor_refresh_inflight);
+        let dirty = Arc::clone(&self.monitor_refresh_dirty);
+        spawn_worker(move || {
+            #[cfg(not(test))]
+            crate::secrets::reload_if_changed();
+            for m in to_spawn {
+                let key = account_id(Origin::Monitor, &m.id);
+                struct ClearInflight {
+                    inflight: Arc<std::sync::Mutex<HashSet<String>>>,
+                    dirty: Arc<AtomicBool>,
+                    key: String,
+                }
+                impl Drop for ClearInflight {
+                    fn drop(&mut self) {
+                        if let Ok(mut set) = self.inflight.lock() {
+                            set.remove(&self.key);
+                        }
+                        self.dirty.store(true, Ordering::Release);
+                    }
+                }
+                let _clear = ClearInflight {
+                    inflight: Arc::clone(&inflight),
+                    dirty: Arc::clone(&dirty),
+                    key,
+                };
+                #[cfg(not(test))]
+                let http_ref: &dyn crate::usage::monitor::source::MonitorHttp =
+                    &crate::usage::monitor::source::LiveHttp;
+                #[cfg(test)]
+                let Some(ref http_arc) = test_http else {
+                    continue;
+                };
+                #[cfg(test)]
+                let http_ref: &dyn crate::usage::monitor::source::MonitorHttp = http_arc.as_ref();
+                let deps = crate::usage::monitor::cache::RefreshDeps {
+                    http: http_ref,
+                    notifier: None,
+                    env: &crate::usage::monitor::source::process_env,
+                    now_ms: crate::usage::now_ms(),
+                };
+                let _ = crate::usage::monitor::cache::refresh_one(&m, &deps, force);
+            }
+        });
+        count
     }
 
     /// Mark a profile for an immediate re-fetch. `refresh_plan` expires the
@@ -4094,8 +4235,9 @@ impl App {
 
     /// The Overview's read-only rows in display order, as indices into
     /// [`App::usage_extras`]: upstream-clauth accounts first (the
-    /// `clauth (read-only)` group), then monitors. Empty while no collect hook
-    /// yields anything, which keeps the Overview exactly as it was.
+    /// `clauth (read-only)` group), then monitors grouped by provider. Empty
+    /// while no collect hook yields anything, which keeps the Overview
+    /// exactly as it was.
     pub(crate) fn overview_extras(&self) -> Vec<usize> {
         let upstream = |o: &crate::usage::observation::AccountObservation| {
             o.origin == crate::usage::observation::Origin::Upstream
@@ -4105,11 +4247,12 @@ impl App {
         let hermes = |o: &crate::usage::observation::AccountObservation| {
             o.origin == crate::usage::observation::Origin::HermesProfile
         };
-        let (mut first, rest): (Vec<usize>, Vec<usize>) = (0..self.usage_extras.len())
+        let (first, rest): (Vec<usize>, Vec<usize>) = (0..self.usage_extras.len())
             .filter(|&i| !hermes(&self.usage_extras[i]))
             .partition(|&i| upstream(&self.usage_extras[i]));
-        first.extend(rest);
-        first
+        let mut out = group_extra_indices_by_provider(first, &self.usage_extras);
+        out.extend(group_extra_indices_by_provider(rest, &self.usage_extras));
+        out
     }
 
     /// The extra the Overview selection rests on: the shared
@@ -4807,10 +4950,20 @@ fn poll_usage_extras(app: &mut App) {
         return;
     }
     let now = std::time::Instant::now();
-    if app.usage_extras_polled.is_some_and(|t| {
-        now.duration_since(t) < std::time::Duration::from_millis(USAGE_EXTRAS_POLL_MS)
-    }) {
+    let dirty = app.monitor_refresh_dirty.swap(false, Ordering::AcqRel);
+    if !dirty
+        && app.usage_extras_polled.is_some_and(|t| {
+            now.duration_since(t) < std::time::Duration::from_millis(USAGE_EXTRAS_POLL_MS)
+        })
+    {
         return;
+    }
+    #[cfg(not(test))]
+    if app.usage_extras_polled.is_none() {
+        let now_ms = crate::usage::now_ms();
+        crate::usage::monitor::grok::ensure_official_grok_config();
+        crate::usage::monitor::antigravity::ensure_official_antigravity_config(now_ms);
+        crate::usage::monitor::codex_native::ensure_official_codex_config(now_ms);
     }
     app.usage_extras_polled = Some(now);
     let config = (*app.config()).clone();
@@ -4825,16 +4978,78 @@ fn poll_usage_extras(app: &mut App) {
     };
     let extras = usage_extras_from(&ctx, MONITOR_SOURCES, UPSTREAM_SOURCES);
     set_usage_extras(app, extras);
+    #[cfg(not(test))]
+    let _ = app.refresh_due_monitors();
+}
+
+/// Canonical provider display name for a local `profiles.toml` profile.
+pub(crate) fn profile_provider_name(p: &Profile) -> &'static str {
+    if p.usage_cache_is_third_party() {
+        crate::usage::observation::SourceId::from_provider(p.provider).display_name()
+    } else {
+        crate::usage::observation::SourceId::AnthropicOauth.display_name()
+    }
+}
+
+/// Group indices into `extras` by `o.provider` in first-seen provider order,
+/// preserving relative order within each provider.
+pub(crate) fn group_extra_indices_by_provider(
+    indices: Vec<usize>,
+    extras: &[crate::usage::observation::AccountObservation],
+) -> Vec<usize> {
+    let mut providers: Vec<&str> = Vec::new();
+    for &i in &indices {
+        let p = extras[i].provider.as_str();
+        if !providers.iter().any(|&seen| seen.eq_ignore_ascii_case(p)) {
+            providers.push(p);
+        }
+    }
+    let mut out = Vec::with_capacity(indices.len());
+    for p in providers {
+        out.extend(
+            indices
+                .iter()
+                .copied()
+                .filter(|&i| extras[i].provider.eq_ignore_ascii_case(p)),
+        );
+    }
+    out
 }
 
 /// The extras the Usage rail lists: the collector's hook observations
-/// ([`crate::usage::collect::hook_observations`]), first id wins.
+/// ([`crate::usage::collect::hook_observations`]), first id wins, grouped by
+/// provider (if the last local profile shares a provider with any extra, that
+/// provider leads so the group stays contiguous on the Usage rail).
 pub(crate) fn usage_extras_from(
     ctx: &crate::usage::collect::CollectCtx<'_>,
     monitors: &[crate::usage::collect::SourceHook],
     upstream: &[crate::usage::collect::SourceHook],
 ) -> Vec<crate::usage::observation::AccountObservation> {
-    crate::usage::collect::hook_observations(ctx, monitors, upstream)
+    let raw = crate::usage::collect::hook_observations(ctx, monitors, upstream);
+    let mut providers: Vec<String> = Vec::new();
+    if let Some(last_prof) = ctx.config.and_then(|c| c.profiles.last()) {
+        let last_p = profile_provider_name(last_prof);
+        if raw.iter().any(|o| o.provider.eq_ignore_ascii_case(last_p)) {
+            providers.push(last_p.to_string());
+        }
+    }
+    for o in &raw {
+        if !providers
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(&o.provider))
+        {
+            providers.push(o.provider.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for p in &providers {
+        for o in &raw {
+            if o.provider.eq_ignore_ascii_case(p) {
+                out.push(o.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Replace the extras, keeping the selection on the same account id when it
@@ -9263,7 +9478,7 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 /// third-party leg fetches generic api-key endpoints too — `is_third_party`
 /// would refuse a litellm row the scheduler refreshes every cadence.
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
-    if app.tab == Tab::Usage && app.usage_extra_cursor.is_some() {
+    if matches!(app.tab, Tab::Usage | Tab::Overview) && app.usage_extra_cursor.is_some() {
         return None;
     }
     let cfg = app.config();
@@ -9291,7 +9506,18 @@ fn queue_focused_usage_refresh(app: &mut App) {
         Some((name, false, false)) => {
             app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
         }
-        None => {}
+        None => {
+            if let Some(i) = app.usage_extra_cursor
+                && let Some(obs) = app.usage_extras.get(i)
+                && obs.origin == crate::usage::observation::Origin::Monitor
+            {
+                let id = obs.id.clone();
+                let label = obs.label.clone();
+                if app.refresh_monitor_one(&id) {
+                    app.toast(ToastKind::Info, format!("refreshing '{label}'"));
+                }
+            }
+        }
     }
 }
 
@@ -14474,4 +14700,11 @@ fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MONITOR_HTTP: std::cell::RefCell<
+        Option<Arc<dyn crate::usage::monitor::source::MonitorHttp + Send + Sync>>,
+    > = const { std::cell::RefCell::new(None) };
 }

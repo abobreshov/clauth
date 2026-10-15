@@ -586,13 +586,86 @@ fn agy_falls_through_daily_host_on_5xx_and_transport_error() {
         let calls = http.calls();
         assert_eq!(calls.len(), 3);
         assert!(calls[0].contains("daily-cloudcode-pa"));
+        assert!(calls[1].contains("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"));
         assert!(
-            calls[1].contains(
+            calls[2].contains(
                 "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
             )
         );
-        assert!(calls[2].contains("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"));
     }
+}
+#[test]
+fn agy_load_code_assist_resolves_project_for_paid_tier_and_quota_summary() {
+    let home = crate::testutil::HomeSandbox::new();
+    let seen_bodies: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        std::sync::Arc::default();
+    let recorded = seen_bodies.clone();
+    let mut http = super::super::source::FakeHttp::offline();
+    http.send_reply = Box::new(move |_, req| {
+        let req_body = std::str::from_utf8(req.json_body.unwrap_or_default())
+            .unwrap()
+            .to_string();
+        recorded
+            .lock()
+            .unwrap()
+            .push((req.url.to_string(), req_body.clone()));
+        let body = if req.url.ends_with("loadCodeAssist") {
+            let parsed: Value = serde_json::from_str(&req_body).unwrap();
+            assert_eq!(parsed["metadata"]["ideType"].as_str(), Some("ANTIGRAVITY"));
+            if parsed.get("cloudaicompanionProject").is_some() {
+                assert_eq!(
+                    parsed["cloudaicompanionProject"].as_str(),
+                    Some("rising-fact-p41fc")
+                );
+                json!({
+                    "currentTier": {"id": "g1-ultra-tier", "name": "Google AI Ultra"},
+                    "paidTier": {"id": "g1-ultra-tier", "name": "Google AI Ultra"},
+                    "cloudaicompanionProject": "rising-fact-p41fc"
+                })
+                .to_string()
+            } else {
+                json!({
+                    "currentTier": {"id": "standard-tier", "name": "Gemini Code Assist"},
+                    "cloudaicompanionProject": "rising-fact-p41fc"
+                })
+                .to_string()
+            }
+        } else if req.url.ends_with("retrieveUserQuotaSummary") {
+            let parsed: Value = serde_json::from_str(&req_body).unwrap();
+            assert_eq!(parsed["project"].as_str(), Some("rising-fact-p41fc"));
+            include_str!("../fixtures/monitors/agy-summary.json").to_string()
+        } else {
+            panic!("unexpected {}", req.url);
+        };
+        Ok(HttpReply {
+            retry_after_secs: None,
+            status: 200,
+            body,
+            headers: vec![],
+        })
+    });
+    let probe = Fake {
+        owner: true,
+        locked: 0,
+        unlocked: 1,
+        blob: json!({"access_token":"ACCESS","expiry":2000000000})
+            .to_string()
+            .into_bytes(),
+    };
+    let mut legacy_target = target(home.home());
+    legacy_target.previous = Some(Reading {
+        plan: Some("Gemini Code Assist".into()),
+        plan_checked_at: Some(90),
+        cloudaicompanion_project: None,
+        ..Reading::default()
+    });
+    let reading = fetch_with(&legacy_target, &http, &probe).unwrap();
+    assert_eq!(reading.plan.as_deref(), Some("Google AI Ultra"));
+    assert_eq!(
+        reading.cloudaicompanion_project.as_deref(),
+        Some("rising-fact-p41fc")
+    );
+    assert_eq!(seen_bodies.lock().unwrap().len(), 3);
 }
 // Slice-2 review: only usage prompts authenticate; documentation URLs and
 // command listings are ordinary data on both probe and usage responses.

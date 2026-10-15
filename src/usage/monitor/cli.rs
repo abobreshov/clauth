@@ -430,7 +430,7 @@ pub(crate) fn preset(name: &str) -> Result<MonitorConfig> {
     let (kind, id, label) = match name {
         "grok" => (MonitorKind::Grok, "grok", "Grok (CLI login)"),
         "antigravity" | "agy" => (MonitorKind::Antigravity, "agy", "Antigravity (agy login)"),
-        "codex-native" => (
+        "codex-native" | "codex" => (
             MonitorKind::CodexNative,
             "codex-native",
             "Codex (~/.codex login)",
@@ -471,7 +471,7 @@ pub(crate) fn preset(name: &str) -> Result<MonitorConfig> {
             m.via = Some("keyring".into());
             m.ttl_secs = Some(600);
         }
-        "codex-native" => {
+        "codex-native" | "codex" => {
             m.tool_home = Some("~/.codex".into());
             m.ttl_secs = Some(300);
         }

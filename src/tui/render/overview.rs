@@ -285,11 +285,48 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut rows: Vec<ListItem<'_>> = Vec::new();
     let mut selected_row = 0;
     let mut starts = Vec::new();
+    let mut block_ends = Vec::new();
+    let profile_providers: Vec<&str> = {
+        let cfg = app.config();
+        let mut out = Vec::new();
+        for item in &items {
+            if let MainItemKind::Profile(idx) = item
+                && let Some(p) = cfg.profiles.get(*idx)
+            {
+                let prov = crate::tui::app::profile_provider_name(p);
+                if !out.contains(&prov) {
+                    out.push(prov);
+                }
+            }
+        }
+        out
+    };
+    let show_profile_provider_headers = profile_providers.len() > 1 || !extras.is_empty();
+    let mut last_profile_provider: Option<&str> = None;
     let mut codex_heading = false;
     for (index, item) in items.iter().enumerate() {
         let selected = index == sel && selected_extra.is_none();
         let line = match item {
             MainItemKind::Profile(idx) => {
+                if show_profile_provider_headers {
+                    let prov = app
+                        .config()
+                        .profiles
+                        .get(*idx)
+                        .map(crate::tui::app::profile_provider_name);
+                    if let Some(prov) = prov
+                        && last_profile_provider != Some(prov)
+                    {
+                        if !rows.is_empty() {
+                            rows.push(ListItem::new(Line::from("")));
+                        }
+                        rows.push(ListItem::new(Line::from(vec![Span::styled(
+                            format!("  {prov}"),
+                            theme::dim(),
+                        )])));
+                        last_profile_provider = Some(prov);
+                    }
+                }
                 render_overview_row(app, *idx, &widths, selected, focused)
             }
             MainItemKind::Codex(idx) => {
@@ -311,6 +348,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             selected_row = rows.len();
         }
         rows.push(ListItem::new(select_line(line, selected, focused, width)));
+        block_ends.push(rows.len());
     }
     // The Hermes section: read-only like codex. Only the `Hermes` view
     // selects a row (Enter and `s` there toast the relaunch hint), so the
@@ -338,46 +376,92 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             let line = render_hermes_row(row, &widths);
             rows.push(ListItem::new(select_line(line, selected, focused, width)));
+            if selectable {
+                block_ends.push(rows.len());
+            }
         }
     }
-    // The read-only rows: upstream clauth's accounts, then monitors, each
-    // group under its own caption. The cursor lands on them (⏎ opens the Usage
-    // tab there) but no account action does — see `read_only_hint`.
+    // The read-only rows: upstream clauth's accounts, then monitors grouped by
+    // provider, each group under its own caption. The cursor lands on them
+    // (⏎ opens the Usage tab there) but no account action does — see
+    // `read_only_hint`.
     let mut list_sel = selected_row;
     let now = now_epoch_secs();
     let reset_fmt = ResetFmt::from_state(&app.config().state);
-    for (caption, upstream) in [("clauth (read-only)", true), ("monitors", false)] {
-        let group: Vec<usize> = extras
-            .iter()
-            .copied()
-            .filter(|&i| (app.usage_extras[i].origin == Origin::Upstream) == upstream)
-            .collect();
-        if group.is_empty() {
-            continue;
-        }
+    let upstream_group: Vec<usize> = extras
+        .iter()
+        .copied()
+        .filter(|&i| app.usage_extras[i].origin == Origin::Upstream)
+        .collect();
+    if !upstream_group.is_empty() {
         if !rows.is_empty() {
             rows.push(ListItem::new(Line::from("")));
         }
         rows.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("  {caption}"),
+            "  clauth (read-only)".to_string(),
             theme::dim(),
         )])));
-        for i in group {
+        for i in upstream_group {
             starts.push(rows.len());
             let selected = selected_extra == Some(i);
             if selected {
                 list_sel = rows.len();
             }
-            let line = render_extra_row(
+            let spinner_tick = app
+                .is_monitor_refreshing(&app.usage_extras[i].id)
+                .then_some(app.tick_count);
+            for line in render_extra_rows_with_spinner(
                 &app.usage_extras[i],
                 &widths,
                 selected,
                 focused,
                 reset_fmt,
                 now,
-            );
+                spinner_tick,
+            ) {
+                rows.push(ListItem::new(select_line(line, selected, focused, width)));
+            }
+            block_ends.push(rows.len());
+        }
+    }
+    let monitor_group: Vec<usize> = extras
+        .iter()
+        .copied()
+        .filter(|&i| app.usage_extras[i].origin != Origin::Upstream)
+        .collect();
+    let mut last_monitor_provider: Option<&str> = None;
+    for i in monitor_group {
+        let prov = app.usage_extras[i].provider.as_str();
+        if !last_monitor_provider.is_some_and(|p| p.eq_ignore_ascii_case(prov)) {
+            if !rows.is_empty() {
+                rows.push(ListItem::new(Line::from("")));
+            }
+            rows.push(ListItem::new(Line::from(vec![Span::styled(
+                format!("  monitors · {prov}"),
+                theme::dim(),
+            )])));
+            last_monitor_provider = Some(prov);
+        }
+        starts.push(rows.len());
+        let selected = selected_extra == Some(i);
+        if selected {
+            list_sel = rows.len();
+        }
+        let spinner_tick = app
+            .is_monitor_refreshing(&app.usage_extras[i].id)
+            .then_some(app.tick_count);
+        for line in render_extra_rows_with_spinner(
+            &app.usage_extras[i],
+            &widths,
+            selected,
+            focused,
+            reset_fmt,
+            now,
+            spinner_tick,
+        ) {
             rows.push(ListItem::new(select_line(line, selected, focused, width)));
         }
+        block_ends.push(rows.len());
     }
 
     draw_following_list(
@@ -387,9 +471,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         list_sel_hermes.unwrap_or(list_sel),
         &app.overview_selector,
     );
-    app.overview_selector
-        .block_ends
-        .replace(starts.iter().map(|s| s + 1).collect());
+    app.overview_selector.block_ends.replace(block_ends);
     app.overview_selector.tips.replace(vec![0; starts.len()]);
     app.overview_selector.starts.replace(starts);
 }
@@ -447,11 +529,18 @@ impl OverviewWidths {
             .profiles
             .iter()
             .map(|p| grapheme_cells(p.name.as_str()))
-            .chain(
-                extras
-                    .iter()
-                    .map(|&i| app.usage_extras[i].label.chars().count()),
-            )
+            .chain(extras.iter().flat_map(|&i| {
+                let obs = &app.usage_extras[i];
+                let groups = extra_model_groups(obs);
+                if groups.is_empty() {
+                    vec![obs.label.chars().count()]
+                } else {
+                    groups
+                        .into_iter()
+                        .map(|(g, _)| extra_group_row_label(&obs.label, g).chars().count())
+                        .collect()
+                }
+            }))
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
@@ -766,13 +855,63 @@ fn render_hermes_row(row: &HermesRow, widths: &OverviewWidths) -> Line<'static> 
     Line::from(spans)
 }
 
+fn model_group_name(w: &QuotaWindow) -> Option<&str> {
+    match &w.scope {
+        crate::usage::observation::WindowScope::Model { models } => {
+            models.first().map(String::as_str).filter(|s| !s.is_empty())
+        }
+        _ => None,
+    }
+}
+
+fn extra_group_row_label(obs_label: &str, group_name: &str) -> String {
+    let base = obs_label
+        .split_once(" (")
+        .map_or(obs_label, |(prefix, _)| prefix)
+        .trim();
+    let short_group = group_name
+        .strip_suffix(" Models")
+        .or_else(|| group_name.strip_suffix(" models"))
+        .unwrap_or(group_name)
+        .replace(" and ", "/");
+    format!("{base} ({short_group})")
+}
+
+fn extra_model_groups(obs: &AccountObservation) -> Vec<(&str, Vec<QuotaWindow>)> {
+    let mut names: Vec<&str> = Vec::new();
+    for w in &obs.windows {
+        let Some(name) = model_group_name(w) else {
+            return Vec::new();
+        };
+        if !names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            names.push(name);
+        }
+    }
+    if names.len() < 2 {
+        return Vec::new();
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let windows = obs
+                .windows
+                .iter()
+                .filter(|w| model_group_name(w).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+                .cloned()
+                .collect();
+            (name, windows)
+        })
+        .collect()
+}
+
 /// One read-only row (an upstream-clauth account or a monitor), in the claude
 /// columns and dimmed whole: name, plan, then the lead metric as the claude
 /// rows draw a window — mini bar, `%`, countdown — in the 5h column (the
 /// session window when there is one, with the weekly one under `7d`), or the
 /// lead balance when the account publishes no window. The upstream `●` keeps
 /// its hue: which account clauth has live is the one fact these rows are
-/// here to tell. The timer and live slots stay blank — nothing here polls.
+/// here to tell.
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_extra_row(
     obs: &AccountObservation,
     widths: &OverviewWidths,
@@ -781,6 +920,103 @@ fn render_extra_row(
     reset_fmt: ResetFmt,
     now: i64,
 ) -> Line<'static> {
+    render_extra_row_with_spinner(obs, widths, selected, focused, reset_fmt, now, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_extra_rows(
+    obs: &AccountObservation,
+    widths: &OverviewWidths,
+    selected: bool,
+    focused: bool,
+    reset_fmt: ResetFmt,
+    now: i64,
+) -> Vec<Line<'static>> {
+    render_extra_rows_with_spinner(obs, widths, selected, focused, reset_fmt, now, None)
+}
+
+fn render_extra_rows_with_spinner(
+    obs: &AccountObservation,
+    widths: &OverviewWidths,
+    selected: bool,
+    focused: bool,
+    reset_fmt: ResetFmt,
+    now: i64,
+    spinner_tick: Option<u64>,
+) -> Vec<Line<'static>> {
+    let groups = extra_model_groups(obs);
+    if groups.is_empty() {
+        return vec![render_extra_slice_row(
+            obs,
+            &obs.label,
+            &obs.windows,
+            widths,
+            selected,
+            focused,
+            reset_fmt,
+            now,
+            spinner_tick,
+            true,
+        )];
+    }
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (group_name, group_windows))| {
+            let label = extra_group_row_label(&obs.label, group_name);
+            render_extra_slice_row(
+                obs,
+                &label,
+                &group_windows,
+                widths,
+                selected,
+                focused,
+                reset_fmt,
+                now,
+                if idx == 0 { spinner_tick } else { None },
+                idx == 0,
+            )
+        })
+        .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_extra_row_with_spinner(
+    obs: &AccountObservation,
+    widths: &OverviewWidths,
+    selected: bool,
+    focused: bool,
+    reset_fmt: ResetFmt,
+    now: i64,
+    spinner_tick: Option<u64>,
+) -> Line<'static> {
+    render_extra_slice_row(
+        obs,
+        &obs.label,
+        &obs.windows,
+        widths,
+        selected,
+        focused,
+        reset_fmt,
+        now,
+        spinner_tick,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_extra_slice_row(
+    obs: &AccountObservation,
+    label: &str,
+    windows: &[QuotaWindow],
+    widths: &OverviewWidths,
+    selected: bool,
+    focused: bool,
+    reset_fmt: ResetFmt,
+    now: i64,
+    spinner_tick: Option<u64>,
+    first_row: bool,
+) -> Line<'static> {
     let dim_all = |mut spans: Vec<Span<'static>>| {
         for s in &mut spans {
             s.style = theme::dim();
@@ -788,19 +1024,19 @@ fn render_extra_row(
         spans
     };
     let mut spans = vec![
-        if selected && focused {
+        if first_row && selected && focused {
             Span::styled("❯ ", theme::accent().bold())
         } else {
             Span::raw("  ")
         },
-        if obs.active {
+        if first_row && obs.active {
             Span::styled("●", Style::default().fg(theme::accent_2_color()))
         } else {
             Span::raw(" ")
         },
         Span::raw(" "),
     ];
-    let (nt, np) = fixed_split(&obs.label, widths.name);
+    let (nt, np) = fixed_split(label, widths.name);
     spans.push(Span::styled(
         nt,
         bold_when(theme::dim(), selected && focused),
@@ -812,26 +1048,47 @@ fn render_extra_row(
         None => Span::styled(fixed(NO_DATA, widths.kind), theme::faint()),
     });
     spans.push(narrow_gap(widths));
-    spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
-
-    let short_windows: Vec<QuotaWindow> = obs
-        .windows
-        .iter()
-        .filter(|w| matches!(w.window_secs, Some(3_600 | 18_000)))
-        .cloned()
-        .collect();
-    let short = obs.window(WINDOW_SESSION).or_else(|| {
-        lead_window(&short_windows, now).and_then(|l| obs.windows.iter().find(|w| w.id == l.id))
+    spans.push(match spinner_tick {
+        Some(tick) => Span::styled(
+            format!("{:<TIMER_SLOT$}", spinner_frame(tick)),
+            spinner_style(ProfileActivity::Fetching),
+        ),
+        None => Span::raw(" ".repeat(TIMER_SLOT)),
     });
-    let lead = short.or_else(|| lead_window(&obs.windows, now));
-    let weekly = short.and_then(|s| {
-        obs.window(WINDOW_WEEKLY)
-            .or_else(|| {
-                obs.windows
-                    .iter()
-                    .find(|w| w.window_secs == Some(604_800) && w.scope == s.scope)
-            })
-            .or_else(|| obs.windows.iter().find(|w| w.window_secs == Some(604_800)))
+
+    let highest_in_bucket = |secs_pred: fn(Option<u64>) -> bool| -> Option<&QuotaWindow> {
+        let mut best: Option<&QuotaWindow> = None;
+        for w in windows.iter().filter(|w| secs_pred(w.window_secs)) {
+            if let Some(cur) = best {
+                let w_key = (w.exhausted, w.used_pct.unwrap_or(-1.0));
+                let cur_key = (cur.exhausted, cur.used_pct.unwrap_or(-1.0));
+                if (w_key.0 && !cur_key.0)
+                    || (w_key.0 == cur_key.0
+                        && w_key.1.partial_cmp(&cur_key.1) == Some(std::cmp::Ordering::Greater))
+                {
+                    best = Some(w);
+                }
+            } else {
+                best = Some(w);
+            }
+        }
+        best
+    };
+    let short = windows
+        .iter()
+        .find(|w| w.id == WINDOW_SESSION)
+        .or_else(|| highest_in_bucket(|s| matches!(s, Some(3_600 | 18_000))));
+    let weekly = windows
+        .iter()
+        .find(|w| w.id == WINDOW_WEEKLY)
+        .or_else(|| highest_in_bucket(|s| s == Some(604_800)))
+        .or_else(|| windows.iter().find(|w| w.label == LABEL_7D));
+    let lead = short.or_else(|| {
+        if weekly.is_some() {
+            None
+        } else {
+            lead_window(windows, now)
+        }
     });
     let cell = |window: Option<&QuotaWindow>, w: usize, include_bar: bool| {
         let usage = window.and_then(extra_usage_window);
@@ -864,13 +1121,18 @@ fn render_extra_row(
             }
             cells
         }
-        None => match extra_lead_money(obs) {
-            Some(money) => vec![Span::styled(
-                fixed(&format!("[{money}]"), widths.five_hour),
-                theme::dim(),
-            )],
-            None => vec![Span::styled(NO_DATA.to_string(), theme::faint())],
-        },
+        None => {
+            if weekly.is_none()
+                && let Some(money) = extra_lead_money(obs)
+            {
+                vec![Span::styled(
+                    fixed(&format!("[{money}]"), widths.five_hour),
+                    theme::dim(),
+                )]
+            } else {
+                vec![Span::styled(NO_DATA.to_string(), theme::faint())]
+            }
+        }
     };
     let pad_to = |spans: &mut Vec<Span<'static>>, cells: Vec<Span<'static>>, w: usize| {
         let len: usize = cells.iter().map(|s| s.content.chars().count()).sum();
@@ -878,18 +1140,21 @@ fn render_extra_row(
         spans.push(Span::raw(" ".repeat(w.saturating_sub(len))));
     };
     pad_to(&mut spans, five_spans, widths.five_hour);
-    // A lead that is not the 5h/1h window names itself in the 7d cell it leaves
-    // empty, so a monthly pool never reads as a 5h reading. (After the columns
-    // would be clipped: the gaps already widen to the row's full width.)
+    // A lead that is neither a 5h/1h nor a 7d window names itself in the 7d
+    // cell it leaves empty, so a monthly pool (`30d`) never reads as a 5h
+    // reading; a single 7d window (e.g. Grok) renders in the 7d column and
+    // leaves the 5h column empty (`—`).
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        let seven = match (weekly, lead.filter(|_| short.is_none())) {
+        let non_weekly_lead = lead
+            .filter(|w| short.is_none() && w.window_secs != Some(604_800) && w.label != LABEL_7D);
+        let seven = match (weekly, non_weekly_lead) {
             (Some(_), _) => cell(weekly, widths.seven_day, widths.seven_day >= 18),
             (None, Some(w)) => vec![Span::styled(
                 fixed(&format!("({})", w.label), widths.seven_day),
                 theme::dim(),
             )],
-            (None, None) => Vec::new(),
+            (None, None) => cell(None, widths.seven_day, false),
         };
         pad_to(&mut spans, seven, widths.seven_day);
     }
