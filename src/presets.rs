@@ -246,7 +246,6 @@ fn builtins() -> Vec<Preset> {
     BUILTINS
         .iter()
         .map(|b| Preset {
-            env: &[],
             name: b.name.to_string(),
             base_url: Some(b.base_url.to_string()),
             models: b.binds.models(),

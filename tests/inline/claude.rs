@@ -6658,4 +6658,3 @@ fn arming_from_disk_lands_a_live_stage_before_it_stamps() {
     assert_eq!(store.refresh_token(), Some("rt-mid"));
     assert!(!dir.join("credentials.json.staged").exists());
 }
-

@@ -10345,7 +10345,9 @@ fn failed_owner_persist_prevents_the_namespaced_item_write_decision() {
 #[test]
 fn an_item_legs_ownership_wait_leaves_its_keychain_budget_whole() {
     let home = HomeSandbox::new();
-    let runtime = home.home().join(".tollgate/profiles/budgeted/runtime-702-1");
+    let runtime = home
+        .home()
+        .join(".tollgate/profiles/budgeted/runtime-702-1");
     fs::create_dir_all(&runtime).expect("runtime dir");
     let profile = crate::profile::ProfileName::from("budgeted");
     let session = SessionId::for_test("702-1");

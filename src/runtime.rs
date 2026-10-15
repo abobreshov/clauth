@@ -7052,7 +7052,9 @@ fn refusal_line(session: &str, current: &str, intended: &str, why: &SwapRefused)
     if matches!(why, SwapRefused::OutgoingRecordUnreadable(_)) {
         format!("tollgate: session {session} stays on {current}: {why}")
     } else {
-        format!("tollgate: session {session} stays on {current}: {intended} is not swappable ({why})")
+        format!(
+            "tollgate: session {session} stays on {current}: {intended} is not swappable ({why})"
+        )
     }
 }
 
