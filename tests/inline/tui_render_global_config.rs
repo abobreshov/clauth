@@ -1060,6 +1060,28 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
     }
 }
 
+/// A 23-cell pane (a 27-col terminal) must keep the dim clock's current value
+/// whole: it drops to its own line past the caret gutter instead of clipping
+/// the trailing `h`.
+#[test]
+fn the_clock_notation_stays_whole_at_a_narrow_pane() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let rows = toggles(); // reset_display Relative -> the clock row is dim
+    let lines = detail_row(
+        GlobalConfigRow::ClockNotation,
+        false,
+        rows,
+        tunables(),
+        None,
+        23,
+    );
+    let text: Vec<String> = lines.iter().map(line_text).collect();
+    assert!(
+        text.iter().any(|t| t.trim() == "24h"),
+        "the whole `24h` drops to its own line at 23 cells: {text:?}"
+    );
+}
+
 /// Both rows re-explain themselves per value — the value alone doesn't say what
 /// changes on screen, and the notation hint is where "local timezone" is stated.
 #[test]

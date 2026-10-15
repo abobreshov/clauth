@@ -305,3 +305,30 @@ fn fit_truncates_wide_text_by_cells_and_preserves_graphemes_and_styles() {
     );
     assert_eq!(fit(&cmd(family), 2, dim()), spans(&cmd(family), dim()));
 }
+
+#[test]
+fn fit_budgets_display_cells_and_keeps_a_wide_glyph_whole() {
+    assert_eq!(fit("日本語", 5, dim()), vec![Span::styled("日本…", dim())]);
+    assert_eq!(fit("日本語", 6, dim()), vec![Span::styled("日本語", dim())]);
+    assert_eq!(fit("🧭🧭", 3, dim()), vec![Span::styled("🧭…", dim())]);
+}
+
+#[test]
+fn fit_keeps_a_multicodepoint_grapheme_whole() {
+    assert_eq!(fit("⚠️⚠️", 3, dim()), vec![Span::styled("⚠️…", dim())]);
+    assert_eq!(fit("👨‍👩‍👧👨‍👩‍👧", 3, dim()), vec![Span::styled("👨‍👩‍👧…", dim())]);
+}
+
+#[test]
+fn fit_drops_controls_before_measuring() {
+    assert_eq!(fit("\n⚠️x", 3, dim()), vec![Span::styled("⚠️x", dim())]);
+    assert_eq!(
+        fit("\te\u{301}xyz", 2, dim()),
+        vec![Span::styled("e\u{301}…", dim())]
+    );
+}
+
+#[test]
+fn fit_budgets_lam_alef_per_grapheme() {
+    assert_eq!(fit("لالالا", 3, dim()), vec![Span::styled("لا…", dim())]);
+}

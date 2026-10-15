@@ -15,7 +15,7 @@ use super::super::app::{App, NoteBuffer, StatusFocus};
 use super::super::theme;
 use super::format::{
     ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
-    spinner_style,
+    spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
@@ -208,9 +208,9 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
     let focused = app.usage_detail_focus == StatusFocus::Detail;
     let block = if profile.is_some() {
-        section_box_verbatim(title, focused, false)
+        section_box_verbatim(title, focused, false, area.width)
     } else {
-        section_box(title, focused, false)
+        section_box(title, focused, false, area.width)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -600,8 +600,12 @@ impl Stat {
             label_spans.push(Span::raw(" ".repeat(max_rate_w)));
         }
 
-        vec![
-            Line::from({
+        let pct_cells = Span::raw(&pct_str).width();
+        let fits =
+            Span::raw(&self.label).width() + max_rate_w + amount_section_w + pct_cells <= pct_col;
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if fits {
+            out.push(Line::from({
                 let mut spans = label_spans;
                 spans.push(Span::raw(" ".repeat(header_pad)));
                 if max_amount_w > 0 {
@@ -618,9 +622,35 @@ impl Stat {
                     self.color.add_modifier(Modifier::BOLD),
                 ));
                 spans
-            }),
-            Line::from(bar_line),
-        ]
+            }));
+        } else {
+            // The eyebrow no longer holds the `%` figure: it drops to its own
+            // line, right-aligned to the far edge, carrying the amount with it
+            // so no figure vanishes — the pair never hard-wraps apart.
+            out.push(Line::from(label_spans));
+            let mut dropped = Vec::new();
+            if max_amount_w > 0 {
+                let amount_cells = Span::raw(&self.amount).width();
+                let right = max_amount_w + 2 + pct_cells;
+                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(right))));
+                dropped.push(Span::raw(
+                    " ".repeat(max_amount_w.saturating_sub(amount_cells)),
+                ));
+                if !self.amount.is_empty() {
+                    dropped.push(Span::styled(self.amount.clone(), theme::faint()));
+                }
+                dropped.push(Span::raw("  "));
+            } else {
+                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(pct_cells))));
+            }
+            dropped.push(Span::styled(
+                pct_str,
+                self.color.add_modifier(Modifier::BOLD),
+            ));
+            out.push(Line::from(dropped));
+        }
+        out.push(Line::from(bar_line));
+        out
     }
 }
 
@@ -1002,11 +1032,11 @@ fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
     if avail < 3 {
         return Vec::new();
     }
-    let text = crate::format::truncate(text, avail - 3);
+    let text = truncate(text, avail - 3);
     if text.chars().count() < 4 {
         return Vec::new();
     }
-    let pad = avail - text.chars().count();
+    let pad = avail - Span::raw(&text).width();
     vec![
         Span::raw(" ".repeat(pad)),
         Span::styled(text, theme::faint()),
@@ -1793,15 +1823,25 @@ fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
     let pad = " ".repeat(NOTES_VALUE_LEAD);
     match note.filter(|t| !t.is_empty()) {
         None => {
-            let mut spans = vec![Span::styled(
-                key_cell("notes:", KEY_W, KEY_GUTTER),
-                theme::accent(),
-            )];
-            spans.extend(prose::spans(
+            let lead = Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent());
+            let hint = prose::wrap(
                 concat!("press ", key_lit!("n"), " to add notes"),
+                value_w,
                 theme::faint(),
-            ));
-            vec![Line::from(spans)]
+            );
+            let mut lines = Vec::new();
+            for (j, seg) in hint.into_iter().enumerate() {
+                if j == 0 {
+                    let mut spans = vec![lead.clone()];
+                    spans.extend(seg);
+                    lines.push(Line::from(spans));
+                } else {
+                    let mut spans = vec![Span::raw(pad.clone())];
+                    spans.extend(seg);
+                    lines.push(Line::from(spans));
+                }
+            }
+            lines
         }
         Some(text) => {
             let mut lines = Vec::new();

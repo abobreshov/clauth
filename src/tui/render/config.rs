@@ -13,13 +13,14 @@ use super::super::app::{
     App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS, config_rows,
 };
 use super::super::theme;
+use super::format::{middle_truncate, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, bold_when, cycle_row_lines,
     draw_scrolled_lines, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    key_cell, label_style, master_detail, name_color, picker_row, pill, section_box,
-    section_box_verbatim,
+    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, picker_row, pill,
+    section_box, section_box_verbatim, value_caret,
 };
-use super::prose::{cmd, cmd_lit};
+use super::prose::{cmd, cmd_lit, key_lit};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // +1 for the trailing `+ new` picker row.
@@ -41,7 +42,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
         "accounts",
         focused,
         sel,
-        &app.setup_selector_offset,
+        &app.setup_selector,
         |w| {
             let mut rows: Vec<_> = cfg
                 .profiles
@@ -86,6 +87,8 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
+    /// `Profile::bell_threshold` as the `alert at` buffer spells it; empty = off.
+    bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
     disabled: bool,
     /// The global active profile — one of the two gates (mirroring
@@ -199,6 +202,7 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
+            bell_threshold: String::new(),
             disabled: false,
             is_active: false,
             has_live_session: false,
@@ -285,6 +289,10 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 auto_start: p.auto_start,
+                bell_threshold: p
+                    .bell_threshold
+                    .map(crate::tui::app::format_weekly_pct)
+                    .unwrap_or_default(),
                 disabled: p.is_disabled(),
                 is_active: cfg.is_active(&p.name),
                 // Read per frame for the selected profile only, same as
@@ -342,9 +350,9 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Profile names render verbatim; structural titles ("+ new account", "settings") stay uppercased.
     let is_profile_name = app.profile_cursor < app.config().profiles.len();
     let block = if is_profile_name {
-        section_box_verbatim(&snap.title, actions_focused, false)
+        section_box_verbatim(&snap.title, actions_focused, false, area.width)
     } else {
-        section_box(&snap.title, actions_focused, false)
+        section_box(&snap.title, actions_focused, false, area.width)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -698,6 +706,9 @@ fn draw_settings_rows(
     // Start + end of the focused row's block (row plus its tooltip lines), so a
     // wrapped hint can't scroll off the bottom while its row stays visible.
     let mut focus = (0usize, 1usize);
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut block_ends: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut tips: Vec<usize> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
@@ -711,9 +722,22 @@ fn draw_settings_rows(
             &input,
             inner.width as usize,
         );
+        // The tooltip this row carries when focused: its range tooltip while
+        // editing the bell threshold, else its behaviour hint.
+        let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
+            alert_range_tooltip(&input, inner.width as usize)
+        } else if !is_editing {
+            row_hint(*row, snap)
+                .map(|text| help_tooltip_lines(&text, inner.width as usize))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let tip_len = tip_lines.len() as u16;
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
         }
+        starts.push(line_idx as usize);
         if selected || is_editing {
             focus.0 = line_idx as usize;
         }
@@ -725,21 +749,28 @@ fn draw_settings_rows(
             });
             line_idx += 1;
         }
-        if selected
-            && !is_editing
-            && let Some(text) = row_hint(*row, snap)
-        {
-            let hint = help_tooltip_lines(&text, inner.width as usize);
-            line_idx += hint.len() as u16;
-            lines.extend(hint);
+        if selected || is_editing {
+            line_idx += tip_len;
+            lines.extend(tip_lines);
         }
         if selected || is_editing {
             focus.1 = line_idx as usize;
         }
+        block_ends.push(if selected || is_editing {
+            line_idx as usize
+        } else {
+            (line_idx + tip_len) as usize
+        });
+        tips.push(tip_len as usize);
     }
 
     // The row list outgrows a short terminal (env entries + model overrides are
     // unbounded), so it scrolls to the focused row rather than clipping its tail.
+    app.setup_detail_viewport.set(inner.height as usize);
+    app.setup_detail_total.set(lines.len());
+    app.setup_detail_row_starts.replace(starts);
+    app.setup_detail_block_ends.replace(block_ends);
+    app.setup_detail_tips.replace(tips);
     let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
 
     // Position the native terminal cursor at the caret when a text/model field is active.
@@ -762,7 +793,11 @@ fn draw_settings_rows(
 fn row_label_cols(row: ConfigRow, snap: &Snap) -> usize {
     match row {
         ConfigRow::EnvEntry(i) => {
-            let key_len = snap.env.get(i).map(|(k, _)| k.chars().count()).unwrap_or(0);
+            let key_len = snap
+                .env
+                .get(i)
+                .map(|(k, _)| Span::raw(k).width())
+                .unwrap_or(0);
             DETAIL_KEY_W.max(key_len) + DETAIL_KEY_GUTTER
         }
         _ => DETAIL_KEY_W + DETAIL_KEY_GUTTER,
@@ -790,6 +825,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
+        ConfigRow::BellThreshold => &snap.bell_threshold,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
         | ConfigRow::ModelOverrideAdd
@@ -807,8 +843,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// Inline help for rows whose labels don't self-describe, phrased for the row's
 /// current value so it re-explains itself as the value changes. `login_is_oauth`
 /// (not the base-url buffer) picks the login/log-out wording — the copy has to
-/// name what ⏎ really does — while `auto_start` / `base_url` flip on their own
-/// value.
+/// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
+/// on their own value.
 fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
@@ -837,6 +873,16 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "sends a 1-token request to Haiku at every 5h usage reset"
         }
         ConfigRow::AutoStart => "5h usage window stays closed after reset",
+        ConfigRow::BellThreshold if snap.bell_threshold.is_empty() => concat!(
+            "no alert when 5h usage climbs; ",
+            key_lit!("↵"),
+            " or ",
+            key_lit!("+"),
+            " to set one"
+        ),
+        ConfigRow::BellThreshold => {
+            "alerts once when 5h usage reaches this, again after it drops below"
+        }
         ConfigRow::ModelOverrideAdd => "set custom model names on this account",
         ConfigRow::Login if snap.console_login => {
             "log into alibaba console to see this account's usage"
@@ -910,6 +956,17 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     Some(hint.to_string())
 }
 
+/// Sub-line under the `alert at` field while typing: the accepted input,
+/// DANGER while the buffer would be refused (the Fallback `rotate at` twin).
+fn alert_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = "0-100 % · empty turns it off";
+    if crate::tui::app::parse_bell_threshold(input.trimmed()).is_none() {
+        invalid_tooltip_lines(range, width)
+    } else {
+        help_tooltip_lines(range, width)
+    }
+}
+
 fn detail_row(
     row: ConfigRow,
     selected: bool,
@@ -927,28 +984,62 @@ fn detail_row(
         Span::raw("  ")
     };
     let line = match row {
-        ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
-        ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
-        ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
+        ConfigRow::Name => {
+            return kv_field(arrow, "name", input, editing, selected, false, false, width);
+        }
+        ConfigRow::BaseUrl => {
+            return kv_field(
+                arrow, "base url", input, editing, selected, false, true, width,
+            );
+        }
+        ConfigRow::ApiKey => {
+            return kv_field(
+                arrow, "api key", input, editing, selected, true, false, width,
+            );
+        }
         // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.
         ConfigRow::Model if !editing => {
             return model_cycle_lines(arrow, &input.value, selected, width);
         }
-        ConfigRow::Model => kv_field(arrow, "model", input, editing, selected, false),
-        ConfigRow::OpusModel => kv_field(arrow, "opus", input, editing, selected, false),
-        ConfigRow::SonnetModel => kv_field(arrow, "sonnet", input, editing, selected, false),
-        ConfigRow::HaikuModel => kv_field(arrow, "haiku", input, editing, selected, false),
-        ConfigRow::FableModel => kv_field(arrow, "fable", input, editing, selected, false),
-        ConfigRow::SubagentModel => kv_field(arrow, "subagent", input, editing, selected, false),
+        ConfigRow::Model => {
+            return kv_field(
+                arrow, "model", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::OpusModel => {
+            return kv_field(arrow, "opus", input, editing, selected, false, false, width);
+        }
+        ConfigRow::SonnetModel => {
+            return kv_field(
+                arrow, "sonnet", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::HaikuModel => {
+            return kv_field(
+                arrow, "haiku", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::FableModel => {
+            return kv_field(
+                arrow, "fable", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::SubagentModel => {
+            return kv_field(
+                arrow, "subagent", input, editing, selected, false, false, width,
+            );
+        }
         // A custom env entry: its key is the label; mask the value when the key
         // looks like a credential (mirrors the api-key row).
         ConfigRow::EnvEntry(i) => {
             let key = snap.env.get(i).map(|(k, _)| k.clone()).unwrap_or_default();
             let mask = env_key_is_secret(&key);
-            kv_field(arrow, &key, input, editing, selected, mask)
+            return kv_field(arrow, &key, input, editing, selected, mask, false, width);
         }
         // While editing, the typed text is the new key; at rest, the add chip.
-        ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
+        ConfigRow::EnvAdd if editing => {
+            return kv_field(arrow, "key", input, editing, selected, false, false, width);
+        }
         ConfigRow::EnvAdd => Line::from(vec![
             arrow,
             Span::styled("+ add env", bold_when(theme::accent(), selected)),
@@ -992,6 +1083,35 @@ fn detail_row(
                 ("disable account".to_string(), theme::danger().bold())
             };
             Line::from(vec![row_arrow, Span::styled(label, style)])
+        }
+        // A refused buffer renders DANGER beside its range line, and the ` %`
+        // unit trails the native caret: the `rotate at` editor's shape.
+        ConfigRow::BellThreshold if editing => {
+            let invalid = crate::tui::app::parse_bell_threshold(input.trimmed()).is_none();
+            let mut spans = vec![
+                arrow,
+                Span::styled(
+                    key_cell("alert at", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    label_style(selected),
+                ),
+            ];
+            spans.extend(value_caret(input, invalid));
+            spans.push(Span::styled(
+                " %",
+                if invalid {
+                    theme::danger()
+                } else {
+                    theme::faint()
+                },
+            ));
+            Line::from(spans)
+        }
+        ConfigRow::BellThreshold => {
+            let (value, style) = match snap.bell_threshold.as_str() {
+                "" => ("off".to_string(), theme::faint()),
+                pct => (format!("{pct}%"), theme::accent()),
+            };
+            kv_static(arrow, "alert at", value, style, selected)
         }
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
@@ -1083,6 +1203,12 @@ fn detail_row(
     vec![line]
 }
 
+/// One form row's key + value line(s). `middle` picks middle-ellipsis for the
+/// value (a URL row) instead of the trailing-ellipsis default.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call per row carries its whole chrome: key, value, edit/mask/ellipsis flags"
+)]
 fn kv_field(
     arrow: Span<'static>,
     key: &str,
@@ -1090,16 +1216,48 @@ fn kv_field(
     editing: bool,
     focused: bool,
     mask_value: bool,
-) -> Line<'static> {
-    let mut spans = vec![
-        arrow,
-        Span::styled(
-            key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-            label_style(focused),
-        ),
-    ];
-    spans.extend(value_spans(input, editing, mask_value));
-    Line::from(spans)
+    middle: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    // A long env-key label widens the key cell past DETAIL_KEY_W (`key_cell`
+    // pads to the key's own width), so the value column opens after the
+    // RENDERED key — measured, never the constant. A key wider than the pane
+    // clamps with `…` like any value, never a mid-word cut.
+    let full_key = key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+    let key_cell_span = if Span::raw(&full_key).width() > width.saturating_sub(2) {
+        let budget = width.saturating_sub(2 + DETAIL_KEY_GUTTER);
+        format!("{}{}", truncate(key, budget), " ".repeat(DETAIL_KEY_GUTTER))
+    } else {
+        full_key
+    };
+    let lead = 2 + Span::raw(&key_cell_span).width();
+    let value_w = width.saturating_sub(lead);
+    let mut spans = vec![arrow, Span::styled(key_cell_span, label_style(focused))];
+    if editing || mask_value || input.value.is_empty() {
+        spans.extend(value_spans(input, editing, mask_value));
+        return vec![Line::from(spans)];
+    }
+    if value_w >= 4 {
+        let value = if middle {
+            middle_truncate(&input.value, value_w)
+        } else {
+            truncate(&input.value, value_w)
+        };
+        spans.push(Span::styled(value, theme::accent()));
+        return vec![Line::from(spans)];
+    }
+    // The value column can't hold a clamped value: drop it below the key,
+    // indented past the caret gutter, at the full pane width.
+    vec![
+        Line::from(spans),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                truncate(&input.value, width.saturating_sub(2)),
+                theme::accent(),
+            ),
+        ]),
+    ]
 }
 
 fn kv_static(

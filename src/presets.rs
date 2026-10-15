@@ -391,3 +391,77 @@ pub(crate) fn delete_preset(name: &str) -> Result<()> {
 #[cfg(test)]
 #[path = "../tests/inline/presets.rs"]
 mod tests;
+
+/// What applying a preset does with a set field the preset leaves unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leftover {
+    Keep,
+    Clear,
+}
+
+/// An endpoint + model block as the Setup rows list it: label and value, in
+/// row order.
+fn block_rows<'a>(
+    base_url: Option<&'a str>,
+    m: &'a ModelSettings,
+) -> [(&'static str, Option<&'a str>); 7] {
+    [
+        ("base url", base_url),
+        ("model", m.default.as_deref()),
+        ("fable", m.fable.as_deref()),
+        ("opus", m.opus.as_deref()),
+        ("sonnet", m.sonnet.as_deref()),
+        ("haiku", m.haiku.as_deref()),
+        ("subagent", m.subagent.as_deref()),
+    ]
+}
+
+impl Preset {
+    /// Over an account's endpoint + model block: the fields whose value this
+    /// preset's own replaces, and the fields holding a value it leaves unset,
+    /// each in Setup row order.
+    pub(crate) fn apply_diff(
+        &self,
+        base_url: Option<&str>,
+        models: &ModelSettings,
+    ) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut replaces = Vec::new();
+        let mut leaves = Vec::new();
+        let ours = block_rows(self.base_url.as_deref(), &self.models);
+        for ((label, mine), (_, theirs)) in ours.into_iter().zip(block_rows(base_url, models)) {
+            match (mine, theirs) {
+                (Some(mine), Some(theirs)) if mine != theirs => replaces.push(label),
+                (None, Some(_)) => leaves.push(label),
+                _ => {}
+            }
+        }
+        (replaces, leaves)
+    }
+
+    /// The endpoint + model block applying this preset leaves: every field it
+    /// sets, and every field it leaves unset kept or cleared per `leftover`.
+    pub(crate) fn applied_to(
+        &self,
+        base_url: &Option<String>,
+        models: &ModelSettings,
+        leftover: Leftover,
+    ) -> (Option<String>, ModelSettings) {
+        let pick = |mine: &Option<String>, theirs: &Option<String>| match (mine, leftover) {
+            (Some(_), _) => mine.clone(),
+            (None, Leftover::Keep) => theirs.clone(),
+            (None, Leftover::Clear) => None,
+        };
+        let m = &self.models;
+        (
+            pick(&self.base_url, base_url),
+            ModelSettings {
+                default: pick(&m.default, &models.default),
+                opus: pick(&m.opus, &models.opus),
+                sonnet: pick(&m.sonnet, &models.sonnet),
+                haiku: pick(&m.haiku, &models.haiku),
+                fable: pick(&m.fable, &models.fable),
+                subagent: pick(&m.subagent, &models.subagent),
+            },
+        )
+    }
+}

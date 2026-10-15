@@ -55,6 +55,80 @@ fn cell_is_always_exactly_width() {
     }
 }
 
+// ── display-cell budgeting ─────────────────────────────────────────────────
+//
+// A wide glyph occupies two cells but one `char`/grapheme; the helpers budget
+// cells so a CJK or emoji value keeps its `…` inside the column instead of
+// overrunning the pane edge.
+
+/// CJK is two cells per char: a 5-cell column holds two glyphs plus `…`.
+#[test]
+fn fixed_split_budgets_display_cells_for_cjk() {
+    assert_eq!(fixed_split("日本語", 5), ("日本…".into(), "".into()));
+    assert_eq!(fixed_split("日本語", 6).0, "日本語");
+}
+
+/// An emoji (`🧭`, one two-cell glyph) never splits and the `…` stays inside
+/// an odd budget.
+#[test]
+fn fixed_split_keeps_a_wide_glyph_whole_at_an_odd_budget() {
+    assert_eq!(fixed_split("🧭🧭", 3), ("🧭…".into(), "".into()));
+    assert_eq!(fixed_split("🧭🧭", 4).0, "🧭🧭");
+}
+
+/// `truncate` shares the cell budget: the content is `fixed_split`'s.
+#[test]
+fn truncate_budgets_display_cells() {
+    assert_eq!(truncate("日本語", 5), "日本…");
+    assert_eq!(truncate("日本語", 6), "日本語");
+    assert_eq!(truncate("🧭🧭", 3), "🧭…");
+    assert_eq!(truncate("abc", 5), "abc");
+    assert_eq!(truncate("abc", 0), "");
+}
+
+/// Middle ellipsis budgets both halves by cells, so a CJK path's head and tail
+/// stay inside the column instead of the tail being silently dropped.
+#[test]
+fn middle_truncate_budgets_display_cells_for_cjk() {
+    assert_eq!(middle_truncate("日本語/アカウント", 12), "日本語…ント");
+    assert_eq!(middle_truncate("🧭🧭🧭🧭", 5), "🧭…🧭");
+    // ASCII stays byte-identical to the old char budget.
+    assert_eq!(
+        middle_truncate("~/repos/rs/src/tui/theme.rs", 20),
+        "~/repos/rs…/theme.rs"
+    );
+}
+
+/// A 2-cell glyph that does not fit the content budget leaves the `…` inside
+/// the column and the pad absorbs the straddle, so `fixed` renders exactly
+/// `width` cells.
+#[test]
+fn fixed_split_pads_the_straddled_wide_glyph() {
+    assert_eq!(fixed_split("日本語", 4), ("日…".into(), " ".into()));
+}
+
+/// Multi-codepoint graphemes stay whole: `⚠️` (base + VS16) and a ZWJ family
+/// are one grapheme each, never split.
+#[test]
+fn helpers_keep_a_multicodepoint_grapheme_whole() {
+    assert_eq!(fixed_split("⚠️⚠️", 3), ("⚠️…".into(), "".into()));
+    assert_eq!(truncate("⚠️⚠️", 3), "⚠️…");
+    assert_eq!(fixed_split("👨‍👩‍👧👨‍👩‍👧", 3), ("👨‍👩‍👧…".into(), "".into()));
+    assert_eq!(truncate("👨‍👩‍👧👨‍👩‍👧", 3), "👨‍👩‍👧…");
+}
+
+/// Arabic lam-alef renders per grapheme as two cells though the whole-string
+/// width folds it to one; every helper measures per grapheme, so it never
+/// overruns its budget.
+#[test]
+fn helpers_budget_lam_alef_per_grapheme() {
+    assert_eq!(truncate("لالالا", 3), "لا…");
+    assert_eq!(fixed_split("لالالا", 3), ("لا…".into(), "".into()));
+    assert_eq!(middle_truncate("لالالا", 5), "لا…لا");
+    assert_eq!(fixed("لا", 2), "لا");
+    assert_eq!(fixed("لا", 3), "لا ");
+}
+
 // ── fetch-state cue ──────────────────────────────────────────────────────
 //
 // `fetch_cue_color`: amber = serving last-known numbers, red = failed, none =

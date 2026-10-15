@@ -30,15 +30,15 @@ use super::super::app::{
     parse_herdr_tag_secs,
 };
 use super::super::theme;
-use super::format::spinner_frame;
+use super::format::middle_truncate;
+use super::format::{spinner_frame, truncate};
 use super::panes::{
     cycle_row_lines, draw_scrollbar, draw_scrolled_lines, empty_state, follow_scroll_offset,
     head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
     master_detail, section_box, value_caret,
 };
 use super::prose;
-use super::status::middle_truncate;
-use crate::format::truncate;
+
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
 use crate::usage::humanize_duration;
@@ -67,7 +67,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.plugin.row_count() == 0 {
-        app.plugin.selector_offset.set(0);
+        app.plugin.selector.offset.set(0);
         let widget = if app.plugin.error.is_some() {
             empty_state("check failed", "r", "to retry")
         } else {
@@ -104,13 +104,24 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let viewport = inner.height as usize;
+    app.plugin.selector.viewport.set(viewport);
+    app.plugin.selector.total.set(rows.len());
+    app.plugin
+        .selector
+        .starts
+        .replace((0..rows.len()).collect());
+    app.plugin
+        .selector
+        .block_ends
+        .replace((1..=rows.len()).collect());
+    app.plugin.selector.tips.replace(vec![0; rows.len()]);
     let start = follow_scroll_offset(
         rows.len(),
         viewport,
         (cursor_line, cursor_line + 1),
-        app.plugin.selector_offset.get(),
+        app.plugin.selector.offset.get(),
     );
-    app.plugin.selector_offset.set(start);
+    app.plugin.selector.offset.set(start);
     let shown = rows.len().saturating_sub(start).min(viewport.max(1));
     let window: Vec<Line<'static>> = rows.iter().skip(start).take(shown).cloned().collect();
 
@@ -173,7 +184,7 @@ fn selector_row(health: Health, label: &str, row: SelectorRow<'_>) -> Line<'stat
         with_bg(label_style)
     };
 
-    let label_len = label.chars().count();
+    let label_len = Span::raw(label).width();
     // Pad short labels to the group's widest so the values share a left edge.
     let align = label_pad.saturating_sub(label_len);
     // 2 (caret) + 2 (dot + space) + label + alignment pad, then the value trails
@@ -209,7 +220,7 @@ fn selector_row(health: Health, label: &str, row: SelectorRow<'_>) -> Line<'stat
 
 /// Pad a span list with tinted filler so the hover tint spans the full width.
 fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui::style::Color>) {
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = spans.iter().map(|s| s.width()).sum();
     let pad = content_w.saturating_sub(used);
     if pad > 0 {
         let style = match tint {
@@ -264,11 +275,14 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (block, detail): (Block<'static>, &[String]) =
         if let Some(check) = app.plugin.selected_check() {
             (
-                section_box(check.label, focused, false),
+                section_box(check.label, focused, false, area.width),
                 check.detail.as_slice(),
             )
         } else {
-            (section_box("plugin", focused, false), [].as_slice())
+            (
+                section_box("plugin", focused, false, area.width),
+                [].as_slice(),
+            )
         };
 
     let inner = block.inner(area);
@@ -288,7 +302,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // Indented sub-lines (model overrides) render dim, never through the key
         // column — exclude them so they can't inflate the real rows' gap.
         .filter(|line| !line.starts_with("  "))
-        .filter_map(|line| line.split_once(": ").map(|(k, _)| k.chars().count()))
+        .filter_map(|line| line.split_once(": ").map(|(k, _)| Span::raw(k).width()))
         .max()
         .unwrap_or(0)
         .min(18);
@@ -313,7 +327,9 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.plugin.detail_max_scroll.set(max_scroll);
+    app.plugin.detail_viewport.set(viewport as u16);
     let scroll = app.plugin.detail_scroll.min(max_scroll);
+    app.plugin.displayed_scroll.set(scroll);
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -332,7 +348,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// rather than holding a manual offset. The section header underlines while
 /// focus rests on one of its rows.
 fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: Vec<Line<'static>>) {
-    let focused = app.plugin.focus == PluginFocus::Detail;
+    let focused = app.plugin.focus == PluginFocus::Detail && !app.plugin.diagnostic_focus;
 
     lines.push(Line::from(""));
     let mut section_style = theme::label();
@@ -374,7 +390,7 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
                 // gutter; the native terminal cursor owns the caret. x = "✎ "
                 // (2) + label + the 2-space value gap + pre-caret cols.
                 let cx = inner.x.saturating_add(
-                    (2 + row.label().chars().count() + 2 + head_cols(input)) as u16,
+                    (2 + Span::raw(row.label()).width() + 2 + head_cols(input)) as u16,
                 );
                 caret = Some((cx, lines.len()));
                 lines.extend(row_lines);
@@ -401,7 +417,19 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
         }
     }
 
-    let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.plugin.form_offset));
+    let viewport = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16;
+    app.plugin.detail_max_scroll.set(max_scroll);
+    app.plugin.detail_viewport.set(viewport as u16);
+    let offset = if app.plugin.diagnostic_focus {
+        let scroll = app.plugin.detail_scroll.min(max_scroll) as usize;
+        draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport), None)
+    } else {
+        draw_scrolled_lines(frame, inner, lines, focus, Some(&app.plugin.form_offset))
+    };
+    app.plugin
+        .displayed_scroll
+        .set(offset.min(u16::MAX as usize) as u16);
     // A caret scrolled off the top has no cell to sit in; leaving the cursor
     // unset is better than parking it on an unrelated row.
     if let Some((cx, row)) = caret
@@ -539,7 +567,7 @@ fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
         return Line::from(prose::fit(text, width, theme::dim()));
     }
     if let Some((key, value)) = text.split_once(": ") {
-        let pad = key_w.saturating_sub(key.chars().count()) + 2;
+        let pad = key_w.saturating_sub(Span::raw(key).width()) + 2;
         let mut spans = vec![Span::styled(
             format!("{key}{}", " ".repeat(pad)),
             theme::label(),
@@ -655,7 +683,7 @@ fn draw_delegates(frame: &mut Frame<'_>, area: Rect, rows: &[DelegateCells]) {
     }
     // Third panel on this body, and never focused — no key reaches it — so it
     // keeps the blurred chrome and the non-first panel's TEXT_DIM title.
-    let block = section_box("delegates", false, false);
+    let block = section_box("delegates", false, false, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -697,7 +725,7 @@ fn delegate_lines(rows: &[DelegateCells], viewport: usize, width: usize) -> Vec<
     let visible = &rows[..shown];
     let name_w = visible
         .iter()
-        .map(|r| r.profile.chars().count())
+        .map(|r| Span::raw(&r.profile).width())
         .max()
         .unwrap_or(0)
         .min(NAME_W_MAX);

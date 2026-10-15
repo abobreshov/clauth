@@ -8,9 +8,9 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::super::theme;
+use super::format::{grapheme_cells, prefix_in_cells};
 use super::panes::wrap_words;
 
 const KEY_OPEN: char = '\u{E000}';
@@ -126,26 +126,26 @@ pub(crate) fn spans(text: &str, base: Style) -> Vec<Span<'static>> {
 /// [`spans`] cut to `width` cells on grapheme boundaries, reserving a cell
 /// for a trailing `…` in `base` whenever text is dropped.
 pub(crate) fn fit(text: &str, width: usize, base: Style) -> Vec<Span<'static>> {
-    let mut chars = classify(text);
+    // Control graphemes never reach the screen, so they drop out of both the
+    // measurement and the kept list — otherwise `chars[..consumed]` indexes a
+    // list that still holds them and the cut lands inside a grapheme.
+    let chars: Vec<(char, Kind)> = classify(text)
+        .into_iter()
+        .filter(|(c, _)| !c.is_control())
+        .collect();
     let visible: String = chars.iter().map(|(ch, _)| *ch).collect();
-    if Span::raw(&visible).width() > width {
-        let budget = width.saturating_sub(1);
-        let mut used = 0;
-        let mut kept = 0;
-        for grapheme in visible.graphemes(true) {
-            let cells = Span::raw(grapheme).width();
-            if used + cells > budget {
-                break;
-            }
-            used += cells;
-            kept += grapheme.chars().count();
-        }
-        chars.truncate(kept);
-        if width > 0 {
-            chars.push(('…', Kind::Prose));
-        }
+    if grapheme_cells(&visible) <= width {
+        return runs(&chars, base);
     }
-    runs(&chars, base)
+    if width == 0 {
+        return Vec::new();
+    }
+    // One cell is reserved for `…`; the rest fills with whole graphemes.
+    let (kept_text, _) = prefix_in_cells(&visible, width - 1);
+    let consumed = kept_text.chars().count();
+    let mut kept: Vec<(char, Kind)> = chars[..consumed].to_vec();
+    kept.push(('…', Kind::Prose));
+    runs(&kept, base)
 }
 
 /// [`wrap_words`] over marked copy: the wrap budget counts only visible

@@ -6,13 +6,15 @@ The header's first row reads `tollgate vX.Y.Z`, then a `[ guest ]` pill while up
 
 Colours follow the `palette` key: the running Omarchy theme when there is one, else Catppuccin Mocha, reloaded live when the theme changes ([Configuration](Configuration#palette)). There is no Config tab row for it.
 
+Page Up and Page Down move the focused list, detail, form or modal by its viewport less one row, keeping an overlap. Lists and forms stop at their ends and keep each newly selected row visible; modal buttons stay pinned while their body scrolls. The terminal needs at least 34 columns and 14 rows.
+
 ## Tabs
 
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / 7d bars, chain position, selectable codex accounts | switch Claude accounts, select Codex accounts, reorder Claude accounts, pick which harness shows |
 | **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state; below the profiles, every monitor and (in guest mode) every upstream clauth account, as metric cards | scroll detail, edit a local account note, refresh one account, toggle estimates and the pace marker |
-| **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
+| **Tokens** | global Claude Code token stats and API-equivalent cost | focus and scroll dashboard cards, drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start, 5h alert | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
 | **Config** | program-wide settings | change any of the rows in the table below |
@@ -21,7 +23,7 @@ Colours follow the `palette` key: the running Omarchy theme when there is one, e
 
 An Overview row showing `same account as <name>` has resolved to the same Anthropic account as that profile. Login warns about the likely browser-account mix-up in a toast. The Fallback tab names the duplicate blocker, and walks skip later duplicates until their login resolves to another account.
 
-The active account is orange. A red `!` marks an account whose 5h alert fired until usage falls below the line; it outranks the active dot. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint tollgate doesn't recognize shows none. A codex account's banked usage-limit resets show as `↺ N` on its Overview row while one is available — `tollgate limit-reset` spends one ([Codex](Codex#use-a-usage-limit-reset)). Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together. On the fallback chain panel below the accounts, `↲ ~40m` beside a member names the account the chain switches to next, and roughly when.
+The active account is orange. A red `!` marks an account whose 5h alert fired until usage falls below the line; it outranks the active dot. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint tollgate doesn't recognize shows none. A codex account's banked usage-limit resets show as `↺ N` on its Overview row while one is available — `tollgate limit-reset` spends one ([Codex](Codex#use-a-usage-limit-reset)). Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together. On the fallback chain panel below the accounts, `↲ ~40m` beside a member names the account the chain switches to next, and roughly when. A `+N more` line names the hidden members.
 
 **Monitors and upstream accounts on the Usage tab.** The Usage tab's account rail lists the profiles first, then each `monitor:<id>` from `monitors.toml`, then, in guest mode, each `upstream:<name>` read from upstream clauth's status feed. <kbd>↑</kbd> <kbd>↓</kbd> walk the whole rail and wrap. Selecting one of those extra rows shows it as metric cards: a header with the provider and plan, a stale or failure line when there is one, then one card per window (label, reset countdown with local time, a full-width bar with an elapsed marker `│`, the value with a pace glyph `↑ → ↓` and a severity word, a dim footnote) and one per money meter (balance, a folded spend row, caps and budgets). They are read-only and have no Setup tab row; `tollgate monitor refresh` fetches a monitor. The list is re-read from disk every 2 seconds, so a monitor added from the shell appears without a restart.
 
@@ -44,6 +46,10 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 | <kbd>esc</kbd> | step back out of a sub-pane; in an open text field, put back the saved value (the footer reads `esc revert`), or on the new-account form keep what you typed (`esc done`) |
 | <kbd>q</kbd> | step back, or arm quit at the top level; press again to confirm |
 | <kbd>ctrl</kbd>+<kbd>c</kbd> | quit from anywhere |
+
+A descended Usage or Tokens model detail scrolls one line with <kbd>↑</kbd> / <kbd>↓</kbd>; <kbd>esc</kbd> or <kbd>←</kbd> returns to its selector without changing the selected account or model. <kbd>PageUp</kbd> / <kbd>PageDown</kbd> move one page, the visible height less one line: a list or form moves its selection about a page and stops at the first or last row, and no line is passed over unseen. Choice dialogs and action menus follow the selected option so it remains visible; an overflowing choice shows a scrollbar. A custom-field overwrite whose consequence cannot fit in the choice dialog opens a confirmation with its full explanation scrollable (<kbd>↑</kbd> / <kbd>↓</kbd> and the page keys, while <kbd>←</kbd> / <kbd>→</kbd> pick the button) and cancel selected by default; a fitting choice acts at once. Toasts stack in the top-right corner, at most three lines each: a longer message ends its third line in `…`, and a failure leads with what went wrong and why.
+
+On the Tokens dashboard, <kbd>↑</kbd> / <kbd>↓</kbd> move focus card to card in reading order (wrapping), <kbd>PageUp</kbd> / <kbd>PageDown</kbd> move about a page and stop at the ends, and the grid scrolls by whole cards when it is taller than the screen: a card that does not fit whole moves below the fold, with a scrollbar in the body's right edge, instead of clipping its border.
 
 ### Tab-dependent
 
@@ -106,13 +112,17 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `verify login` (`v`) | reads the stored OAuth login's account once, without rotating the token; available with credentials and hidden while verification runs. Reports identity changes and duplicate accounts in a local toast |
 | `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax, Ollama Cloud (and the local Ollama daemon, whose usage key is minted on the same page) and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint tollgate does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
+Applying a preset writes the endpoint and model values it sets and keeps fields it leaves unset. If an unset field already has a value, the confirmation offers `keep them` by default or `clear them`. This also applies to the `+ new` draft.
+
 There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
 
 `disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `tollgate start` session; the pick names whichever is in the way.
 
 ## Setup tab rows
 
-The account list ends in an action row: `+ new`, which turns this pane into the create form. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed.
+The saved account’s `alert at` row sets the 5h usage alert threshold. `+` and `-` step it by 5 from 95%; Enter accepts 0–100 and an empty value turns it off.
+
+The account list ends in an action row: `+ new`, which turns this pane into the create form. The form carries the same `model` and `+ model override` rows a saved account does, and `create account` saves every one. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed. A captured login on a different endpoint than the form's takes none of the form's model rows.
 
 | Row | Sets |
 |-----|------|
@@ -177,6 +187,8 @@ Each row is a check on your Claude Code wiring: `tollgate` on `PATH` and `claude
 | `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
 | `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
 | `install the tollgate plugin` / `install globally (user scope)` | the first spelling when the plugin row reads not installed, the second when it is installed for this project only. Either confirms into the real `claude plugin` installer at user scope. Refused in guest mode, like `wire mcpServers` and the herdr fix |
+
+Page Up and Page Down read the selected check’s diagnostic output, including the prose above the herdr options. The footer advertises these keys while the detail overflows. Arrow keys return to the herdr options.
 
 The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel.
 

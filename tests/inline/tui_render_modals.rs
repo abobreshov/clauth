@@ -239,7 +239,7 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
         rows.join("\n")
     );
 
-    // The section whole — its header, both rows, and its placement. A copy-only
+    // The section whole — its header, all three key rows, and its placement. A copy-only
     // pin would pass with the scroll row parked back under TABS, four lines from
     // that section's own ↑↓ row.
     let head = rows
@@ -247,13 +247,15 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
         .position(|r| r.contains("THIS MODAL"))
         .unwrap_or_else(|| panic!("the modal documents its own keys:\n{}", rows.join("\n")));
     assert_eq!(
-        rows[head..head + 4].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 5].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  THIS MODAL                                                             │"
                 .to_string(),
             "│                                                                         │"
                 .to_string(),
             "│    ↑ ↓                 scroll                                           │"
+                .to_string(),
+            "│    page up / page down  scroll a page                                   │"
                 .to_string(),
             "│    esc · q · ?         close                                            │"
                 .to_string(),
@@ -289,6 +291,7 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
             ("↵", "open settings · edit field · flip toggle"),
             ("↵ on a field", "edit inline; ↵ again saves"),
             ("space", "cycle the model preset (model row)"),
+            ("+ / -", "step alert at by 5"),
             ("env", "+ add env · ↵ edits a value"),
             (
                 "a",
@@ -608,7 +611,7 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
 
 #[test]
 fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
-    use crate::tui::app::{ConfirmAction, ConfirmState};
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -619,6 +622,7 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
             .into(),
         detail: Some("api → oauth switches may not work until cc restarts.".into()),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddChainCandidate("test_name".into()),
     };
     let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
@@ -720,8 +724,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             "USAGE",
             &[
                 "│    ↑ ↓                 scroll account detail",
-                "│    page up             scroll account detail up a viewport",
-                "│    page down           scroll account detail down a viewport",
                 "│    esc                 return to account selector",
                 "│    ←                   return to account selector",
                 "│    r                   refresh account",
@@ -735,6 +737,8 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &dashboard,
             "TOKENS",
             &[
+                "│    ↑ ↓                 move between cards",
+                "│    page up / page down  move a page of cards",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
                 "│    r                   reload on-disk stats",
@@ -745,6 +749,8 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &populated_dashboard,
             "TOKENS",
             &[
+                "│    ↑ ↓                 move between cards",
+                "│    page up / page down  move a page of cards",
                 "│    ↵                   open per-model breakdown",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
@@ -782,8 +788,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             "TOKENS",
             &[
                 "│    ↑ ↓                 scroll model detail",
-                "│    page up             scroll model detail up a viewport",
-                "│    page down           scroll model detail down a viewport",
                 "│    esc                 return to model selector",
                 "│    ←                   return to model selector",
                 "│    c                   count cache in token figures",
@@ -849,8 +853,6 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
                 "│  USAGE",
                 "│",
                 "│    ↑ ↓                 scroll account detail",
-                "│    page up             scroll account detail up a viewport",
-                "│    page down           scroll account detail down a viewport",
                 "│    esc                 return to account selector",
                 "│    ←                   return to account selector",
                 "│    r                   refresh account",
@@ -866,8 +868,6 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
                 "│  TOKENS",
                 "│",
                 "│    ↑ ↓                 scroll model detail",
-                "│    page up             scroll model detail up a viewport",
-                "│    page down           scroll model detail down a viewport",
                 "│    esc                 return to model selector",
                 "│    ←                   return to model selector",
                 "│    c                   count cache in token figures",
@@ -1016,5 +1016,1029 @@ fn empty_tokens_hides_enter_in_dashboard_and_model_selector_footer() {
         let exact = TestBackend::with_lines([rendered[0].trim_end()]);
         exact.assert_buffer_lines([expected.trim_end()]);
         assert_eq!(rendered.len(), 1, "{name}: one footer row");
+    }
+}
+#[test]
+fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
+    use crate::tui::app::{
+        ActionItem, ActionMenuAction, ActionMenuState, DivergenceTargetForm, PresetPickerForm,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let render = |draw: &dyn Fn(&mut Frame<'_>, Rect)| {
+        let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        term.draw(|f| draw(f, f.area())).unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let targets = (0..24).map(|i| format!("account-{i:02}")).collect();
+    let target = DivergenceTargetForm {
+        targets,
+        cursor: 24,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let rows = render(&|f, area| draw_divergence_target(f, area, &target));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("❯ overwrite 'account-23'")),
+        "selected target hidden: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains('┃')),
+        "target overflow has no thumb: {rows:?}"
+    );
+
+    let presets = (0..24)
+        .map(|i| crate::presets::Preset {
+            name: format!("preset-{i:02}"),
+            base_url: None,
+            models: Default::default(),
+            env: Default::default(),
+            builtin: false,
+        })
+        .collect();
+    let preset = PresetPickerForm {
+        target: "work".into(),
+        presets,
+        cursor: 23,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let rows = render(&|f, area| draw_preset_picker(f, area, &preset));
+    assert!(
+        rows.iter().any(|row| row.contains("❯ preset-23")),
+        "selected preset hidden: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains('┃')),
+        "preset overflow has no thumb: {rows:?}"
+    );
+    let mut preset = preset;
+    preset.cursor = 5;
+    let before = render(&|f, area| draw_preset_picker(f, area, &preset));
+    let before_y = before
+        .iter()
+        .position(|row| row.contains("❯ preset-05"))
+        .unwrap();
+    preset.cursor = 6;
+    let rows = render(&|f, area| draw_preset_picker(f, area, &preset));
+    let after_y = rows
+        .iter()
+        .position(|row| row.contains("❯ preset-06"))
+        .unwrap();
+    assert_eq!(
+        after_y,
+        before_y + 1,
+        "an interior selection must move within its viewport: {rows:?}"
+    );
+    preset.cursor = 23;
+    let _ = render(&|f, area| draw_preset_picker(f, area, &preset));
+    preset.cursor = 0;
+    let rows = render(&|f, area| draw_preset_picker(f, area, &preset));
+    assert!(
+        rows.iter().any(|row| row.contains("❯ preset-00")),
+        "wrapped selection cannot return to first: {rows:?}"
+    );
+
+    let menu = ActionMenuState {
+        items: (0..24)
+            .map(|_| ActionItem {
+                label: "reload stats",
+                hotkey: Some('r'),
+                action: ActionMenuAction::ReloadTokenStats,
+            })
+            .collect(),
+        scoped_len: 0,
+        context: None,
+        cursor: 23,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let rows = render(&|f, area| draw_action_menu(f, area, &menu));
+    assert!(
+        rows.iter().any(|row| row.contains("❯ reload stats")),
+        "selected action hidden: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains('┃')),
+        "action overflow has no thumb: {rows:?}"
+    );
+
+    let mut menu = menu;
+    menu.cursor = 5;
+    let before = render(&|f, area| draw_action_menu(f, area, &menu));
+    let before_y = before
+        .iter()
+        .position(|row| row.contains("❯ reload stats"))
+        .unwrap();
+    menu.cursor = 6;
+    let rows = render(&|f, area| draw_action_menu(f, area, &menu));
+    let after_y = rows
+        .iter()
+        .position(|row| row.contains("❯ reload stats"))
+        .unwrap();
+    assert_eq!(
+        after_y,
+        before_y + 1,
+        "an interior action must move within its viewport: {rows:?}"
+    );
+    let split = ActionMenuState {
+        scoped_len: 12,
+        cursor: 12,
+        ..menu
+    };
+    let rows = render(&|f, area| draw_action_menu(f, area, &split));
+    assert!(
+        rows.iter().any(|row| row.contains("❯ reload stats")),
+        "first global action hidden: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains('─') && !row.contains('╭') && !row.contains('╰')),
+        "group rule missing: {rows:?}"
+    );
+    let mut app = empty_app(Tab::Tokens);
+    app.open_modal(Modal::ActionMenu(ActionMenuState {
+        items: vec![
+            ActionItem {
+                label: "period: lifetime",
+                hotkey: Some('l'),
+                action: ActionMenuAction::TokensPeriodLifetime,
+            },
+            ActionItem {
+                label: "period: daily",
+                hotkey: Some('p'),
+                action: ActionMenuAction::TokensPeriodDaily,
+            },
+        ],
+        scoped_len: 0,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    crate::tui::app::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('p')),
+    );
+    assert!(app.modals.is_empty());
+    assert_eq!(app.token_period, crate::tui::app::TokenPeriod::Daily);
+
+    let narrow = ActionMenuState {
+        items: vec![ActionItem {
+            label: "reload stats",
+            hotkey: Some('r'),
+            action: ActionMenuAction::ReloadTokenStats,
+        }],
+        scoped_len: 0,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let mut term = Terminal::new(TestBackend::new(20, 14)).unwrap();
+    term.draw(|f| draw_action_menu(f, f.area(), &narrow))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains("❯ rel…   r")),
+        "narrow menu hid its assigned hotkey or label ellipsis: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains('┃')),
+        "fitting menu drew a thumb: {rows:?}"
+    );
+    let env = crate::tui::app::EnvCollisionForm {
+        profile: "work".into(),
+        key: "ENDPOINT".into(),
+        reason: "a very long setting name that wraps across the narrow modal content field".into(),
+        existing_idx: None,
+        cursor: 2,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(false),
+    };
+    let rows = render(&|f, area| draw_env_collision(f, area, &env));
+    assert!(
+        rows.iter().any(|row| row.contains("❯ cancel")),
+        "selected env choice hidden: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("back out, no change")),
+        "selected choice detail hidden: {rows:?}"
+    );
+    let tall_env = crate::tui::app::EnvCollisionForm {
+        reason: "your ~/.claude/settings.json".into(),
+        cursor: 0,
+        ..env
+    };
+    let mut narrow = Terminal::new(TestBackend::new(20, 14)).unwrap();
+    narrow
+        .draw(|f| draw_env_collision(f, f.area(), &tall_env))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(narrow.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains("❯ add the")),
+        "selected overwrite action hidden: {rows:?}"
+    );
+    // The selected choice may exceed this viewport; its confirmation must carry the full consequence.
+    let mut app = empty_app(Tab::Config);
+    app.modals
+        .push(crate::tui::app::Modal::EnvCollision(tall_env));
+    let press = |app: &mut App, code| crate::tui::app::handle_key(app, crate::testutil::key(code));
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    let confirm = app
+        .modals
+        .last()
+        .expect("overwrite needs a second confirmation");
+    narrow
+        .draw(|f| super::draw(f, f.area(), &app, confirm))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(narrow.backend().buffer());
+    let buttons: Vec<_> = rows
+        .iter()
+        .filter_map(|row| {
+            let inside = row.split_once('│')?.1.split_once('│')?.0;
+            matches!(inside.trim(), "cancel" | "add").then(|| inside.trim().to_owned())
+        })
+        .collect();
+    assert_eq!(
+        buttons,
+        ["cancel", "add"],
+        "both decisions stay visible before scrolling"
+    );
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    assert!(
+        matches!(app.modals.last(), Some(crate::tui::app::Modal::EnvCollision(form)) if !form.reviewing_overwrite),
+        "cancel must return to the choice list"
+    );
+    press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+    let confirm = app.modals.last().unwrap();
+    narrow
+        .draw(|f| super::draw(f, f.area(), &app, confirm))
+        .unwrap();
+    for _ in 0..20 {
+        press(&mut app, ratatui::crossterm::event::KeyCode::Down);
+    }
+    let confirm = app.modals.last().unwrap();
+    narrow
+        .draw(|f| super::draw(f, f.area(), &app, confirm))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(narrow.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains("laude/sett"))
+            && rows.iter().any(|row| row.contains("ings.json")),
+        "overwrite confirmation hid its consequence ending: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("cancel")),
+        "overwrite confirmation hid its safe choice: {rows:?}"
+    );
+    press(&mut app, ratatui::crossterm::event::KeyCode::Esc);
+    assert!(
+        matches!(app.modals.last(), Some(crate::tui::app::Modal::EnvCollision(form)) if !form.reviewing_overwrite),
+        "esc must return to the choice list"
+    );
+    let full = crate::tui::app::EnvCollisionForm {
+        profile: "work".into(),
+        key: "ENDPOINT".into(),
+        reason: "your ~/.claude/settings.json".into(),
+        existing_idx: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: true,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(true),
+    };
+    let mut wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    wide.draw(|f| draw_env_collision(f, f.area(), &full))
+        .unwrap();
+    let consequence: Vec<_> = crate::testutil::buffer_rows(wide.backend().buffer())
+        .into_iter()
+        .filter(|row| row.contains("this account's value overrides"))
+        .map(|row| {
+            row.split_once('│')
+                .unwrap()
+                .1
+                .split_once('│')
+                .unwrap()
+                .0
+                .trim()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        consequence,
+        ["this account's value overrides your ~/.claude/settings.json"],
+        "the whole interpolated consequence must remain intact"
+    );
+    let divergence = crate::tui::app::DivergenceForm {
+        active: "work".into(),
+        sibling: Some("other".into()),
+        cursor: 3,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let rows = render(&|f, area| draw_divergence(f, area, &divergence));
+    assert!(
+        rows.iter().any(|row| row.contains("❯ discard this login")),
+        "selected divergence choice hidden: {rows:?}"
+    );
+}
+
+/// The preset picker teaches its `d` in prose: ACCENT + bold, the rest dim.
+#[test]
+fn the_preset_picker_styles_its_delete_key() {
+    use crate::tui::app::PresetPickerForm;
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let form = PresetPickerForm {
+        target: "work".into(),
+        presets: Vec::new(),
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| draw_preset_picker(f, f.area(), &form))
+        .unwrap();
+    crate::testutil::assert_prose_part(
+        term.backend().buffer(),
+        "d deletes a saved preset",
+        "d",
+        true,
+    );
+}
+
+/// A wrapped option list pages by lines, never skipping an option the user
+/// never saw: at 36 cols each of the 30 long names wraps to two rows, so one
+/// PageDown must keep the old last visible option on screen.
+#[test]
+fn divergence_target_pages_lines_without_skipping_an_option() {
+    use crate::tui::app::{DivergenceTargetForm, Modal, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Overview);
+    let targets = (0..30)
+        .map(|i| format!("wrap{i:02} {}", "x".repeat(50)))
+        .collect();
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        targets,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    let mut term = Terminal::new(TestBackend::new(36, 20)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let before = crate::testutil::buffer_rows(term.backend().buffer());
+    let last_visible = before
+        .iter()
+        .rev()
+        .find(|r| r.contains("wrap"))
+        .map(|r| {
+            let start = r.find("wrap").unwrap();
+            r[start..start + 6].to_string()
+        })
+        .expect("a visible option row");
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    let cursor = match app.modals.last() {
+        Some(Modal::DivergenceTarget(form)) => form.cursor,
+        _ => panic!("picker still mounted"),
+    };
+    assert!(cursor > 0, "PageDown moves the cursor forward");
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let after = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        after.iter().any(|r| r.contains(&last_visible)),
+        "the old last visible option stays visible after PageDown"
+    );
+}
+
+/// The action menu's published row starts account for the rule line between
+/// the scoped and global groups, so a page across the rule lands on the right
+/// row.
+#[test]
+fn action_menu_publishes_starts_that_count_the_group_rule() {
+    use crate::tui::app::{ActionItem, ActionMenuAction, ActionMenuState};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let menu = ActionMenuState {
+        items: (0..30)
+            .map(|_| ActionItem {
+                label: "reload stats",
+                hotkey: None,
+                action: ActionMenuAction::ReloadTokenStats,
+            })
+            .collect(),
+        scoped_len: 12,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|f| draw_action_menu(f, f.area(), &menu)).unwrap();
+    let starts = menu.starts.borrow();
+    assert_eq!(starts[11], 11, "the last scoped item sits on row 11");
+    assert_eq!(
+        starts[12], 13,
+        "the first global item sits one row down, below the rule"
+    );
+    assert_eq!(
+        menu.total.get(),
+        31,
+        "the rule line counts toward the total"
+    );
+}
+
+/// PageDown across the group rule lands one row short of the identity step,
+/// because the rule line sits between the groups and every row below it is one
+/// line further down.
+#[test]
+fn action_menu_pages_across_the_rule_line() {
+    use crate::tui::app::{ActionItem, ActionMenuAction, ActionMenuState, Modal, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Overview);
+    let menu = ActionMenuState {
+        items: (0..30)
+            .map(|_| ActionItem {
+                label: "reload stats",
+                hotkey: None,
+                action: ActionMenuAction::ReloadTokenStats,
+            })
+            .collect(),
+        scoped_len: 12,
+        context: None,
+        cursor: 11,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    app.open_modal(Modal::ActionMenu(menu));
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    let cursor = match app.modals.last() {
+        Some(Modal::ActionMenu(state)) => state.cursor,
+        _ => panic!("menu mounted"),
+    };
+    assert_eq!(
+        cursor, 21,
+        "the page step counts the rule line between groups"
+    );
+}
+
+/// Hand-pinned page landings for the single-line selectors and option modals
+/// the other tests don't reach: each literal is derived from the fixture at the
+/// drawn size (one page = the pane's visible rows minus one), never from a
+/// published viewport.
+#[test]
+fn selectors_and_modals_page_by_hand_pinned_cursors() {
+    use crate::tokens::{ModelTokens, TokenStats};
+    use crate::tui::app::{
+        Check, DivergenceForm, DivergenceTargetForm, EnvCollisionForm, Health, Modal,
+        PresetPickerForm, Tab, TokenView, handle_key,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<crate::profile::Profile> = (0..25)
+        .map(|i| {
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from(format!(
+                "acct-{i:02}"
+            )))
+        })
+        .collect();
+
+    // Tokens models selector: 25 single-line rows at 80x24, page = 17.
+    let mut app = app_on(Tab::Tokens, vec![]);
+    app.token_stats = Some(TokenStats {
+        models: (0..25)
+            .map(|i| ModelTokens {
+                model: format!("claude-model-{i:02}"),
+                input: 1,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    });
+    app.token_view = TokenView::Models;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.token_model_cursor, 17, "tokens page");
+
+    // Chain selector: 25 members + `+ add` = 26 rows at 80x24, page = 17.
+    let mut app = app_on(Tab::Fallback, profiles.clone());
+    app.config().state.fallback_chain = profiles.iter().map(|p| p.name.clone()).collect();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.chain_cursor, 17, "chain page");
+
+    // Plugin selector: four rows all visible, page stops at the last.
+    let mut app = empty_app(Tab::Plugin);
+    app.plugin.checks = ["path", "mcp", "plugin", "herdr"]
+        .into_iter()
+        .map(|label| Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+        })
+        .collect();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.plugin.cursor, 3, "plugin page stops at the last row");
+
+    // Preset picker: 24 rows at 60x14, page = 5.
+    let mut app = empty_app(Tab::Overview);
+    let presets = (0..24)
+        .map(|i| crate::presets::Preset {
+            name: format!("preset-{i:02}"),
+            base_url: None,
+            models: Default::default(),
+            env: Default::default(),
+            builtin: false,
+        })
+        .collect();
+    app.open_modal(Modal::PresetPicker(PresetPickerForm {
+        target: "work".into(),
+        presets,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::PresetPicker(s)) if s.cursor == 5),
+        "preset page"
+    );
+
+    // Divergence prompt: 4 rows at 60x14, page = 3.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::Divergence(DivergenceForm {
+        active: "work".into(),
+        sibling: Some("other".into()),
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(s)) if s.cursor == 3),
+        "divergence page"
+    );
+
+    // Divergence target picker: 24 targets + `+ new` at 60x14, page = 5.
+    let mut app = empty_app(Tab::Overview);
+    let targets = (0..24).map(|i| format!("account-{i:02}")).collect();
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        targets,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::DivergenceTarget(s)) if s.cursor == 5),
+        "target page"
+    );
+
+    // Env-collision review scrolls one page (viewport 2 -> step 1).
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::EnvCollision(EnvCollisionForm {
+        profile: "work".into(),
+        key: "ENDPOINT".into(),
+        reason: "set by the base url field".into(),
+        existing_idx: None,
+        cursor: 2,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: true,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(false),
+    }));
+    let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::EnvCollision(s)) if s.scroll.get() == 1),
+        "env review page"
+    );
+}
+
+/// The action menu sizes its width from the widest label's cells, so a CJK
+/// label renders whole instead of being cut by a char-derived modal width.
+#[test]
+fn the_action_menu_sizes_its_width_by_cells() {
+    use crate::tui::app::{ActionItem, ActionMenuAction, ActionMenuState};
+    use ratatui::{Frame, Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let menu = ActionMenuState {
+        items: vec![ActionItem {
+            label: "日本語の上流",
+            hotkey: None,
+            action: ActionMenuAction::ReloadTokenStats,
+        }],
+        scoped_len: 0,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f: &mut Frame<'_>| draw_action_menu(f, f.area(), &menu))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains('流')),
+        "a CJK action label must render whole: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains('…')),
+        "a CJK action label must not be needlessly cut: {rows:?}"
+    );
+}
+
+/// The action menu's title measures the scope name by cells and follows the
+/// panel meta rule: the name shows only while it leaves a 3-dash rule after
+/// ` ACTIONS `, else it drops whole, and a modal narrower than its own title
+/// ends the title in `…` inside the border.
+#[test]
+fn the_action_menu_sizes_its_title_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cjk-日本語アカウント"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (14, "╭─ ACTI… ╮"),
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ────────────╮"),
+        (34, "╭─ ACTIONS ──────────────────╮"),
+        (41, "╭─ ACTIONS ─────────────────────────╮"),
+        (42, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (45, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// Desktop pin: the action-menu title sizes by cells, so the CJK name does not
+/// clip the `ACTIONS` scope to `ACTIO` — the pre-S9 clip.
+#[test]
+fn the_action_menu_title_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cjk-日本語アカウント"),
+        )],
+    );
+    for w in [80u16, 160] {
+        let (rows, left, right) = render_action_menu(&app, w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(
+            title, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮",
+            "action-menu title at {w} cols"
+        );
+    }
+}
+
+/// A 30-char ASCII account name (an email passes `validate_name_chars`) drops
+/// from the action menu's title rather than cutting ` ACTIONS `, through the
+/// width that would leave it a 2-dash rule, and shows whole behind a 3-dash
+/// rule once the terminal has room.
+#[test]
+fn the_action_menu_drops_a_name_that_leaves_no_rule() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("a.thirty.char.name@example.org"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (34, "╭─ ACTIONS ──────────────────╮"),
+        (51, "╭─ ACTIONS ───────────────────────────────────╮"),
+        (52, "╭─ ACTIONS ─── a.thirty.char.name@example.org ─╮"),
+        (80, "╭─ ACTIONS ─── a.thirty.char.name@example.org ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+    let buf = term.backend().buffer();
+    let area = *buf.area();
+    let top = (0..area.height)
+        .find(|&y| {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            row.contains("CHECK OUTPUT")
+        })
+        .expect("modal top border");
+    let x = (0..area.width)
+        .find(|&xx| buf[(xx, top)].symbol() == "C")
+        .map(|c| c - 3)
+        .expect("modal left corner");
+    let width = (x..area.width)
+        .find(|&xx| buf[(xx, top)].symbol() == "╮")
+        .map(|xx| xx - x + 1)
+        .expect("modal right corner");
+    let bottom = (top + 1..area.height)
+        .find(|&y| buf[(x, y)].symbol() == "╰")
+        .expect("modal bottom border");
+    (top + 1..bottom)
+        .map(|y| (x..x + width).map(|xx| buf[(xx, y)].symbol()).collect())
+        .collect()
+}
+
+/// A diagnostic modal splits a body line between graphemes
+/// measured in display cells, so a wide CJK line chunks to rows that keep every
+/// character (never a row ratatui then cuts past the inner width) and an emoji
+/// grapheme stays whole. Pinned whole-row at 34/45/80.
+#[test]
+fn the_check_output_modal_chunks_body_lines_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "日本語サービスの障害を調査中です\n⚠️ 🧭 emoji-line tail\nplain ascii line\n";
+    let want: &[(u16, &[&str])] = &[
+        (
+            34,
+            &[
+                "│                            │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調   │",
+                "│  査 中 で す                   │",
+                "│  ⚠️  🧭  emoji-line tail     │",
+                "│  plain ascii line          │",
+                "│                            │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│                                    │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調 査 中 で す   │",
+                "│  ⚠️  🧭  emoji-line tail             │",
+                "│  plain ascii line                  │",
+                "│                                    │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│                                    │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調 査 中 で す   │",
+                "│  ⚠️  🧭  emoji-line tail             │",
+                "│  plain ascii line                  │",
+                "│                                    │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(*w, 12)).unwrap();
+        term.draw(|fr| {
+            draw_modal(
+                fr,
+                fr.area(),
+                "CHECK OUTPUT",
+                body.lines()
+                    .map(|line| Line::from(Span::styled(line.to_string(), theme::body())))
+                    .collect(),
+            )
+        })
+        .unwrap();
+        let got = check_output_body_rows(&term);
+        assert_eq!(got, *expected, "check output modal body at {w} cols");
+    }
+}
+
+/// An ASCII-only body chunks byte-identically to the old char budgeting: the
+/// split happens at the same cell boundary (each ASCII char is one cell).
+/// Pinned whole-row at 45/80 as the regression guard.
+#[test]
+fn the_check_output_modal_ascii_body_renders_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\nshort\n";
+    let want: &[(u16, &[&str])] = &[
+        (
+            45,
+            &[
+                "│                                       │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHI  │",
+                "│  JKLMNOPQRSTUVWXYZ0123456789          │",
+                "│  short                                │",
+                "│                                       │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│                                                                  │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789  │",
+                "│  short                                                           │",
+                "│                                                                  │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(*w, 12)).unwrap();
+        term.draw(|fr| {
+            draw_modal(
+                fr,
+                fr.area(),
+                "CHECK OUTPUT",
+                body.lines()
+                    .map(|line| Line::from(Span::styled(line.to_string(), theme::body())))
+                    .collect(),
+            )
+        })
+        .unwrap();
+        let got = check_output_body_rows(&term);
+        assert_eq!(got, *expected, "check output ascii body at {w} cols");
+    }
+}
+
+/// A scrolled modal fits its title like a panel does: a short body leaves the
+/// modal sized by its title, which renders whole with both insets, and a modal
+/// narrower than its title ends the title in `…` inside the border.
+#[test]
+fn a_scrolled_modal_fits_its_title_by_cells() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    for (w, expected) in [(80u16, "╭─ CHECK OUTPUT ╮"), (14, "╭─ CHEC… ╮")] {
+        let mut term = Terminal::new(TestBackend::new(w, 12)).unwrap();
+        term.draw(|f| draw_modal(f, f.area(), "CHECK OUTPUT", vec![Line::from("exit 1")]))
+            .unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let top = rows
+            .iter()
+            .find(|r| r.contains('\u{256d}') && r.contains("CHEC"))
+            .expect("the check output modal's top border");
+        let start = top.find("\u{256d}─ CHEC").expect("the modal's left corner");
+        let end = start
+            + top[start..]
+                .find('\u{256e}')
+                .expect("the modal's right corner");
+        assert_eq!(
+            &top[start..end + '\u{256e}'.len_utf8()],
+            expected,
+            "check output title at {w} cols"
+        );
+    }
+}
+
+#[test]
+fn confirm_pages_scroll_the_body_under_pinned_choices() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "review the consequences carefully ".repeat(20),
+        detail: Some("this action changes the chosen account".into()),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::Switch("other".into()),
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 16)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let before = crate::testutil::buffer_rows(term.backend().buffer());
+    let button_y = before
+        .iter()
+        .position(|r| r.contains("cancel") && r.contains("confirm"))
+        .unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert!(matches!(app.modals.last(), Some(Modal::Confirm(state)) if state.scroll.offset > 0));
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let after = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(after[button_y].contains("cancel") && after[button_y].contains("confirm"));
+    assert_ne!(before, after, "paging must move the prose");
+}
+
+#[test]
+fn preset_apply_keeps_all_three_choices_visible_at_the_width_floor() {
+    use crate::tui::app::{ConfirmScroll, PresetApplyButton, PresetApplyForm};
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let form = PresetApplyForm {
+        target: "work".into(),
+        preset: "local".into(),
+        message: "apply the local preset to work".into(),
+        replaces: vec!["base url"],
+        leaves: vec!["model", "opus", "sonnet"],
+        focus: PresetApplyButton::Keep,
+        scroll: ConfirmScroll::default(),
+    };
+    for width in [34, 80] {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 16)).unwrap();
+        term.draw(|f| draw_preset_apply(f, f.area(), &form))
+            .unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("cancel") && r.contains("keep") && r.contains("clear")),
+            "{width}: {rows:?}"
+        );
+        let keep = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "k" && cell.bg == theme::text_color())
+            .expect("keep label");
+        assert_eq!(keep.bg, theme::text_color());
     }
 }

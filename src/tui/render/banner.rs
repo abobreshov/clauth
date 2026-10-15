@@ -28,8 +28,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, banner: &Banner) {
         format!(" ! {severity}: "),
         Style::default().fg(fg).bg(bg),
     )];
-    spans.extend(prose::spans(
+    let budget = (area.width as usize).saturating_sub(spans.iter().map(Span::width).sum());
+    spans.extend(prose::fit(
         &banner.message,
+        budget,
         Style::default().fg(fg).bg(bg),
     ));
 

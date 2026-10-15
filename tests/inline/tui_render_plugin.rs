@@ -1169,3 +1169,76 @@ fn plugin_popup_cycle_wraps_at_the_value_column_without_reflowing_on_focus() {
         }
     }
 }
+
+/// The same diagnostic page keys reach prose above the herdr form and keep
+/// the ordinary check's scroll bounds in step with a resized pane.
+#[test]
+fn page_keys_read_plugin_and_herdr_diagnostics() {
+    use crate::tui::app::{PluginFocus, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    for label in ["mcp", "herdr"] {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Plugin;
+        app.plugin.focus = PluginFocus::Detail;
+        app.plugin.checks = vec![Check {
+            label,
+            health: Health::Warn,
+            detail: (0..40).map(|i| format!("diagnostic-{i:02}")).collect(),
+            fix: None,
+        }];
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        assert!(app.plugin.detail_max_scroll.get() > 0);
+        assert!(app.plugin.detail_viewport.get() > 1);
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        for _ in 0..10 {
+            handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+        }
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        let top = crate::testutil::buffer_rows(term.backend().buffer());
+        assert!(
+            top.iter().any(|r| r.contains("diagnostic-00")),
+            "{label}: {top:?}"
+        );
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        let next = crate::testutil::buffer_rows(term.backend().buffer());
+        assert!(
+            !next.iter().any(|r| r.contains("diagnostic-00")),
+            "{label}: {next:?}"
+        );
+        assert!(app.plugin.diagnostic_focus);
+        assert!(app.plugin.displayed_scroll.get() > 0);
+        if label == "herdr" {
+            handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+            term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+            assert!(!app.plugin.diagnostic_focus);
+            assert!(
+                crate::testutil::buffer_rows(term.backend().buffer())
+                    .iter()
+                    .any(|r| r.contains("pane tag"))
+            );
+        }
+    }
+}
+
+#[test]
+fn plugin_detail_values_fit_by_display_cells_on_both_palette_tiers() {
+    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let line = detail_line("path: /日本語/🌍/plugin/entry.json", 4, 24);
+        assert!(line.width() <= 24, "detail must fit by cells: {line:?}");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.ends_with('…'), "clamped path: {text}");
+    }
+}

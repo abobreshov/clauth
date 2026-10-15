@@ -437,6 +437,11 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
+    /// Threshold for the five-hour alert; the legacy TOML key remains accepted.
+    pub(crate) fn five_hour_alert_threshold(&self) -> Option<f64> {
+        self.bell_threshold
+    }
+
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
@@ -1785,6 +1790,7 @@ struct ProfileConfig {
     #[serde(default)]
     check_scoped: Option<bool>,
     #[serde(default)]
+    #[serde(alias = "five_hour_alert_threshold")]
     bell_threshold: Option<f64>,
     #[serde(default)]
     disabled: bool,
@@ -2793,7 +2799,11 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
+        .filter(|(k, _)| {
+            k != "bell_command"
+                && !modelled.contains(k.as_str())
+                && !rendered_table.contains_key(k.as_str())
+        })
         .collect();
     if carried.is_empty() {
         return rendered; // the common case: nothing unmodelled on disk
@@ -3995,7 +4005,11 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
+        .filter(|(k, _)| {
+            k != "five_hour_alert_threshold"
+                && !modelled.contains(k.as_str())
+                && !rendered_table.contains_key(k.as_str())
+        })
         .collect();
     if carried.is_empty() {
         return merged; // the common case

@@ -458,7 +458,7 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let b = profile("b", 95.0, 100.0, 1800);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     let hint =
         resumes_line(&lines).expect("resumes hint must render when the whole chain is exhausted");
     assert!(
@@ -477,7 +477,7 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     let hint = resumes_line(&lines)
         .expect("resumes hint must render even with no active profile (wrap-off cleared it)");
     assert!(hint.contains("resumes: a in ~"), "{hint}");
@@ -492,7 +492,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -524,7 +524,7 @@ fn a_wallet_bearing_active_shows_its_drains_line() {
             })
             .collect(),
     );
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     let drains = lines
         .iter()
         .map(line_text)
@@ -544,7 +544,7 @@ fn a_wallet_bearing_active_without_a_series_shows_no_drains_line() {
     let ds = deepseek_profile("ds", &["63.34 CNY"]);
     let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     assert!(
         !lines.iter().map(line_text).any(|t| t.contains("drains in")),
         "no series, no runway: {:?}",
@@ -560,7 +560,7 @@ fn healthy_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 5.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     assert!(resumes_line(&lines).is_none());
 }
 
@@ -1477,6 +1477,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
             name_w: 8,
             gauge_w: GAUGE_W,
             thr_w: 3,
+            figure_inline: true,
             reason: None,
             switch_eta: Some(7200),
         },
@@ -1520,6 +1521,7 @@ fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
                 name_w: 8,
                 gauge_w: GAUGE_W,
                 thr_w: 3,
+                figure_inline: true,
                 reason: None,
                 switch_eta: Some(7200),
             },
@@ -1561,7 +1563,7 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     let app = App::new(config);
 
     let wide = 120;
-    let lines = fallback_flow_lines(&app, wide);
+    let lines = fallback_flow_lines(&app, wide).0;
     let marked = lines
         .iter()
         .find(|l| line_text(l).contains('×'))
@@ -1597,6 +1599,7 @@ fn chain_rows_align_the_threshold_percent_column() {
     let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
     let texts: Vec<String> = fallback_flow_lines(&app, 60)
+        .0
         .iter()
         .map(line_text)
         .collect();
@@ -1631,6 +1634,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
             name_w: 8,
             gauge_w: GAUGE_W,
             thr_w: 3,
+            figure_inline: true,
             reason: Some(BlockedReason::AuthBroken),
             switch_eta: Some(7200),
         },
@@ -1664,6 +1668,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
                 name_w: 8,
                 gauge_w: GAUGE_W,
                 thr_w: 3,
+                figure_inline: true,
                 reason: Some(BlockedReason::AuthBroken),
                 switch_eta: Some(7200),
             },
@@ -1698,6 +1703,7 @@ fn fallback_panel_marks_a_blocked_member() {
     config.state.auth_broken.push("a".into());
     let app = App::new(config);
     let joined = fallback_flow_lines(&app, 60)
+        .0
         .iter()
         .map(line_text)
         .collect::<Vec<_>>()
@@ -1934,6 +1940,106 @@ fn five_hour_cell_text(widths: &OverviewWidths, deepseek: bool, row: &Line<'stat
         .skip(col)
         .take(widths.five_hour)
         .collect()
+}
+
+/// A DeepSeek balance never fabricates a figure and never closes a bracket
+/// around a cut amount: the whole balance keeps its brackets while they fit,
+/// sheds them before cutting, and only then ends in `…`. The `[11]` and
+/// `[1132.60 CN]` shapes the char-take produced are the one outcome that must
+/// never ship.
+#[test]
+fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["1132.60 CNY"])],
+        None,
+        vec![],
+    ));
+    // `OverviewWidths` takes the accounts list's INNER width (terminal − 4).
+    // Below 42 cols the 5h column is the 4-cell figure-only tier, so the whole
+    // 11-cell balance must cut — with `…`, never a closed bracket around a cut
+    // figure (`[11]`). At 42–60 the 12-cell column holds the whole balance,
+    // brackets shed before any cut; at 80 the 17-cell column keeps its brackets.
+    for (terminal, expected) in [
+        (34u16, "113…"),
+        (41u16, "113…"),
+        (42u16, "1132.60 CNY "),
+        (60u16, "1132.60 CNY "),
+    ] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let cell = five_hour_cell_text(&widths, true, &row);
+        assert_eq!(cell, expected, "balance cell at {terminal} cols");
+    }
+}
+
+/// A long email-style chain name renders whole on desktop (no `…` with free
+/// cells left) — the round-1 clamp to 18 cells was the regression.
+#[test]
+fn a_long_chain_name_renders_whole_on_desktop() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "abcdefghijklmnopqrstuvwxyz";
+    let a = profile(name, 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some(name), vec![name]);
+    let app = App::new(config);
+    for w in [80usize, 160] {
+        let lines = fallback_flow_lines(&app, w).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let row = texts
+            .iter()
+            .find(|t| t.contains(name))
+            .expect("the member row renders");
+        assert_eq!(
+            row,
+            " ╶ 1 abcdefghijklmnopqrstuvwxyz  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%"
+        );
+    }
+}
+
+/// The all-spent caption's first line carries the 2-cell lead AND the chip, so
+/// its tail must wrap to `width - chip - 2` — the round-1 budget only
+/// subtracted the chip and let the first line overrun the pane by two cells.
+#[test]
+fn the_stay_caption_wraps_without_overrunning_the_first_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    // Every caption line, chip included, stays within the pane: the round-1
+    // budget let the first line overrun by two cells. Pinned whole-row at the
+    // six terminal widths (inner = terminal − 4 chrome cells).
+    for (w, caption_lines) in [
+        (
+            23usize,
+            &[
+                "  [ stay ] on the",
+                "  active",
+                "  account when",
+                "  all spent",
+            ][..],
+        ),
+        (
+            24usize,
+            &["  [ stay ] on the active", "  account when", "  all spent"][..],
+        ),
+        (
+            30usize,
+            &["  [ stay ] on the active", "  account when all", "  spent"][..],
+        ),
+        (
+            41usize,
+            &["  [ stay ] on the active account when all", "  spent"][..],
+        ),
+    ] {
+        let lines = fallback_flow_lines(&app, w).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let start = texts
+            .iter()
+            .position(|t| t.contains("[ stay ]"))
+            .unwrap_or_else(|| panic!("stay caption missing at inner {w}: {texts:?}"));
+        let got: Vec<String> = texts[start..].to_vec();
+        assert_eq!(got, caption_lines, "stay caption at inner {w} cells");
+    }
 }
 
 /// DeepSeek accounts carry a USD balance where OAuth profiles carry a 5h
@@ -2743,7 +2849,7 @@ fn an_empty_roster_pair_renders_no_meta_slot() {
 fn an_empty_title_keeps_the_full_rule_run() {
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 3)).expect("terminal");
-    term.draw(|f| f.render_widget(section_box("", true, true), f.area()))
+    term.draw(|f| f.render_widget(section_box("", true, true, f.area().width), f.area()))
         .expect("draw");
     assert_eq!(
         crate::testutil::buffer_rows(term.backend().buffer())[0],
@@ -4019,6 +4125,130 @@ fn overview_extra_row_renders_5h_and_7d_columns_for_model_scoped_monitor_windows
     assert!(monthly_text.contains("(30d)"), "{monthly_text}");
 }
 
+fn chain_app(names: &[String]) -> App {
+    let profiles: Vec<Profile> = names.iter().map(|n| profile(n, 95.0, 20.0, 3600)).collect();
+    let chain: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    App::new(config_with(profiles, None, chain))
+}
+
+#[test]
+fn truncate_chain_keeps_captions_and_names_hidden_members() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let (full, member_count) = fallback_flow_lines(&app, 76);
+    assert_eq!(member_count, 28, "the builder returns its member count");
+    assert_eq!(full.len(), 29, "28 members + the all-spent caption");
+    // 11 inner rows: 9 members + the caption + the more-line.
+    let cut = truncate_chain(full, &(1..=member_count).collect::<Vec<_>>(), 11);
+    assert_eq!(cut.len(), 11);
+    assert_eq!(
+        line_text(cut.last().unwrap()),
+        "  +19 more · → fallback tab",
+        "the last row names the 19 hidden members"
+    );
+    assert!(
+        line_text(&cut[8]).contains("a8"),
+        "the ninth member still draws"
+    );
+    assert!(
+        line_text(&cut[9]).contains("when all spent"),
+        "the all-spent caption survives the cut"
+    );
+}
+
+#[test]
+fn truncate_chain_draws_every_member_that_fits_without_the_more_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // 11 members = the panel's inner height at 80×24; the base drew all 11 and
+    // the round-1 code hid two behind a `+2 more` line.
+    let names: Vec<String> = (0..11).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let (full, member_count) = fallback_flow_lines(&app, 76);
+    assert_eq!(full.len(), 12, "11 members + the all-spent caption");
+    let cut = truncate_chain(full, &(1..=member_count).collect::<Vec<_>>(), 11);
+    assert_eq!(cut.len(), 11, "every member fits, the caption drops");
+    assert!(
+        cut.iter().all(|l| !line_text(l).contains("more · ")),
+        "no hidden-members line when every member fits"
+    );
+    assert!(
+        line_text(&cut[10]).contains("a10"),
+        "the eleventh member draws"
+    );
+}
+
+#[test]
+fn overview_chain_panel_names_hidden_members_on_a_short_terminal() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let more = rows
+        .iter()
+        .find(|r| r.contains("more · "))
+        .unwrap_or_else(|| panic!("the hidden-members line renders: {rows:#?}"));
+    let content = more
+        .strip_prefix("│ ")
+        .unwrap_or(more)
+        .trim_end_matches([' ', '│']);
+    assert_eq!(
+        content, "  +19 more · → fallback tab",
+        "the whole last content row names the hidden members, got {content:?}"
+    );
+}
+
+#[test]
+fn overview_chain_panel_omits_the_more_line_when_everyone_fits() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..3).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        !out.contains("more · "),
+        "no hidden-members line when the chain fits"
+    );
+}
+
+#[test]
+fn overview_more_line_styles_the_arrow_as_a_key() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    crate::testutil::assert_prose_part(buf, "+19 more · → fallback tab", "→", true);
+    // The words beside the arrow are the caption style, faint — pinned by
+    // equality, not just "not accent".
+    let faint = crate::tui::theme::text_faint_color();
+    for word in ["+19 more", "fallback tab"] {
+        let cells =
+            crate::testutil::needle_cells(buf, word).unwrap_or_else(|| panic!("`{word}` missing"));
+        for cell in cells {
+            if cell.symbol() == " " {
+                continue;
+            }
+            assert_eq!(cell.fg, faint, "`{word}` renders faint");
+            assert!(
+                !cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                "`{word}` is not bold"
+            );
+        }
+    }
+}
+
 /// A hybrid's Overview bar text equals the
 /// provider-derived percentage — `apply_usage` fills `Profile.usage` from the
 /// picker, so the Overview shows 10% (the provider bar), never the OAuth 100%.
@@ -4224,7 +4454,7 @@ fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
 fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(10.0, false);
-    let lines = fallback_flow_lines(&app, 120);
+    let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
         " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~8m",
@@ -4239,7 +4469,7 @@ fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_activ
 fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(100.0, true);
-    let lines = fallback_flow_lines(&app, 120);
+    let lines = fallback_flow_lines(&app, 120).0;
     let off: Vec<String> = lines
         .iter()
         .map(line_text)
@@ -4291,10 +4521,10 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
             .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
     }
 
-    let lines = fallback_flow_lines(&app, 120);
+    let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "the caption must name the clear member, not the kick-rejected one"
     );
 }
@@ -4343,10 +4573,10 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
             .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
     }
 
-    let lines = fallback_flow_lines(&app, 120);
+    let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "the caption must prefer the fresh member over the dead-reading one"
     );
 }
@@ -4377,10 +4607,10 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
             .unwrap()
             .insert("bravo".to_string(), crate::usage::FetchStatus::Fresh);
     }
-    let lines = fallback_flow_lines(&app, 120);
+    let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "burn-aware with the default floor still projects the crossing"
     );
 }
@@ -4431,10 +4661,118 @@ fn the_projected_switch_skips_a_live_key_rejected_member() {
             .unwrap()
             .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
     }
-    let lines = fallback_flow_lines(&app, 120);
+    let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "the caption skips the live key-rejected sibling and names the clear one"
+    );
+}
+
+#[test]
+fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["1132.60 CNY"])],
+        None,
+        vec![],
+    ));
+    for (terminal, expected) in [
+        (80u16, "[1132.60 CNY]    "),
+        (160u16, "[1132.60 CNY]             "),
+    ] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let cell = five_hour_cell_text(&widths, true, &row);
+        assert_eq!(cell, expected, "balance cell at {terminal} cols");
+    }
+}
+
+#[test]
+fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    for w in [76usize, 156] {
+        let lines = fallback_flow_lines(&app, w).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let start = texts
+            .iter()
+            .position(|t| t.contains("[ stay ]"))
+            .unwrap_or_else(|| panic!("stay caption missing at inner {w}: {texts:?}"));
+        let got: Vec<String> = texts[start..].to_vec();
+        assert_eq!(
+            got,
+            vec!["  [ stay ] on the active account when all spent"],
+            "stay caption at inner {w} cells"
+        );
+    }
+}
+
+#[test]
+fn narrow_chain_records_both_rows_of_each_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = vec![
+        "alpha".to_string(),
+        "bravo".to_string(),
+        "charlie".to_string(),
+    ];
+    let app = chain_app(&names);
+    let (full, ends) = fallback_flow_blocks(&app, 24);
+    assert_eq!(ends, [2, 4, 6]);
+    for end in ends {
+        assert!(line_text(&full[end - 1]).contains("/ 95%"));
+    }
+}
+
+#[test]
+fn truncate_chain_keeps_complete_narrow_members_and_counts_hidden_members() {
+    let full: Vec<Line<'static>> = [
+        "alpha",
+        "20 / 95%",
+        "bravo",
+        "20 / 95%",
+        "charlie",
+        "20 / 95%",
+        "when all spent",
+    ]
+    .into_iter()
+    .map(Line::from)
+    .collect();
+    let cut = truncate_chain(full, &[2, 4, 6], 4);
+    let text: Vec<String> = cut.iter().map(line_text).collect();
+    assert_eq!(
+        text,
+        [
+            "alpha",
+            "20 / 95%",
+            "when all spent",
+            "  +2 more · → fallback tab"
+        ]
+    );
+}
+
+#[test]
+fn truncate_chain_keeps_all_complete_narrow_members_when_their_rows_fit() {
+    let full: Vec<Line<'static>> = [
+        "alpha",
+        "20 / 95%",
+        "bravo",
+        "20 / 95%",
+        "charlie",
+        "20 / 95%",
+        "when all spent",
+    ]
+    .into_iter()
+    .map(Line::from)
+    .collect();
+    let cut = truncate_chain(full, &[2, 4, 6], 6);
+    let text: Vec<String> = cut.iter().map(line_text).collect();
+    assert_eq!(
+        text,
+        [
+            "alpha", "20 / 95%", "bravo", "20 / 95%", "charlie", "20 / 95%"
+        ]
     );
 }

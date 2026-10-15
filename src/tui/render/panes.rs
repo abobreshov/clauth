@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wra
 
 use super::super::app::{App, InputState};
 use super::super::theme;
+use super::format::{fixed_split, grapheme_cells, truncate};
 use super::prose;
 use crate::profile::AppConfig;
 
@@ -24,7 +25,8 @@ pub(super) fn selector_width(body_w: u16) -> u16 {
 /// Phone-width threshold: below this, layouts that place panes side-by-side
 /// stack them vertically instead — at Moshi's ~45 columns the horizontal
 /// master-detail split leaves the detail pane ~13 usable cells. At or above
-/// it every layout is byte-identical to the desktop rendering.
+/// it every layout renders as on desktop, except the Overview chain rows: they
+/// test their panel's inner width (body − 4), so bodies 60–63 still narrow them.
 pub(super) const NARROW_BODY_W: u16 = 60;
 
 /// Key column width of the two master-detail settings cards, the Setup
@@ -90,15 +92,15 @@ pub(super) fn bold_when(style: Style, cond: bool) -> Style {
     }
 }
 
-/// Key-column cell: `key` left-justified to `max(width, key.len())` then a
+/// Key-column cell: `key` left-justified to `max(width, key cells)` then a
 /// fixed `gutter`-space gap, so every row's value opens at the same column
-/// even when one key fills `width`. A plain `width.saturating_sub(len).max(1)`
+/// even when one key fills `width`. A plain `width.saturating_sub(cells).max(1)`
 /// pad pushes an exactly-fitting key one cell past its siblings; this shape
 /// keeps the gap separate from the width so it never collides. Each pane passes
 /// its own `width` (its longest key) and the house `gutter` of 2.
 pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
-    let w = width.max(key.chars().count());
-    format!("{key:<w$}{}", " ".repeat(gutter))
+    let kw = Span::raw(key).width();
+    format!("{key}{}", " ".repeat(width.max(kw) - kw + gutter))
 }
 
 /// One segment of a cycle row: the active option renders `[label]` while the
@@ -369,30 +371,42 @@ pub(super) fn picker_row(
     } else {
         Span::raw("  ")
     };
+    // A profile name longer than the selector (an email address passes
+    // `validate_name_chars`) clamps with `…` instead of running past the pane
+    // edge — the marked Fallback arm's clamp, without the marker column.
+    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2));
     let line = Line::from(vec![
         arrow,
-        Span::styled(name, bold_when(name_style, selected && focused)),
+        Span::styled(text, bold_when(name_style, selected && focused)),
+        Span::raw(pad),
     ]);
     select_line(line, selected, focused, width)
 }
 
-/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
-/// hotkey `ACCENT` + action on second line.
-pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
-    Paragraph::new(vec![
+/// The empty state's two text lines (dim hint, hotkey-accented action), shared
+/// by the bordered [`empty_state`] widget and a caller that renders them bare
+/// so a pinned footnote composes with them.
+pub(super) fn empty_state_lines(hint: &str, hotkey: &str, action: &str) -> Vec<Line<'static>> {
+    vec![
         Line::from(Span::styled(hint.to_string(), theme::dim())),
         Line::from(prose::spans(
             &format!("{} {action}", prose::key(hotkey)),
             theme::dim(),
         )),
-    ])
-    .block(
-        Block::bordered()
-            .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(theme::line_color())),
-    )
-    .style(theme::base())
-    .wrap(Wrap { trim: false })
+    ]
+}
+
+/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
+/// hotkey `ACCENT` + action on second line.
+pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
+    Paragraph::new(empty_state_lines(hint, hotkey, action))
+        .block(
+            Block::bordered()
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(theme::line_color())),
+        )
+        .style(theme::base())
+        .wrap(Wrap { trim: false })
 }
 
 /// Renders a scrollbar into the 1-cell right-padding column of a panel.
@@ -438,9 +452,10 @@ pub(super) fn draw_scrollbar(
     }
 }
 
-/// Rows of context the form scroll keeps past the focused line while content
-/// remains (the cursor never rests against the viewport edge).
-const SCROLL_PAD: usize = 3;
+/// Rows of context every cursor-following scroll keeps past the focused line
+/// while content remains (the cursor never rests against the viewport edge):
+/// forms, modals, Status, the page-key landing and the selector lists.
+const SCROLL_PAD: usize = 2;
 
 /// Render a form pane's assembled lines into `inner`, scrolled so the focused
 /// block `focus.0..focus.1` stays on screen, plus the overflow scrollbar.
@@ -476,6 +491,153 @@ pub(super) fn draw_scrolled_lines(
     offset
 }
 
+/// The footnote's wrapped lines: raw text cut to the content width, each line
+/// `TEXT_FAINT`.
+pub(super) fn footnote_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap_words(text, width)
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, theme::faint())))
+        .collect()
+}
+
+/// How a pinned footnote splits the pane interior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FootnoteLayout {
+    /// No footnote: the scroll area is the whole interior.
+    Absent,
+    /// Footnote pinned below the scroll area with `margin` blank rows above it.
+    Pinned { scroll: usize, margin: usize },
+    /// Interior too short to pin: the footnote renders as the scroll content's
+    /// last line instead.
+    Inline,
+}
+
+/// The split a pinned footnote produces for an `inner_h`-row interior and a
+/// `footnote_h`-line footnote: pinned with a margin while the scroll area keeps
+/// 3 rows, margin dropped next, inlined past that. `footnote_h == 0` is absent.
+pub(super) fn footnote_layout(inner_h: usize, footnote_h: usize) -> FootnoteLayout {
+    if footnote_h == 0 {
+        FootnoteLayout::Absent
+    } else if inner_h >= footnote_h + 1 + 3 {
+        FootnoteLayout::Pinned {
+            scroll: inner_h - footnote_h - 1,
+            margin: 1,
+        }
+    } else if inner_h >= footnote_h + 3 {
+        FootnoteLayout::Pinned {
+            scroll: inner_h - footnote_h,
+            margin: 0,
+        }
+    } else {
+        FootnoteLayout::Inline
+    }
+}
+
+/// Split `inner` for a `foot_h`-line footnote: the scroll area and the footnote
+/// area (absent when the footnote is inlined into the content or missing). The
+/// one place the pinned geometry lives — the scrolled-footnote helper and a
+/// bare empty state both read it.
+pub(super) fn footnote_split(inner: Rect, foot_h: usize) -> (Rect, Option<Rect>) {
+    match footnote_layout(inner.height as usize, foot_h) {
+        FootnoteLayout::Pinned { scroll, margin } => {
+            let scroll_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: scroll as u16,
+            };
+            let foot_area = Rect {
+                x: inner.x,
+                y: inner.y + scroll as u16 + margin as u16,
+                width: inner.width,
+                height: foot_h as u16,
+            };
+            (scroll_area, Some(foot_area))
+        }
+        FootnoteLayout::Absent | FootnoteLayout::Inline => (inner, None),
+    }
+}
+
+/// What a [`draw_scrolled_lines_with_footnote`] frame drew: the applied offset,
+/// the scroll viewport (a pinned footnote shrinks it) and the total line count
+/// (an inline footnote is part of the scroll content, so it counts).
+pub(super) struct ScrolledDraw {
+    pub(crate) offset: usize,
+    pub(crate) viewport: usize,
+    pub(crate) total: usize,
+}
+
+/// A pane note pinned under a scrolled form (cloudy-tui "Pinned footnote"):
+/// one blank margin row above the wrapped note, the scroll area shrunk by the
+/// footnote's height plus that margin, the overflow scrollbar spanning the
+/// scroll area only. `footnote` is the raw one-fragment text; it wraps at the
+/// content width, renders `TEXT_FAINT`, never scrolls, never takes focus and
+/// never carries a key. `None` leaves the scroll area at the full height.
+///
+/// Short pane: when the scroll area would fall under 3 rows the margin drops
+/// first, and past that the footnote renders as the scroll content's last line
+/// instead of pinning — there the focused block's follow carries it, so walking
+/// to the last row still reaches it.
+pub(super) fn draw_scrolled_lines_with_footnote(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+    saved: Option<&Cell<usize>>,
+    footnote: Option<&str>,
+) -> ScrolledDraw {
+    let foot: Vec<Line<'static>> = footnote
+        .map(|text| footnote_lines(text, inner.width as usize))
+        .unwrap_or_default();
+    match footnote_layout(inner.height as usize, foot.len()) {
+        FootnoteLayout::Absent => {
+            let total = lines.len();
+            let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
+            ScrolledDraw {
+                offset,
+                viewport: inner.height as usize,
+                total,
+            }
+        }
+        FootnoteLayout::Inline => {
+            let pre = lines.len();
+            let mut lines = lines;
+            lines.extend(foot);
+            let viewport = inner.height as usize;
+            // When the focused block ends at the old last line AND the block
+            // plus the footnote fit in the viewport together, extend the block
+            // over the footnote so the follow reaches it; otherwise the block
+            // wins — the cursor stays visible and the footnote stays below the
+            // fold at that pane height.
+            let focus = if focus.1 == pre && lines.len() - focus.0 <= viewport {
+                (focus.0, lines.len())
+            } else {
+                focus
+            };
+            let total = lines.len();
+            let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
+            ScrolledDraw {
+                offset,
+                viewport,
+                total,
+            }
+        }
+        FootnoteLayout::Pinned { .. } => {
+            let total = lines.len();
+            let (scroll_area, foot_area) = footnote_split(inner, foot.len());
+            let offset = draw_scrolled_lines(frame, scroll_area, lines, focus, saved);
+            if let Some(area) = foot_area {
+                frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
+            }
+            ScrolledDraw {
+                offset,
+                viewport: scroll_area.height as usize,
+                total,
+            }
+        }
+    }
+}
+
 /// Smallest offset that keeps the focused block (`focus.0` inclusive, `focus.1`
 /// exclusive) plus a [`SCROLL_PAD`] band on screen, clamped to the content.
 ///
@@ -493,7 +655,7 @@ pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)
         .min(total - viewport)
 }
 
-pub(super) fn follow_scroll_offset(
+pub(crate) fn follow_scroll_offset(
     total: usize,
     viewport: usize,
     focus: (usize, usize),
@@ -521,28 +683,53 @@ pub(super) fn follow_scroll_offset(
     }
 }
 
+/// A selector list's scroll state: the offset the render wrote back, the
+/// visible-row count the last render drew, each cursor row's start line, the
+/// end line its block reaches when focused (own lines plus any tooltip), and
+/// the total line count. The key handler reads these at key time, so its page
+/// step tracks a resize, a multi-line row's spans, and the follow the cursor
+/// landing will produce instead of guessing.
+#[derive(Debug, Default)]
+pub(crate) struct ListView {
+    pub(crate) offset: Cell<usize>,
+    pub(crate) viewport: Cell<usize>,
+    pub(crate) total: Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) tips: std::cell::RefCell<Vec<usize>>,
+}
+
 pub(super) fn draw_following_list(
     frame: &mut Frame<'_>,
     inner: Rect,
     rows: Vec<ListItem<'static>>,
     sel: usize,
-    offset: &Cell<usize>,
+    list: &ListView,
 ) {
     let total = rows.len();
     let viewport = inner.height as usize;
+    list.viewport.set(viewport);
+    list.total.set(total);
+    // A flat `List` has one rendered line per row; a caller whose rows carry a
+    // band header or spacer (Overview) overrides these starts after this call.
+    list.starts.replace((0..total).collect());
+    list.block_ends.replace((0..total).map(|i| i + 1).collect());
+    list.tips.replace(vec![0; total]);
     let prior = if viewport == 0 || total <= viewport {
         0
     } else {
-        offset.get().min(total - viewport)
+        list.offset.get().min(total - viewport)
     };
     let mut state = ListState::default().with_offset(prior);
     state.select(Some(sel));
     frame.render_stateful_widget(
-        List::new(rows).style(theme::base()).scroll_padding(3),
+        List::new(rows)
+            .style(theme::base())
+            .scroll_padding(SCROLL_PAD),
         inner,
         &mut state,
     );
-    offset.set(state.offset());
+    list.offset.set(state.offset());
     draw_scrollbar(frame, inner, total, state.offset(), viewport);
 }
 
@@ -553,16 +740,21 @@ pub(super) fn draw_selector_list(
     title: &str,
     focused: bool,
     sel: usize,
-    offset: &Cell<usize>,
+    list: &ListView,
     build_rows: impl FnOnce(u16) -> Vec<Line<'static>>,
 ) {
-    let block = section_box(title, focused, true);
+    let block = section_box(title, focused, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let rows = build_rows(inner.width);
     if rows.is_empty() {
-        offset.set(0);
+        list.offset.set(0);
+        list.viewport.set(0);
+        list.total.set(0);
+        list.starts.replace(Vec::new());
+        list.block_ends.replace(Vec::new());
+        list.tips.replace(Vec::new());
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -572,7 +764,7 @@ pub(super) fn draw_selector_list(
         inner,
         rows.into_iter().map(ListItem::new).collect(),
         sel,
-        offset,
+        list,
     );
 }
 
@@ -604,6 +796,34 @@ pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Ve
         .collect()
 }
 
+/// Chunk `text` into `width`-cell runs, splitting between graphemes by their
+/// display width and never on whitespace: every byte lands in exactly one
+/// chunk. A path whose name holds spaces keeps them.
+pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_w = 0;
+    for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
+        let grapheme_w = Span::raw(grapheme.symbol).width();
+        if !chunk.is_empty() && chunk_w + grapheme_w > width {
+            lines.push(std::mem::take(&mut chunk));
+            chunk_w = 0;
+        }
+        chunk.push_str(grapheme.symbol);
+        chunk_w += grapheme_w;
+    }
+    if !chunk.is_empty() {
+        lines.push(chunk);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Greedy word-wrap to `width` cells, measured the way the buffer renders: by
 /// grapheme, a wide one taking two; long words are hard-split between
 /// graphemes.
@@ -620,19 +840,11 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
             if !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
             }
-            let mut chunk = String::new();
-            let mut chunk_w = 0;
-            for grapheme in Span::raw(word).styled_graphemes(Style::default()) {
-                let grapheme_w = Span::raw(grapheme.symbol).width();
-                if !chunk.is_empty() && chunk_w + grapheme_w > width {
-                    lines.push(std::mem::take(&mut chunk));
-                    chunk_w = 0;
-                }
-                chunk.push_str(grapheme.symbol);
-                chunk_w += grapheme_w;
-            }
-            line = chunk;
-            line_w = chunk_w;
+            let mut chunks = chunk_graphemes(word, width);
+            let last = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
+            line = last;
+            line_w = Span::raw(&line).width();
             continue;
         }
         let extra = usize::from(!line.is_empty());
@@ -720,19 +932,34 @@ pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static
 /// Border: `LINE_STRONG` when focused, `LINE` when blurred.
 /// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
-pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, true, Vec::new(), None)
+pub(super) fn section_box(title: &str, focused: bool, first: bool, width: u16) -> Block<'static> {
+    section_box_impl(title, focused, first, true, Vec::new(), None, width)
 }
 
 /// Like [`section_box`] but preserves the title's original case — use only when
 /// the title is a profile/account name, not a structural label.
-pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, false, Vec::new(), None)
+pub(super) fn section_box_verbatim(
+    title: &str,
+    focused: bool,
+    first: bool,
+    width: u16,
+) -> Block<'static> {
+    section_box_impl(title, focused, first, false, Vec::new(), None, width)
 }
 
 /// Border cells of rule a title must keep before the meta slot may render: a
 /// single dash between the two reads as part of the title's own rule run.
-const META_RULE_MIN: usize = 3;
+pub(super) const META_RULE_MIN: usize = 3;
+
+pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16) -> bool {
+    // `╭─` + ` TITLE ` + left + rule + ` meta ─` + `╮`: the corner-adjacent dash
+    // is a border cell of its own.
+    let insets = 3
+        + Line::from(title_label(title, true, u16::MAX)).width()
+        + left_w
+        + meta_line(meta, Style::default()).width();
+    !meta.is_empty() && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
+}
 
 /// [`section_box`] with two meta slots: `left` as a title of its own one
 /// border cell after the title (`╭─ TITLE ─ left ───`), `meta` in the border
@@ -762,13 +989,16 @@ pub(super) fn section_box_meta(
     // `╭─` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`:
     // the corner-adjacent dash is a border cell of its own, counted here so the
     // right slot keeps its ≥[`META_RULE_MIN`] rule cells at the compliant shape.
+    // This builder keeps the title un-ellipsized: its left slot never gives way,
+    // so a too-narrow row clips from the right (the left slot first) — the
+    // documented shape, not a title `…`.
     let insets = 3
-        + Line::from(title_label(title, true)).width()
+        + Line::from(title_label(title, true, u16::MAX)).width()
         + left.as_ref().map_or(0, |left| 1 + left.width())
         + meta_line(meta, Style::default()).width();
     let rule = usize::from(width).saturating_sub(insets);
     let meta = (!meta.is_empty() && rule >= META_RULE_MIN).then_some(meta);
-    let block = section_box_impl(title, focused, first, true, Vec::new(), meta);
+    let block = section_box_impl(title, focused, first, true, Vec::new(), meta, u16::MAX);
     match left {
         Some(left) => block.title_top(left),
         None => block,
@@ -784,9 +1014,10 @@ pub(super) fn section_box_loading(
     focused: bool,
     first: bool,
     frame: &str,
+    width: u16,
 ) -> Block<'static> {
     let suffix = vec![Span::styled(format!("{frame} "), theme::accent())];
-    section_box_impl(title, focused, first, true, suffix, None)
+    section_box_impl(title, focused, first, true, suffix, None, width)
 }
 
 /// The note editor's docked slot: an empty-title section box whose title break
@@ -803,6 +1034,7 @@ pub(super) fn edit_slot_block() -> Block<'static> {
             Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold()),
         ],
         None,
+        u16::MAX,
     )
 }
 
@@ -813,6 +1045,7 @@ fn section_box_impl(
     uppercase: bool,
     suffix: Vec<Span<'static>>,
     meta: Option<&str>,
+    width: u16,
 ) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::line_strong_color())
@@ -834,12 +1067,20 @@ fn section_box_impl(
             base
         }
     };
+    let suffix_w: usize = suffix.iter().map(Span::width).sum();
     let mut title_spans = Vec::with_capacity(2 + suffix.len());
     if !title.is_empty() {
         // The corner-adjacent dash `╭─ TITLE`: chrome owns every `─` cell, so it
         // carries the border token, never the title style.
         title_spans.push(Span::styled("─", border_style));
-        title_spans.push(Span::styled(title_label(title, uppercase), title_style));
+        // A trailing suffix (the loading spinner) shares the border break with
+        // the title, so the title budget must leave it room or the spinner
+        // pushes into the corner.
+        let title_w = width.saturating_sub(suffix_w.min(u16::MAX as usize) as u16);
+        title_spans.push(Span::styled(
+            title_label(title, uppercase, title_w),
+            title_style,
+        ));
     }
     // An EMPTY title pushes no spans at all — not even `title_label("")`'s
     // two-space inset, which would punch a hole in the top border. The
@@ -857,13 +1098,24 @@ fn section_box_impl(
     block
 }
 
-/// A panel title as it sits in the border break: ` TITLE `.
-fn title_label(title: &str, uppercase: bool) -> String {
-    if uppercase {
-        format!(" {} ", title.to_uppercase())
+/// A panel title as it sits in the border break: ` TITLE `, ellipsized to the
+/// border when the panel is narrower than it. The title line renders into the
+/// `width - 2` area past the corner; `─` plus the two insets leave `width - 5`
+/// cells for the title itself, so a longer title ends in `…` inside the border
+/// instead of running into the corner. Byte-identical whenever the title fits.
+pub(super) fn title_label(title: &str, uppercase: bool, width: u16) -> String {
+    let text = if uppercase {
+        title.to_uppercase()
     } else {
-        format!(" {title} ")
-    }
+        title.to_string()
+    };
+    let budget = usize::from(width).saturating_sub(5);
+    let text = if grapheme_cells(&text) > budget {
+        truncate(&text, budget)
+    } else {
+        text
+    };
+    format!(" {text} ")
 }
 
 /// The title-right meta slot. A right-aligned title ends flush against the
@@ -892,7 +1144,7 @@ pub(super) fn draw_profile_selector(
         "accounts",
         focused,
         sel,
-        &app.usage_selector_offset,
+        &app.usage_selector,
         |w| {
             cfg.profiles
                 .iter()

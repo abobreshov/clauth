@@ -32,3 +32,34 @@ fn the_usage_hints_advertise_the_note_key() {
         "an empty roster keeps n = new account off the hint bar, got {hints:?}"
     );
 }
+
+/// On the Setup tab's `alert at` row the bar names the stepper keys, the same
+/// pair the Fallback card's threshold row names.
+#[test]
+fn the_setup_alert_row_advertises_its_stepper_keys() {
+    use crate::tui::app::{ConfigFocus, ConfigRow, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
+    });
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.profile_cursor = 0;
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BellThreshold)
+        .expect("the alert row is listed");
+    assert_eq!(
+        tab_hints(&app),
+        [
+            ("↑↓", "row"),
+            ("+", "raise"),
+            ("-", "lower"),
+            ("↵", "type"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ]
+    );
+}
