@@ -958,3 +958,102 @@ fn agy_map_summary_orders_5h_before_7d_within_each_group() {
     assert_eq!(hourly.windows[1].label, "7d Gemini Models");
     assert_eq!(hourly.windows[1].window_secs, Some(604800));
 }
+
+#[test]
+fn agy_sends_cli_user_agent_and_keeps_consumer_on_daily_endpoint() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut http = super::super::source::FakeHttp::offline();
+    http.send_reply = Box::new(|_, req| {
+        assert_eq!(req.extra, &[("User-Agent", USER_AGENT)]);
+        assert!(req.url.contains("daily-cloudcode-pa.googleapis.com"));
+        let body = if req.url.ends_with("loadCodeAssist") {
+            json!({
+                "paidTier": {"id": "g1-ultra-lite-tier", "name": "Google AI Ultra"},
+                "cloudaicompanionProject": "aicode-consumers"
+            })
+            .to_string()
+        } else {
+            json!({
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.7644},
+                            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.8355}
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1.0},
+                            {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 1.0}
+                        ]
+                    }
+                ]
+            })
+            .to_string()
+        };
+        Ok(HttpReply {
+            retry_after_secs: None,
+            status: 200,
+            body,
+            headers: vec![],
+        })
+    });
+    let probe = Fake {
+        owner: true,
+        locked: 0,
+        unlocked: 1,
+        blob: json!({
+            "token": {"access_token": "ACCESS", "expiry": 2000000000},
+            "auth_method": "consumer"
+        })
+        .to_string()
+        .into_bytes(),
+    };
+    let reading = fetch_with(&target(home.home()), &http, &probe).unwrap();
+    assert_eq!(reading.plan.as_deref(), Some("Google AI Ultra"));
+    assert_eq!(reading.windows.len(), 4);
+    assert_eq!(reading.windows[0].id, "agy.gemini-5h");
+    assert_eq!(reading.windows[0].used_pct, Some(16.0));
+    assert_eq!(reading.windows[1].id, "agy.gemini-weekly");
+    assert_eq!(reading.windows[1].used_pct, Some(24.0));
+    assert_eq!(http.calls().len(), 2);
+}
+
+#[test]
+fn agy_gcp_and_adc_auth_methods_route_directly_to_production_endpoint() {
+    let home = crate::testutil::HomeSandbox::new();
+    for auth_method in ["gcp", "adc"] {
+        let mut http = super::super::source::FakeHttp::offline();
+        http.send_reply = Box::new(|_, req| {
+            assert_eq!(req.extra, &[("User-Agent", USER_AGENT)]);
+            assert!(req.url.contains("https://cloudcode-pa.googleapis.com/"));
+            let body = if req.url.ends_with("loadCodeAssist") {
+                json!({"paidTier": {"name": "Enterprise"}}).to_string()
+            } else {
+                include_str!("../fixtures/monitors/agy-summary.json").to_string()
+            };
+            Ok(HttpReply {
+                retry_after_secs: None,
+                status: 200,
+                body,
+                headers: vec![],
+            })
+        });
+        let probe = Fake {
+            owner: true,
+            locked: 0,
+            unlocked: 1,
+            blob: json!({
+                "token": {"access_token": "ACCESS", "expiry": 2000000000},
+                "auth_method": auth_method
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        let reading = fetch_with(&target(home.home()), &http, &probe).unwrap();
+        assert_eq!(reading.plan.as_deref(), Some("Enterprise"));
+        assert_eq!(http.calls().len(), 2);
+    }
+}

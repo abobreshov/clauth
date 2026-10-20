@@ -12,7 +12,7 @@ use crate::usage::collect::CollectCtx;
 use crate::usage::derive::{Severity, account_severity};
 use crate::usage::observation::{
     AccountObservation, Amount, Freshness, MoneyKind, MoneyMeter, MoneyScope, Period, PeriodKind,
-    ScopeOrigin, Timestamp,
+    QuotaWindow, RunningRate, ScopeOrigin, Timestamp,
 };
 
 /// The budget meter's id.
@@ -26,17 +26,55 @@ pub(crate) fn monitor_observations(ctx: &CollectCtx<'_>) -> Vec<AccountObservati
     let Ok(monitors) = super::config::load() else {
         return Vec::new();
     };
+    let show_estimates = ctx.config.is_none_or(|c| c.state.show_estimates);
     monitors
         .iter()
         .filter(|m| m.enabled || ctx.include_disabled)
         .map(|m| {
             let cache = super::cache::load(&m.id).filter(|c| c.matches(m));
             // Judged against the monitor's own TTL, not the profile cadence.
-            observe_monitor(m, cache.as_ref(), ctx.now_ms, |at| {
+            let mut obs = observe_monitor(m, cache.as_ref(), ctx.now_ms, |at| {
                 ctx.freshness_at_cadence(at, m.ttl_ms())
-            })
+            });
+            if !show_estimates {
+                for w in &mut obs.windows {
+                    w.running_rate = None;
+                }
+            }
+            obs
         })
         .collect()
+}
+
+/// Window-anchored burn rate and exhaustion estimate for a monitor window with
+/// a positive utilization, reset timestamp, and known window duration.
+pub(crate) fn window_running_rate(w: &QuotaWindow, now_secs: i64) -> Option<RunningRate> {
+    let pct = w.used_pct.filter(|p| p.is_finite() && *p > 0.0)?;
+    let window_secs = w.window_secs.filter(|&s| s > 0)?;
+    let reset_iso = w.resets_at?.to_rfc3339();
+    let label = match window_secs {
+        3_600 => "1h".to_string(),
+        18_000 => "5h".to_string(),
+        604_800 => "7d".to_string(),
+        s if s.is_multiple_of(86_400) => format!("{}d", s / 86_400),
+        s if s.is_multiple_of(3_600) => format!("{}h", s / 3_600),
+        _ => w.label.clone(),
+    };
+    let usage_win = crate::usage::UsageWindow {
+        utilization: pct,
+        resets_at: Some(reset_iso),
+    };
+    let per_day = crate::usage::window_avg_pace_per_day(&label, &usage_win, now_secs)?;
+    let unit = if window_secs >= 86_400 { "d" } else { "h" };
+    let rate = if unit == "d" { per_day } else { per_day / 24.0 };
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    Some(RunningRate {
+        pct_per_unit: rate,
+        unit: unit.to_string(),
+        time_left_secs: crate::usage::eta_left_secs(rate, pct, unit),
+    })
 }
 
 /// One monitor's observation at `now_ms`. `freshness` judges the age of the
@@ -73,6 +111,12 @@ pub(crate) fn observe_monitor(
             .iter()
             .filter(|w| w.resets_at.is_none_or(|t| now_secs < t.secs()))
             .cloned()
+            .map(|mut w| {
+                if w.running_rate.is_none() {
+                    w.running_rate = window_running_rate(&w, now_secs);
+                }
+                w
+            })
             .collect();
         obs.money = reading.money.clone();
         obs.best_effort = reading.best_effort;

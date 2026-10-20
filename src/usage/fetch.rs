@@ -589,16 +589,17 @@ impl UsageInfo {
 /// Nominal length of the rolling window named by `label`, in seconds. `None`
 /// for labels with no fixed window (e.g. the monthly extra-credits bar).
 pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
-    if label == LABEL_5H {
+    if label == LABEL_5H || label.starts_with("5h ") {
         Some(5 * 3600)
     } else if label == LABEL_7D || label.starts_with("7d ") {
         // `7d` plus every per-model weekly label (`"7d fable"`, `"7d opus"`, …).
         Some(7 * 86_400)
     } else {
-        // Provider window labels of the form `<n>h` / `<n>d` (e.g. z.ai's
-        // `5h`/`7d`/`30d`) so any api-key account with a windowed limit gets the
-        // same average pace + ideal-pace line as the OAuth windows.
-        parse_nh_nd_label(label)
+        // Provider and monitor window labels of the form `<n>h` / `<n>d` (e.g.
+        // z.ai's `5h`/`7d`/`30d` or Antigravity's `1h Gemini Models`) so any
+        // windowed limit gets the same average pace + ideal-pace line as the
+        // OAuth windows.
+        parse_nh_nd_label(label.split_whitespace().next().unwrap_or(label))
     }
 }
 

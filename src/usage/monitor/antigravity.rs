@@ -231,6 +231,8 @@ fn check_items(m: &KeyringMetadata) -> Result<(), Failure> {
 #[derive(Deserialize)]
 struct Blob {
     token: Option<Token>,
+    #[serde(default)]
+    auth_method: Option<String>,
     #[serde(flatten)]
     flat: Token,
 }
@@ -245,7 +247,7 @@ struct Token {
     )]
     expiry: Option<Value>,
 }
-pub(crate) fn parse_blob_with_expiry(bytes: &[u8], now: i64) -> Result<(Secret, i64), Failure> {
+fn parse_blob_login(bytes: &[u8], now: i64) -> Result<(Secret, i64, Option<String>), Failure> {
     if bytes.len() > 1024 * 1024 {
         return Err(Failure::new(
             FailureKind::Unavailable,
@@ -267,6 +269,7 @@ pub(crate) fn parse_blob_with_expiry(bytes: &[u8], now: i64) -> Result<(Secret, 
     let blob: Blob =
         serde_json::from_slice(decoded.as_deref().map(|v| v.as_slice()).unwrap_or(bytes))
             .map_err(|_| Failure::new(FailureKind::AuthRequired, "agy login blob is unreadable"))?;
+    let auth_method = blob.auth_method;
     let token = blob.token.unwrap_or(blob.flat);
     let access = token
         .access_token
@@ -277,7 +280,7 @@ pub(crate) fn parse_blob_with_expiry(bytes: &[u8], now: i64) -> Result<(Secret, 
         None => crate::codex_auth::jwt_exp_ms(access.expose()).map(|ms| ms / 1000),
     };
     match expiry {
-        Some(exp) if exp > now.saturating_add(60) => Ok((access, exp)),
+        Some(exp) if exp > now.saturating_add(60) => Ok((access, exp, auth_method)),
         Some(_) => Err(Failure::new(
             FailureKind::AuthRequired,
             "agy's token expired; open agy for a moment",
@@ -289,19 +292,30 @@ pub(crate) fn parse_blob_with_expiry(bytes: &[u8], now: i64) -> Result<(Secret, 
     }
 }
 #[cfg(test)]
+pub(crate) fn parse_blob_with_expiry(bytes: &[u8], now: i64) -> Result<(Secret, i64), Failure> {
+    parse_blob_login(bytes, now).map(|(access, exp, _)| (access, exp))
+}
+#[cfg(test)]
 pub(crate) fn parse_blob(bytes: &[u8], now: i64) -> Result<Secret, Failure> {
     parse_blob_with_expiry(bytes, now).map(|(access, _)| access)
+}
+fn read_login(
+    probe: &dyn KeyringProbe,
+    now: i64,
+) -> Result<(Secret, i64, Option<String>), Failure> {
+    if !probe.has_owner()? {
+        return Err(unavailable());
+    }
+    check_items(&probe.metadata()?)?;
+    parse_blob_login(&probe.secret()?, now)
 }
 pub(crate) fn read_token_with_expiry(
     probe: &dyn KeyringProbe,
     now: i64,
 ) -> Result<(Secret, i64), Failure> {
-    if !probe.has_owner()? {
-        return Err(unavailable());
-    }
-    check_items(&probe.metadata()?)?;
-    parse_blob_with_expiry(&probe.secret()?, now)
+    read_login(probe, now).map(|(access, exp, _)| (access, exp))
 }
+#[cfg(test)]
 pub(crate) fn read_token(probe: &dyn KeyringProbe, now: i64) -> Result<Secret, Failure> {
     read_token_with_expiry(probe, now).map(|(access, _)| access)
 }
@@ -344,6 +358,10 @@ pub(crate) fn needs_project_backfill(reading: &Reading) -> bool {
             || (!reading.windows.is_empty()
                 && reading.windows.iter().all(|w| w.id.starts_with("agy.3p-"))))
 }
+// Cloud Code's retrieveUserQuotaSummary filters the Gemini Models quota group
+// unless User-Agent carries the CLI surface and version segment.
+pub(crate) const USER_AGENT: &str = "antigravity/cli/1.4.3";
+
 #[cfg(target_os = "linux")]
 pub(crate) fn fetch_with(
     target: &MonitorTarget,
@@ -359,9 +377,13 @@ pub(crate) fn fetch_with(
         }
         return fetch_cli(&LiveCliRunner, target.now_secs);
     }
-    let token = read_token(probe, target.now_secs)?;
-    let host = std::cell::Cell::new("daily-cloudcode-pa");
-    let send_one = |h: &str, path: &str, agent: &'static str, body: &[u8]| {
+    let (token, _, auth_method) = read_login(probe, target.now_secs)?;
+    let initial_host = match auth_method.as_deref() {
+        Some("gcp" | "adc") => "cloudcode-pa",
+        _ => "daily-cloudcode-pa",
+    };
+    let host = std::cell::Cell::new(initial_host);
+    let send_one = |h: &str, path: &str, body: &[u8]| {
         let url = format!("https://{h}.googleapis.com/v1internal:{path}");
         http.send(
             MonitorKind::Antigravity,
@@ -369,20 +391,20 @@ pub(crate) fn fetch_with(
                 method: Method::Post,
                 url: &url,
                 auth: Auth::Bearer(&token),
-                extra: &[("User-Agent", agent)],
+                extra: &[("User-Agent", USER_AGENT)],
                 json_body: Some(body),
             },
         )
     };
-    let send_post = |path: &str, agent: &'static str, body: &[u8]| -> Result<HttpReply, Failure> {
-        let first = send_one(host.get(), path, agent, body);
+    let send_post = |path: &str, body: &[u8]| -> Result<HttpReply, Failure> {
+        let first = send_one(host.get(), path, body);
         if host.get() == "daily-cloudcode-pa"
             && first
                 .as_ref()
                 .map_or(true, |r| r.status == 404 || r.status >= 500)
         {
             host.set("cloudcode-pa");
-            send_one(host.get(), path, agent, body)
+            send_one(host.get(), path, body)
         } else {
             first
         }
@@ -396,7 +418,6 @@ pub(crate) fn fetch_with(
     {
         let reply = send_post(
             "loadCodeAssist",
-            "antigravity",
             br#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#,
         )?;
         status(&reply, target.now_secs)?;
@@ -404,6 +425,11 @@ pub(crate) fn fetch_with(
             Failure::new(FailureKind::Unavailable, "agy plan response unrecognized")
         })?;
         let root = raw.get("response").unwrap_or(&raw);
+        if auth_method.as_deref() != Some("consumer")
+            && root["paidTier"]["usesGcpTos"].as_bool() == Some(true)
+        {
+            host.set("cloudcode-pa");
+        }
         let resolved_project = extract_project(root);
         let has_paid_tier = root["paidTier"]["name"]
             .as_str()
@@ -414,12 +440,17 @@ pub(crate) fn fetch_with(
                 "metadata": { "ideType": "ANTIGRAVITY" }
             })
             .to_string();
-            let reply2 = send_post("loadCodeAssist", "antigravity", body.as_bytes())?;
+            let reply2 = send_post("loadCodeAssist", body.as_bytes())?;
             status(&reply2, target.now_secs)?;
             let raw2: Value = serde_json::from_str(&reply2.body).map_err(|_| {
                 Failure::new(FailureKind::Unavailable, "agy plan response unrecognized")
             })?;
             let root2 = raw2.get("response").unwrap_or(&raw2);
+            if auth_method.as_deref() != Some("consumer")
+                && root2["paidTier"]["usesGcpTos"].as_bool() == Some(true)
+            {
+                host.set("cloudcode-pa");
+            }
             extract_plan(root2).or_else(|| extract_plan(root))
         } else {
             extract_plan(root)
@@ -431,31 +462,11 @@ pub(crate) fn fetch_with(
         Some(proj) => serde_json::json!({ "project": proj }).to_string(),
         None => "{}".to_string(),
     };
-    let quota = send_post(
-        "retrieveUserQuotaSummary",
-        "antigravity",
-        quota_body.as_bytes(),
-    )?;
+    let quota = send_post("retrieveUserQuotaSummary", quota_body.as_bytes())?;
     status(&quota, target.now_secs)?;
     let quota: Value = serde_json::from_str(&quota.body)
         .map_err(|_| Failure::new(FailureKind::Unavailable, "agy quota response unrecognized"))?;
     let mut reading = map_summary(&quota)?;
-    if host.get() == "daily-cloudcode-pa"
-        && reading.windows.iter().all(|w| w.id.starts_with("agy.3p-"))
-    {
-        host.set("cloudcode-pa");
-        let prod = send_one(
-            host.get(),
-            "retrieveUserQuotaSummary",
-            "antigravity",
-            quota_body.as_bytes(),
-        )?;
-        status(&prod, target.now_secs)?;
-        let prod: Value = serde_json::from_str(&prod.body).map_err(|_| {
-            Failure::new(FailureKind::Unavailable, "agy quota response unrecognized")
-        })?;
-        reading = map_summary(&prod)?;
-    }
     reading.plan = plan;
     reading.plan_checked_at = plan_checked_at;
     reading.cloudaicompanion_project = project;

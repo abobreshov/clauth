@@ -530,3 +530,77 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[test]
+fn antigravity_monitor_windows_compute_burn_rate_and_time_left_estimates() {
+    let cfg = MonitorConfig::new("agy", MonitorKind::Antigravity);
+    let now_secs = (NOW_MS / 1000) as i64;
+
+    let mut gemini_5h = QuotaWindow::new(
+        "agy.gemini-5h",
+        "5h Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    gemini_5h.window_secs = Some(18_000);
+    gemini_5h.used_pct = Some(16.0);
+    // 2h elapsed out of 5h (3h remaining)
+    gemini_5h.resets_at = Some(Timestamp::from_secs(now_secs + 3 * 3600));
+
+    let mut gemini_7d = QuotaWindow::new(
+        "agy.gemini-weekly",
+        "7d Gemini Models",
+        WindowScope::Model {
+            models: vec!["Gemini Models".into()],
+        },
+    );
+    gemini_7d.window_secs = Some(604_800);
+    gemini_7d.used_pct = Some(24.0);
+    // 4d elapsed out of 7d (3d remaining)
+    gemini_7d.resets_at = Some(Timestamp::from_secs(now_secs + 3 * 86_400));
+
+    let mut claude_5h = QuotaWindow::new(
+        "agy.3p-5h",
+        "5h Claude and GPT models",
+        WindowScope::Model {
+            models: vec!["Claude and GPT models".into()],
+        },
+    );
+    claude_5h.window_secs = Some(18_000);
+    claude_5h.used_pct = Some(0.0);
+    claude_5h.resets_at = Some(Timestamp::from_secs(now_secs + 3 * 3600));
+
+    let reading = Reading {
+        plan: Some("Google AI Ultra".into()),
+        windows: vec![gemini_5h, gemini_7d, claude_5h],
+        ..Reading::default()
+    };
+    let obs = observe_monitor(
+        &cfg,
+        Some(&cache_with(reading, NOW_MS - 1000, None)),
+        NOW_MS,
+        fresh,
+    );
+    assert_eq!(obs.windows.len(), 3);
+    let r_5h = obs.windows[0]
+        .running_rate
+        .as_ref()
+        .expect("5h window with usage has running_rate");
+    assert_eq!(r_5h.unit, "h");
+    assert!((r_5h.pct_per_unit - 8.0).abs() < 1e-6);
+    assert_eq!(r_5h.display(), "8%/h · 10h 30m left");
+
+    let r_7d = obs.windows[1]
+        .running_rate
+        .as_ref()
+        .expect("7d window with usage has running_rate");
+    assert_eq!(r_7d.unit, "d");
+    assert!((r_7d.pct_per_unit - 6.0).abs() < 1e-6);
+    assert_eq!(r_7d.display(), "6%/d · 12d 16h left");
+
+    assert!(
+        obs.windows[2].running_rate.is_none(),
+        "0% unused window does not fabricate a burn rate"
+    );
+}

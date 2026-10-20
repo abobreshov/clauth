@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2 — 2026-10-20
+
+### Usage and monitors
+
+- Antigravity (`agy`) quota fetches now send the `antigravity/cli/1.4.3` user-agent required by `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` to include the `Gemini Models` group, and route consumer logins to `daily-cloudcode-pa.googleapis.com` while routing GCP (`"gcp"` / `"adc"`) logins to `cloudcode-pa.googleapis.com`, matching the `agy` CLI (`Models & Quota`).
+- Monitor quota windows (including Antigravity `5h`/`7d` model groups and Grok `7d`) now compute window-anchored burn rates (`%/h` for `1h`/`5h`, `%/d` for `7d`) and time-left exhaustion estimates (`X left`) across the TUI Usage view, CLI `tollgate usage`, and JSON output when `show_estimates` is enabled.
+
 ## 0.4.1 — 2026-10-15
 
 ### Usage and monitors

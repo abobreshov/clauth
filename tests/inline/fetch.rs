@@ -1605,9 +1605,11 @@ fn window_avg_pace_leaves_an_under_pace_window_alone() {
 fn window_duration_parses_provider_labels() {
     assert_eq!(window_duration_secs(LABEL_5H), Some(5 * 3600));
     assert_eq!(window_duration_secs(LABEL_7D), Some(7 * 86_400));
-    // Dynamic per-model labels resolve to the 7-day window.
+    // Dynamic per-model labels resolve to their window duration.
     assert_eq!(window_duration_secs("7d fable"), Some(7 * 86_400));
     assert_eq!(window_duration_secs("7d opus"), Some(7 * 86_400));
+    assert_eq!(window_duration_secs("5h Gemini Models"), Some(5 * 3600));
+    assert_eq!(window_duration_secs("1h Gemini Models"), Some(3600));
     assert_eq!(window_duration_secs("5h"), Some(5 * 3600));
     assert_eq!(window_duration_secs("30d"), Some(30 * 86_400));
     assert_eq!(window_duration_secs("14d"), Some(14 * 86_400));
