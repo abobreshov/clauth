@@ -73,12 +73,13 @@ fn agy_missing_expiry_and_under_60s_fail_closed() {
 }
 #[test]
 fn agy_accepts_response_envelope_and_bare_groups() {
-    let value = json!({"groups":[{"displayName":"Gemini","buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.25,"resetTime":2000000000}]}]});
+    let value = json!({"groups":[{"displayName":"Gemini","buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.25,"resetTime":2000000000},{"bucketId":"gemini-sub1","window":"5h","remainingFraction":0.9933714,"resetTime":2000000000}]}]});
     for body in [value.clone(), json!({"response":value})] {
         let r = map_summary(&body).unwrap();
         assert_eq!(r.windows[0].used_pct, Some(75.));
         assert_eq!(r.windows[0].window_secs, Some(18000));
         assert!(!r.windows[0].chain_eligible);
+        assert_eq!(r.windows[1].used_pct, Some(0.66));
     }
 }
 #[test]
@@ -929,7 +930,7 @@ fn agy_map_summary_orders_5h_before_7d_within_each_group() {
             "7d Claude and GPT models",
         ]
     );
-    assert_eq!(reading.windows[0].used_pct, Some(17.0));
+    assert_eq!(reading.windows[0].used_pct, Some(16.74));
 
     let hourly_body = json!({
         "groups": [
@@ -1015,9 +1016,9 @@ fn agy_sends_cli_user_agent_and_keeps_consumer_on_daily_endpoint() {
     assert_eq!(reading.plan.as_deref(), Some("Google AI Ultra"));
     assert_eq!(reading.windows.len(), 4);
     assert_eq!(reading.windows[0].id, "agy.gemini-5h");
-    assert_eq!(reading.windows[0].used_pct, Some(16.0));
+    assert_eq!(reading.windows[0].used_pct, Some(16.45));
     assert_eq!(reading.windows[1].id, "agy.gemini-weekly");
-    assert_eq!(reading.windows[1].used_pct, Some(24.0));
+    assert_eq!(reading.windows[1].used_pct, Some(23.56));
     assert_eq!(http.calls().len(), 2);
 }
 

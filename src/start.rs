@@ -81,7 +81,7 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
 /// order, and the transport probe runs last. That ordering is load-bearing: a
 /// start refused for a cause the user can act on never materializes a profile
 /// dir for an account that never launched.
-fn refuse_unless_chain_eligible(
+pub(crate) fn refuse_unless_chain_eligible(
     config: &AppConfig,
     profile: &crate::profile::Profile,
     isolation: Isolation,

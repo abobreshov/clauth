@@ -17,6 +17,14 @@ pub(crate) mod cards;
 pub(crate) mod collect;
 pub(crate) mod derive;
 mod fetch;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the usage probe reads it once the usage-store rework lands"
+    )
+)]
+mod inference;
 // Hermes homes' own usage ledger (`state.db`) as `hermes:<name>` observations
 // (hermes spec §4.6): the sqlite3 read, its cache, the collect hook and the
 // daemon leg.

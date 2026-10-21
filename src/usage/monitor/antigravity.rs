@@ -569,7 +569,7 @@ pub(crate) fn map_summary(value: &Value) -> Result<Reading, Failure> {
             window.used_pct = bucket["remainingFraction"]
                 .as_f64()
                 .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-                .map(|v| ((1. - v) * 100.).round());
+                .map(|v| ((1. - v) * 10000.).round() / 100.);
             window.exhausted = window.used_pct.is_some_and(|v| v >= 100.);
             window.resets_at = super::nous::value_timestamp(&bucket["resetTime"]);
             group_windows.push(window);

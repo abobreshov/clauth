@@ -3558,6 +3558,7 @@ impl SessionSwap {
             // matching-login carry and the install/sign-out owner search save
             // its sibling keys before replacing the outgoing item.
             relink_to_canonical(&link, &plan.store)?;
+            let _ = crate::claude_json::strip_oauth_account_at(&self.runtime.join(".claude.json"));
 
             // Past here the session IS on the new member, so nothing may report
             // otherwise. Publish, then let a registry failure be logged rather
@@ -3959,6 +3960,7 @@ impl SessionSwap {
             }
             touch_store(plan, file_mtime(&current))?;
             relink_to_canonical(&link, &plan.store)?;
+            let _ = crate::claude_json::strip_oauth_account_at(&self.runtime.join(".claude.json"));
 
             // Past here the session IS on the sidecar, so nothing may report
             // otherwise. The row's `launch_store` follows in the same hold on

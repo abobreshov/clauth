@@ -749,6 +749,7 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHel
     // Captured before `active_profile` is reassigned.
     let prev_env_keys = outgoing_env_keys(config);
     let profile = config.find(name).context("profile not found")?;
+    let target_is_oauth = profile.is_oauth();
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
     // issue #17: drop the outgoing account's cached identity so Claude Code
     // re-derives it from the just-relinked credentials instead of showing
@@ -764,7 +765,31 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHel
     let mut state = load_app_state()?;
     state.set_active(Some(name.clone()), held);
     state.last_switch_at = config.state.last_switch_at;
-    save_app_state(&state)
+    save_app_state(&state)?;
+    if target_is_oauth {
+        for row in crate::live_sessions::list() {
+            if row.isolated
+                || row.harness != crate::harness::Harness::Claude
+                || row.executor() != crate::hot_swap::Executor::Oauth
+            {
+                continue;
+            }
+            let probe =
+                ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
+            if crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
+                && (probe != *name
+                    || row
+                        .intended_member
+                        .as_deref()
+                        .is_some_and(|intended| intended != name.as_str()))
+            {
+                let _ = crate::live_sessions::update_as_daemon(&row.session_id, |fields| {
+                    fields.request_member(name.as_str());
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn edit_profile_endpoint(

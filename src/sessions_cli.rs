@@ -138,6 +138,19 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
     };
 
     let canonical = resolve_profile_name(&config, &chosen)?;
+    let canonical = if !is_tty
+        && config.state.fallback_chain.contains(&canonical)
+        && let Some(active_name) = config.state.active_profile.as_ref()
+        && active_name != &canonical
+        && config.state.fallback_chain.contains(active_name)
+        && config
+            .find(active_name)
+            .is_some_and(|p| !p.disabled && p.is_oauth())
+    {
+        active_name.clone()
+    } else {
+        canonical
+    };
 
     // Guest mode: the session's `projects/` is tollgate's guest store, never
     // the operator's, so the transcript is copied there for `--resume` to find
@@ -145,10 +158,13 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
     crate::runtime::seed_guest_resume(&session.path)?;
 
     let resume_args = vec!["--resume".to_string(), session.id];
+    let follows_chain = config.find(&canonical).is_some_and(|p| {
+        crate::start::refuse_unless_chain_eligible(&config, p, Isolation::Shared).is_ok()
+    });
     // Shared isolation: a resume adopts the chosen account against the shared
-    // store, the same lifecycle a bare `tollgate start <name>` uses. A resume never
-    // opts into the fallback chain — there is no `--with-fallback` on this
-    // surface to ask for it. In guest mode the shared runtime it builds is the
+    // store, the same lifecycle a bare `tollgate start <name>` uses, and opts
+    // into the fallback chain whenever the target account and daemon are
+    // eligible. In guest mode the shared runtime it builds is the
     // guest one (`runtime::build_runtime_dir_with_active_env`), so a resume
     // links neither `plugins/` nor `projects/` at the operator's trees.
     crate::start::run(
@@ -157,7 +173,7 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
         &resume_args,
         Isolation::Shared,
         Some(&workspace),
-        false,
+        follows_chain,
         None,
     )
 }

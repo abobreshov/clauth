@@ -7443,3 +7443,25 @@ fn a_login_clear_retires_the_spent_record() {
             .exists()
     );
 }
+
+#[test]
+fn switch_profile_moves_live_shared_claude_oauth_sessions_onto_the_new_active_profile() {
+    let _home = HomeSandbox::new();
+    let config = two_profiles_active_on_one();
+    let row = crate::testutil::live_row("4242-0", "one");
+    crate::live_sessions::register(&row).expect("register row");
+    let _marker =
+        crate::runtime::hold_session_row_marker(&ProfileName::from("one"), false, "4242-0")
+            .expect("hold marker");
+
+    through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("switch one -> two");
+    });
+
+    let updated = crate::live_sessions::get("4242-0").expect("row exists");
+    assert_eq!(
+        updated.intended_member.as_deref(),
+        Some("two"),
+        "a global switch must also request the new active profile on live shared claude oauth sessions"
+    );
+}

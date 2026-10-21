@@ -170,8 +170,15 @@ pub(crate) fn strip_home_oauth_account() -> Result<()> {
     if crate::identity::upstream_active() {
         return Ok(());
     }
-    let path = home_dir()?.join(".claude.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    strip_oauth_account_at(&home_dir()?.join(".claude.json"))
+}
+
+/// Strip the cached `oauthAccount` block from a specific `.claude.json` (either
+/// `~/.claude.json` on a global switch or `<runtime>/.claude.json` on a
+/// per-session swap) so Claude Code re-derives the identity from the newly
+/// linked credentials file.
+pub(crate) fn strip_oauth_account_at(path: &Path) -> Result<()> {
+    let Ok(bytes) = std::fs::read(path) else {
         return Ok(()); // missing — never create
     };
     let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&bytes) else {
@@ -182,7 +189,7 @@ pub(crate) fn strip_home_oauth_account() -> Result<()> {
     }
     let bytes = serde_json::to_vec_pretty(&Value::Object(obj))
         .context("failed to serialize .claude.json after stripping oauthAccount")?;
-    atomic_write(&path, &bytes).with_context(|| format!("failed to write {}", path.display()))
+    atomic_write(path, &bytes).with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(test)]
