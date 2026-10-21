@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.3 — 2026-10-21
+
+### Sessions and account switching
+
+- Global profile switches (`tollgate <profile>`, `tollgate switch <profile>`, TUI `Enter`, and daemon auto-switch) now propagate `intended_member` to all live shared Claude OAuth sessions in `live_sessions/`, and per-session credential swaps strip the cached `oauthAccount` block from `<runtime>/.claude.json` so Claude Code re-derives the switched account identity immediately.
+- `tollgate resume` now enables `follows_chain` (`⇄`) whenever the target account and daemon are chain-eligible, and non-interactive (`herdr`) restores follow the current active fallback-chain member rather than a stale `--profile` from before an auto-switch.
+
+### Usage and monitors
+
+- Antigravity (`agy`) quota window mapping now preserves two-decimal percentages (`0.66%`, `10.83%`) instead of integer-rounding sub-1% `5h` usage to `0%`, and `usage::inference::anthropic` parses `anthropic-ratelimit-unified-*` rate-limit headers from `/v1/messages` responses.
+
 ## 0.4.2 — 2026-10-20
 
 ### Usage and monitors

@@ -156,10 +156,20 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled))
 }
 
+/// The widest whole reading, `100%`: the label budget every Overview usage tier
+/// is sized for. A longer label (`73.42%`) widens its column by the excess.
+pub(super) const PCT_LABEL_BUDGET: usize = 4;
+
 /// Cells the bar block occupies at the widest tier: `[` + 10 cells + `]` +
 /// ` 100%`. Whatever the reset suffix adds has to fit in the rest of the column,
 /// which is padded to a fixed width by the caller.
 const BAR_BLOCK_COLS: usize = 17;
+
+/// A window's reading as the bracketed bar prints it, so a column can size its
+/// label width off the same text its rows render.
+pub(super) fn window_label(window: &UsageWindow) -> String {
+    crate::format::format_pct(window.utilization.clamp(0.0, 100.0))
+}
 
 /// Overview accounts rows only: `[███░░░]` with dim brackets around the bar.
 /// Brackets render in `dim`; filled/empty cells keep their semantic util color,
@@ -178,9 +188,10 @@ pub(super) fn window_summary_spans_bracketed(
     fmt: ResetFmt,
     stale: bool,
 ) -> Vec<Span<'static>> {
-    window_summary_spans_bracketed_at(
+    window_summary_spans_bracketed_with_label_at(
         window,
         width,
+        0,
         include_bar,
         reset_style,
         fmt,
@@ -191,9 +202,36 @@ pub(super) fn window_summary_spans_bracketed(
 
 /// [`window_summary_spans_bracketed`] against a caller-supplied clock so a
 /// test can pin the fixture and the render to one instant.
+#[cfg(test)]
 pub(crate) fn window_summary_spans_bracketed_at(
     window: Option<&UsageWindow>,
     width: usize,
+    include_bar: bool,
+    reset_style: Option<Style>,
+    fmt: ResetFmt,
+    stale: bool,
+    now: i64,
+) -> Vec<Span<'static>> {
+    window_summary_spans_bracketed_with_label_at(
+        window,
+        width,
+        0,
+        include_bar,
+        reset_style,
+        fmt,
+        stale,
+        now,
+    )
+}
+
+/// [`window_summary_spans_bracketed_at`] with a caller-supplied column label
+/// width `label_w`, so rows sharing a column align their `%` signs even when
+/// one row has two decimals (`10.83%`) and another is whole (`0%`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn window_summary_spans_bracketed_with_label_at(
+    window: Option<&UsageWindow>,
+    width: usize,
+    label_w: usize,
     include_bar: bool,
     reset_style: Option<Style>,
     fmt: ResetFmt,
@@ -212,7 +250,7 @@ pub(crate) fn window_summary_spans_bracketed_at(
     };
 
     let figure = crate::format::format_pct(pct);
-    let figure_w = figure.len().max(4);
+    let figure_w = figure.len().max(label_w).max(PCT_LABEL_BUDGET);
     let secs = reset_in_secs_at(window, now);
     let bare_reset_fits = width >= 26
         && secs.is_some_and(|s| 13 + figure_w + 3 + humanize_duration(s).chars().count() <= width);
@@ -222,11 +260,12 @@ pub(crate) fn window_summary_spans_bracketed_at(
             Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, 10), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {figure:>4}"), fill_style),
+            Span::styled(format!(" {figure:>figure_w$}"), fill_style),
         ];
         if let Some(secs) = secs {
             let style = reset_style.unwrap_or_else(theme::faint);
-            spans.extend(reset_suffix_spans(secs, fmt, width, style));
+            let effective_w = width.saturating_sub(figure_w.saturating_sub(PCT_LABEL_BUDGET));
+            spans.extend(reset_suffix_spans(secs, fmt, effective_w, style));
         }
         spans
     } else if include_bar && width >= 13 + figure_w {
@@ -235,7 +274,7 @@ pub(crate) fn window_summary_spans_bracketed_at(
             Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, 10), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {figure:>4}"), fill_style),
+            Span::styled(format!(" {figure:>figure_w$}"), fill_style),
         ]
     } else if include_bar && width >= 8 + figure_w {
         // [███░░░] XX%  — bar shrinks to fit
@@ -244,10 +283,10 @@ pub(crate) fn window_summary_spans_bracketed_at(
             Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, bar_cells), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {figure:>4}"), fill_style),
+            Span::styled(format!(" {figure:>figure_w$}"), fill_style),
         ]
     } else {
-        vec![Span::styled(format!("{figure:>4}"), fill_style)]
+        vec![Span::styled(format!("{figure:>figure_w$}"), fill_style)]
     }
 }
 

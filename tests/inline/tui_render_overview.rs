@@ -4805,7 +4805,7 @@ fn antigravity_multi_group_windows_render_separate_overview_rows() {
         },
     );
     gemini_5h.window_secs = Some(18_000);
-    gemini_5h.used_pct = Some(4.0);
+    gemini_5h.used_pct = Some(10.83);
     gemini_5h.resets_at = Some(Timestamp(now + 4 * 3_600 + 38 * 60));
 
     let mut gemini_7d = QuotaWindow::new(
@@ -4816,7 +4816,7 @@ fn antigravity_multi_group_windows_render_separate_overview_rows() {
         },
     );
     gemini_7d.window_secs = Some(604_800);
-    gemini_7d.used_pct = Some(49.0);
+    gemini_7d.used_pct = Some(34.78);
     gemini_7d.resets_at = Some(Timestamp(now + 5 * 86_400 + 22 * 3_600));
 
     let mut claude_5h = QuotaWindow::new(
@@ -4853,9 +4853,9 @@ fn antigravity_multi_group_windows_render_separate_overview_rows() {
     let row_claude = line_text(&rendered[1]);
     assert!(
         row_gemini.contains("Antigravity (Gemini)")
-            && row_gemini.contains("4% (4h 38m)")
-            && row_gemini.contains("49% (5d 22h)"),
-        "first row shows Gemini 5h and 7d windows: {row_gemini}"
+            && row_gemini.contains("10.83% (4h 38m)")
+            && row_gemini.contains("34.78% (5d 22h)"),
+        "first row shows Gemini 5h and 7d windows with reset times: {row_gemini}"
     );
     assert!(
         row_claude.contains("Antigravity (Claude/GPT)")
@@ -4865,6 +4865,9 @@ fn antigravity_multi_group_windows_render_separate_overview_rows() {
     );
 
     crate::tui::app::set_usage_extras(&mut app, vec![obs]);
+    let full_widths = OverviewWidths::new(140, &app);
+    assert_eq!(full_widths.five_hour, 28);
+    assert_eq!(full_widths.seven_day, 29);
     let rows = overview_text(&app, 140, 12);
     let _ = row_with(&rows, "Antigravity (Gemini)");
     let _ = row_with(&rows, "Antigravity (Claude/GPT)");
