@@ -15456,11 +15456,13 @@ fn c_on_the_tokens_tab_flips_count_cache() {
     );
 }
 
-/// On the Overview `c` cycles the filter all → claude → codex → hermes → all and
-/// leaves the Tokens flag alone; on a tab with no `c` binding it is a no-op.
+/// The harness filter is hidden in tollgate (`HARNESS_FILTER_KEY` is off): `c`
+/// on the Overview leaves the filter at `All` and the Tokens flag alone, and
+/// on a tab with no `c` binding it is a no-op too. When the key comes back,
+/// `c` cycles all → claude → codex → hermes → all.
 #[test]
-fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
-    use super::{HarnessFilter, handle_key};
+fn c_on_the_overview_leaves_the_hidden_harness_filter_and_count_cache_alone() {
+    use super::{HARNESS_FILTER_KEY, HarnessFilter, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![crate::testutil::blank_profile(
         &crate::profile::ProfileName::from("a"),
@@ -15473,15 +15475,17 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
         seen.push(app.harness_filter);
     }
-    assert_eq!(
-        seen,
+    let expected = if HARNESS_FILTER_KEY {
         [
             HarnessFilter::Claude,
             HarnessFilter::Codex,
             HarnessFilter::Hermes,
-            HarnessFilter::All
+            HarnessFilter::All,
         ]
-    );
+    } else {
+        [HarnessFilter::All; 4]
+    };
+    assert_eq!(seen, expected);
     assert_eq!(
         app.config().state.count_cache,
         count_cache,

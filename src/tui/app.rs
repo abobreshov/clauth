@@ -2044,6 +2044,12 @@ pub(crate) enum MainItemKind {
     Codex(usize),
 }
 
+/// Whether `c` on the Overview cycles the harness filter. Off in tollgate for
+/// now: the Overview shows codex and other providers as monitor rows, not
+/// harness rows, so a filter step only hides the Claude accounts. With it off
+/// the filter stays `All`, `c` is unbound there and the footer omits it.
+pub(crate) const HARNESS_FILTER_KEY: bool = false;
+
 /// The Overview's visible harness filter; selection maps onto the rows it shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HarnessFilter {
@@ -4511,7 +4517,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // Overview only: it is the one screen listing accounts, so the filter
         // has nothing to mean anywhere else. Guarded rather than swallowed so
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
-        KeyCode::Char('c') if app.tab == Tab::Overview => {
+        KeyCode::Char('c') if HARNESS_FILTER_KEY && app.tab == Tab::Overview => {
             app.disarm_quit();
             let selected = app.current_main_item();
             app.harness_filter = app.harness_filter.next();

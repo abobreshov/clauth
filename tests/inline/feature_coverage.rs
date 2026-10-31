@@ -227,7 +227,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "a_quarantined_codex_member_is_walked_around",
             "apply_codex_switch_",
             "delete_codex_",
-            "c_on_the_overview_cycles_the_harness_filter",
+            "c_on_the_overview_leaves_the_hidden_harness_filter",
             "a_quarantined_codex_row_renders_the_broken_marker",
         ],
     ),

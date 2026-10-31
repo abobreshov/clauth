@@ -177,22 +177,13 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 
     let tail: &[(&str, &str)] = match app.tab {
         // A read-only row reorders nothing; ⏎ opens it on the Usage tab.
+        // No `c harness` hint while `HARNESS_FILTER_KEY` is off.
         Tab::Overview
             if app.harness_filter.shows_claude() && app.overview_selected_extra().is_some() =>
         {
-            &[
-                ("↵", "usage"),
-                ("a", "actions"),
-                ("c", "harness"),
-                ("?", "help"),
-            ]
+            &[("↵", "usage"), ("a", "actions"), ("?", "help")]
         }
-        Tab::Overview => &[
-            ("⇧↑↓", "reorder"),
-            ("a", "actions"),
-            ("c", "harness"),
-            ("?", "help"),
-        ],
+        Tab::Overview => &[("⇧↑↓", "reorder"), ("a", "actions"), ("?", "help")],
         // The hint derives from the key's behavior on this frame: with no
         // accounts, `n` still starts a new account (the empty state's promise)
         // and the note editor does not exist yet.

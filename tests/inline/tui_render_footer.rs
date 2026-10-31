@@ -33,6 +33,29 @@ fn the_usage_hints_advertise_the_note_key() {
     );
 }
 
+/// The Overview bar names no `c` key while the harness filter is hidden, on an
+/// account row and on a read-only row alike.
+#[test]
+fn the_overview_hints_omit_the_hidden_harness_key() {
+    use crate::tui::app::HARNESS_FILTER_KEY;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile(&"alice".into())],
+    });
+    app.tab = Tab::Overview;
+    let hints = tab_hints(&app);
+    assert!(
+        hints.contains(&("a", "actions")),
+        "the Overview hints render, got {hints:?}"
+    );
+    assert_eq!(
+        hints.iter().any(|(k, _)| *k == "c"),
+        HARNESS_FILTER_KEY,
+        "`c` shows on the Overview bar only while the harness filter key is on, got {hints:?}"
+    );
+}
+
 /// On the Setup tab's `alert at` row the bar names the stepper keys, the same
 /// pair the Fallback card's threshold row names.
 #[test]
