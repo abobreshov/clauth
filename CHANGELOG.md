@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 — 2026-10-31
+
+### Security
+
+- Dependency versions now match upstream's lockfile, which the 0.5.0 port missed: rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10 and tokio 1.54.1. These close six RustSec vulnerabilities (RUSTSEC-2026-0346 to -0349, -0381 and -0382) and the tokio `AsyncFd` soundness advisory (RUSTSEC-2026-0386). 0.4.4 and 0.5.0 both shipped the older versions.
+
+### Build
+
+- Clippy on Rust 1.99 no longer fails on a deprecated atomic method or a needless borrow.
+- The macOS CI job installs nextest on images whose rustup comes from Homebrew.
+
 ## 0.5.0 — 2026-10-31
 
 ### Upstream port

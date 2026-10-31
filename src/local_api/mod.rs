@@ -248,7 +248,7 @@ impl Drop for Slot {
 
 fn claim_slot() -> Option<Slot> {
     LIVE_CONNECTIONS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < MAX_CONNECTIONS).then_some(live + 1)
         })
         .ok()

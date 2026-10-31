@@ -92,9 +92,15 @@ jobs:
       # nextest's own installer, not the taiki-e action: the shared
       # install-action hygiene guard bails on the mac/windows images' bash
       # startup (the same 2026-09-22 regression as the toolchain action above).
+      # The macOS image's rustup comes from Homebrew, so nothing else creates
+      # this dir or puts it on PATH there.
       - name: install nextest
         shell: bash
-        run: curl -LsSf https://get.nexte.st/latest/${{ matrix.os == 'windows-latest' && 'windows-tar' || matrix.os == 'macos-latest' && 'mac' || 'linux' }} | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+        run: |
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "$bin"
+          [ "$RUNNER_OS" != macOS ] || echo "$bin" >> "$GITHUB_PATH"
+          curl -LsSf https://get.nexte.st/latest/${{ matrix.os == 'windows-latest' && 'windows-tar' || matrix.os == 'macos-latest' && 'mac' || 'linux' }} | tar zxf - -C "$bin"
       - if: runner.os == 'Linux'
         uses: taiki-e/install-action@cargo-llvm-cov
       # `every_completion_script_parses_in_its_own_shell` runs each shipped

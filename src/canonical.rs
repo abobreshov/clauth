@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// a comparison takes this same form; never shown, never handed to another
 /// program.
 // `allow`, not upstream's `expect`: tollgate's clippy.toml does not ban these yet
-// (the 0.5.1 canonical sweep adds the rule), so an `expect` would be unfulfilled.
+// (a later canonical sweep adds the rule), so an `expect` would be unfulfilled.
 #[allow(
     clippy::disallowed_methods,
     reason = "this module is the one place that calls it"
@@ -22,7 +22,7 @@ pub(crate) fn identity(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 /// program. Windows' `\\?\` verbatim prefix goes wherever a plain spelling
 /// exists; past 260 characters and on UNC paths it stays, as Windows needs.
 // `allow`, not upstream's `expect`: tollgate's clippy.toml does not ban these yet
-// (the 0.5.1 canonical sweep adds the rule), so an `expect` would be unfulfilled.
+// (a later canonical sweep adds the rule), so an `expect` would be unfulfilled.
 #[allow(
     clippy::disallowed_methods,
     reason = "this module is the one place that calls it"
@@ -35,7 +35,7 @@ pub(crate) fn plain(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 /// [`identity`] result at the moment it is shown, or a stored path an older
 /// tollgate wrote verbatim.
 // `allow`, not upstream's `expect`: tollgate's clippy.toml does not ban these yet
-// (the 0.5.1 canonical sweep adds the rule), so an `expect` would be unfulfilled.
+// (a later canonical sweep adds the rule), so an `expect` would be unfulfilled.
 #[allow(
     clippy::disallowed_methods,
     reason = "this module is the one place that calls it"

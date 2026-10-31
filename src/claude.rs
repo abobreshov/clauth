@@ -4788,7 +4788,7 @@ pub(crate) fn sync_item_into_its_store(item: &serde_json::Value, relinked: Optio
             .filter(|value| login_access_token(value) == Some(login))
             .map(|value| (store.to_path_buf(), value))
     };
-    let owner = relinked.and_then(&owns).or_else(|| {
+    let owner = relinked.and_then(owns).or_else(|| {
         let names = match crate::profile::load_app_state() {
             Ok(state) => {
                 let active = state
